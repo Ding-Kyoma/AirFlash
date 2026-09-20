@@ -1,0 +1,34 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.8.22'
+          python-version: '3.12'
+      - name: Python checks
+        shell: pwsh
+        run: |
+          uv sync --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          uv run pytest
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          uv run ruff check .
+          exit $LASTEXITCODE
+      - name: Native checks and build
+        shell: pwsh
+        run: ./scripts/build-native.ps1 -Check
+      - name: .NET tests
+        shell: pwsh
+        run: ./scripts/dotnet.ps1 test AirFlash.sln -p:RestoreLockedMode=true

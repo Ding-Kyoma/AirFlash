@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:loc="clr-namespace:AirFlash.App.Ui" xmlns:vm="clr-namespace:AirFlash.App.ViewModels" x:Class="AirFlash.App.Ui.ControlPanel" Title="AirFlash" Width="440" SizeToContent="Height" WindowStyle="None" ResizeMode="NoResize" ShowInTaskbar="False" Topmost="True" UseLayoutRounding="True" SnapsToDevicePixels="True" PreviewKeyDown="OnKeyDown" Deactivated="OnDeactivated" Closing="OnClosing">
+  <Window.Resources>
+    <Style x:Key="VolumeSlider" TargetType="Slider" BasedOn="{StaticResource {x:Type Slider}}">
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}"/>
+      <Style.Resources>
+        <!-- Scope the Fluent thumb border override to volume sliders. -->
+        <SolidColorBrush x:Key="ControlElevationBorderBrush" Color="{Binding BorderBrush.Color, RelativeSource={RelativeSource AncestorType={x:Type Slider}}}"/>
+      </Style.Resources>
+    </Style>
+  </Window.Resources>
+  <Border BorderBrush="{DynamicResource LineBrush}" BorderThickness="1" Padding="16" Background="{DynamicResource CanvasBrush}">
+    <Grid>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="*"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
+      <Grid Margin="2,0,0,18">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <StackPanel Orientation="Horizontal">
+          <Image Source="pack://application:,,,/Assets/app.png" Width="26" Height="26" VerticalAlignment="Center" Margin="0,2,10,0"/>
+          <TextBlock Text="AirFlash" FontSize="21" FontWeight="SemiBold" VerticalAlignment="Center"/>
+        </StackPanel>
+        <Button Grid.Column="1" Style="{StaticResource IconButton}"  ToolTip="{loc:Text 'Settings'}" AutomationProperties.Name="{loc:Text 'Settings'}" Click="OnSettings" Margin="0,0,7,0"><TextBlock Text="" FontFamily="Segoe Fluent Icons"/></Button>
+        <Button Grid.Column="2" Style="{StaticResource IconButton}" ToolTip="{loc:Text 'Quit'}" AutomationProperties.Name="{loc:Text 'Quit'}" Click="OnQuit" Margin="0,0,0,0"><Viewbox Width="18" Height="18"><Path Data="M 10,3 L 3,3 3,21 10,21 M 8,12 L 22,12 M 17,7 L 22,12 17,17" Stroke="{DynamicResource TextBrush}" StrokeThickness="1.6" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"/></Viewbox></Button>
+      </Grid>
+      <Border Grid.Row="1" Padding="10" CornerRadius="6" Background="{DynamicResource TintBrush}" Margin="0,0,0,12" Visibility="{Binding Notice, Converter={StaticResource NonEmpty}}">
+        <TextBlock Text="{Binding Notice}" Style="{StaticResource Hint}"/>
+      </Border>
+      <ScrollViewer x:Name="DeviceScroll" Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" MaxHeight="480">
+        <StackPanel>
+          <Border x:Name="EmptyState" Padding="18,28">
+            <Border.Style>
+              <Style TargetType="Border" BasedOn="{StaticResource Card}">
+                <Setter Property="Visibility" Value="Collapsed"/>
+                <Style.Triggers>
+                  <DataTrigger Binding="{Binding Receivers.Count}" Value="0">
+                    <Setter Property="Visibility" Value="Visible"/>
+                  </DataTrigger>
+                </Style.Triggers>
+              </Style>
+            </Border.Style>
+            <StackPanel>
+              <TextBlock Text="{loc:Text 'Searching for receivers'}" FontWeight="SemiBold" TextAlignment="Center"/>
+              <TextBlock Text="{loc:Text 'Connect your PC and HomePod to the same network,&#10;or add a receiver in settings.'}" TextAlignment="Center" Style="{StaticResource Hint}" Margin="0,8,0,0"/>
+            </StackPanel>
+          </Border>
+          <ItemsControl ItemsSource="{Binding Receivers}">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <Border Padding="12" Margin="0,0,0,10" CornerRadius="10" BorderThickness="1">
+                  <Border.Style>
+                    <Style TargetType="Border">
+                      <Setter Property="Background" Value="{DynamicResource SurfaceBrush}"/>
+                      <Setter Property="BorderBrush" Value="{DynamicResource LineBrush}"/>
+                      <Style.Triggers>
+                        <DataTrigger Binding="{Binding Active}" Value="True">
+                          <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}"/>
+                        </DataTrigger>
+                      </Style.Triggers>
+                    </Style>
+                  </Border.Style>
+                  <Grid>
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition Width="42"/>
+                      <ColumnDefinition Width="*"/>
+                      <ColumnDefinition Width="42"/>
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                      <RowDefinition Height="Auto"/>
+                      <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <Border Background="{DynamicResource TintBrush}" Width="32" Height="36" CornerRadius="8" VerticalAlignment="Top">
+                      <TextBlock Text="" FontFamily="Segoe Fluent Icons" FontSize="19" Foreground="{DynamicResource AccentBrush}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
+                    <StackPanel Grid.Column="1" Margin="0,0,8,0">
+                      <TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Name}"/>
+                      <TextBlock Text="{Binding StateText}" Style="{StaticResource Hint}" Margin="0,3,0,0"/>
+                    </StackPanel>
+                    <Button Grid.Column="2" Content="{Binding PlayGlyph}" Command="{Binding ToggleCommand}" ToolTip="{Binding PlayHint}" AutomationProperties.Name="{Binding PlayHint}" Style="{StaticResource IconButton}" Foreground="{DynamicResource AccentBrush}"/>
+                    <Grid Grid.Row="1" Grid.ColumnSpan="3" Margin="0,9,0,0">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="108"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="40"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <Slider Style="{StaticResource VolumeSlider}" Grid.Column="1" Minimum="0" Maximum="100" TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding Volume, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Center" AutomationProperties.Name="{loc:Text 'Device volume'}" PreviewMouseLeftButtonDown="OnSliderPreviewMouseLeftButtonDown"/>
+                      <TextBlock Grid.Column="2" Text="{Binding Volume, StringFormat={}{0}%}" HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="{DynamicResource MutedBrush}"/>
+                      <Button Grid.Column="3" Content="{Binding MuteLabel}" Command="{Binding MuteCommand}" AutomationProperties.Name="{Binding MuteLabel}" Width="64" Padding="8,4" Margin="10,0,0,0" FontSize="11"/>
+                    </Grid>
+                  </Grid>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </StackPanel>
+      </ScrollViewer>
+      <StackPanel Grid.Row="3">
+        <Grid Margin="2,4,2,14" Visibility="{Binding Settings.ShowStreamingModes, Converter={StaticResource BoolVisibility}}">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="190"/>
+          </Grid.ColumnDefinitions>
+          <TextBlock Text="{loc:Text 'Latency mode'}" VerticalAlignment="Center" Style="{StaticResource Hint}"/>
+          <ComboBox Grid.Column="1" ItemsSource="{x:Static vm:Choices.Latencies}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding LatencyMode, Mode=TwoWay}" DropDownOpened="OnPopupOpened" DropDownClosed="OnPopupClosed" AutomationProperties.Name="{loc:Text 'Latency mode'}"/>
+        </Grid>
+        <Border Padding="12" Margin="0,0,0,10" CornerRadius="10" Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource LineBrush}" BorderThickness="1" Visibility="{Binding Settings.ShowMasterControl, Converter={StaticResource BoolVisibility}}">
+          <Grid>
+            <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="108"/>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="40"/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+          <TextBlock Text="{loc:Text 'Master volume'}" VerticalAlignment="Center" Margin="0,0,14,0" FontWeight="SemiBold"/>
+            <Slider Style="{StaticResource VolumeSlider}" Grid.Column="1" Minimum="0" Maximum="100" TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding MasterVolume, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Center" AutomationProperties.Name="{loc:Text 'Master volume'}" PreviewMouseLeftButtonDown="OnSliderPreviewMouseLeftButtonDown"/>
+            <TextBlock Grid.Column="2" Text="{Binding MasterVolume, StringFormat={}{0}%}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+            <Button Grid.Column="3" Content="{Binding MuteLabel}" Command="{Binding MuteCommand}" AutomationProperties.Name="{Binding MuteLabel}" Width="64" Padding="8,4" Margin="10,0,0,0" FontSize="11"/>
+          </Grid>
+        </Border>
+      </StackPanel>
+      <StackPanel Grid.Row="4" Margin="2,4,2,0">
+        <DockPanel>
+          <Ellipse Width="6" Height="6" Fill="{DynamicResource AccentBrush}" Margin="0,0,7,0"/>
+          <TextBlock Text="{Binding StatusTitle}" FontWeight="SemiBold" FontSize="12"/>
+        </DockPanel>
+        <TextBlock Text="{Binding StatusDetail}" Style="{StaticResource Hint}" Margin="13,4,0,0" MaxHeight="62" TextTrimming="CharacterEllipsis" ToolTip="{Binding StatusDetail}"/>
+        <Expander Header="{loc:Text 'View error details'}" Visibility="{Binding ErrorDetails, Converter={StaticResource NonEmpty}}" Margin="0,8,0,0">
+          <ScrollViewer MaxHeight="120" VerticalScrollBarVisibility="Auto">
+            <TextBlock Text="{Binding ErrorDetails}" Style="{StaticResource Hint}" Margin="0,8,0,0"/>
+          </ScrollViewer>
+        </Expander>
+      </StackPanel>
+    </Grid>
+  </Border>
+</Window>

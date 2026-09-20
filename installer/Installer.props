@@ -1,0 +1,12 @@
+<Project>
+  <PropertyGroup>
+    <WixToolsetVersion Condition="'$(WixToolsetVersion)' == ''">6.0.2</WixToolsetVersion>
+    <ProductVersion Condition="'$(ProductVersion)' == ''">0.2.0</ProductVersion>
+    <AppExe Condition="'$(AppExe)' == ''">$(MSBuildProjectDirectory)\..\build\wpf-publish\AirFlash.exe</AppExe>
+    <AppIcon Condition="'$(AppIcon)' == ''">$(MSBuildProjectDirectory)\..\desktop\AirFlash.App\Assets\app.ico</AppIcon>
+    <UiLicenseFile Condition="'$(UiLicenseFile)' == ''">$(MSBuildProjectDirectory)\License.rtf</UiLicenseFile>
+    <OutputPath Condition="'$(OutputPath)' == ''">$(MSBuildProjectDirectory)\..\dist\</OutputPath>
+    <DebugType Condition="'$(DebugType)' == ''">none</DebugType>
+    <DefineConstants>$(DefineConstants);ProductVersion=$(ProductVersion);AppExe=$(AppExe);AppIcon=$(AppIcon);UiLicenseFile=$(UiLicenseFile)</DefineConstants>
+  </PropertyGroup>
+</Project>

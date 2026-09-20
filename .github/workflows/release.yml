@@ -1,0 +1,78 @@
+name: Release
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: airflash-release
+  cancel-in-progress: false
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Reserve an increasing version
+        id: version
+        shell: pwsh
+        run: |
+          git checkout -B main
+          . ./scripts/release-version.ps1
+          $version = Reserve-ReleaseVersion (Get-Location).Path
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.8.22'
+          python-version: '3.12'
+      - name: Python checks
+        shell: pwsh
+        run: |
+          uv sync --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          uv run pytest
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          uv run ruff check .
+          exit $LASTEXITCODE
+      - name: Native checks
+        shell: pwsh
+        run: ./scripts/build-native.ps1 -Check
+      - name: .NET tests
+        shell: pwsh
+        run: ./scripts/dotnet.ps1 test AirFlash.sln -p:RestoreLockedMode=true
+      - name: Build and verify
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          ./scripts/build.ps1 -ReservedVersion $env:RELEASE_VERSION
+          ./scripts/verify-release.ps1 -Version $env:RELEASE_VERSION
+      - name: Installer lifecycle in disposable runner
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/test-installer.ps1
+      - name: Publish verified release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $tag = 'v' + $env:RELEASE_VERSION
+          $sha = git rev-parse HEAD
+          gh release create $tag dist/AirFlash.exe dist/AirFlash.msi dist/SHA256SUMS.txt --target $sha --title "AirFlash $env:RELEASE_VERSION" --notes-file docs/RELEASE-NOTES.md --latest
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Preserve failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-failure-logs
+          path: artifacts/installer-test/*.log
+          retention-days: 7

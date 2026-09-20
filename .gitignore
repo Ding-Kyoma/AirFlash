@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+build/
+dist/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Packaging artifacts
+*.exe
+*.msi
+*.wixpdb
+installer/out/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Runtime data (should never live in the repo)
+logs/
+*.log
+state/
+
+# Native engine build output
+native/**/target/
+artifacts/
+
+# .NET build output
+**/bin/
+**/obj/
+**/TestResults/
+*.zip
+
+# Local agent instructions and private material
+AGENTS.md
+.env
+.env.*
+*.dpapi
+*.pem
+*.pfx
+*.key
+*.dmp

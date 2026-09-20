@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Strings.zh.json" WithCulture="false" LogicalName="AirFlash.Core.Strings.zh.json"/>
+  </ItemGroup>
+</Project>

@@ -1,0 +1,17 @@
+<Project Sdk="WixToolset.Sdk/6.0.2">
+  <Import Project="Installer.props"/>
+  <PropertyGroup>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <OutputName>AirFlash</OutputName>
+    <OutputPath>$(OutputPath)</OutputPath>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="WixToolset.UI.wixext" Version="$(WixToolsetVersion)"/>
+    <PackageReference Include="WixToolset.Util.wixext" Version="$(WixToolsetVersion)"/>
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="Package.wxs"/>
+  </ItemGroup>
+</Project>

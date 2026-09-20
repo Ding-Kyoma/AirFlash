@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <OutputType Condition="'$(AirFlashConsole)' == 'true'">Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>AirFlash</AssemblyName>
+    <RootNamespace>AirFlash.App</RootNamespace>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <Version>0.2.0</Version>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets/app.ico</ApplicationIcon>
+    <PublishTrimmed>false</PublishTrimmed>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <NoWarn>$(NoWarn);WPF0001</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../AirFlash.Core/AirFlash.Core.csproj"/>
+    <PackageReference Include="NAudio" Version="2.2.1"/>
+  </ItemGroup>
+  <ItemGroup>
+    <Resource Include="Assets/app.png"/>
+    <EmbeddedResource Include="Assets/ThirdPartyNotices.txt" LogicalName="AirFlash.ThirdPartyNotices.txt"/>
+    <EmbeddedResource Include="../../native/airflash-engine/target/release/airflash-engine.exe" LogicalName="AirFlash.Engine.exe" Condition="Exists('../../native/airflash-engine/target/release/airflash-engine.exe')"/>
+  </ItemGroup>
+  <Target Name="RequireEngineForPublish" BeforeTargets="PrepareForPublish">
+    <Error Condition="!Exists('../../native/airflash-engine/target/release/airflash-engine.exe')" Text="Build the Rust engine first with scripts/build-native.ps1."/>
+  </Target>
+</Project>
