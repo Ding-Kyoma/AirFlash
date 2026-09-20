@@ -31,4 +31,4 @@ jobs:
         run: ./scripts/build-native.ps1 -Check
       - name: .NET tests
         shell: pwsh
-        run: ./scripts/dotnet.ps1 test AirFlash.sln -p:RestoreLockedMode=true
+        run: ./scripts/dotnet.ps1 test AirFlash.sln '-p:RestoreLockedMode=true'

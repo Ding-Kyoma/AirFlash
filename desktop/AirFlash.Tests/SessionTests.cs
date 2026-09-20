@@ -66,7 +66,7 @@ public sealed class SessionTests
     {
         var process = new FakeConnection(); var factory = new FakeFactory(process); await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
         var settings = Settings(); settings.ForceReconnect = true; await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
-        process.Emit("error", message: "authentication signature verification failed"); await Until(() => process.Disposed); Assert.Equal(1, factory.OpenCount); Assert.Equal(PlaybackState.Error, controller.Snapshot.State);
+        process.Emit("error", message: "authentication signature verification failed"); await Until(() => process.Disposed && controller.Snapshot.State == PlaybackState.Error); Assert.Equal(1, factory.OpenCount); Assert.Equal(PlaybackState.Error, controller.Snapshot.State);
     }
     [Fact]
     public async Task ConnectionTimeoutBecomesActionableError()
@@ -87,7 +87,7 @@ public sealed class SessionTests
     public async Task StopAndFailedSessionRestoreMute()
     {
         var process = new FakeConnection(); var audio = new FakeAudio(); await using var controller = new SessionController(new FakeFactory(process), audio, timing: Fast);
-        await controller.StartAsync(Pod(), Settings()); await Until(() => audio.Muted); process.Emit("error", message: "peer closed"); await Until(() => process.Disposed); Assert.False(audio.Muted);
+        await controller.StartAsync(Pod(), Settings()); await Until(() => audio.Muted); process.Emit("error", message: "peer closed"); await Until(() => process.Disposed && controller.Snapshot.State == PlaybackState.Error); Assert.False(audio.Muted);
     }
     [Fact]
     public async Task TurningOffMuteWhileStreamingRestoresImmediately()
