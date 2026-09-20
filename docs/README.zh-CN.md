@@ -5,13 +5,16 @@
   <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-![AirFlash 中文界面](images/airflash-zh-CN.png)
+<p align="center">
+  <img src="images/airflash-zh-CN.png" alt="AirFlash 中文界面" width="550" />
+</p>
 
 通过原生 AirPlay 2 发送端，将 Windows 桌面声音低延迟发送到 HomePod。
 AirFlash 支持现有的双 HomePod 立体声组合，并针对 Windows 音频播放场景
 优化延迟。
 
-> **状态：** 早期版本。当前硬件覆盖范围较窄。
+AirFlash 是 TuneBlade（AirPlay 1）的 AirPlay 2 替代方案，旨在让 Windows
+能够向运行较新版本 HomePod 软件的设备流送音频。
 
 ## 安装
 

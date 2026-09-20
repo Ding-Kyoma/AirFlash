@@ -5,13 +5,16 @@
   <a href="docs/README.zh-CN.md">简体中文</a>
 </p>
 
-![AirFlash English interface](docs/images/airflash-en.png)
+<p align="center">
+  <img src="docs/images/airflash-en.png" alt="AirFlash English interface" width="550" />
+</p>
 
 Windows desktop audio streaming to HomePod over a native AirPlay 2 sender.
 AirFlash supports existing two-device stereo pairs and low-latency playback
 from Windows.
 
-> **Status:** early-stage release. Hardware coverage is intentionally narrow.
+AirFlash is an AirPlay 2 alternative to TuneBlade (AirPlay 1), designed to bring
+Windows audio streaming to HomePods running newer versions of HomePod software.
 
 ## Installation
 
