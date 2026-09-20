@@ -118,11 +118,4 @@ acoustic playback or end-to-end latency.
 
 ## License
 
-Dual-licensed. AirFlash is available under the GNU General Public
-License, version 3 or any later version (see [LICENSE-GPLv3](LICENSE-GPLv3)),
-or under the AirFlash Commercial License (see
-[LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md); contact
-https://github.com/Ding-Kyoma/AirFlash/issues). Protocol implementation and dependency
-notices are documented in
-[native/airflash-engine/README.md](native/airflash-engine/README.md) and
-[desktop/THIRD-PARTY-NOTICES.md](desktop/THIRD-PARTY-NOTICES.md).
+[GPLv3+](LICENSE-GPLv3) or [Commercial License](LICENSE-COMMERCIAL.md).
