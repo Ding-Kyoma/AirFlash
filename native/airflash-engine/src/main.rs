@@ -1,7 +1,7 @@
 //! Versioned JSONL qualification interface. stdout is exclusively structured IPC.
 use airflash_engine::{
     rtsp::Cancellation,
-    session::{ProbeOptions, probe},
+    session::{ProbeOptions, probe_with_volume},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -40,6 +40,7 @@ struct Running {
     gain: std::sync::Arc<std::sync::atomic::AtomicU32>,
     pending_pin: Option<std::sync::mpsc::Sender<String>>,
     gain_limit: f64,
+    volume: airflash_engine::volume::Control,
 }
 impl Drop for Running {
     fn drop(&mut self) {
@@ -110,7 +111,7 @@ fn main() {
             "hello" => send(
                 &request.id,
                 &request.session_id,
-                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"partial","live_loopback":true,"commands":["hello","start","probe","stop","set_gain","pair","pair_pin"],"production_ready":false}),
+                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"partial","live_loopback":true,"commands":["hello","start","probe","stop","set_gain","set_device_volume","pair","pair_pin"],"production_ready":false}),
             ),
             "probe" | "start" => {
                 let options: ProbeOptions = match serde_json::from_value(request.params) {
@@ -145,10 +146,12 @@ fn main() {
                 let gain =
                     std::sync::Arc::new(std::sync::atomic::AtomicU32::new(options.gain.to_bits()));
                 let worker_gain = gain.clone();
+                let volume = airflash_engine::volume::Control::default();
+                let worker_volume = volume.clone();
                 let gain_limit = if request.command == "probe" { 0.1 } else { 1.0 };
                 let worker = thread::spawn(move || {
                     let emit = |e| send(&request.id, &request.session_id, e);
-                    if let Err(error) = probe(options, worker_cancel, worker_gain, emit) {
+                    if let Err(error) = probe_with_volume(options, worker_cancel, worker_gain, worker_volume, emit) {
                         emit(airflash_engine::transport::error_event(&error));
                     }
                 });
@@ -159,7 +162,19 @@ fn main() {
                     gain,
                     pending_pin: None,
                     gain_limit,
+                    volume,
                 });
+            }
+            "set_device_volume" => {
+                if let Some(r) = running.as_ref().filter(|r| r.id == request.session_id && r.pending_pin.is_none()) {
+                    if let (Some(percent), Some(sequence)) = (
+                        request.params.get("volume").and_then(Value::as_u64).filter(|v| *v <= 100),
+                        request.params.get("sequence").and_then(Value::as_u64).filter(|v| *v > 0)) {
+                        r.volume.set(airflash_engine::volume::Command { sequence, percent: percent as u8 });
+                    } else {
+                        send(&request.id, &request.session_id, json!({"event":"device_volume_error","message":"invalid device volume command"}));
+                    }
+                }
             }
             "set_gain" => {
                 if let Some(r) = running.as_ref().filter(|r| r.id == request.session_id) {
@@ -277,6 +292,7 @@ fn main() {
                     gain: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
                     pending_pin: Some(tx),
                     gain_limit: 0.0,
+                    volume: airflash_engine::volume::Control::default(),
                 });
             }
             "stop" => {

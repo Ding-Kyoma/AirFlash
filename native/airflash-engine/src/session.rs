@@ -474,6 +474,16 @@ pub fn probe(
     gain: std::sync::Arc<std::sync::atomic::AtomicU32>,
     emit: impl Fn(Json),
 ) -> Result<()> {
+    probe_with_volume(options, cancel, gain, crate::volume::Control::default(), emit)
+}
+
+pub fn probe_with_volume(
+    options: ProbeOptions,
+    cancel: Cancellation,
+    gain: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    volume: crate::volume::Control,
+    emit: impl Fn(Json),
+) -> Result<()> {
     if options.duration_ms == 0 {
         options.validate_start()?;
     } else {
@@ -555,6 +565,8 @@ pub fn probe(
     for member in &mut members {
         member.start_feedback(start)?;
     }
+    let volume_worker = crate::volume::Worker::start(members.iter().map(|m|
+        (m.peer.host.to_string(), m.uri.clone(), m.conn.clone())).collect(), volume)?;
     let mut next_metrics = start + Duration::from_secs(1);
     let mut last_marker = 0u64;
     let mut next_sync = start;
@@ -564,6 +576,7 @@ pub fn probe(
     let mut pcm = vec![0; PCM_BYTES];
     let outcome = (|| -> Result<()> {
         while (options.duration_ms == 0 || start.elapsed() < duration) && !cancel.is_cancelled() {
+            for event in volume_worker.events.try_iter() { emit(event); }
             for member in &members {
                 for notice in member.health.notices() {
                     emit(notice);
@@ -652,6 +665,7 @@ pub fn probe(
     emit(
         json!({"event":"metrics","packets_per_member":packets,"frames":schedule.frames,"max_send_lateness_us":schedule.max_lateness_us,"retransmits":members.iter().map(|m|m.media.metrics.retransmits_sent).sum::<u64>(),"ptp_packets_received":ptp.as_ref().map(|p|p.received.load(Ordering::Relaxed)),"measured_latency_ms":null,"qualified":false}),
     );
+    drop(volume_worker);
     for m in &mut members {
         m.close();
     }

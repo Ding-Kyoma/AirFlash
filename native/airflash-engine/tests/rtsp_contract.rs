@@ -168,3 +168,21 @@ fn idle_eof_and_authentication_failure_are_distinct() {
         Some(WireError::Authentication)
     ));
 }
+
+#[test]
+fn delayed_reply_from_timed_out_volume_query_is_not_next_response() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut connection = Connection::connect(listener.local_addr().unwrap(), Cancellation::default()).unwrap();
+    let (socket, _) = listener.accept().unwrap();
+    let server = thread::spawn(move || {
+        let mut peer = Connection::from_stream(socket, Cancellation::default()).unwrap();
+        let first = peer.read().unwrap();
+        let second = peer.read().unwrap();
+        peer.write(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 3\r\n\r\noldRTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 3\r\n\r\nnew", first.headers["cseq"], second.headers["cseq"]).as_bytes()).unwrap();
+    });
+    connection.set_timeout(Duration::from_millis(30)).unwrap();
+    assert!(connection.request("GET", "/info", &[], &[]).is_err());
+    connection.set_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(connection.request("POST", "/feedback", &[], &[]).unwrap().body, b"new");
+    server.join().unwrap();
+}

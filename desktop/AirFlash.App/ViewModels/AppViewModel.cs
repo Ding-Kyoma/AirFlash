@@ -22,7 +22,6 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private bool _volumeDirty, _autoSuppressed, _closing;
     private string? _defaultEndpoint;
     private long _editRevision;
-    private readonly Dictionary<string, int> _mutedReceivers = [];
     private Task _startup = Task.CompletedTask;
     private Task? _disposeTask;
     private bool _monitorVisible;
@@ -216,6 +215,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             foreach (var row in Receivers) row.Refresh();
             StopCommand.Refresh();
         }
+        foreach (var row in Receivers) row.Refresh();
         if (_monitorVisible) RefreshMonitor();
     });
     public void SetMonitorVisible(bool visible)
@@ -278,22 +278,19 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         var receiver = eligible.OrderByDescending(r => r.Id == _settings.LastReceiverId).FirstOrDefault();
         if (receiver is not null && !_autoAttempted.Contains(receiver.Id)) await ToggleAsync(receiver);
     }
-    public bool IsReceiverMuted(string id) => _mutedReceivers.ContainsKey(id);
-    public void ToggleReceiverMute(string id)
+    public DeviceVolumeState ReceiverVolume(string id) => _snapshot.Receiver?.Id == id &&
+        _snapshot.State is PlaybackState.Streaming or PlaybackState.Standby ? _snapshot.DeviceVolume ?? new() : new();
+    public async Task ToggleReceiverMuteAsync(string id)
     {
-        if (_mutedReceivers.TryGetValue(id, out var restore))
+        var volume = ReceiverVolume(id);
+        if (!volume.Available) return;
+        if (volume.Display == 0)
         {
-            _mutedReceivers.Remove(id);
-            SetReceiverVolumeCore(id, restore > 0 ? restore : 100);
+            if (volume.LastNonZero is { } restore) await Session.SetDeviceVolumeAsync(id, restore);
         }
-        else
-        {
-            _mutedReceivers[id] = _settings.ReadOptions(id).Volume ?? 100;
-            SetReceiverVolumeCore(id, 0);
-        }
+        else await Session.SetDeviceVolumeAsync(id, 0);
     }
-    public void SetReceiverVolume(string id, int value) { _mutedReceivers.Remove(id); SetReceiverVolumeCore(id, value); }
-    private void SetReceiverVolumeCore(string id, int value) { _settings.Options(id).Volume = Math.Clamp(value, 0, 100); VolumeChanged(); }
+    public Task SetReceiverVolumeAsync(string id, int value) => Session.SetDeviceVolumeAsync(id, value);
     private void VolumeChanged() { _editRevision++; _volumeDirty = true; _volumeTimer.Stop(); if (!_closing) _volumeTimer.Start(); }
     public async Task FlushVolumeAsync()
     {
@@ -398,12 +395,24 @@ public sealed class ReceiverViewModel : ObservableObject
     {
         _app = app; Receiver = receiver;
         ToggleCommand = new(() => app.ToggleAsync(Receiver), app.ShowError, () => CanPlay);
-        MuteCommand = new(() => { app.ToggleReceiverMute(Receiver.Id); Notify(nameof(Volume)); Notify(nameof(Muted)); Notify(nameof(MuteLabel)); });
+        MuteCommand = new(() => app.ToggleReceiverMuteAsync(Receiver.Id), app.ShowError, () => CanMute);
     }
     public string Name => Receiver.Name;
     public string Detail => Receiver.Detail;
-    public int Volume { get => _app.Settings.ReadOptions(Receiver.Id).Volume ?? 100; set { if (Volume == value) return; _app.SetReceiverVolume(Receiver.Id, value); Notify(); } }
-    public bool Muted => _app.IsReceiverMuted(Receiver.Id);
+    private DeviceVolumeState DeviceVolume => _app.ReceiverVolume(Receiver.Id);
+    public int Volume { get => DeviceVolume.Display ?? 0; set { if (Volume != value && CanSetVolume) _ = SetVolumeAsync(value); } }
+    private async Task SetVolumeAsync(int value)
+    {
+        try { await _app.SetReceiverVolumeAsync(Receiver.Id, value); }
+        catch (Exception error) { _app.ShowError(error); }
+    }
+    public string VolumeText => DeviceVolume.Display is { } value ? $"{value}%" : "—";
+    public string VolumeStatus => DeviceVolume.Status switch {
+        "pending" => L.Get("Synchronizing…"), "unconfirmed" => L.Get("Volume not confirmed"),
+        "unsynced" => L.Get("Volume not synchronized"), _ => "" };
+    public bool CanSetVolume => DeviceVolume.Available;
+    public bool CanMute => CanSetVolume && (!Muted || DeviceVolume.LastNonZero is > 0);
+    public bool Muted => DeviceVolume.Display == 0;
     public string MuteLabel => Muted ? L.Get("Unmute") : L.Get("Mute");
     public bool Active => _app.Snapshot.IsActive && _app.Snapshot.Receiver?.Id == Receiver.Id;
     public bool CanPlay => Active || Receiver.Online && Receiver.Complete;
@@ -411,15 +420,16 @@ public sealed class ReceiverViewModel : ObservableObject
     public string PlayHint => Active ? L.Get("Stop playback / disconnect") : L.Get("Play on this device");
     public string StateText => (Active ? _app.StatusTitle : !Receiver.Online ? L.Get("Offline") : !Receiver.Complete ? L.Get("Waiting for the other member") : L.Get("Disconnected")) + (Receiver.IsGroup ? $" · {Receiver.Members.Length}/2" : "");
     public AsyncCommand ToggleCommand { get; }
-    public RelayCommand MuteCommand { get; }
+    public AsyncCommand MuteCommand { get; }
     public void Refresh()
     {
-        var values = new Dictionary<string, object?> { [nameof(Name)] = Name, [nameof(Detail)] = Detail, [nameof(Volume)] = Volume, [nameof(Muted)] = Muted, [nameof(MuteLabel)] = MuteLabel, [nameof(Active)] = Active, [nameof(CanPlay)] = CanPlay, [nameof(PlayGlyph)] = PlayGlyph, [nameof(PlayHint)] = PlayHint, [nameof(StateText)] = StateText };
+        var values = new Dictionary<string, object?> { [nameof(Name)] = Name, [nameof(Detail)] = Detail, [nameof(Volume)] = Volume, [nameof(VolumeText)] = VolumeText, [nameof(VolumeStatus)] = VolumeStatus, [nameof(CanSetVolume)] = CanSetVolume, [nameof(CanMute)] = CanMute, [nameof(Muted)] = Muted, [nameof(MuteLabel)] = MuteLabel, [nameof(Active)] = Active, [nameof(CanPlay)] = CanPlay, [nameof(PlayGlyph)] = PlayGlyph, [nameof(PlayHint)] = PlayHint, [nameof(StateText)] = StateText };
         foreach (var (name, value) in values)
             if (!_display.TryGetValue(name, out var old) || !Equals(old, value))
             {
                 _display[name] = value; Notify(name);
                 if (name == nameof(CanPlay)) ToggleCommand.Refresh();
+                if (name == nameof(CanMute)) MuteCommand.Refresh();
             }
     }
 }

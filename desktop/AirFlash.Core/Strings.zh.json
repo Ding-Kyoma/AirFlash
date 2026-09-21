@@ -214,5 +214,8 @@
   "Responding": "响应正常",
   "Requested value": "请求值",
   "Receiver-reported value": "接收端返回值",
-  "Feedback: {0}; last successful response: {1}; failures: {2}": "保活：{0}；最近成功响应耗时：{1}；失败：{2}"
+  "Feedback: {0}; last successful response: {1}; failures: {2}": "保活：{0}；最近成功响应耗时：{1}；失败：{2}",
+  "Synchronizing…": "同步中…",
+  "Volume not confirmed": "音量未确认",
+  "Volume not synchronized": "音量未同步"
 }

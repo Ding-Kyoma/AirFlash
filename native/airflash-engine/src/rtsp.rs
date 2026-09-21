@@ -295,6 +295,9 @@ impl Connection {
         bytes.extend(body);
         self.write(&bytes)
     }
+    pub fn stale_response(&self, response: &Message) -> bool {
+        response.headers.get("cseq").and_then(|s| s.parse::<u32>().ok()).is_some_and(|seq| seq < self.cseq)
+    }
     pub fn validate_cseq(&self, response: &Message) -> Result<()> {
         if let Some(seq) = response.headers.get("cseq") {
             ensure!(seq.parse::<u32>()? == self.cseq, "mismatched CSeq");
@@ -309,7 +312,13 @@ impl Connection {
         body: &[u8],
     ) -> Result<Message> {
         self.begin_request(method, path, headers, body)?;
-        let response = self.read().with_context(|| format!("{method} {path}"))?;
+        let deadline = Instant::now() + self.timeout;
+        let response = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let response = self.read_for(remaining, None)?.ok_or(WireError::ReadTimeout)
+                .with_context(|| format!("{method} {path}"))?;
+            if !self.stale_response(&response) { break response; }
+        };
         self.validate_cseq(&response)?;
         ensure!(
             response.status()? == 200,

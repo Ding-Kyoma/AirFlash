@@ -131,8 +131,6 @@
                         <TextBlock Text="{loc:Text 'Custom latency / ms (blank uses global)'}" Style="{StaticResource Hint}"/>
                         <TextBox Text="{Binding Options.CustomBufferMs, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" Margin="0,4,0,12"/>
                       </StackPanel>
-                      <TextBlock Text="{loc:Text 'Device volume / % (blank uses 100%)'}" Style="{StaticResource Hint}"/>
-                      <TextBox Text="{Binding Options.Volume, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" Margin="0,4,0,12"/>
                       <TextBlock Text="{loc:Text 'Standby threshold / seconds (blank uses global)'}" Style="{StaticResource Hint}"/>
                       <TextBox Text="{Binding Options.StandbySeconds, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" Margin="0,4,0,0"/>
                     </StackPanel>

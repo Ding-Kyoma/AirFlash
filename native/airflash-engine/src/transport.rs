@@ -318,7 +318,7 @@ fn feedback_loop(
             if let Some(response) =
                 connection.read_for(POLL.min(timing.hard - elapsed), Some(stop))?
             {
-                break response;
+                if !connection.stale_response(&response) { break response; }
             }
         };
         connection.validate_cseq(&response)?;

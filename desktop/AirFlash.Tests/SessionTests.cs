@@ -18,11 +18,11 @@ public sealed class SessionTests
         Assert.Equal(PlaybackState.Connecting, controller.Snapshot.State); await controller.StopAsync(); Assert.True(process.Disposed); Assert.Equal(PlaybackState.Idle, controller.Snapshot.State);
     }
     [Fact]
-    public async Task GainPrecedesAudioAndUsesReceiverTimesMaster()
+    public async Task GainPrecedesAudioAndIgnoresLegacyReceiverVolume()
     {
         var process = new FakeConnection(); await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast);
         var settings = Settings(); settings.Options("a").Volume = 25; await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
-        var command = process.Commands.Single(c => c.Command == "start"); Assert.Equal(.025, command.Parameters.Number("gain")); Assert.Equal(200, command.Parameters.Number("latency_ms"));
+        var command = process.Commands.Single(c => c.Command == "start"); Assert.Equal(.1, command.Parameters.Number("gain")); Assert.Equal(200, command.Parameters.Number("latency_ms"));
         Assert.Equal(44100, command.Parameters.Number("sample_rate"));
         Assert.Equal(JsonValueKind.Array, command.Parameters.GetProperty("peers")[0].GetProperty("codecs").ValueKind);
     }
@@ -192,6 +192,60 @@ public sealed class SessionTests
     private static async Task Until(Func<bool> predicate)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3)); while (!predicate()) await Task.Delay(5, timeout.Token);
+    }
+    [Fact]
+    public async Task DeviceVolumeReadsWithoutWritingAndDebouncesLatestTarget()
+    {
+        var process = new FakeConnection(); await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: SessionTiming.Default);
+        await controller.StartAsync(Pod(), Settings()); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.Null(controller.Snapshot.DeviceVolume!.Actual);
+        await controller.SetDeviceVolumeAsync("a", 90);
+        Assert.DoesNotContain(process.Commands, c => c.Command == "set_device_volume");
+        process.EmitData(new { @event = "device_volume", host = "127.0.0.1", volume = 28, sequence = 0, status = "confirmed", available = true });
+        await Until(() => controller.Snapshot.DeviceVolume?.Actual == 28);
+        Assert.DoesNotContain(process.Commands, c => c.Command == "set_device_volume");
+        var first = controller.SetDeviceVolumeAsync("a", 40);
+        var last = controller.SetDeviceVolumeAsync("a", 55);
+        await Until(() => process.Commands.Any(c => c.Command == "set_device_volume"));
+        var command = Assert.Single(process.Commands, c => c.Command == "set_device_volume");
+        Assert.Equal(55, command.Parameters.Number("volume"));
+        var sequence = command.Parameters.Integer("sequence");
+        process.EmitData(new { @event = "device_volume", host = "127.0.0.1", volume = 28, sequence, status = "pending", available = true });
+        await Until(() => controller.Snapshot.DeviceVolume?.ReadAfterWrite == true);
+        Assert.Equal(55, controller.Snapshot.DeviceVolume!.Display);
+        process.EmitData(new { @event = "device_volume", host = "127.0.0.1", volume = 55, sequence, status = "confirmed", available = true });
+        await Until(() => controller.Snapshot.DeviceVolume?.Target is null);
+        Assert.Equal(55, controller.Snapshot.DeviceVolume!.Actual);
+        await controller.StopAsync(); await Task.WhenAll(first, last);
+        Assert.Null(controller.Snapshot.DeviceVolume!.Actual);
+    }
+    [Fact]
+    public async Task StereoLeaderIsFirstAndOnlyLeaderReadoutIsAccepted()
+    {
+        var process = new FakeConnection(); await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast);
+        var leader = new Receiver("leader", "leader", "127.0.0.2") { IsLeader = true };
+        var group = Pod("stereo:pair") with { Members = [Pod(), leader] };
+        await controller.StartAsync(group, Settings()); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.Equal("127.0.0.2", process.Commands.Single(c => c.Command == "start").Parameters.GetProperty("peers")[0].Text("host"));
+        process.EmitData(new { @event = "device_volume", host = "127.0.0.1", volume = 90, sequence = 0, status = "confirmed", available = true });
+        process.EmitData(new { @event = "device_volume", host = "127.0.0.2", volume = 30, sequence = 0, status = "confirmed", available = true });
+        await Until(() => controller.Snapshot.DeviceVolume?.Actual == 30);
+    }
+    [Fact]
+    public async Task ReconnectDiscardsOldVolumeAndPendingEdits()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection();
+        await using var controller = new SessionController(new FakeFactory(first, second), new FakeAudio(), timing: Fast);
+        await controller.StartAsync(Pod(), Settings()); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        first.EmitData(new { @event = "device_volume", host = "127.0.0.1", volume = 30, sequence = 0, status = "confirmed", available = true });
+        await Until(() => controller.Snapshot.DeviceVolume?.Actual == 30);
+        var edit = controller.SetDeviceVolumeAsync("a", 80);
+        await controller.StartAsync(Pod(), Settings()); await Until(() => second.Session.Length > 0 && controller.Snapshot.State == PlaybackState.Streaming);
+        await edit; Assert.Null(controller.Snapshot.DeviceVolume!.Actual);
+        second.EmitData(new { @event = "device_volume", host = "127.0.0.1", volume = 80, sequence = 0, status = "confirmed", available = true }, first.Session);
+        second.EmitData(new { @event = "device_volume", host = "127.0.0.1", volume = 32, sequence = 0, status = "confirmed", available = true });
+        await Until(() => controller.Snapshot.DeviceVolume?.Actual == 32);
+        Assert.DoesNotContain(second.Commands, c => c.Command == "set_device_volume");
     }
     private sealed class FakeFactory(params FakeConnection[] processes) : IEngineFactory
     {

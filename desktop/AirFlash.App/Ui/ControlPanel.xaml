@@ -92,8 +92,9 @@
                         <ColumnDefinition Width="40"/>
                         <ColumnDefinition Width="Auto"/>
                       </Grid.ColumnDefinitions>
-                      <Slider Style="{StaticResource VolumeSlider}" Grid.Column="1" Minimum="0" Maximum="100" TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding Volume, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Center" AutomationProperties.Name="{loc:Text 'Device volume'}" PreviewMouseLeftButtonDown="OnSliderPreviewMouseLeftButtonDown"/>
-                      <TextBlock Grid.Column="2" Text="{Binding Volume, StringFormat={}{0}%}" HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="{DynamicResource MutedBrush}"/>
+                      <TextBlock Text="{Binding VolumeStatus}" Style="{StaticResource Hint}" VerticalAlignment="Center" TextWrapping="Wrap" Margin="0,0,8,0"/>
+                      <Slider IsEnabled="{Binding CanSetVolume}" Style="{StaticResource VolumeSlider}" Grid.Column="1" Minimum="0" Maximum="100" TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding Volume, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Center" AutomationProperties.Name="{loc:Text 'Device volume'}" PreviewMouseLeftButtonDown="OnSliderPreviewMouseLeftButtonDown"/>
+                      <TextBlock Grid.Column="2" Text="{Binding VolumeText}" HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="{DynamicResource MutedBrush}"/>
                       <Button Grid.Column="3" Content="{Binding MuteLabel}" Command="{Binding MuteCommand}" AutomationProperties.Name="{Binding MuteLabel}" Width="64" Padding="8,4" Margin="10,0,0,0" FontSize="11"/>
                     </Grid>
                   </Grid>
