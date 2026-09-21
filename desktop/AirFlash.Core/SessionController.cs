@@ -6,7 +6,7 @@ namespace AirFlash.Core;
 
 public enum PlaybackState { Idle, Connecting, Streaming, Standby, Pairing, Error }
 public sealed record StreamMetrics(double? CaptureToSendP95 = null, double? MaxQueueAge = null, long? Underruns = null, long? DroppedFrames = null, int? InputRate = null);
-public sealed record SessionSnapshot(PlaybackState State, Receiver? Receiver = null, string Message = "", StreamMetrics? Metrics = null, int TargetLatency = 0, PlaybackDiagnostics? Diagnostics = null, int StreamRate = 0)
+public sealed record SessionSnapshot(PlaybackState State, Receiver? Receiver = null, string Message = "", StreamMetrics? Metrics = null, int TargetLatency = 0, PlaybackDiagnostics? Diagnostics = null, int StreamRate = 0, DeviceVolumeState? DeviceVolume = null)
 {
     public bool IsActive => State is PlaybackState.Connecting or PlaybackState.Streaming or PlaybackState.Standby or PlaybackState.Pairing;
 }
@@ -27,6 +27,63 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private Receiver? _receiver;
     private long _generation;
     private bool _muted;
+    private DeviceVolumeState _deviceVolume = new();
+    private long _volumeSequence;
+    private CancellationTokenSource? _volumeEdit;
+    public async Task SetDeviceVolumeAsync(string receiverId, int value)
+    {
+        CancellationToken token;
+        long sequence, epoch;
+        lock (_sync)
+        {
+            if (_receiver?.Id != receiverId || !_deviceVolume.Available || _snapshot.State is not (PlaybackState.Streaming or PlaybackState.Standby)) return;
+            _volumeEdit?.Cancel(); _volumeEdit?.Dispose();
+            _volumeEdit = CancellationTokenSource.CreateLinkedTokenSource(_lifetime!.Token);
+            token = _volumeEdit.Token; sequence = ++_volumeSequence; epoch = _generation;
+            _deviceVolume = _deviceVolume.Begin(Math.Clamp(value, 0, 100), sequence);
+        }
+        PublishCurrent(epoch);
+        try
+        {
+            await Task.Delay(200, token).ConfigureAwait(false);
+            await _serial.WaitAsync(token).ConfigureAwait(false);
+            try
+            {
+                IEngineConnection? connection; string? session;
+                lock (_sync)
+                {
+                    if (epoch != _generation || sequence != _deviceVolume.Sequence) return;
+                    connection = _connection; session = _sessionId;
+                }
+                if (connection is null || session is null) return;
+                await connection.SendAsync(session, "set_device_volume", new { volume = Math.Clamp(value, 0, 100), sequence }, token).ConfigureAwait(false);
+            }
+            finally { _serial.Release(); }
+            await Task.Delay(TimeSpan.FromSeconds(3), token).ConfigureAwait(false);
+            lock (_sync)
+            {
+                if (epoch != _generation || sequence != _deviceVolume.Sequence || _deviceVolume.Target is null) return;
+                _deviceVolume = _deviceVolume.Timeout();
+            }
+            PublishCurrent(epoch);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception error) when (error is IOException or ObjectDisposedException or InvalidOperationException)
+        {
+            lock (_sync)
+            {
+                if (epoch != _generation || sequence != _deviceVolume.Sequence) return;
+                _deviceVolume = _deviceVolume.Timeout() with { Available = false };
+            }
+            log?.Invoke($"Device volume command failed: {error.Message}");
+            PublishCurrent(epoch);
+        }
+    }
+    private void PublishCurrent(long epoch)
+    {
+        // Hold the state lock through publication so an old state cannot replace stop/reconnect.
+        lock (_sync) { if (epoch == _generation) Publish(epoch, _snapshot.State, _snapshot.Message); }
+    }
     private PlaybackDiagnostics _diagnostics = new();
     private readonly Dictionary<string, EngineNotice> _warnings = [];
     private SessionSnapshot _snapshot = new(PlaybackState.Idle);
@@ -78,7 +135,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     }
     private async Task StopLockedAsync()
     {
-        ++_generation;
+        lock (_sync) { ++_generation; _volumeEdit?.Cancel(); _volumeEdit?.Dispose(); _volumeEdit = null; _deviceVolume = new(); }
         if (_lifetime is not null) await _lifetime.CancelAsync().ConfigureAwait(false);
         if (_work is not null) await _work.ConfigureAwait(false);
         _lifetime?.Dispose(); _lifetime = null; _work = null;
@@ -127,13 +184,19 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             {
                 var settings = _settings;
                 var peers = new List<object>();
-                foreach (var member in receiver.Peers) peers.Add(new { host = await ResolveAsync(member.Address, cancellation).ConfigureAwait(false), port = member.Port, codecs = member.Codecs.Select(x => (int)x).ToArray() });
+                string? volumeHost = null;
+                foreach (var member in receiver.Peers.OrderByDescending(p => p.IsLeader))
+                {
+                    var host = await ResolveAsync(member.Address, cancellation).ConfigureAwait(false);
+                    volumeHost ??= host;
+                    peers.Add(new { host, port = member.Port, codecs = member.Codecs.Select(x => (int)x).ToArray() });
+                }
                 await using var connection = factory.Open();
                 var session = Guid.NewGuid().ToString("N");
                 SetConnection(connection, session);
                 try
                 {
-                    lock (_sync) { if (epoch == _generation) { _diagnostics = _diagnostics with { Transport = null, Warnings = [] }; _warnings.Clear(); _snapshot = _snapshot with { Metrics = null }; } }
+                    lock (_sync) { if (epoch == _generation) { _diagnostics = _diagnostics with { Transport = null, Warnings = [] }; _warnings.Clear(); _deviceVolume = new(); _volumeEdit?.Cancel(); _snapshot = _snapshot with { Metrics = null }; } }
                     Publish(epoch, PlaybackState.Connecting, attempts > 0 ? L.Format("Reconnecting ({0}/{1})", attempts, settings.MaxReconnectAttempts) : L.Get("Connecting…"));
                     var deadline = DateTime.UtcNow + _timing.Connect;
                     await connection.SendAsync(session, "start", new { peers, source = "loopback", duration_ms = 0, latency_ms = settings.Latency(receiver.Id), gain = Gain(receiver), timing = "ptp", capture_endpoint = settings.EffectiveEndpoint, sample_rate = int.Parse(settings.StreamSampleRate) }, cancellation).ConfigureAwait(false);
@@ -151,6 +214,17 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                             startedAt = Stopwatch.GetTimestamp();
                             if (_settings.MuteWhileStreaming) await audio.MuteAsync(_settings.EffectiveEndpoint).ConfigureAwait(false);
                             Publish(epoch, PlaybackState.Streaming);
+                        }
+                        else if (kind == "device_volume" && startedAt != 0 && item.Text("host") == volumeHost)
+                        {
+                            lock (_sync)
+                            {
+                                if (epoch != _generation) continue;
+                                var wasPending = _deviceVolume.Target is not null;
+                                _deviceVolume = _deviceVolume.Receive(item);
+                                if (wasPending && _deviceVolume.Target is null) _volumeEdit?.Cancel();
+                            }
+                            PublishCurrent(epoch);
                         }
                         else if (kind == "warning" && startedAt != 0)
                         {
@@ -208,7 +282,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     }
     private async Task PairMembersAsync(Receiver receiver, Func<Receiver, CancellationToken, Task<string?>> requestPin, long epoch, CancellationToken cancellation)
     {
-        foreach (var member in receiver.Peers)
+        foreach (var member in receiver.Peers.OrderByDescending(p => p.IsLeader))
         {
             await using var connection = factory.Open();
             var session = Guid.NewGuid().ToString("N");
@@ -281,7 +355,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         lock (_sync)
         {
             if (epoch != _generation) return;
-            snapshot = new(state, _receiver, message, metrics ?? _snapshot.Metrics, _receiver is null ? 0 : _settings.Latency(_receiver.Id), _diagnostics, int.TryParse(_settings.StreamSampleRate, out var streamRate) ? streamRate : 0);
+            snapshot = new(state, _receiver, message, metrics ?? _snapshot.Metrics, _receiver is null ? 0 : _settings.Latency(_receiver.Id), _diagnostics, int.TryParse(_settings.StreamSampleRate, out var streamRate) ? streamRate : 0, _deviceVolume);
             _snapshot = snapshot;
         }
         Changed?.Invoke(snapshot);

@@ -78,7 +78,7 @@ public sealed class AppSettings : ObservableObject
         var options = ReadOptions(id);
         return (options.LatencyMode ?? LatencyMode) switch { "realtime" => 120, "buffered" => 500, "custom" => Math.Clamp(options.CustomBufferMs ?? CustomBufferMs, 0, 2000), _ => 200 };
     }
-    public double Gain(string id) => Math.Clamp(MasterVolume, 0, 100) / 100d * Math.Clamp(ReadOptions(id).Volume ?? 100, 0, 100) / 100d;
+    public double Gain(string id) => Math.Clamp(MasterVolume, 0, 100) / 100d;
     public string? EffectiveEndpoint => CaptureMode == "loopback" ? null : CaptureEndpoint;
     public string? Validate()
     {

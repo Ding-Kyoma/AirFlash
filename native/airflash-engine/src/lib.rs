@@ -15,3 +15,4 @@ pub mod live;
 pub mod credentials;
 
 pub mod transport;
+pub mod volume;

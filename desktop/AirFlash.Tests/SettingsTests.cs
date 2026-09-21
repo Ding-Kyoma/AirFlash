@@ -127,10 +127,10 @@ public sealed class SettingsTests
         var clone = s.Clone(); Assert.Null(clone.Validate()); Assert.Null(clone.ReadOptions("id").CustomBufferMs); Assert.Equal(s.ManualReceivers[0], clone.ManualReceivers[0]);
     }
     [Fact]
-    public void GainCombinesMasterAndDeviceVolumes()
+    public void GainUsesOnlyMasterVolume()
     {
         var settings = new AppSettings { MasterVolume = 40 }; settings.Options("a").Volume = 25;
-        Assert.Equal(.1, settings.Gain("a")); Assert.Equal(.4, settings.Gain("b"));
+        Assert.Equal(.4, settings.Gain("a")); Assert.Equal(.4, settings.Gain("b"));
     }
     [Theory]
     [InlineData("realtime", 120)]
