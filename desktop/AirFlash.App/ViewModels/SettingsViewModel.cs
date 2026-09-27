@@ -239,17 +239,25 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         {
             var adapters = NetworkAdapterCatalog.List();
             var options = new List<DiscoveryAdapterOption> { new("", L.Get("All network interfaces (default)")) };
-            options.AddRange(adapters.Select(a => new DiscoveryAdapterOption(a.Id, a.Label)));
+            options.AddRange(adapters.OrderByDescending(a => a.Available)
+                .ThenBy(a => a.Name, StringComparer.CurrentCultureIgnoreCase)
+                .Select(a => new DiscoveryAdapterOption(a.Id, a.Label)));
             var selected = Draft.DiscoveryInterfaceId;
             if (selected.Length > 0 && options.All(a => !a.Id.Equals(selected, StringComparison.OrdinalIgnoreCase)))
                 options.Add(new(selected, L.Get("Unavailable · ") + selected));
-            foreach (var option in options)
+            for (var i = 0; i < options.Count; i++)
             {
+                var option = options[i];
                 var current = DiscoveryAdapters.FirstOrDefault(a => a.Id == option.Id);
-                if (current is null) DiscoveryAdapters.Add(option);
-                else if (current.Label != option.Label) current.Label = option.Label;
+                if (current is null) DiscoveryAdapters.Insert(i, option);
+                else
+                {
+                    if (current.Label != option.Label) current.Label = option.Label;
+                    var previous = DiscoveryAdapters.IndexOf(current);
+                    if (previous != i) DiscoveryAdapters.Move(previous, i);
+                }
             }
-            foreach (var obsolete in DiscoveryAdapters.Where(a => options.All(o => o.Id != a.Id)).ToArray()) DiscoveryAdapters.Remove(obsolete);
+            while (DiscoveryAdapters.Count > options.Count) DiscoveryAdapters.RemoveAt(DiscoveryAdapters.Count - 1);
             NetworkStatus = selected.Length == 0 ? L.Get("Discovery uses all network interfaces.") :
                 DiscoveryInterface.ResolveIndex(selected, adapters) is null ? L.Get("The selected network interface is unavailable. Discovery is paused.") :
                 L.Get("Discovery uses only the selected network interface.");
