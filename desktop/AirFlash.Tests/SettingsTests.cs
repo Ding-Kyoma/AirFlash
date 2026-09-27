@@ -15,7 +15,7 @@ public sealed class SettingsTests
             StreamSampleRate = "48000",
             LatencyMode = "custom", CustomBufferMs = 650, StandbyEnabled = true,
             StandbySilenceSeconds = 22, CaptureMode = "endpoint", CaptureEndpoint = "b",
-            MasterVolume = 41, LastReceiverId = "a",
+            MasterVolume = 41, LastReceiverId = "a", DiscoveryInterfaceId = "01db7c77-1016-49cb-8f5c-f5c194425d15",
             Extra = new() { ["future_option"] = JsonSerializer.SerializeToElement(new { enabled = true }) }
         };
         source.Options("a").Volume = 52; source.Options("a").Hidden = true;
@@ -68,6 +68,17 @@ public sealed class SettingsTests
         Assert.Equal("system", settings.UiLanguage);
         Assert.Equal("system", settings.Theme);
         Assert.Null(settings.Validate());
+    }
+    [Fact]
+    public void DiscoveryInterfaceDefaultsToAllAndSurvivesSerialization()
+    {
+        var settings = new AppSettings();
+        Assert.Equal("", settings.DiscoveryInterfaceId);
+        settings.DiscoveryInterfaceId = "01db7c77-1016-49cb-8f5c-f5c194425d15";
+        Assert.Null(settings.Validate());
+        Assert.Equal(settings.DiscoveryInterfaceId, settings.Clone().DiscoveryInterfaceId);
+        settings.DiscoveryInterfaceId = "invalid";
+        Assert.NotNull(settings.Validate());
     }
     [Fact]
     public void ThemeDefaultsToSystemAndValidatesSupportedModes()

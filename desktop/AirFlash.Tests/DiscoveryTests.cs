@@ -6,6 +6,18 @@ public sealed class DiscoveryTests
 {
     private static ServiceRecord Member(string name, string address, string id, bool leader, string kind = "_airplay._tcp.local") => new(name, kind, address, 7000, new Dictionary<string, string> { ["deviceid"] = id, ["tsid"] = "stable", ["gid"] = "unstable", ["gpn"] = "家庭影院", ["igl"] = leader ? "1" : "0", ["cn"] = "0,1,2,3" });
     [Fact]
+    public void SelectedInterfaceNeverFallsBackToAllWhenMissingOrDisconnected()
+    {
+        const string selected = "01db7c77-1016-49cb-8f5c-f5c194425d15";
+        var adapters = new[] { new DiscoveryAdapter(selected, "Wi-Fi", "Physical", "192.168.1.2", true, 17),
+            new DiscoveryAdapter("vpn", "ZeroTier", "Virtual", "10.1.1.2", true, 42) };
+        Assert.Equal(0u, DiscoveryInterface.ResolveIndex("", adapters));
+        Assert.Equal(17u, DiscoveryInterface.ResolveIndex(selected, adapters));
+        Assert.Null(DiscoveryInterface.ResolveIndex("missing", adapters));
+        Assert.Null(DiscoveryInterface.ResolveIndex(selected, adapters.Select(a => a with { IsUp = false })));
+        Assert.Null(DiscoveryInterface.ResolveIndex(selected, adapters.Select(a => a with { Ipv4Addresses = "" })));
+    }
+    [Fact]
     public void AggregatesBothServicesAndPreservesCodecList()
     {
         var receivers = ReceiverAggregator.Build([Member("left._airplay._tcp.local", "10.0.0.1", "aa:bb", true), Member("right._airplay._tcp.local", "10.0.0.2", "cc:dd", false), Member("aabb@Cinema._raop._tcp.local", "10.0.0.1", "aabb", true, "_raop._tcp.local")]);

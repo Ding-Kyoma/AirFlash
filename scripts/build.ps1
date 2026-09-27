@@ -1,5 +1,5 @@
 # Build Rust, publish the self-contained WPF desktop application, and create the MSI.
-param([switch]$Console, [string]$ReservedVersion)
+param([switch]$Console, [string]$ReservedVersion, [ValidateSet('stable','preview')][string]$ReleaseChannel = 'stable')
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 Set-Location -LiteralPath $repoRoot
@@ -18,7 +18,7 @@ New-Item -ItemType Directory -Path (Join-Path $repoRoot 'artifacts') -Force | Ou
 $releaseLock = [IO.File]::Open((Join-Path $repoRoot 'artifacts/release.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
 try {
 . (Join-Path $PSScriptRoot 'release-version.ps1')
-$releaseVersion = Reserve-ReleaseVersion $repoRoot $ReservedVersion
+$releaseVersion = Reserve-ReleaseVersion $repoRoot $ReservedVersion $ReleaseChannel
 Write-Host "Building AirFlash $releaseVersion"
 Remove-SafeDirectory (Join-Path $repoRoot 'build')
 Remove-SafeDirectory (Join-Path $repoRoot 'dist')
@@ -28,7 +28,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Native build failed' }
 $publish = Join-Path $repoRoot 'build/wpf-publish'
 $project = Join-Path $repoRoot 'desktop/AirFlash.App/AirFlash.App.csproj'
 $consoleFlag = if ($Console) { 'true' } else { 'false' }
-& (Join-Path $PSScriptRoot 'dotnet.ps1') publish $project -c Release -r win-x64 --self-contained true '-p:IncludeNativeLibrariesForSelfExtract=true' '-p:PublishTrimmed=false' '-p:EnableCompressionInSingleFile=true' '-p:RestoreLockedMode=true' '-p:DebugType=None' '-p:DebugSymbols=false' "-p:PathMap=$repoRoot=/_/" "-p:AirFlashConsole=$consoleFlag" "-p:Version=$releaseVersion" "-p:FileVersion=$releaseVersion.0" "-p:AssemblyVersion=$releaseVersion.0" -o $publish
+$informationalVersion = if ($ReleaseChannel -eq 'preview') { "$releaseVersion-rc.1" } else { $releaseVersion }
+& (Join-Path $PSScriptRoot 'dotnet.ps1') publish $project -c Release -r win-x64 --self-contained true '-p:IncludeNativeLibrariesForSelfExtract=true' '-p:PublishTrimmed=false' '-p:EnableCompressionInSingleFile=true' '-p:RestoreLockedMode=true' '-p:DebugType=None' '-p:DebugSymbols=false' "-p:PathMap=$repoRoot=/_/" "-p:AirFlashConsole=$consoleFlag" "-p:Version=$releaseVersion" "-p:InformationalVersion=$informationalVersion" "-p:FileVersion=$releaseVersion.0" "-p:AssemblyVersion=$releaseVersion.0" -o $publish
 if ($LASTEXITCODE -ne 0) { throw 'WPF publish failed; do not use residual dist files' }
 $builtExe = Join-Path $publish 'AirFlash.exe'
 if (-not (Test-Path -LiteralPath $builtExe -PathType Leaf)) { throw 'Published executable missing' }

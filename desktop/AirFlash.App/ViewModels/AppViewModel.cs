@@ -81,6 +81,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         Endpoints.DevicesChanged += OnEndpointsChangedAsync;
         Endpoints.Failed += ShowError;
         _settings = store.Load();
+        _discovery.SetInterface(_settings.DiscoveryInterfaceId);
         Session = new(factory, audio, AppPaths.Log);
         Session.Changed += SessionChanged;
         _discovery.Changed += list => _dispatcher.BeginInvoke(() => OnDiscovered(list));
@@ -153,7 +154,12 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         {
             var before = AllReceivers;
             var discovered = list.ToDictionary(r => r.Id);
-            foreach (var key in _known.Keys.ToArray()) if (!_known[key].IsManual && !discovered.ContainsKey(key)) _known[key] = _known[key] with { Online = false };
+            foreach (var key in _known.Keys.ToArray())
+                if (!_known[key].IsManual && !discovered.ContainsKey(key))
+                {
+                    if (_settings.DiscoveryInterfaceId.Length > 0) _known.Remove(key);
+                    else _known[key] = _known[key] with { Online = false };
+                }
             foreach (var receiver in list)
             {
                 if (!_known.TryGetValue(receiver.Id, out var previous) || !previous.Online || !previous.Complete && receiver.Complete) _autoAttempted.Remove(receiver.Id);
@@ -352,6 +358,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
                 _settings = revision == _editRevision ? merged.Clone() : SettingsMerge.Merge(before, _settings, merged);
                 foreach (var removed in baseline.Receivers.Keys.Except(draft.Receivers.Keys)) _settings.Receivers.Remove(removed);
                 _volumeDirty = revision != _editRevision;
+                if (before.DiscoveryInterfaceId != _settings.DiscoveryInterfaceId) _discovery.SetInterface(_settings.DiscoveryInterfaceId);
                 var oldCatalog = AllReceivers;
                 MergeManualReceivers(); RefreshReceivers();
                 Notify(nameof(Settings)); Notify(nameof(MasterVolume)); Notify(nameof(LatencyMode));

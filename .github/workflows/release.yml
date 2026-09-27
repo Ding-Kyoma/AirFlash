@@ -8,8 +8,10 @@ concurrency:
   cancel-in-progress: false
 jobs:
   release:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/nic-discovery-preview'
     runs-on: windows-2025
+    env:
+      RELEASE_CHANNEL: ${{ github.ref == 'refs/heads/main' && 'stable' || 'preview' }}
     permissions:
       contents: write
     steps:
@@ -21,9 +23,9 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          git checkout -B main
+          git checkout -B $env:GITHUB_REF_NAME
           . ./scripts/release-version.ps1
-          $version = Reserve-ReleaseVersion (Get-Location).Path
+          $version = Reserve-ReleaseVersion (Get-Location).Path '' $env:RELEASE_CHANNEL
           "version=$version" >> $env:GITHUB_OUTPUT
       - uses: actions/setup-dotnet@v4
         with:
@@ -52,14 +54,15 @@ jobs:
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          ./scripts/build.ps1 -ReservedVersion $env:RELEASE_VERSION
+          ./scripts/build.ps1 -ReservedVersion $env:RELEASE_VERSION -ReleaseChannel $env:RELEASE_CHANNEL
           ./scripts/verify-release.ps1 -Version $env:RELEASE_VERSION
       - name: Installer lifecycle in disposable runner
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/test-installer.ps1
-      - name: Publish verified release
+      - name: Publish verified stable release
+        if: github.ref == 'refs/heads/main'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -69,6 +72,16 @@ jobs:
           $sha = git rev-parse HEAD
           gh release create $tag dist/AirFlash.exe dist/AirFlash.msi dist/SHA256SUMS.txt --target $sha --title "AirFlash $env:RELEASE_VERSION" --notes-file docs/RELEASE-NOTES.md --latest
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Preserve verified preview assets for maintainer publication
+        if: github.ref == 'refs/heads/codex/nic-discovery-preview'
+        uses: actions/upload-artifact@v4
+        with:
+          name: airflash-preview-${{ steps.version.outputs.version }}-${{ github.sha }}
+          path: |
+            dist/AirFlash.exe
+            dist/AirFlash.msi
+            dist/SHA256SUMS.txt
+          retention-days: 14
       - name: Preserve failure diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
