@@ -46,6 +46,8 @@ public sealed class AppSettings : ObservableObject
     public string UiLanguage { get => _UiLanguage; set => Set(ref _UiLanguage, value); }
     private string _Theme = "system";
     public string Theme { get => _Theme; set => Set(ref _Theme, value); }
+    private string _DiscoveryInterfaceId = "";
+    public string DiscoveryInterfaceId { get => _DiscoveryInterfaceId; set => Set(ref _DiscoveryInterfaceId, value ?? ""); }
     private string _StreamSampleRate = "44100";
     public string StreamSampleRate { get => _StreamSampleRate; set => Set(ref _StreamSampleRate, value); }
     private string _LatencyMode = "normal";
@@ -84,6 +86,7 @@ public sealed class AppSettings : ObservableObject
     {
         if (UiLanguage is not ("system" or "en" or "zh")) return L.Get("Select a valid language.");
         if (Theme is not ("system" or "dark" or "light")) return L.Get("Select a valid theme.");
+        if (DiscoveryInterfaceId is null || (DiscoveryInterfaceId.Length > 0 && !Guid.TryParse(DiscoveryInterfaceId, out _))) return L.Get("Select a valid network interface.");
         if (MasterVolume is < 0 or > 100) return L.Get("Master volume must be between 0 and 100.");
         if (MaxReconnectAttempts is < 1 or > 20) return L.Get("Retry attempts must be between 1 and 20.");
         if (!Modes.Contains(LatencyMode)) return L.Get("Select a valid latency mode.");
@@ -108,6 +111,7 @@ public sealed class AppSettings : ObservableObject
         StartAtLogin = source.StartAtLogin; MuteWhileStreaming = source.MuteWhileStreaming;
         AutoConnectOnDiscover = source.AutoConnectOnDiscover; ForceReconnect = source.ForceReconnect;
         MaxReconnectAttempts = source.MaxReconnectAttempts; UiLanguage = source.UiLanguage; Theme = source.Theme;
+        DiscoveryInterfaceId = source.DiscoveryInterfaceId;
         StreamSampleRate = source.StreamSampleRate;
         LatencyMode = source.LatencyMode; CustomBufferMs = source.CustomBufferMs;
         StandbyEnabled = source.StandbyEnabled; StandbySilenceSeconds = source.StandbySilenceSeconds;

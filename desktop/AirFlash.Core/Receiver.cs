@@ -57,11 +57,27 @@ public static class ReceiverAggregator
     }
 }
 public sealed record AudioEndpoint(string Id, string Name);
+public sealed record DiscoveryAdapter(string Id, string Name, string Description, string Ipv4Addresses, bool IsUp, uint InterfaceIndex)
+{
+    public bool Available => IsUp && InterfaceIndex != 0 && Ipv4Addresses.Length > 0;
+    public string Label => $"{Name} · {Ipv4Addresses} · {(Available ? L.Get("Connected") : L.Get("Unavailable"))}";
+}
+public static class DiscoveryInterface
+{
+    // An unavailable selection must never turn into index 0 (all interfaces).
+    public static uint? ResolveIndex(string id, IEnumerable<DiscoveryAdapter> adapters)
+    {
+        if (id.Length == 0) return 0;
+        var adapter = adapters.FirstOrDefault(a => a.Id.Equals(id, StringComparison.OrdinalIgnoreCase));
+        return adapter is { Available: true } ? adapter.InterfaceIndex : null;
+    }
+}
 public interface IDiscoveryService : IDisposable
 {
     event Action<IReadOnlyList<Receiver>>? Changed;
     event Action<string>? Failed;
     void Start();
+    void SetInterface(string id);
 }
 public interface IAudioService
 {

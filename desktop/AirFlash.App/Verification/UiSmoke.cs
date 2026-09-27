@@ -110,7 +110,7 @@ internal static class UiSmoke
             {
                 ThemeService.SetForVerification(dark); await Pump();
                 CheckThemeColors(dark, checks);
-                for (var page = 0; page < 6; page++)
+                for (var page = 0; page < 7; page++)
                 {
                     settings.ViewModel.SelectedPage = page; await Pump();
                     Render(settings, Path.Combine(directory, $"settings-{(dark ? "dark" : "light")}-{page}.png"), 1);
@@ -134,7 +134,7 @@ internal static class UiSmoke
                 settings.Show();
             }
             Check(app.MonitorMembers.Count == 1 && app.MonitorRecoveries == "2", "transport metrics reach monitoring view", checks);
-            checks.Add("six pages rendered in light/dark; panel at 100/150/200 percent");
+            checks.Add("seven pages rendered in light/dark; panel at 100/150/200 percent");
             await app.StopAsync(); await Until(() => app.Snapshot.State == PlaybackState.Idle);
             Check(engine.DisposedCount == engine.CreatedCount, "stop releases mock engine", checks);
             await UiRegression.RunAsync(checks, directory);
@@ -244,6 +244,8 @@ internal static class UiSmoke
         public event Action<IReadOnlyList<Receiver>>? Changed;
         public event Action<string>? Failed { add { } remove { } }
         public void Start() => Publish();
+        public string SelectedInterface { get; private set; } = "";
+        public void SetInterface(string id) { SelectedInterface = id; Changed?.Invoke(id.Length == 0 ? Items : []); }
         public IReadOnlyList<Receiver> Items { get; set; } = [
             new("a", "家庭影院", "127.0.0.1") { Model = "HomePod" },
             new("b", "客厅立体声", "127.0.0.2") { StereoId = "pair", Members = [new("left", "左侧", "127.0.0.2"), new("right", "右侧", "127.0.0.3")] },

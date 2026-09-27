@@ -132,6 +132,19 @@ internal static class UiRegression
             Check(member is not null && ReferenceEquals(member, app.MonitorMembers[0]), "monitor member rows survive metrics updates", checks);
 
             await app.StopAsync();
+            vm.SelectedPage = 5; await Pump();
+            vm.AddManual("Manual LAN", "192.0.2.10", 7000);
+            app.Settings.Options("a").Hidden = true;
+            vm.Draft.DiscoveryInterfaceId = "01db7c77-1016-49cb-8f5c-f5c194425d15";
+            Check(await vm.ApplyAsync(), "network selection persists", checks);
+            await Pump();
+            Check(vm.NetworkStatus == L.Get("The selected network interface is unavailable. Discovery is paused."), "missing selected interface is reported without fallback", checks);
+            Check(discovery.SelectedInterface == vm.Draft.DiscoveryInterfaceId && !app.AllReceivers.Any(r => r.Id == "a") && app.AllReceivers.Any(r => r.IsManual) && app.Settings.ReadOptions("a").Hidden, "network switch clears remote catalog but preserves manual receiver and saved preference", checks);
+            vm.Draft.DiscoveryInterfaceId = "";
+            var resetApplied = await vm.ApplyAsync();
+            Check(resetApplied, "return to all interfaces succeeds: " + vm.Error + "; selected=" + vm.Draft.DiscoveryInterfaceId, checks);
+            await Pump();
+            Check(app.AllReceivers.Any(r => r.Id == "a"), "all interfaces restores discovery", checks);
             store.SaveGate = new(TaskCreationOptions.RunContinuationsAsynchronously);
             store.SaveEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
             vm.Draft.ForceReconnect = !vm.Draft.ForceReconnect;

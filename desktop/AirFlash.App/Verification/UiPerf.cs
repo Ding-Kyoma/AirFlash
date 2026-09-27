@@ -47,7 +47,7 @@ internal static class UiPerf
             await Measure("panel.first", () => panel.ShowPanel());
             panel.Hide();
             await Measure("settings.first", () => { settings = new(app); settings.Show(); });
-            for (var page = 0; page < 6; page++)
+            for (var page = 0; page < 7; page++)
             {
                 var selected = page;
                 await Measure($"page.{page}.first", () => settings!.ViewModel.SelectedPage = selected);
@@ -55,7 +55,7 @@ internal static class UiPerf
             for (var sample = 0; sample < 30; sample++)
             {
                 phase = "warm";
-                for (var page = 0; page < 6; page++)
+                for (var page = 0; page < 7; page++)
                 {
                     var selected = page;
                     await Measure("page.cached", () => settings!.ViewModel.SelectedPage = selected);
