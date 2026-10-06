@@ -24,10 +24,11 @@ internal static class UiSmoke
         var directory = Path.GetDirectoryName(report)!; Directory.CreateDirectory(directory);
         AppPaths.DataDirectory = Path.Combine(directory, "isolated-data");
         var checks = new List<string>();
+        object? iconEnvironment = null;
         var store = new MemoryStore(); var engine = new MockFactory();
         await using var app = new AppViewModel(store, new MockDiscovery(), new MockAutostart(), new MockAudio(), engine, Application.Current.Dispatcher) { EngineVersion = "0.1.0（模拟）" };
         var panel = new ControlPanel(app); SettingsWindow? settings = null;
-        using var tray = new TrayService(panel, app, () => { }, () => { }); panel.Tray = tray;
+        using var tray = new TrayService(panel, app, () => { }, () => { }, Guid.NewGuid()); panel.Tray = tray;
         try
         {
             var instanceName = "verification-" + Guid.NewGuid().ToString("N");
@@ -69,6 +70,27 @@ internal static class UiSmoke
             app.MasterVolume = 25; await app.FlushVolumeAsync();
             Check(engine.Commands.Any(c => c.Text("command") == "set_gain" && c.GetProperty("params").Number("gain") == .25), "master gain reaches engine", checks);
             settings = new(app); settings.Show(); await Pump();
+            iconEnvironment = IconVerification.Run(settings, tray, checks, directory);
+            foreach (var message in new[] { 0x001a, 0x007e })
+            {
+                SendMessage(tray.WindowHandle, (uint)message, IntPtr.Zero, IntPtr.Zero); await Pump();
+            }
+            GetWindowRect(tray.WindowHandle, out var trayBounds);
+            var rectanglePointer = Marshal.AllocHGlobal(Marshal.SizeOf<NativeWindowPlacement.Rectangle>());
+            try
+            {
+                Marshal.StructureToPtr(trayBounds, rectanglePointer, false);
+                var trayDpi = AppIconService.WindowDpi(tray.WindowHandle);
+                SendMessage(tray.WindowHandle, 0x02e0, new((long)(trayDpi | trayDpi << 16)), rectanglePointer);
+                await Pump();
+            }
+            finally { Marshal.FreeHGlobal(rectanglePointer); }
+            Check(tray.IconHandle != IntPtr.Zero, "display/settings/DPI notifications preserve tray icon", checks);
+            tray.RemoveForVerification();
+            SendMessage(tray.WindowHandle, RegisterWindowMessage("TaskbarCreated"), IntPtr.Zero, IntPtr.Zero); await Pump();
+            Check(tray.IsRegisteredForVerification, "Explorer recreation registers tray icon again", checks);
+            SendMessage(tray.WindowHandle, RegisterWindowMessage("TaskbarCreated"), IntPtr.Zero, IntPtr.Zero); await Pump();
+            Check(tray.IsRegisteredForVerification, "repeated Explorer notification retains one registered tray icon", checks);
             Check(!settings.ApplyButton.IsEnabled, "apply initially disabled", checks);
             settings.ViewModel.SelectedPage = 2; await Pump();
             var radio = Descendants(settings).OfType<RadioButton>().Single(r => (string?)r.Content == L.Get("Specific output endpoint"));
@@ -123,7 +145,7 @@ internal static class UiSmoke
                     }
                 }
                 settings.Hide(); panel.ShowPanel(); await Pump();
-                foreach (var scale in new[] { 1d, 1.5, 2d }) Render(panel, Path.Combine(directory, $"panel-{(dark ? "dark" : "light")}-{scale * 100}.png"), scale);
+                foreach (var scale in new[] { 1d, 1.25, 1.5, 1.75, 2d }) Render(panel, Path.Combine(directory, $"panel-{(dark ? "dark" : "light")}-{scale * 100}.png"), scale);
                 var quit = Descendants(panel).OfType<Button>().Single(b => System.Windows.Automation.AutomationProperties.GetName(b) == L.Get("Quit"));
                 var quitRequested = false;
                 void OnQuit() => quitRequested = true;
@@ -134,17 +156,18 @@ internal static class UiSmoke
                 settings.Show();
             }
             Check(app.MonitorMembers.Count == 1 && app.MonitorRecoveries == "2", "transport metrics reach monitoring view", checks);
-            checks.Add("seven pages rendered in light/dark; panel at 100/150/200 percent");
+            checks.Add("seven pages rendered in light/dark; panel at 100/125/150/175/200 percent");
             await app.StopAsync(); await Until(() => app.Snapshot.State == PlaybackState.Idle);
             Check(engine.DisposedCount == engine.CreatedCount, "stop releases mock engine", checks);
             await UiRegression.RunAsync(checks, directory);
-            App.WriteOutput(args, new { ok = true, checks, note = "All engine/audio/discovery/autostart services are simulated. DPI renders do not replace physical multimonitor QA." });
+            App.WriteOutput(args, new { ok = true, checks, icon_environment = iconEnvironment, note = "All engine/audio/discovery/autostart services are simulated. DPI renders do not replace physical multimonitor QA." });
             return 0;
         }
         catch (Exception error) { App.WriteOutput(args, new { ok = false, checks, error = error.ToString() }); return 1; }
         finally { settings?.Close(); panel.ShutdownPanel(); }
     }
     [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr handle, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern uint RegisterWindowMessage(string message);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr handle, out NativeWindowPlacement.Rectangle rectangle);
     private static void Check(bool value, string message, List<string> checks) { if (!value) throw new InvalidOperationException(message); checks.Add(message); }
     private static void CheckThemeColors(bool dark, List<string> checks)

@@ -12,6 +12,7 @@ public sealed class PinDialog : Window
     {
         Title = L.Get("Pair HomePod"); Width = 390; SizeToContent = SizeToContent.Height; ResizeMode = ResizeMode.NoResize; WindowStartupLocation = WindowStartupLocation.CenterOwner;
         WindowThemeService.Track(this);
+        AppIconService.Track(this);
         var panel = new StackPanel { Margin = new(24) };
         panel.Children.Add(new TextBlock { Text = L.Format("Enter the PIN provided by {0} ({1})", receiver.Name, receiver.Address), TextWrapping = TextWrapping.Wrap, Margin = new(0, 0, 0, 18) });
         _code.PreviewTextInput += (_, args) => args.Handled = args.Text.Any(c => !char.IsAsciiDigit(c) && c != '-');

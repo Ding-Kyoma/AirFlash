@@ -14,6 +14,7 @@ public partial class SettingsWindow : Window
     {
         InitializeComponent(); ViewModel = new(app); DataContext = ViewModel;
         WindowThemeService.Track(this);
+        AppIconService.Track(this);
         ViewModel.CloseRequested += _ => Close();
         ViewModel.AddReceiverRequested += () => { var dialog = new ManualReceiverDialog { Owner = this }; if (dialog.ShowDialog() == true) ViewModel.AddManual(dialog.DeviceName, dialog.Host, dialog.Port); };
         ViewModel.PairRequested += async receiver =>

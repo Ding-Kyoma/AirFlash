@@ -23,7 +23,7 @@ public partial class ControlPanel : Window
     public event Action? QuitRequested;
     public ControlPanel(AppViewModel viewModel)
     {
-        InitializeComponent(); _viewModel = viewModel; DataContext = viewModel; WindowThemeService.Track(this);
+        InitializeComponent(); _viewModel = viewModel; DataContext = viewModel; WindowThemeService.Track(this); AppIconService.Track(this);
         viewModel.SettingsChanged += UpdateLayoutSettings;
         viewModel.Receivers.CollectionChanged += OnReceiversChanged;
         SizeChanged += (_, _) => { if (!_placing) RequestPlacement(); };

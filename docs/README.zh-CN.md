@@ -1,4 +1,4 @@
-# <img src="../desktop/AirFlash.App/Assets/app.png" width="36" height="36" alt="" style="vertical-align:middle" /> AirFlash
+# <img src="../desktop/AirFlash.App/Assets/app.svg" width="36" height="36" alt="" style="vertical-align:middle" /> AirFlash
 
 <p align="center">
   <a href="../README.md">English</a> ·
@@ -56,6 +56,8 @@ AirFlash 使用全新的应用数据目录 `%APPDATA%/AirFlash` 和
 实时模式目标延迟为 120 ms；目标值和本机传输统计不代表端到端声学延迟的实测值。
 
 版本预留与发布方法见 [发布流程](RELEASING.md)。
+
+矢量源图、资源生成与高 DPI 验收步骤见 [图标维护](ICONS.md)。
 
 ## 技术栈
 
