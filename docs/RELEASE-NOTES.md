@@ -1,8 +1,22 @@
-Windows x64 · Windows 10/11 · English / 简体中文
+# AirFlash 0.3.0
 
-- Stream Windows system audio to HomePod over AirPlay 2, including existing two-HomePod stereo pairs.
-- Choose low-latency profiles and check for stable updates in Settings → About.
-- Download AirFlash.msi to install, or AirFlash.exe for portable use. Verify downloads with SHA256SUMS.txt.
+Windows x64 · Windows 10/11 · English and Simplified Chinese
+
+## Features
+
+- Choose a local network adapter for AirPlay discovery in Settings → Network. Discovery pauses when the selected adapter is unavailable and resumes when it reconnects; available adapters are listed first.
+- Adjust a global ten-band equalizer with presets, preamp gain, and automatic attenuation to reduce clipping risk. Changes are previewed during playback; Apply saves them, while Cancel or closing Settings restores the saved sound.
+- Support development through the coffee button in the Simplified Chinese About page.
+
+## Bug Fixes
+
+- Improve application, window, and tray icon clarity on high-DPI displays, including DPI changes between monitors.
+- Recover from failed tray icon registration with a fallback identity and retries, and restore registration after Explorer restarts.
+- Reconcile compatible AirPlay and RAOP discovery records to reduce duplicate receiver entries and preserve saved receiver settings and pairing associations when discovery identities change.
+- Avoid restarting active playback for receiver metadata changes that do not change the connection or playback settings.
+
+## Downloads
+
+- Download **AirFlash.msi** to install, or **AirFlash.exe** for portable use. Verify downloads with **SHA256SUMS.txt**.
+- Check for stable updates in Settings → About.
 - Binaries are unsigned. Target latency is not a measurement of end-to-end acoustic latency.
-
-中文说明：支持通过 AirPlay 2 将 Windows 系统声音播放到 HomePod，以及现有双 HomePod 立体声组合。在“设置 → 关于”中检查更新。安装版下载 AirFlash.msi，便携版下载 AirFlash.exe；SHA256SUMS.txt 提供校验值。发布文件尚未签名，目标延迟不代表端到端声学延迟实测值。

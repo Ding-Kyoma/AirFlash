@@ -1,6 +1,17 @@
 name: Release
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'New X.Y.Z version to reserve; leave empty for automatic increment'
+        type: string
+        required: false
+        default: ''
+      publish:
+        description: 'Publish a stable release automatically; disable for maintainer publication'
+        type: boolean
+        required: false
+        default: true
 permissions:
   contents: read
 concurrency:
@@ -22,10 +33,12 @@ jobs:
       - name: Reserve an increasing version
         id: version
         shell: pwsh
+        env:
+          NEW_RELEASE_VERSION: ${{ inputs.version }}
         run: |
           git checkout -B $env:GITHUB_REF_NAME
           . ./scripts/release-version.ps1
-          $version = Reserve-ReleaseVersion (Get-Location).Path '' $env:RELEASE_CHANNEL
+          $version = Reserve-ReleaseVersion (Get-Location).Path '' $env:RELEASE_CHANNEL -NewVersion $env:NEW_RELEASE_VERSION
           "version=$version" >> $env:GITHUB_OUTPUT
       - uses: actions/setup-dotnet@v4
         with:
@@ -65,7 +78,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/test-installer.ps1
       - name: Publish verified stable release
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && inputs.publish
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -75,6 +88,17 @@ jobs:
           $sha = git rev-parse HEAD
           gh release create $tag dist/AirFlash.exe dist/AirFlash.msi dist/SHA256SUMS.txt --target $sha --title "AirFlash $env:RELEASE_VERSION" --notes-file docs/RELEASE-NOTES.md --latest
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Preserve verified stable assets for maintainer publication
+        if: github.ref == 'refs/heads/main' && !inputs.publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: airflash-release-${{ steps.version.outputs.version }}-${{ github.sha }}
+          path: |
+            dist/AirFlash.exe
+            dist/AirFlash.msi
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
       - name: Preserve verified preview assets for maintainer publication
         if: github.ref == 'refs/heads/codex/nic-discovery-preview'
         uses: actions/upload-artifact@v4

@@ -1,5 +1,5 @@
 # Build Rust, publish the self-contained WPF desktop application, and create the MSI.
-param([switch]$Console, [string]$ReservedVersion, [ValidateSet('stable','preview')][string]$ReleaseChannel = 'stable')
+param([switch]$Console, [string]$ReservedVersion, [ValidateSet('stable','preview')][string]$ReleaseChannel = 'stable', [string]$NewVersion)
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 Set-Location -LiteralPath $repoRoot
@@ -18,7 +18,7 @@ New-Item -ItemType Directory -Path (Join-Path $repoRoot 'artifacts') -Force | Ou
 $releaseLock = [IO.File]::Open((Join-Path $repoRoot 'artifacts/release.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
 try {
 . (Join-Path $PSScriptRoot 'release-version.ps1')
-$releaseVersion = Reserve-ReleaseVersion $repoRoot $ReservedVersion $ReleaseChannel
+$releaseVersion = Reserve-ReleaseVersion $repoRoot $ReservedVersion $ReleaseChannel -NewVersion $NewVersion
 Write-Host "Building AirFlash $releaseVersion"
 Remove-SafeDirectory (Join-Path $repoRoot 'build')
 Remove-SafeDirectory (Join-Path $repoRoot 'dist')
