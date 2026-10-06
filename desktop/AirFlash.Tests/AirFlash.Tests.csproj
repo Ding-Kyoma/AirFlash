@@ -14,5 +14,6 @@
     </PackageReference>
     <ProjectReference Include="../AirFlash.Core/AirFlash.Core.csproj"/>
     <Compile Include="../AirFlash.App/Ui/VolumeSliderMath.cs" Link="VolumeSliderMath.cs"/>
+    <Compile Include="../AirFlash.App/Services/TrayRegistration.cs" Link="TrayRegistration.cs"/>
   </ItemGroup>
 </Project>

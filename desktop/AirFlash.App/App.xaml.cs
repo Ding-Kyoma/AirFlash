@@ -22,7 +22,7 @@ public partial class App : Application
     {
         // Initialize before any windows, view models or static choice labels are created.
         var languageIndex = Array.IndexOf(args.Args, "--ui-language");
-        var smokeLanguage = (args.Args.Contains("--ui-smoke") || args.Args.Contains("--ui-perf")) && languageIndex >= 0 && languageIndex + 1 < args.Args.Length
+        var smokeLanguage = (args.Args.Contains("--ui-smoke") || args.Args.Contains("--tray-smoke") || args.Args.Contains("--ui-perf")) && languageIndex >= 0 && languageIndex + 1 < args.Args.Length
             ? new[] { args.Args[languageIndex + 1] } : null;
         L.Initialize(smokeLanguage);
         base.OnStartup(args);
@@ -40,6 +40,7 @@ public partial class App : Application
             if (args.Args.Contains("--discovery-check")) { Shutdown(await DiscoveryCheckAsync(args.Args)); return; }
             if (args.Args.Contains("--audio-check")) { Shutdown(await AudioCheckAsync(args.Args)); return; }
             if (args.Args.Contains("--ui-smoke")) { Shutdown(await UiSmoke.RunAsync(args.Args)); return; }
+            if (args.Args.Contains("--tray-smoke")) { Shutdown(await UiSmoke.RunAsync(args.Args)); return; }
             if (args.Args.Contains("--ui-perf")) { Shutdown(await UiPerf.RunAsync(args.Args)); return; }
             _instance = new();
             if (!_instance.IsOwner) { await _instance.NotifyExistingAsync(); await _instance.DisposeAsync(); _instance = null; Shutdown(); return; }
@@ -68,7 +69,7 @@ public partial class App : Application
         catch (Exception error)
         {
             AppPaths.Log(error.ToString());
-            if (args.Args.Any(a => a.EndsWith("-check", StringComparison.Ordinal) || a is "--ui-smoke" or "--ui-perf")) { WriteOutput(args.Args, new { ok = false, error = error.ToString() }); Shutdown(1); return; }
+            if (args.Args.Any(a => a.EndsWith("-check", StringComparison.Ordinal) || a is "--ui-smoke" or "--tray-smoke" or "--ui-perf")) { WriteOutput(args.Args, new { ok = false, error = error.ToString() }); Shutdown(1); return; }
             MessageBox.Show(error.Message, L.Get("AirFlash startup failed"), MessageBoxButton.OK, MessageBoxImage.Error);
             Quit();
         }
