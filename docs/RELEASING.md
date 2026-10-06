@@ -2,7 +2,7 @@
 
 Stable releases are built from `main` by the manually dispatched **Release** GitHub Actions workflow. It reserves a version before tests, runs native/.NET/Python checks, builds fresh Windows x64 binaries, verifies versions and checksums, exercises MSI installation in a disposable runner, and publishes the release only after success.
 
-For validation without public distribution, dispatch with `publish_release=false` (`gh workflow run release.yml --ref main -f publish_release=false`). This still reserves a new version and runs all build and installer checks, but saves `airflash-stable-<version>-<sha>` as an Actions artifact instead of creating a GitHub Release. Preview behavior is unchanged. Desktop tray verification is documented in [TRAY-DIAGNOSTICS.md](TRAY-DIAGNOSTICS.md).
+Desktop tray verification is documented in [TRAY-DIAGNOSTICS.md](TRAY-DIAGNOSTICS.md).
 
 Versions are three numeric components. `reserved/X.Y.Z` tags are permanent reservations, including failed builds. Never remove, move, or reuse them. The pre-GitHub floor is 0.2.3. `vX.Y.Z` identifies a published release and points to its source commit. Concurrent workflow runs are serialized; atomic remote reservations also prevent local collisions.
 

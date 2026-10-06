@@ -1,11 +1,6 @@
 name: Release
 on:
   workflow_dispatch:
-    inputs:
-      publish_release:
-        description: Publish the stable release (disable for build and installer validation only)
-        type: boolean
-        default: true
 permissions:
   contents: read
 concurrency:
@@ -70,7 +65,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/test-installer.ps1
       - name: Publish verified stable release
-        if: github.ref == 'refs/heads/main' && inputs.publish_release
+        if: github.ref == 'refs/heads/main'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -80,11 +75,11 @@ jobs:
           $sha = git rev-parse HEAD
           gh release create $tag dist/AirFlash.exe dist/AirFlash.msi dist/SHA256SUMS.txt --target $sha --title "AirFlash $env:RELEASE_VERSION" --notes-file docs/RELEASE-NOTES.md --latest
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Preserve verified unpublished assets
-        if: github.ref == 'refs/heads/codex/nic-discovery-preview' || !inputs.publish_release
+      - name: Preserve verified preview assets for maintainer publication
+        if: github.ref == 'refs/heads/codex/nic-discovery-preview'
         uses: actions/upload-artifact@v4
         with:
-          name: airflash-${{ env.RELEASE_CHANNEL }}-${{ steps.version.outputs.version }}-${{ github.sha }}
+          name: airflash-preview-${{ steps.version.outputs.version }}-${{ github.sha }}
           path: |
             dist/AirFlash.exe
             dist/AirFlash.msi
