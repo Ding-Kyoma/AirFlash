@@ -10,6 +10,83 @@ public sealed class SessionTests
     private static Receiver Pod(string id = "a") => new(id, id, "127.0.0.1");
     private static AppSettings Settings() => new() { AutoConnectOnDiscover = false, ForceReconnect = false, MasterVolume = 10 };
     private static readonly SessionTiming Fast = new(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1), TimeSpan.FromMilliseconds(10));
+    private static EqualizerSettings Sound(double gain) { var eq = new EqualizerSettings { Enabled = true }; eq.SetBand(0, gain); return eq; }
+    private static double EqGain(EngineCommand command) => command.Parameters.GetProperty("equalizer").GetProperty("band_gains_db")[0].GetDouble();
+    [Fact]
+    public async Task EqualizerStartsFromSavedSettingsAndDebouncesWithoutRestarting()
+    {
+        var process = new FakeConnection(); var factory = new FakeFactory(process);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        var settings = Settings(); settings.Equalizer = Sound(2);
+        await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.Equal(2, EqGain(process.Commands.Single(c => c.Command == "start")));
+        var count = process.Commands.Count(c => c.Command == "set_equalizer"); var owner = Guid.NewGuid();
+        var edits = Enumerable.Range(1, 10).Select(i => controller.PreviewEqualizerAsync(owner, Sound(i))).ToArray();
+        await Task.WhenAll(edits);
+        Assert.Equal(count + 1, process.Commands.Count(c => c.Command == "set_equalizer"));
+        Assert.Equal(10, EqGain(process.Commands.Last(c => c.Command == "set_equalizer")));
+        Assert.Equal(2, settings.Equalizer.BandGainsDb[0]); Assert.Equal(1, factory.OpenCount);
+        settings.MasterVolume = 45; await controller.UpdateSettingsAsync(settings);
+        Assert.Equal(10, EqGain(process.Commands.Last(c => c.Command == "set_equalizer")));
+        await controller.ClearEqualizerPreviewAsync(owner);
+        Assert.Equal(2, EqGain(process.Commands.Last(c => c.Command == "set_equalizer")));
+    }
+    [Fact]
+    public async Task EqualizerRollbackUsesLastApplyAndOldOwnerCannotClearNewPreview()
+    {
+        var process = new FakeConnection(); await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast);
+        var settings = Settings(); await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var oldOwner = Guid.NewGuid(); var newOwner = Guid.NewGuid();
+        await controller.PreviewEqualizerAsync(oldOwner, Sound(4)); settings.Equalizer = Sound(4);
+        await controller.UpdateSettingsAsync(settings); await controller.ClearEqualizerPreviewAsync(oldOwner);
+        var pending = controller.PreviewEqualizerAsync(oldOwner, Sound(7));
+        await controller.ClearEqualizerPreviewAsync(oldOwner); await pending;
+        Assert.Equal(4, EqGain(process.Commands.Last(c => c.Command == "set_equalizer")));
+        await controller.PreviewEqualizerAsync(newOwner, Sound(9));
+        await controller.ClearEqualizerPreviewAsync(oldOwner);
+        Assert.Equal(9, EqGain(process.Commands.Last(c => c.Command == "set_equalizer")));
+        await controller.ClearEqualizerPreviewAsync(newOwner);
+        Assert.Equal(4, EqGain(process.Commands.Last(c => c.Command == "set_equalizer")));
+    }
+    [Fact]
+    public async Task ContinuousEqualizerDraggingSendsWhileInputIsStillChanging()
+    {
+        var process = new FakeConnection(); await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast);
+        await controller.StartAsync(Pod(), Settings()); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var count = process.Commands.Count(c => c.Command == "set_equalizer"); var owner = Guid.NewGuid();
+        var edits = new List<Task>();
+        for (var i = 1; i <= 10; i++) { edits.Add(controller.PreviewEqualizerAsync(owner, Sound(i))); await Task.Delay(20); }
+        Assert.True(process.Commands.Count(c => c.Command == "set_equalizer") >= count + 2);
+        await Task.WhenAll(edits); Assert.Equal(10, EqGain(process.Commands.Last(c => c.Command == "set_equalizer")));
+    }
+    [Fact]
+    public async Task EqualizerPreviewSurvivesReconnectAndReceiverSwitch()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection(); var third = new FakeConnection();
+        await using var controller = new SessionController(new FakeFactory(first, second, third), new FakeAudio(), timing: Fast);
+        var settings = Settings(); settings.ForceReconnect = true;
+        await controller.PreviewEqualizerAsync(Guid.NewGuid(), Sound(6));
+        await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.Equal(6, EqGain(first.Commands.Single(c => c.Command == "start")));
+        first.Emit("error", message: "network lost"); await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(6, EqGain(second.Commands.Single(c => c.Command == "start")));
+        await controller.StartAsync(Pod("other"), settings); await third.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(6, EqGain(third.Commands.Single(c => c.Command == "start")));
+    }
+    [Fact]
+    public async Task EqualizerErrorsStayNonfatalAndIgnoreObsoleteSequences()
+    {
+        var process = new FakeConnection(); await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast);
+        await controller.StartAsync(Pod(), Settings()); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var feedback = new ConcurrentQueue<string?>(); controller.EqualizerFeedback += feedback.Enqueue;
+        await controller.PreviewEqualizerAsync(Guid.NewGuid(), Sound(4));
+        var sequence = process.Commands.Last(c => c.Command == "set_equalizer").Parameters.Integer("sequence");
+        process.EmitData(new { @event = "equalizer_error", sequence = sequence - 1, message = "obsolete" });
+        process.EmitData(new { @event = "equalizer_error", sequence, message = "invalid equalizer" });
+        await Until(() => feedback.Contains("invalid equalizer"));
+        Assert.DoesNotContain("obsolete", feedback); Assert.Equal(PlaybackState.Streaming, controller.Snapshot.State);
+        process.EmitData(new { @event = "equalizer_changed", sequence }); await Until(() => feedback.Contains(null));
+    }
     [Fact]
     public async Task StartIsNonblockingAndStopCancelsPendingConnection()
     {

@@ -26,7 +26,7 @@ internal static class UiRegression
             Check(catalogChanges == 0 && audio.Enumerations == 0, "unchanged discovery does not refresh catalogs", checks);
 
             var retries = UiSmoke.Descendants(window).OfType<TextBox>().Single(t => System.Windows.Automation.AutomationProperties.GetName(t) == L.Get("Maximum retry attempts"));
-            retries.Text = "invalid"; await Pump(); vm.SelectedPage = 2;
+            retries.Text = "invalid"; await Pump(); vm.SelectedPage = SettingsViewModel.AudioCapturePage;
             await Until(() => !vm.IsEndpointLoading); await Pump(); vm.SelectedPage = 0;
             Check(retries.Text == "invalid" && !vm.ApplyCommand.CanExecute(null), "first endpoint load preserves invalid input on another page", checks);
             retries.Text = "5"; await Pump();
@@ -94,7 +94,7 @@ internal static class UiRegression
             Check(!await vm.ApplyAsync() && !vm.HasChanges && store.Saved.MuteWhileStreaming && vm.Error.Contains("mock mute failed", StringComparison.Ordinal), "saved configuration and audio failure are distinguished", checks);
             audio.FailMute = false; vm.Draft.MuteWhileStreaming = false; await vm.ApplyAsync();
 
-            vm.SelectedPage = 2; await vm.LoadEndpointsAsync(false);
+            vm.SelectedPage = SettingsViewModel.AudioCapturePage; await vm.LoadEndpointsAsync(false);
             Check(vm.Endpoints.Any(e => e.Id == "endpoint-b"), "audio page uses cached endpoints", checks);
             audio.Items = [new("endpoint-a", "Renamed")];
             for (var i = 0; i < 40; i++) audio.NotifyEndpoints();
@@ -125,14 +125,14 @@ internal static class UiRegression
             var statusNotifications = 0; var rowNotifications = 0;
             app.PropertyChanged += (_, args) => { if (args.PropertyName == nameof(AppViewModel.StatusTitle)) statusNotifications++; };
             foreach (var receiver in app.Receivers) receiver.PropertyChanged += (_, _) => rowNotifications++;
-            vm.SelectedPage = 4; await Pump();
+            vm.SelectedPage = SettingsViewModel.MonitorPage; await Pump();
             var member = app.MonitorMembers.FirstOrDefault();
             await Task.Delay(800); await Pump();
             Check(statusNotifications == 0 && rowNotifications == 0, "metrics do not refresh status or receiver rows", checks);
             Check(member is not null && ReferenceEquals(member, app.MonitorMembers[0]), "monitor member rows survive metrics updates", checks);
 
             await app.StopAsync();
-            vm.SelectedPage = 5; await Pump();
+            vm.SelectedPage = SettingsViewModel.NetworkPage; await Pump();
             vm.AddManual("Manual LAN", "192.0.2.10", 7000);
             app.Settings.Options("a").Hidden = true;
             vm.Draft.DiscoveryInterfaceId = "01db7c77-1016-49cb-8f5c-f5c194425d15";

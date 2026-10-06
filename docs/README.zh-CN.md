@@ -1,4 +1,4 @@
-# <img src="../desktop/AirFlash.App/Assets/app.png" width="36" height="36" alt="" style="vertical-align:middle" /> AirFlash
+# <img src="../desktop/AirFlash.App/Assets/app.svg" width="36" height="36" alt="" style="vertical-align:middle" /> AirFlash
 
 <p align="center">
   <a href="../README.md">English</a> ·
@@ -36,6 +36,7 @@ AirFlash 提供 Windows x64 可执行文件和可独立运行的 MSI 安装包�
 - 支持完整的双 HomePod 立体声组合，并使用同步的加密 RTP 会话。
 - 支持临时或 PIN 配对、DNS-SD 发现和手动添加接收端。
 - 提供延迟模式、托盘运行、静音恢复、断线重连和传输诊断。
+- 在设置中提供全局 10 段均衡器，支持音效预设、即时试听、前级增益和自动余量衰减。
 - 使用有界缓冲、Rubato 重采样、PTP 时序以及 PCM/ALAC 封包。
 - 提供便携式 Windows x64 程序、英文和简体中文界面。
 
@@ -56,6 +57,8 @@ AirFlash 使用全新的应用数据目录 `%APPDATA%/AirFlash` 和
 实时模式目标延迟为 120 ms；目标值和本机传输统计不代表端到端声学延迟的实测值。
 
 版本预留与发布方法见 [发布流程](RELEASING.md)。
+
+矢量源图、资源生成与高 DPI 验收步骤见 [图标维护](ICONS.md)。
 
 ## 技术栈
 

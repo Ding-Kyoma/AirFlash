@@ -11,6 +11,7 @@ public sealed class LicensesWindow : Window
     {
         Title = L.Get("Third-party licenses"); Width = 720; Height = 540;
         WindowThemeService.Track(this);
+        AppIconService.Track(this);
         using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("AirFlash.ThirdPartyNotices.txt")!;
         using var reader = new StreamReader(stream);
         Content = new TextBox { Text = reader.ReadToEnd(), IsReadOnly = true, TextWrapping = TextWrapping.Wrap, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Margin = new(18) };

@@ -84,12 +84,23 @@ public class TrayRegistrationTests
     {
         var shell = new Shell();
         using var tray = new TrayRegistration(shell.Notify, _ => { });
-        Assert.True(tray.TryRegister()); shell.Calls.Clear(); shell.Results.Enqueue(false);
+        Assert.True(tray.TryRegister()); shell.Calls.Clear(); shell.Results.Enqueue(false); shell.Results.Enqueue(false);
         Assert.False(tray.TaskbarCreated());
         Assert.False(tray.IsRegistered);
         Assert.True(tray.TryRegister());
         Assert.All(shell.Calls, call => Assert.Equal(TrayIdentity.Guid, call.Identity));
         Assert.Single(shell.Calls, c => c.Operation == TrayOperation.SetVersion);
+    }
+
+    [Fact]
+    public void RepeatedTaskbarNotificationUpdatesExistingEntryWithoutSwitchingIdentity()
+    {
+        var shell = new Shell();
+        using var tray = new TrayRegistration(shell.Notify, _ => { });
+        Assert.True(tray.TryRegister()); shell.Calls.Clear(); shell.Results.Enqueue(false);
+        Assert.True(tray.TaskbarCreated());
+        Assert.True(tray.IsRegistered);
+        Assert.Equal(new[] { (TrayOperation.Add, TrayIdentity.Guid), (TrayOperation.Modify, TrayIdentity.Guid), (TrayOperation.SetVersion, TrayIdentity.Guid) }, shell.Calls);
     }
 
     [Fact]

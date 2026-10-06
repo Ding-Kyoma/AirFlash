@@ -6,13 +6,13 @@ The published source commits are `c046a7d` (0.2.11) and `8df85f0` (0.2.13-rc.1).
 
 The old implementation ignores every `Shell_NotifyIcon` result. A failed registration therefore leaves a running application without a tray entry. One possible trigger is its fixed GUID: [Microsoft documents](https://learn.microsoft.com/en-us/windows/win32/shell/samples-notificationicon) that moving an unsigned executable can cause its GUID registration to be rejected. The development Windows machine accepted the GUID after a directory move, so this trigger remains unconfirmed for issue #2.
 
-Registration now tries the existing GUID first, then HWND/icon-ID identity if the initial GUID registration fails. It retains the successful identity for updates, geometry queries, deletion and Explorer recovery. Both modes retry unsuccessful registration every two seconds, stopping after success or disposal. Icon extraction falls back to the large application icon and then the shared Windows application icon. Version-negotiation failure keeps the icon usable with legacy callbacks.
+Registration now tries the existing GUID first, then HWND/icon-ID identity if the initial GUID registration fails. It retains the successful identity for updates, geometry queries, deletion and Explorer recovery. Both modes retry unsuccessful registration every two seconds, stopping after success or disposal. The latest main branch's DPI-aware embedded ICO loader remains the primary source; if it fails, executable small/large icons and then a private copy of the shared Windows application icon provide fallback. Version-negotiation failure keeps the icon usable with legacy callbacks. Repeated Explorer notifications update a surviving entry instead of creating a duplicate.
 
 ## Diagnose an affected machine
 
 First check the taskbar's overflow menu: an icon placed there is registered, even when it is not visible directly beside the clock. Logs under `%APPDATA%\AirFlash\logs\wpf-YYYY-MM-DD.log` now contain `Tray path=...` entries with operation, identity and success. Look for:
 
-- `ExtractIconEx`: whether application small/large icon handles were obtained.
+- `LoadEmbeddedIcon`: whether the DPI-aware application icon was loaded; `ExtractIconEx` records executable small/large handles if fallback was necessary.
 - `Add identity=Guid success=False` followed by successful `Add identity=WindowIconId`: GUID registration failed and the fallback recovered.
 - Repeated failed `Add` operations in both modes: registration is still unavailable. Failures are throttled to one entry per operation/identity every 30 seconds.
 - Successful registration with failed `GetRect`: include the HRESULT when reporting the problem.

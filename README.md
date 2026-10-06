@@ -1,4 +1,4 @@
-# <img src="desktop/AirFlash.App/Assets/app.png" width="36" height="36" alt="" style="vertical-align:middle" /> AirFlash
+# <img src="desktop/AirFlash.App/Assets/app.svg" width="36" height="36" alt="" style="vertical-align:middle" /> AirFlash
 
 <p align="center">
   <a href="README.md">English</a> ·
@@ -41,6 +41,8 @@ source you trust.
 - Provides transient or PIN pairing, DNS-SD discovery, and manual receiver setup.
 - Includes selectable latency profiles, tray operation, mute restoration,
   reconnects, and transport diagnostics.
+- Offers a global ten-band equalizer in Settings, with presets, live preview,
+  preamp control, and automatic headroom attenuation.
 - Uses bounded buffering, Rubato resampling, PTP timing, and PCM/ALAC packetization.
 - Ships as a portable Windows x64 app with English and Simplified Chinese UI.
 
@@ -63,6 +65,8 @@ Use **Settings > About > Check for updates** to check for a stable release and o
 The real-time profile targets 120 ms; target and local transport timings are not measurements of end-to-end acoustic latency.
 
 See [Release workflow](docs/RELEASING.md) for version reservation and publishing.
+
+See [Icon maintenance](docs/ICONS.md) for the vector source, generated resources, and high-DPI verification.
 
 ## Stack
 

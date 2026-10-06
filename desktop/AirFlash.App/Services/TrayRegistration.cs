@@ -29,7 +29,12 @@ internal sealed class TrayRegistration(
 
     private bool TryAdd(TrayIdentity identity)
     {
-        if (!Send(TrayOperation.Add, identity)) return false;
+        if (!Send(TrayOperation.Add, identity))
+        {
+            // Explorer can broadcast TaskbarCreated more than once. A surviving
+            // entry uses the already selected identity; update it instead of duplicating it.
+            if (_selectedIdentity != identity || !Send(TrayOperation.Modify, identity)) return false;
+        }
         _selectedIdentity = identity;
         IsRegistered = true;
         UsesVersion4 = Send(TrayOperation.SetVersion, identity);
@@ -54,6 +59,14 @@ internal sealed class TrayRegistration(
         IsRegistered = false;
         UsesVersion4 = false;
         return TryRegister();
+    }
+
+    internal void RemoveForVerification()
+    {
+        if (IsDisposed) return;
+        if (IsRegistered) Send(TrayOperation.Delete, Identity);
+        IsRegistered = false;
+        UsesVersion4 = false;
     }
 
     private bool Send(TrayOperation operation, TrayIdentity identity)

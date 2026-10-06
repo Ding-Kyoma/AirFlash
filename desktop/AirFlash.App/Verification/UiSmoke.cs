@@ -24,12 +24,13 @@ internal static class UiSmoke
         var directory = Path.GetDirectoryName(report)!; Directory.CreateDirectory(directory);
         AppPaths.DataDirectory = Path.Combine(directory, "isolated-data");
         var checks = new List<string>();
+        object? iconEnvironment = null;
         var store = new MemoryStore(); var engine = new MockFactory();
         await using var app = new AppViewModel(store, new MockDiscovery(), new MockAutostart(), new MockAudio(), engine, Application.Current.Dispatcher) { EngineVersion = "0.1.0（模拟）" };
         var panel = new ControlPanel(app); SettingsWindow? settings = null;
         // Verification must never bind the production GUID to a test executable path.
         var guidIndex = Array.IndexOf(args, "--tray-guid");
-        if (guidIndex == args.Length - 1) throw new ArgumentException("--tray-guid requires an isolated GUID.");
+        if (guidIndex >= 0 && guidIndex + 1 >= args.Length) throw new ArgumentException("--tray-guid requires an isolated GUID.");
         var trayGuid = guidIndex >= 0 ? Guid.Parse(args[guidIndex + 1]) : Guid.NewGuid();
         if (trayGuid == new Guid("f3f63f27-a6df-4a27-a942-b448e17dcd12")) throw new ArgumentException("Use an isolated verification GUID.");
         var menuOpened = false; var quitRequestedFromTray = false;
@@ -49,7 +50,7 @@ internal static class UiSmoke
             }
             ThemeService.SetForVerification(false); app.Start(); panel.ShowPanel(); await Pump();
             await Until(() => tray.IsRegistered && tray.TryGetRectangle(out _));
-            Check(tray.TryGetRectangle(out var trayBounds) && trayBounds.Right > trayBounds.Left && trayBounds.Bottom > trayBounds.Top, "real tray registration has an icon rectangle", checks);
+            Check(tray.TryGetRectangle(out var iconBounds) && iconBounds.Right > iconBounds.Left && iconBounds.Bottom > iconBounds.Top, "real tray registration has an icon rectangle", checks);
             Check(app.Receivers.Count == 2 && app.Receivers.All(r => r.Receiver.Online), "offline receivers excluded", checks);
             var area = tray.WorkArea(); GetWindowRect(new System.Windows.Interop.WindowInteropHelper(panel).Handle, out var bounds);
             Check(Math.Abs(bounds.Right - (area.Rect.Right - Math.Round(12 * area.Scale))) <= 2 && Math.Abs(bounds.Bottom - (area.Rect.Bottom - Math.Round(12 * area.Scale))) <= 2, "native panel aligns to monitor work area", checks);
@@ -87,8 +88,29 @@ internal static class UiSmoke
             app.MasterVolume = 25; await app.FlushVolumeAsync();
             Check(engine.Commands.Any(c => c.Text("command") == "set_gain" && c.GetProperty("params").Number("gain") == .25), "master gain reaches engine", checks);
             settings = new(app); settings.Show(); await Pump();
+            iconEnvironment = IconVerification.Run(settings, tray, checks, directory);
+            foreach (var message in new[] { 0x001a, 0x007e })
+            {
+                SendMessage(tray.WindowHandle, (uint)message, IntPtr.Zero, IntPtr.Zero); await Pump();
+            }
+            GetWindowRect(tray.WindowHandle, out var trayBounds);
+            var rectanglePointer = Marshal.AllocHGlobal(Marshal.SizeOf<NativeWindowPlacement.Rectangle>());
+            try
+            {
+                Marshal.StructureToPtr(trayBounds, rectanglePointer, false);
+                var trayDpi = AppIconService.WindowDpi(tray.WindowHandle);
+                SendMessage(tray.WindowHandle, 0x02e0, new((long)(trayDpi | trayDpi << 16)), rectanglePointer);
+                await Pump();
+            }
+            finally { Marshal.FreeHGlobal(rectanglePointer); }
+            Check(tray.IconHandle != IntPtr.Zero, "display/settings/DPI notifications preserve tray icon", checks);
+            tray.RemoveForVerification();
+            SendMessage(tray.WindowHandle, RegisterWindowMessage("TaskbarCreated"), IntPtr.Zero, IntPtr.Zero); await Pump();
+            Check(tray.IsRegisteredForVerification, "Explorer recreation registers tray icon again", checks);
+            SendMessage(tray.WindowHandle, RegisterWindowMessage("TaskbarCreated"), IntPtr.Zero, IntPtr.Zero); await Pump();
+            Check(tray.IsRegisteredForVerification, "repeated Explorer notification retains one registered tray icon", checks);
             Check(!settings.ApplyButton.IsEnabled, "apply initially disabled", checks);
-            settings.ViewModel.SelectedPage = 2; await Pump();
+            settings.ViewModel.SelectedPage = SettingsViewModel.AudioCapturePage; await Pump();
             var radio = Descendants(settings).OfType<RadioButton>().Single(r => (string?)r.Content == L.Get("Specific output endpoint"));
             var radioPeer = UIElementAutomationPeer.CreatePeerForElement(radio)!;
             ((ISelectionItemProvider)radioPeer.GetPattern(PatternInterface.SelectionItem)!).Select();
@@ -111,7 +133,7 @@ internal static class UiSmoke
             settings.ViewModel.SelectedPage = 0; await Pump();
             var retries = Descendants(settings).OfType<TextBox>().Single(t => System.Windows.Automation.AutomationProperties.GetName(t) == L.Get("Maximum retry attempts"));
             retries.Text = "invalid"; await Pump();
-            settings.ViewModel.SelectedPage = 2; await Pump(); settings.ViewModel.SelectedPage = 0; await Pump();
+            settings.ViewModel.SelectedPage = SettingsViewModel.AudioCapturePage; await Pump(); settings.ViewModel.SelectedPage = 0; await Pump();
             Check(retries.Text == "invalid", "invalid edits survive page switches", checks);
             Check(!settings.ApplyButton.IsEnabled && !settings.OkButton.IsEnabled, "invalid number blocks save", checks);
             retries.Text = "5"; await Pump();
@@ -128,11 +150,11 @@ internal static class UiSmoke
             {
                 ThemeService.SetForVerification(dark); await Pump();
                 CheckThemeColors(dark, checks);
-                for (var page = 0; page < 7; page++)
+                for (var page = 0; page < settings!.ViewModel.Pages.Length; page++)
                 {
                     settings.ViewModel.SelectedPage = page; await Pump();
                     Render(settings, Path.Combine(directory, $"settings-{(dark ? "dark" : "light")}-{page}.png"), 1);
-                    if (page == 4)
+                    if (page == SettingsViewModel.MonitorPage)
                     {
                         var scroll = Descendants(settings).OfType<ScrollViewer>().First(v => v.ScrollableHeight > 0);
                         scroll.ScrollToEnd(); await Pump();
@@ -141,7 +163,7 @@ internal static class UiSmoke
                     }
                 }
                 settings.Hide(); panel.ShowPanel(); await Pump();
-                foreach (var scale in new[] { 1d, 1.5, 2d }) Render(panel, Path.Combine(directory, $"panel-{(dark ? "dark" : "light")}-{scale * 100}.png"), scale);
+                foreach (var scale in new[] { 1d, 1.25, 1.5, 1.75, 2d }) Render(panel, Path.Combine(directory, $"panel-{(dark ? "dark" : "light")}-{scale * 100}.png"), scale);
                 var quit = Descendants(panel).OfType<Button>().Single(b => System.Windows.Automation.AutomationProperties.GetName(b) == L.Get("Quit"));
                 var quitRequested = false;
                 void OnQuit() => quitRequested = true;
@@ -152,12 +174,13 @@ internal static class UiSmoke
                 settings.Show();
             }
             Check(app.MonitorMembers.Count == 1 && app.MonitorRecoveries == "2", "transport metrics reach monitoring view", checks);
-            checks.Add("seven pages rendered in light/dark; panel at 100/150/200 percent");
+            checks.Add("eight pages rendered in light/dark; panel at 100/125/150/175/200 percent");
             await app.StopAsync(); await Until(() => app.Snapshot.State == PlaybackState.Idle);
             Check(engine.DisposedCount == engine.CreatedCount, "stop releases mock engine", checks);
             await UiRegression.RunAsync(checks, directory);
+            await UiEqualizer.RunAsync(checks, directory);
             await VerifyTrayLifecycleAsync(tray, app, trayGuid, () => menuOpened, () => quitRequestedFromTray, checks);
-            App.WriteOutput(args, new { ok = true, checks, note = "All engine/audio/discovery/autostart services are simulated. DPI renders do not replace physical multimonitor QA." });
+            App.WriteOutput(args, new { ok = true, checks, icon_environment = iconEnvironment, note = "All engine/audio/discovery/autostart services are simulated. DPI renders do not replace physical multimonitor QA." });
             return 0;
         }
         catch (Exception error) { App.WriteOutput(args, new { ok = false, checks, error = error.ToString() }); return 1; }
@@ -165,6 +188,13 @@ internal static class UiSmoke
     }
     private static async Task VerifyTrayLifecycleAsync(TrayService tray, AppViewModel app, Guid guid, Func<bool> settingsRequested, Func<bool> quitRequested, List<string> checks, bool windowIdentityForVerification = false)
     {
+        // Simulate a shell rebuild without restarting the user's Explorer process.
+        tray.RemoveForVerification();
+        SendMessage(tray.WindowHandle, RegisterWindowMessage("TaskbarCreated"), IntPtr.Zero, IntPtr.Zero); await Pump();
+        await Until(() => tray.IsRegistered && tray.TryGetRectangle(out _));
+        Check(tray.TryGetRectangle(out _), "Explorer recreation restores tray geometry", checks);
+        SendMessage(tray.WindowHandle, RegisterWindowMessage("TaskbarCreated"), IntPtr.Zero, IntPtr.Zero); await Pump();
+        Check(tray.IsRegistered && tray.TryGetRectangle(out _), "repeated Explorer notification retains registered tray geometry", checks);
         SendMessage(tray.WindowHandle, 0x8001, tray.UsesVersion4 ? IntPtr.Zero : new(1), tray.UsesVersion4 ? new(0x1007b) : new(0x205));
         await Pump();
         var menu = tray.ActiveMenu ?? throw new InvalidOperationException("The tray context menu did not open.");
@@ -201,6 +231,7 @@ internal static class UiSmoke
     }
     [DllImport("shell32.dll")] private static extern int Shell_NotifyIconGetRect(ref TrayIdentifier identifier, out NativeWindowPlacement.Rectangle rectangle);
     [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr handle, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern uint RegisterWindowMessage(string message);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr handle, out NativeWindowPlacement.Rectangle rectangle);
     private static void Check(bool value, string message, List<string> checks) { if (!value) throw new InvalidOperationException(message); checks.Add(message); }
     private static void CheckThemeColors(bool dark, List<string> checks)

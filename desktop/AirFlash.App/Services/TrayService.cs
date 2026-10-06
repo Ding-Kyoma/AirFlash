@@ -11,8 +11,9 @@ namespace AirFlash.App.Services;
 public sealed class TrayService : IDisposable
 {
     private readonly HwndSource _source;
-    private readonly IntPtr _icon;
-    private readonly bool _ownsIcon;
+    private AppIconService.NativeIcon _icon;
+    private int _iconPixels;
+    private bool _refreshQueued;
     private readonly TrayRegistration _registration;
     private readonly DispatcherTimer _retry;
     private readonly ControlPanel _panel;
@@ -31,7 +32,8 @@ public sealed class TrayService : IDisposable
     {
         _panel = panel; _viewModel = viewModel; _settings = settings; _quit = quit; _guid = guid;
         _source = new(new HwndSourceParameters("AirFlash.Tray") { WindowStyle = unchecked((int)0x80000000), Width = 0, Height = 0 });
-        try { (_icon, _ownsIcon) = LoadTrayIcon(); }
+        _iconPixels = AppIconService.Pixels(AppIconService.TaskbarDpi(), true);
+        try { _icon = LoadTrayIcon(_iconPixels); }
         catch { _source.Dispose(); throw; }
         _registration = new(Notify, Log, initialIdentity: windowIdentityForVerification ? TrayIdentity.WindowIconId : null);
         _retry = new(DispatcherPriority.Background, _source.Dispatcher) { Interval = TimeSpan.FromSeconds(2) };
@@ -41,26 +43,38 @@ public sealed class TrayService : IDisposable
         viewModel.PropertyChanged += OnPropertyChanged;
     }
     private static void Log(string message) => AppPaths.Log($"Tray path=\"{Environment.ProcessPath}\" {message}");
-    private static (IntPtr Icon, bool Owned) LoadTrayIcon()
+    private static AppIconService.NativeIcon LoadTrayIcon(int pixels)
     {
+        try
+        {
+            var embedded = AppIconService.Create(pixels);
+            Log($"operation=LoadEmbeddedIcon pixels={pixels} success=True");
+            return embedded;
+        }
+        catch (Exception error) when (error is System.ComponentModel.Win32Exception or InvalidDataException)
+        {
+            Log($"operation=LoadEmbeddedIcon pixels={pixels} success=False error={error.Message}");
+        }
         var count = ExtractIconEx(Environment.ProcessPath!, 0, out var large, out var small, 1);
         Log($"operation=ExtractIconEx count={count} small={small != IntPtr.Zero} large={large != IntPtr.Zero}");
         if (small != IntPtr.Zero)
         {
             if (large != IntPtr.Zero && large != small) ReleaseIcon(large);
-            return (small, true);
+            return new(small);
         }
-        if (large != IntPtr.Zero) { Log("operation=LoadIcon fallback=large success=True"); return (large, true); }
+        if (large != IntPtr.Zero) { Log("operation=LoadIcon fallback=large success=True"); return new(large); }
         var shared = LoadIcon(IntPtr.Zero, new(32512));
-        Log($"operation=LoadIcon fallback=system success={shared != IntPtr.Zero}");
-        if (shared == IntPtr.Zero) throw new InvalidOperationException("Windows could not load a tray icon.");
-        return (shared, false);
+        // Copy the shared system handle so NativeIcon owns exactly one private handle.
+        var systemIcon = shared == IntPtr.Zero ? IntPtr.Zero : CopyIcon(shared);
+        Log($"operation=LoadIcon fallback=system success={systemIcon != IntPtr.Zero}");
+        if (systemIcon == IntPtr.Zero) throw new InvalidOperationException("Windows could not load a tray icon.");
+        return new(systemIcon);
     }
     private static void ReleaseIcon(IntPtr icon) => Log($"operation=DestroyIcon success={DestroyIcon(icon)}");
     private void Retry(object? sender, EventArgs args) => UpdateRetry(_registration.TryRegister());
-    private void UpdateRetry(bool registered)
+    private void UpdateRetry(bool registered, bool refresh = true)
     {
-        if (registered || _disposed) _retry.Stop();
+        if (registered || _disposed) { _retry.Stop(); if (!_disposed && refresh) QueueRefresh(); }
         else _retry.Start();
     }
     private void OnPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs args)
@@ -71,20 +85,53 @@ public sealed class TrayService : IDisposable
         UpdateRetry(_registration.Update());
     }
     private Guid IdentityGuid => _registration.Identity == TrayIdentity.Guid ? _guid : Guid.Empty;
-    private bool Notify(TrayOperation operation, TrayIdentity identity)
+    private bool Notify(TrayOperation operation, TrayIdentity identity) => Notify(operation, identity, _icon.DangerousGetHandle());
+    private bool Notify(TrayOperation operation, TrayIdentity identity, IntPtr icon)
     {
         var data = new NotifyData { Size = (uint)Marshal.SizeOf<NotifyData>(), Window = _source.Handle, Id = 1,
             Flags = 1 | 2 | 4 | 0x80 | (identity == TrayIdentity.Guid ? 0x20u : 0), Callback = CallbackMessage,
-            Icon = _icon, Tip = $"AirFlash · {_viewModel.StatusTitle}", Guid = identity == TrayIdentity.Guid ? _guid : Guid.Empty,
+            Icon = icon, Tip = $"AirFlash · {_viewModel.StatusTitle}", Guid = identity == TrayIdentity.Guid ? _guid : Guid.Empty,
             Info = "", InfoTitle = "", Version = operation == TrayOperation.SetVersion ? 4u : 0 };
         return Shell_NotifyIcon((uint)operation, ref data);
+    }
+    private uint IconDpi() => TryGetRectangle(out var rectangle)
+        ? (uint)Math.Round(NativeWindowPlacement.FromRect(rectangle).Scale * 96) : AppIconService.TaskbarDpi();
+    private void QueueRefresh()
+    {
+        if (_disposed || _refreshQueued) return;
+        _refreshQueued = true;
+        _source.Dispatcher.BeginInvoke(() =>
+        {
+            _refreshQueued = false;
+            if (!_disposed) RefreshIcon();
+        }, DispatcherPriority.ContextIdle);
+    }
+    private void RefreshIcon()
+    {
+        if (!IsRegistered) { UpdateRetry(_registration.TryRegister()); return; }
+        var pixels = AppIconService.Pixels(IconDpi(), true);
+        if (pixels == _iconPixels) return;
+        AppIconService.NativeIcon? next = null;
+        try
+        {
+            next = AppIconService.Create(pixels);
+            var success = Notify(TrayOperation.Modify, _registration.Identity, next.DangerousGetHandle());
+            _registration.ReportResult("RefreshIcon", success, _registration.Identity, $"pixels={pixels}");
+            if (!success) { UpdateRetry(_registration.Update(), refresh: false); return; }
+            var previous = _icon; _icon = next; next = null; _iconPixels = pixels;
+            previous.Dispose();
+        }
+        catch (System.ComponentModel.Win32Exception error) { Log($"operation=RefreshIcon success=False error={error.Message}"); }
+        finally { next?.Dispose(); }
     }
     private IntPtr Hook(IntPtr window, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
     {
         if (_disposed) return IntPtr.Zero;
         if (_taskbarCreated != 0 && (uint)message == _taskbarCreated) UpdateRetry(_registration.TaskbarCreated());
+        if (message is 0x001a or 0x007e or 0x02e0) QueueRefresh();
         if ((uint)message == CallbackMessage)
         {
+            QueueRefresh();
             var action = TrayRegistration.DecodeCallback(wParam.ToInt64(), lParam.ToInt64(), _registration.UsesVersion4);
             if (action == TrayAction.TogglePanel) _panel.ToggleFromTray();
             if (action == TrayAction.OpenMenu) ShowMenu();
@@ -104,6 +151,10 @@ public sealed class TrayService : IDisposable
         _registration.ReportResult("SetForegroundWindow", SetForegroundWindow(_source.Handle), _registration.Identity); menu.IsOpen = true;
     }
     internal IntPtr WindowHandle => _source.Handle;
+    internal IntPtr IconHandle => _icon.DangerousGetHandle();
+    internal int IconPixels => _iconPixels;
+    internal bool IsRegisteredForVerification => IsRegistered;
+    internal void RemoveForVerification() => _registration.RemoveForVerification();
     internal bool IsRegistered => _registration.IsRegistered;
     internal bool UsesVersion4 => _registration.UsesVersion4;
     internal TrayIdentity Identity => _registration.Identity;
@@ -128,7 +179,7 @@ public sealed class TrayService : IDisposable
         _retry.Stop(); _retry.Tick -= Retry;
         _viewModel.PropertyChanged -= OnPropertyChanged;
         _registration.Dispose(); _source.Dispose();
-        if (_ownsIcon) ReleaseIcon(_icon);
+        _icon.Dispose();
     }
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct NotifyData
@@ -147,6 +198,7 @@ public sealed class TrayService : IDisposable
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)] private static extern uint ExtractIconEx(string file, int index, out IntPtr large, out IntPtr small, uint count);
     [DllImport("user32.dll")] private static extern bool DestroyIcon(IntPtr icon);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr LoadIcon(IntPtr instance, IntPtr name);
+    [DllImport("user32.dll")] private static extern IntPtr CopyIcon(IntPtr icon);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern uint RegisterWindowMessage(string message);
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr window);
 }

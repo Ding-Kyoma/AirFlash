@@ -9,6 +9,11 @@ namespace AirFlash.App.ViewModels;
 
 public sealed class SettingsViewModel : ObservableObject, IDisposable
 {
+    public const int EqualizerPage = 2, AudioCapturePage = 3, MonitorPage = 5, NetworkPage = 6;
+    private readonly Guid _equalizerOwner = Guid.NewGuid();
+    public EqualizerEditor Equalizer { get; }
+    private string _equalizerError = "";
+    public string EqualizerError { get => _equalizerError; private set => Set(ref _equalizerError, value); }
     private static readonly System.Net.Http.HttpClient UpdateClient = new() { MaxResponseContentBufferSize = 1024 * 1024 };
     public UpdateCheckState Updates { get; } = new(new UpdateService(UpdateClient), Version.Parse(AppPaths.Version));
     public AsyncCommand CheckUpdatesCommand { get; }
@@ -36,13 +41,13 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         {
             if (!Set(ref _selectedPage, value)) return;
             Notify(nameof(PageTitle)); Notify(nameof(PageDescription));
-            if (value == 2) _ = LoadEndpointsAsync(false);
-            if (value == 5) RefreshAdapters();
+            if (value == AudioCapturePage) _ = LoadEndpointsAsync(false);
+            if (value == NetworkPage) RefreshAdapters();
         }
     }
-    public string[] Pages { get; } = [L.Get("General"), L.Get("AirFlash streaming"), L.Get("Audio capture"), L.Get("Receivers"), L.Get("Monitor"), L.Get("Network"), L.Get("About")];
+    public string[] Pages { get; } = [L.Get("General"), L.Get("AirFlash streaming"), L.Get("Equalizer"), L.Get("Audio capture"), L.Get("Receivers"), L.Get("Monitor"), L.Get("Network"), L.Get("About")];
     public string PageTitle => Pages[Math.Clamp(SelectedPage, 0, Pages.Length - 1)];
-    public string PageDescription => new[] { L.Get("Customize startup and appearance"), L.Get("Balance responsiveness and connection stability"), L.Get("Choose the system audio to send to HomePod"), L.Get("Manage receivers, connections and per-device settings"), L.Get("Live statistics for the current session"), L.Get("Choose where AirPlay receivers are discovered"), L.Get("Windows audio, wirelessly to HomePod") }[Math.Clamp(SelectedPage, 0, 6)];
+    public string PageDescription => new[] { L.Get("Customize startup and appearance"), L.Get("Balance responsiveness and connection stability"), L.Get("Shape the sound sent to all receivers"), L.Get("Choose the system audio to send to HomePod"), L.Get("Manage receivers, connections and per-device settings"), L.Get("Live statistics for the current session"), L.Get("Choose where AirPlay receivers are discovered"), L.Get("Windows audio, wirelessly to HomePod") }[Math.Clamp(SelectedPage, 0, Pages.Length - 1)];
     public ObservableCollection<AudioEndpoint> Endpoints { get; } = [];
     public ObservableCollection<DiscoveryAdapterOption> DiscoveryAdapters { get; } = [];
     private string _networkStatus = "";
@@ -73,6 +78,8 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
             catch (Exception error) { ShowError(error); }
         });
         App = app; Draft = app.Settings.Clone(); _baseline = Draft.Clone();
+        Equalizer = new(Draft.Equalizer, EqualizerSampleRate, EqualizerChanged);
+        App.Session.EqualizerFeedback += EqualizerFeedback;
         ApplyCommand = new(async () => { await ApplyAsync(); }, ShowError, CanApply);
         OkCommand = new(async () => { if (!HasChanges || await ApplyAsync()) CloseRequested?.Invoke(true); }, ShowError, () => CanEdit && _validationErrors == 0 && _validation is null);
         CancelCommand = new(() => { if (CanEdit) CloseRequested?.Invoke(false); }, () => CanEdit);
@@ -99,9 +106,39 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private void ManualChanged(object? sender, NotifyCollectionChangedEventArgs args) { if (!_updating) RefreshValidation(); }
     private void DraftChanged(object? sender, PropertyChangedEventArgs args)
     {
+        if (args.PropertyName == nameof(AppSettings.StreamSampleRate)) Equalizer.RefreshHeadroom();
         if (_updating) return;
         RefreshValidation();
         if (args.PropertyName == nameof(AppSettings.DiscoveryInterfaceId)) RefreshAdapters();
+    }
+    private async void EqualizerChanged()
+    {
+        if (_updating || _disposed) return;
+        RefreshValidation();
+        if (Draft.Equalizer.Validate() is not null) return;
+        EqualizerError = "";
+        try { await App.Session.PreviewEqualizerAsync(_equalizerOwner, Draft.Equalizer); }
+        catch (Exception error) { if (!_disposed) { EqualizerError = error.Message; AppPaths.Log(error.ToString()); } }
+    }
+    private int EqualizerSampleRate()
+    {
+        var snapshot = App.Session.Snapshot;
+        return snapshot.IsActive && snapshot.StreamRate is 44100 or 48000 ? snapshot.StreamRate : int.TryParse(Draft.StreamSampleRate, out var rate) ? rate : 44100;
+    }
+    private void EqualizerFeedback(string? error)
+    {
+        if (_disposed) return;
+        Application.Current.Dispatcher.BeginInvoke(() =>
+        {
+            if (_disposed) return;
+            EqualizerError = error is null ? "" : L.Format("Could not update the equalizer: {0}", error);
+            if (error is null) Equalizer.RefreshHeadroom();
+        });
+    }
+    private async Task ClearPreviewAsync()
+    {
+        try { await App.Session.ClearEqualizerPreviewAsync(_equalizerOwner); }
+        catch (Exception error) { if (!_disposed) EqualizerError = error.Message; AppPaths.Log(error.ToString()); }
     }
     private void RefreshValidation(bool clearError = true)
     {
@@ -136,6 +173,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
                 RefreshCatalog(); SyncSubscriptions(); UpdateEndpoints();
             }
             finally { _updating = false; }
+            await ClearPreviewAsync();
             RefreshValidation();
             Error = result.AudioError ?? "";
             return result.AudioUpdated;
@@ -267,6 +305,9 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private void ShowError(Exception error) { Error = error.Message; AppPaths.Log(error.ToString()); }
     public void Dispose()
     {
+        if (_disposed) return;
+        App.Session.EqualizerFeedback -= EqualizerFeedback; Equalizer.Dispose();
+        _ = ClearPreviewAsync();
         Updates.Dispose(); _disposed = true; App.CatalogChanged -= RefreshCatalog; App.Endpoints.Changed -= UpdateEndpoints;
         NetworkChange.NetworkAddressChanged -= NetworkChanged; NetworkChange.NetworkAvailabilityChanged -= NetworkAvailabilityChanged;
         App.SetMonitorVisible(false);

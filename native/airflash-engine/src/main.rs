@@ -1,7 +1,7 @@
 //! Versioned JSONL qualification interface. stdout is exclusively structured IPC.
 use airflash_engine::{
     rtsp::Cancellation,
-    session::{ProbeOptions, probe_with_volume},
+    session::{ProbeOptions, probe_with_controls},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -41,6 +41,7 @@ struct Running {
     pending_pin: Option<std::sync::mpsc::Sender<String>>,
     gain_limit: f64,
     volume: airflash_engine::volume::Control,
+    equalizer: Option<(airflash_engine::equalizer::Control, u32)>,
 }
 impl Drop for Running {
     fn drop(&mut self) {
@@ -111,7 +112,7 @@ fn main() {
             "hello" => send(
                 &request.id,
                 &request.session_id,
-                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"partial","live_loopback":true,"commands":["hello","start","probe","stop","set_gain","set_device_volume","pair","pair_pin"],"production_ready":false}),
+                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"partial","live_loopback":true,"commands":["hello","start","probe","stop","set_gain","set_equalizer","set_device_volume","pair","pair_pin"],"production_ready":false}),
             ),
             "probe" | "start" => {
                 let options: ProbeOptions = match serde_json::from_value(request.params) {
@@ -149,9 +150,13 @@ fn main() {
                 let volume = airflash_engine::volume::Control::default();
                 let worker_volume = volume.clone();
                 let gain_limit = if request.command == "probe" { 0.1 } else { 1.0 };
+                let rate = options.sample_rate;
+                let equalizer = airflash_engine::equalizer::Control::new(options.equalizer, rate).unwrap();
+                let worker_equalizer = equalizer.clone();
+                let live_equalizer = (request.command == "start").then_some((equalizer, rate));
                 let worker = thread::spawn(move || {
                     let emit = |e| send(&request.id, &request.session_id, e);
-                    if let Err(error) = probe_with_volume(options, worker_cancel, worker_gain, worker_volume, emit) {
+                    if let Err(error) = probe_with_controls(options, worker_cancel, worker_gain, worker_volume, worker_equalizer, emit) {
                         emit(airflash_engine::transport::error_event(&error));
                     }
                 });
@@ -163,6 +168,7 @@ fn main() {
                     pending_pin: None,
                     gain_limit,
                     volume,
+                    equalizer: live_equalizer,
                 });
             }
             "set_device_volume" => {
@@ -174,6 +180,25 @@ fn main() {
                     } else {
                         send(&request.id, &request.session_id, json!({"event":"device_volume_error","message":"invalid device volume command"}));
                     }
+                }
+            }
+            "set_equalizer" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Update { sequence: u64, equalizer: airflash_engine::equalizer::Settings }
+                let sequence = request.params.get("sequence").cloned().unwrap_or(Value::Null);
+                let result = (|| -> anyhow::Result<_> {
+                    let update: Update = serde_json::from_value(request.params)?;
+                    anyhow::ensure!(update.sequence > 0, "equalizer sequence must be positive");
+                    let r = running.as_ref().filter(|r| r.id == request.session_id).ok_or_else(|| anyhow::anyhow!("equalizer session is no longer active"))?;
+                    let (control, rate) = r.equalizer.as_ref().ok_or_else(|| anyhow::anyhow!("equalizer updates require a live streaming session"))?;
+                    let prepared = airflash_engine::equalizer::Prepared::new(update.equalizer, *rate)?;
+                    control.set(update.sequence, prepared);
+                    Ok(prepared)
+                })();
+                match result {
+                    Ok(prepared) => send(&request.id, &request.session_id, json!({"event":"equalizer_changed","sequence":sequence,"auto_attenuation_db":prepared.auto_attenuation_db,"effective_preamp_db":prepared.effective_preamp_db})),
+                    Err(error) => send(&request.id, &request.session_id, json!({"event":"equalizer_error","sequence":sequence,"message":error.to_string()})),
                 }
             }
             "set_gain" => {
@@ -293,6 +318,7 @@ fn main() {
                     pending_pin: Some(tx),
                     gain_limit: 0.0,
                     volume: airflash_engine::volume::Control::default(),
+                    equalizer: None,
                 });
             }
             "stop" => {

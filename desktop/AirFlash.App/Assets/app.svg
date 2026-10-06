@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>AirFlash</title>
+  <path fill="#2563EB" d="M 11,1 H 53 A 10,10 0 0 1 63,11 V 53 A 10,10 0 0 1 53,63 H 11 A 10,10 0 0 1 1,53 V 11 A 10,10 0 0 1 11,1 Z"/>
+  <path fill="none" stroke="#FFFFFF" stroke-width="3" d="M 8,35 A 24,24 0 0 1 56,35"/>
+  <path fill="none" stroke="#FFFFFF" stroke-width="3" d="M 16,35 A 16,16 0 0 1 48,35"/>
+  <path fill="#FFFFFF" d="M 32,36 L 48,52 H 16 Z"/>
+</svg>

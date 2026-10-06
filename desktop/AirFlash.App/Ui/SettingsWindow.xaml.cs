@@ -14,6 +14,7 @@ public partial class SettingsWindow : Window
     {
         InitializeComponent(); ViewModel = new(app); DataContext = ViewModel;
         WindowThemeService.Track(this);
+        AppIconService.Track(this);
         ViewModel.CloseRequested += _ => Close();
         ViewModel.AddReceiverRequested += () => { var dialog = new ManualReceiverDialog { Owner = this }; if (dialog.ShowDialog() == true) ViewModel.AddManual(dialog.DeviceName, dialog.Host, dialog.Port); };
         ViewModel.PairRequested += async receiver =>
@@ -22,7 +23,7 @@ public partial class SettingsWindow : Window
             catch (Exception error) { app.ShowError(error); }
         };
         ViewModel.PropertyChanged += (_, args) => { if (args.PropertyName == nameof(SettingsViewModel.SelectedPage)) ShowPage(); };
-        IsVisibleChanged += (_, _) => app.SetMonitorVisible(IsVisible && ViewModel.SelectedPage == 4);
+        IsVisibleChanged += (_, _) => app.SetMonitorVisible(IsVisible && ViewModel.SelectedPage == SettingsViewModel.MonitorPage);
         Closing += (_, args) => { if (ViewModel.IsApplying) args.Cancel = true; };
         Closed += (_, _) => ViewModel.Dispose();
         ShowPage();
@@ -33,11 +34,11 @@ public partial class SettingsWindow : Window
         if (!_pages.TryGetValue(selected, out var page))
         {
             page = (FrameworkElement)((DataTemplate)FindResource($"Page{selected}")).LoadContent();
-            if (selected != 4) page.SetBinding(IsEnabledProperty, new Binding(nameof(SettingsViewModel.CanEdit)));
+            if (selected != SettingsViewModel.MonitorPage) page.SetBinding(IsEnabledProperty, new Binding(nameof(SettingsViewModel.CanEdit)));
             _pages.Add(selected, page); PageContainer.Children.Add(page);
         }
         foreach (var (index, view) in _pages) view.Visibility = index == selected ? Visibility.Visible : Visibility.Collapsed;
-        ViewModel.App.SetMonitorVisible(IsVisible && selected == 4);
+        ViewModel.App.SetMonitorVisible(IsVisible && selected == SettingsViewModel.MonitorPage);
         PageScroll.ScrollToTop();
     }
     private void OnSourceInitialized(object? sender, EventArgs args)
