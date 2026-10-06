@@ -27,7 +27,14 @@ internal static class UiSmoke
         var store = new MemoryStore(); var engine = new MockFactory();
         await using var app = new AppViewModel(store, new MockDiscovery(), new MockAutostart(), new MockAudio(), engine, Application.Current.Dispatcher) { EngineVersion = "0.1.0（模拟）" };
         var panel = new ControlPanel(app); SettingsWindow? settings = null;
-        using var tray = new TrayService(panel, app, () => { }, () => { }); panel.Tray = tray;
+        // Verification must never bind the production GUID to a test executable path.
+        var guidIndex = Array.IndexOf(args, "--tray-guid");
+        if (guidIndex == args.Length - 1) throw new ArgumentException("--tray-guid requires an isolated GUID.");
+        var trayGuid = guidIndex >= 0 ? Guid.Parse(args[guidIndex + 1]) : Guid.NewGuid();
+        if (trayGuid == new Guid("f3f63f27-a6df-4a27-a942-b448e17dcd12")) throw new ArgumentException("Use an isolated verification GUID.");
+        var menuOpened = false; var quitRequestedFromTray = false;
+        var windowIdentityForVerification = args.Contains("--tray-window-id");
+        using var tray = new TrayService(panel, app, () => menuOpened = true, () => quitRequestedFromTray = true, trayGuid, windowIdentityForVerification); panel.Tray = tray;
         try
         {
             var instanceName = "verification-" + Guid.NewGuid().ToString("N");
@@ -41,13 +48,24 @@ internal static class UiSmoke
                 checks.Add("second instance activation via current-user pipe");
             }
             ThemeService.SetForVerification(false); app.Start(); panel.ShowPanel(); await Pump();
+            await Until(() => tray.IsRegistered && tray.TryGetRectangle(out _));
+            Check(tray.TryGetRectangle(out var trayBounds) && trayBounds.Right > trayBounds.Left && trayBounds.Bottom > trayBounds.Top, "real tray registration has an icon rectangle", checks);
             Check(app.Receivers.Count == 2 && app.Receivers.All(r => r.Receiver.Online), "offline receivers excluded", checks);
             var area = tray.WorkArea(); GetWindowRect(new System.Windows.Interop.WindowInteropHelper(panel).Handle, out var bounds);
             Check(Math.Abs(bounds.Right - (area.Rect.Right - Math.Round(12 * area.Scale))) <= 2 && Math.Abs(bounds.Bottom - (area.Rect.Bottom - Math.Round(12 * area.Scale))) <= 2, "native panel aligns to monitor work area", checks);
-            SendMessage(tray.WindowHandle, 0x8001, IntPtr.Zero, new(0x10400)); await Pump();
+            var clickParam = tray.UsesVersion4 ? new IntPtr(0x10400) : new IntPtr(0x202);
+            var clickId = tray.UsesVersion4 ? IntPtr.Zero : new IntPtr(1);
+            SendMessage(tray.WindowHandle, 0x8001, clickId, clickParam); await Pump();
             Check(!panel.IsVisible, "tray activation hides panel", checks);
-            await Task.Delay(280); SendMessage(tray.WindowHandle, 0x8001, IntPtr.Zero, new(0x10400)); await Pump();
+            await Task.Delay(280); SendMessage(tray.WindowHandle, 0x8001, clickId, clickParam); await Pump();
             Check(panel.IsVisible, "tray activation opens panel", checks);
+            if (args.Contains("--tray-smoke"))
+            {
+                var initialIdentity = tray.Identity.ToString();
+                await VerifyTrayLifecycleAsync(tray, app, trayGuid, () => menuOpened, () => quitRequestedFromTray, checks, windowIdentityForVerification);
+                App.WriteOutput(args, new { ok = true, checks, tray_guid = trayGuid, identity = initialIdentity, window_identity_for_verification = windowIdentityForVerification, path = Environment.ProcessPath, note = "Isolated tray verification; engine/audio/discovery/autostart services are simulated." });
+                return 0;
+            }
             var mode = Descendants(panel).OfType<ComboBox>().Single(); mode.IsDropDownOpen = true; await Pump();
             Check(panel.IsVisible, "dropdown does not dismiss panel", checks); mode.IsDropDownOpen = false; await Pump();
             Check(app.Receivers.All(r => r.VolumeText == "—" && !r.CanSetVolume), "disconnected device volume is unknown and disabled", checks);
@@ -138,12 +156,50 @@ internal static class UiSmoke
             await app.StopAsync(); await Until(() => app.Snapshot.State == PlaybackState.Idle);
             Check(engine.DisposedCount == engine.CreatedCount, "stop releases mock engine", checks);
             await UiRegression.RunAsync(checks, directory);
+            await VerifyTrayLifecycleAsync(tray, app, trayGuid, () => menuOpened, () => quitRequestedFromTray, checks);
             App.WriteOutput(args, new { ok = true, checks, note = "All engine/audio/discovery/autostart services are simulated. DPI renders do not replace physical multimonitor QA." });
             return 0;
         }
         catch (Exception error) { App.WriteOutput(args, new { ok = false, checks, error = error.ToString() }); return 1; }
         finally { settings?.Close(); panel.ShutdownPanel(); }
     }
+    private static async Task VerifyTrayLifecycleAsync(TrayService tray, AppViewModel app, Guid guid, Func<bool> settingsRequested, Func<bool> quitRequested, List<string> checks, bool windowIdentityForVerification = false)
+    {
+        SendMessage(tray.WindowHandle, 0x8001, tray.UsesVersion4 ? IntPtr.Zero : new(1), tray.UsesVersion4 ? new(0x1007b) : new(0x205));
+        await Pump();
+        var menu = tray.ActiveMenu ?? throw new InvalidOperationException("The tray context menu did not open.");
+        var items = menu.Items.OfType<MenuItem>().ToArray();
+        items[1].RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+        Check(settingsRequested(), "tray menu opens settings", checks);
+        items[^1].RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+        Check(quitRequested(), "tray menu requests quit", checks);
+        menu.IsOpen = false; await Pump();
+        var window = tray.WindowHandle;
+        tray.Dispose();
+        Check(!tray.IsRegistered && !tray.TryGetRectangle(out _), "disposed tray stops registration", checks);
+        Check(!TrayRectangleExists(guid, tray.Identity, window), "disposed tray is removed from shell", checks);
+        var originallyChinese = L.IsChinese;
+        try
+        {
+            L.Initialize([originallyChinese ? "en-US" : "zh-CN"]);
+            var replacement = new ControlPanel(app);
+            using var rebuilt = new TrayService(replacement, app, () => { }, () => { }, guid, windowIdentityForVerification);
+            try
+            {
+                await Until(() => rebuilt.IsRegistered && rebuilt.TryGetRectangle(out _));
+                Check(rebuilt.TryGetRectangle(out _), "tray is registered after language window rebuild", checks);
+            }
+            finally { rebuilt.Dispose(); replacement.ShutdownPanel(); }
+        }
+        finally { L.Initialize([originallyChinese ? "zh-CN" : "en-US"]); }
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct TrayIdentifier { public uint Size; public IntPtr Window; public uint Id; public Guid Guid; }
+    private static bool TrayRectangleExists(Guid guid, TrayIdentity identity, IntPtr window)
+    {
+        var identifier = new TrayIdentifier { Size = (uint)Marshal.SizeOf<TrayIdentifier>(), Window = window, Id = 1, Guid = identity == TrayIdentity.Guid ? guid : Guid.Empty };
+        return Shell_NotifyIconGetRect(ref identifier, out _) == 0;
+    }
+    [DllImport("shell32.dll")] private static extern int Shell_NotifyIconGetRect(ref TrayIdentifier identifier, out NativeWindowPlacement.Rectangle rectangle);
     [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr handle, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr handle, out NativeWindowPlacement.Rectangle rectangle);
     private static void Check(bool value, string message, List<string> checks) { if (!value) throw new InvalidOperationException(message); checks.Add(message); }
