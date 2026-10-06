@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:loc="clr-namespace:AirFlash.App.Ui" xmlns:services="clr-namespace:AirFlash.App.Services" xmlns:vm="clr-namespace:AirFlash.App.ViewModels" x:Class="AirFlash.App.Ui.SettingsWindow" Title="{loc:Text 'AirFlash settings'}" Width="880" Height="640" MinWidth="640" MinHeight="440" UseLayoutRounding="True" Validation.Error="OnValidationError" SourceInitialized="OnSourceInitialized">
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:loc="clr-namespace:AirFlash.App.Ui" xmlns:services="clr-namespace:AirFlash.App.Services" xmlns:vm="clr-namespace:AirFlash.App.ViewModels" xmlns:core="clr-namespace:AirFlash.Core;assembly=AirFlash.Core" x:Class="AirFlash.App.Ui.SettingsWindow" Title="{loc:Text 'AirFlash settings'}" Width="880" Height="640" MinWidth="640" MinHeight="440" UseLayoutRounding="True" Validation.Error="OnValidationError" SourceInitialized="OnSourceInitialized">
   <Window.Resources>
     <DataTemplate x:Key="Page0">
       <StackPanel>
@@ -330,6 +330,7 @@
         <WrapPanel>
           <Button Content="{loc:Text 'Third-party licenses'}" Command="{Binding LicensesCommand}" Margin="0,0,10,10"/>
           <Button Content="{loc:Text 'Open log folder'}" Command="{Binding OpenLogsCommand}" Margin="0,0,10,10"/>
+          <Button x:Name="CoffeeButton" Content="请作者喝一杯咖啡~" Click="OnCoffeeClick" Visibility="{Binding Source={x:Static core:L.IsChinese}, Converter={StaticResource BoolVisibility}}" Margin="0,0,10,10"/>
         </WrapPanel>
       </StackPanel>
     </DataTemplate>

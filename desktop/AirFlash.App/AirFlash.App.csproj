@@ -22,6 +22,7 @@
     <PackageReference Include="NAudio" Version="2.2.1"/>
   </ItemGroup>
   <ItemGroup>
+    <Resource Include="Assets/PayQrcode.png"/>
     <EmbeddedResource Include="Assets/app.ico" LogicalName="AirFlash.Icon.ico"/>
     <EmbeddedResource Include="Assets/ThirdPartyNotices.txt" LogicalName="AirFlash.ThirdPartyNotices.txt"/>
     <EmbeddedResource Include="../../native/airflash-engine/target/release/airflash-engine.exe" LogicalName="AirFlash.Engine.exe" Condition="Exists('../../native/airflash-engine/target/release/airflash-engine.exe')"/>

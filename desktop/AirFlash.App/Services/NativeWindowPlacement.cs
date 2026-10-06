@@ -29,10 +29,22 @@ public static class NativeWindowPlacement
         var w = (int)(window.Width * area.Scale); var h = (int)(window.Height * area.Scale);
         SetWindowPos(new WindowInteropHelper(window).Handle, IntPtr.Zero, area.Rect.Left + (area.Rect.Width - w) / 2, area.Rect.Top + (area.Rect.Height - h) / 2, w, h, 0x0014);
     }
+    internal static void CenterDialog(Window window)
+    {
+        GetWindowRect(new WindowInteropHelper(window.Owner!).Handle, out var owner);
+        var area = FromRect(owner);
+        window.Width = Math.Min(window.Width, area.Rect.Width / area.Scale - 24);
+        window.Height = Math.Min(window.Height, area.Rect.Height / area.Scale - 24);
+        var w = (int)Math.Round(window.Width * area.Scale); var h = (int)Math.Round(window.Height * area.Scale);
+        var left = Math.Clamp(owner.Left + (owner.Right - owner.Left - w) / 2, area.Rect.Left, area.Rect.Right - w);
+        var top = Math.Clamp(owner.Top + (owner.Bottom - owner.Top - h) / 2, area.Rect.Top, area.Rect.Bottom - h);
+        SetWindowPos(new WindowInteropHelper(window).Handle, IntPtr.Zero, left, top, w, h, 0x0014);
+    }
     [StructLayout(LayoutKind.Sequential)] public struct Rectangle { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] private struct Point { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] private struct MonitorInfo { public int Size; public Rectangle Monitor, Work; public uint Flags; }
     [DllImport("user32.dll")] private static extern bool GetCursorPos(out Point point);
+    [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr window, out Rectangle rectangle);
     [DllImport("user32.dll")] private static extern IntPtr MonitorFromPoint(Point point, uint flags);
     [DllImport("user32.dll")] private static extern IntPtr MonitorFromRect(ref Rectangle rectangle, uint flags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfo info);

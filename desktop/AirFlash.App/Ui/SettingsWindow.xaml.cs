@@ -45,6 +45,10 @@ public partial class SettingsWindow : Window
     {
         NativeWindowPlacement.CenterSettings(this);
     }
+    private void OnCoffeeClick(object sender, RoutedEventArgs args)
+    {
+        new CoffeeWindow { Owner = this }.ShowDialog();
+    }
     private void OnValidationError(object sender, ValidationErrorEventArgs args)
     {
         if (args.Action == ValidationErrorEventAction.Added) _errors.Add(args.Error); else _errors.Remove(args.Error);
