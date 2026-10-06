@@ -59,6 +59,7 @@
                   Name="AirFlash"
                   Description="Send Windows system audio to an AirFlash receiver"
                   Target="[INSTALLFOLDER]AirFlash.exe"
+                  Icon="ApplicationIcon" IconIndex="0"
                   WorkingDirectory="INSTALLFOLDER"/>
         <RegistryValue Root="HKCU"
                        Key="Software\AirFlash"
@@ -75,6 +76,7 @@
                   Name="AirFlash"
                   Description="Send Windows system audio to an AirFlash receiver"
                   Target="[INSTALLFOLDER]AirFlash.exe"
+                  Icon="ApplicationIcon" IconIndex="0"
                   WorkingDirectory="INSTALLFOLDER"/>
         <RemoveFolder Id="RemoveStartMenuFolder" On="uninstall"/>
         <RegistryValue Root="HKCU"

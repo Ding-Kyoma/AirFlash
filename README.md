@@ -1,4 +1,4 @@
-# <img src="desktop/AirFlash.App/Assets/app.png" width="36" height="36" alt="" style="vertical-align:middle" /> AirFlash
+# <img src="desktop/AirFlash.App/Assets/app.svg" width="36" height="36" alt="" style="vertical-align:middle" /> AirFlash
 
 <p align="center">
   <a href="README.md">English</a> ·
@@ -63,6 +63,8 @@ Use **Settings > About > Check for updates** to check for a stable release and o
 The real-time profile targets 120 ms; target and local transport timings are not measurements of end-to-end acoustic latency.
 
 See [Release workflow](docs/RELEASING.md) for version reservation and publishing.
+
+See [Icon maintenance](docs/ICONS.md) for the vector source, generated resources, and high-DPI verification.
 
 ## Stack
 

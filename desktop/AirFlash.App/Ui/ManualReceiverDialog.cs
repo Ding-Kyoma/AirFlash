@@ -16,6 +16,7 @@ public sealed class ManualReceiverDialog : Window
     {
         Title = L.Get("Add receiver manually"); Width = 390; SizeToContent = SizeToContent.Height; ResizeMode = ResizeMode.NoResize; WindowStartupLocation = WindowStartupLocation.CenterOwner;
         WindowThemeService.Track(this);
+        AppIconService.Track(this);
         var panel = new StackPanel { Margin = new(22) };
         foreach (var (label, input) in new[] { (L.Get("Name (optional)"), _name), (L.Get("IP address or hostname"), _host), (L.Get("Port"), _port) })
         { panel.Children.Add(new TextBlock { Text = label, Margin = new(0, 0, 0, 6) }); input.Margin = new(0, 0, 0, 16); panel.Children.Add(input); }

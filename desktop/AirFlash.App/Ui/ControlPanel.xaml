@@ -25,7 +25,7 @@
           <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
         <StackPanel Orientation="Horizontal">
-          <Image Source="pack://application:,,,/Assets/app.png" Width="26" Height="26" VerticalAlignment="Center" Margin="0,2,10,0"/>
+          <Image Source="{StaticResource AppLogo}" Width="26" Height="26" VerticalAlignment="Center" Margin="0,2,10,0"/>
           <TextBlock Text="AirFlash" FontSize="21" FontWeight="SemiBold" VerticalAlignment="Center"/>
         </StackPanel>
         <Button Grid.Column="1" Style="{StaticResource IconButton}"  ToolTip="{loc:Text 'Settings'}" AutomationProperties.Name="{loc:Text 'Settings'}" Click="OnSettings" Margin="0,0,7,0"><TextBlock Text="" FontFamily="Segoe Fluent Icons"/></Button>
