@@ -243,13 +243,29 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         }
         finally { _serial.Release(); }
     }
+    public async Task UpdateReceiverAsync(Receiver receiver, AppSettings settings)
+    {
+        await _serial.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_receiver is not { } previous) return;
+            if (Snapshot.IsActive && Snapshot.State != PlaybackState.Pairing && Signature(previous, _settings) != Signature(receiver, settings))
+                await StartLockedAsync(receiver, settings, null).ConfigureAwait(false);
+            else
+            {
+                lock (_sync) { _receiver = receiver; _settings = settings.Clone(); }
+                PublishCurrent(_generation);
+            }
+        }
+        finally { _serial.Release(); }
+    }
     public async Task SetMutedAsync(bool muted)
     {
         await _serial.WaitAsync().ConfigureAwait(false);
         try { _muted = muted; await SendGainAsync().ConfigureAwait(false); }
         finally { _serial.Release(); }
     }
-    private double Gain(Receiver receiver) => _muted ? 0 : _settings.Gain(receiver.Id);
+    private double Gain(Receiver receiver) => _muted ? 0 : _settings.Gain(_receiver?.Id ?? receiver.Id);
     private async Task SendGainAsync()
     {
         IEngineConnection? connection; string? session;
@@ -263,6 +279,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         var attempts = 0;
         while (!cancellation.IsCancellationRequested)
         {
+            lock (_sync) { if (epoch == _generation && _receiver is not null) receiver = _receiver; }
             var startedAt = 0L;
             try
             {
@@ -345,7 +362,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                             var parsed = new StreamMetrics(metrics.Number("capture_to_send_p95_ms"), metrics.Number("max_queue_age_ms"), metrics.Integer("underrun_packets"), metrics.Integer("dropped_frames"), metrics.Integer("input_rate") is { } rate ? (int)rate : null);
                             var lastAudio = metrics.Number("last_audio_qpc_ns") ?? 0;
                             var silence = lastAudio > 0 ? (Stopwatch.GetTimestamp() * (1e9 / Stopwatch.Frequency) - lastAudio) / 1e9 : Stopwatch.GetElapsedTime(startedAt).TotalSeconds;
-                            var threshold = _settings.ReadOptions(receiver.Id).StandbySeconds ?? _settings.StandbySilenceSeconds;
+                            var threshold = _settings.ReadOptions(Snapshot.Receiver?.Id ?? receiver.Id).StandbySeconds ?? _settings.StandbySilenceSeconds;
                             Publish(epoch, _settings.StandbyEnabled && silence >= threshold ? PlaybackState.Standby : PlaybackState.Streaming, metrics: parsed);
                         }
                     }

@@ -20,6 +20,7 @@ public sealed class WindowsDiscovery : IDiscoveryService
     private bool _started;
     private bool _disposed;
     private long _epoch;
+    private HashSet<string> _diagnostics = new(StringComparer.Ordinal);
     public event Action<IReadOnlyList<Receiver>>? Changed;
     public event Action<string>? Failed;
     public WindowsDiscovery(Func<IReadOnlyList<DiscoveryAdapter>>? adapters = null) => _adapters = adapters ?? NetworkAdapterCatalog.List;
@@ -151,7 +152,9 @@ public sealed class WindowsDiscovery : IDiscoveryService
                     var value = Marshal.PtrToStringUni(Marshal.ReadIntPtr(info.Values, i * IntPtr.Size));
                     if (key is not null) txt[key] = value ?? "";
                 }
-                _records[operation.Name] = (new(operation.Name, operation.Type, new IPAddress(address).ToString(), info.Port, txt), DateTime.UtcNow.AddSeconds(90));
+                var record = new ServiceRecord(operation.Name, operation.Type, new IPAddress(address).ToString(), info.Port, txt);
+                if (!_records.TryGetValue(operation.Name, out var previous) || Describe(previous.Record) != Describe(record)) AppPaths.Log("Discovery resolved: " + Describe(record));
+                _records[operation.Name] = (record, DateTime.UtcNow.AddSeconds(90));
             }
             Publish();
         }
@@ -161,9 +164,18 @@ public sealed class WindowsDiscovery : IDiscoveryService
     private void Publish()
     {
         IReadOnlyList<Receiver> receivers;
-        lock (_sync) { if (_disposed) return; receivers = ReceiverAggregator.Build(_records.Values.Select(p => p.Record)); }
+        lock (_sync)
+        {
+            if (_disposed) return;
+            var diagnostics = new HashSet<string>(StringComparer.Ordinal);
+            receivers = ReceiverAggregator.Build(_records.Values.Select(p => p.Record), message => diagnostics.Add(message));
+            foreach (var message in diagnostics.Except(_diagnostics)) AppPaths.Log(message);
+            _diagnostics = diagnostics;
+        }
         Changed?.Invoke(receivers);
     }
+    private static string Describe(ServiceRecord record) => System.Text.Json.JsonSerializer.Serialize(new { record.Instance, record.ServiceType, record.Address, record.Port,
+        DeviceId = record.Txt.GetValueOrDefault("deviceid", ""), Model = record.Txt.GetValueOrDefault("model", record.Txt.GetValueOrDefault("am", "")), StereoId = record.Txt.GetValueOrDefault("tsid", "") });
     public void Dispose()
     {
         NetworkChange.NetworkAddressChanged -= NetworkChanged;

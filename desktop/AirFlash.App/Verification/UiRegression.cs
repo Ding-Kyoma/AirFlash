@@ -155,6 +155,94 @@ internal static class UiRegression
             Check(store.Saved.ForceReconnect == vm.Draft.ForceReconnect, "shutdown preserves the committed settings", checks);
         }
         finally { store.SaveGate?.TrySetResult(); audio.EnumerationGate?.TrySetResult(); await vm.ApplicationCompleted; window.Close(); }
+        await RunIdentityRegressionAsync(checks, directory);
+        await RunAutoConnectIdentityRegressionAsync(checks);
+        await RunStereoIdentityRegressionAsync(checks, directory);
+    }
+    private static async Task RunIdentityRegressionAsync(List<string> checks, string directory)
+    {
+        var store = new UiSmoke.MemoryStore();
+        var original = store.Load(); original.Options("AA:BB:CC:DD:EE:01").Hidden = true;
+        original.Options("127.0.0.1:7000").Volume = 55; original.Options("history").StandbySeconds = 20;
+        store.Save(original);
+        var discovery = new UiSmoke.MockDiscovery { Items = [new("127.0.0.1:7000", "Office", "127.0.0.1")] };
+        var engine = new UiSmoke.MockFactory();
+        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+        app.Start(); await app.Startup; await Until(() => app.AllReceivers.Count == 1);
+        var window = new SettingsWindow(app); window.Show(); await Pump(); var vm = window.ViewModel;
+        try
+        {
+            Check(vm.Receivers.Single(r => r.Receiver.Id == "127.0.0.1:7000").Detail.StartsWith("127.0.0.1:7000 ·", StringComparison.Ordinal), "endpoint history displays its port only once", checks);
+            vm.Draft.ForceReconnect = true; vm.Draft.Options("127.0.0.1:7000").StandbySeconds = 17;
+            await app.ToggleAsync(app.AllReceivers[0]); await Until(() => app.Snapshot.State == PlaybackState.Streaming);
+            var starts = engine.CreatedCount; store.Fail = true;
+            discovery.Items = ReceiverAggregator.Build([new ServiceRecord("Office._airplay._tcp.local", "_airplay._tcp.local", "127.0.0.1", 7000,
+                new Dictionary<string, string> { ["deviceid"] = "AA:BB:CC:DD:EE:01", ["model"] = "AudioAccessory6,1" })]);
+            discovery.Publish(); await Until(() => app.Notice.Contains("模拟保存失败", StringComparison.Ordinal));
+            Check(app.AllReceivers.Single().Id == "127.0.0.1:7000" && app.Settings.Receivers.ContainsKey("127.0.0.1:7000") && engine.CreatedCount == starts, "failed identity save preserves catalog preferences and playback", checks);
+            store.Fail = false; discovery.Publish();
+            await Until(() => app.Snapshot.Receiver?.Id == "aabbccddee01" && vm.Receivers.Count == 2);
+            Check(engine.CreatedCount == starts && app.Snapshot.IsActive, "identity promotion updates an active stream without reconnecting", checks);
+            Check(app.Settings.ReadOptions("aabbccddee01").Hidden && !app.Settings.Receivers.ContainsKey("127.0.0.1:7000") && app.Receivers.Count == 0, "duplicate settings merge with hidden taking precedence", checks);
+            Check(vm.Draft.ForceReconnect && vm.Draft.ReadOptions("aabbccddee01").StandbySeconds == 17 && vm.HasChanges, "open settings keeps unapplied changes through identity migration", checks);
+            Check(vm.Receivers.Any(r => r.Receiver.Id == "history" && !r.Receiver.Online) && !vm.Receivers.Any(r => r.Receiver.Id == "AA:BB:CC:DD:EE:01"), "confirmed aliases disappear while unrelated offline history remains", checks);
+            Check(await vm.ApplyAsync() && app.Settings.ReadOptions("aabbccddee01").StandbySeconds == 17 && engine.CreatedCount == starts, "applying migrated drafts does not resurrect aliases or restart playback", checks);
+            vm.Draft.Options("aabbccddee01").Hidden = false;
+            Check(await vm.ApplyAsync() && app.Receivers.Count == 1, "merged hidden state remains editable", checks);
+            var catalogChanges = 0; app.CatalogChanged += () => catalogChanges++;
+            discovery.Items = discovery.Items.Select(r => r with { Aliases = r.Aliases.ToArray() }).ToArray();
+            discovery.Publish(); await Pump();
+            Check(catalogChanges == 0 && engine.CreatedCount == starts, "equal alias contents do not redraw the catalog or restart playback", checks);
+            vm.SelectedPage = SettingsViewModel.ReceiversPage; await Pump(); UiSmoke.Render(window, Path.Combine(directory, "settings-identity-merged.png"), 1);
+            vm.AddManual("Manual Office", "127.0.0.1", 7000); await vm.ApplyAsync(); await Pump();
+            Check(vm.Receivers.Count(r => r.Receiver.Address == "127.0.0.1") == 2 && vm.Receivers.Any(r => r.IsManual), "manual receivers retain their independent behavior", checks);
+        }
+        finally { await vm.ApplicationCompleted; window.Close(); }
+    }
+    private static async Task RunAutoConnectIdentityRegressionAsync(List<string> checks)
+    {
+        var store = new UiSmoke.MemoryStore();
+        var settings = store.Load(); settings.AutoConnectOnDiscover = true; store.Save(settings);
+        var discovery = new UiSmoke.MockDiscovery { Items = [new("127.0.0.1:7000", "Office", "127.0.0.1")] };
+        var engine = new UiSmoke.MockFactory { FailOpen = true };
+        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+        app.Start(); await app.Startup; await Until(() => app.Snapshot.State == PlaybackState.Error);
+        Check(engine.CreatedCount == 1, "automatic connection failure makes one attempt", checks);
+        discovery.Items = ReceiverAggregator.Build([new ServiceRecord("Office._airplay._tcp.local", "_airplay._tcp.local", "127.0.0.1", 7000,
+            new Dictionary<string, string> { ["deviceid"] = "AA:BB:CC:DD:EE:01" })]);
+        discovery.Publish(); await Until(() => app.Snapshot.Receiver?.Id == "aabbccddee01");
+        await Task.Delay(1200); await Pump();
+        Check(engine.CreatedCount == 1 && app.Snapshot.State == PlaybackState.Error && app.Settings.LastReceiverId == "aabbccddee01", "identity promotion preserves failed automatic attempts and updates the error session", checks);
+        discovery.Items = []; discovery.Publish(); await Until(() => app.AllReceivers.All(r => !r.Online));
+        discovery.Items = ReceiverAggregator.Build([new ServiceRecord("Office._airplay._tcp.local", "_airplay._tcp.local", "127.0.0.1", 7000,
+            new Dictionary<string, string> { ["deviceid"] = "AA:BB:CC:DD:EE:01" })]);
+        discovery.Publish(); await Until(() => engine.CreatedCount == 2 && app.Snapshot.State == PlaybackState.Error);
+        Check(app.AllReceivers.Single().Id == "aabbccddee01", "a real offline-to-online transition permits another automatic attempt", checks);
+    }
+    private static async Task RunStereoIdentityRegressionAsync(List<string> checks, string directory)
+    {
+        var store = new UiSmoke.MemoryStore(); var settings = store.Load();
+        settings.Options("AA:BB:CC:DD:EE:01").Hidden = true; settings.Options("AA-BB-CC-DD-EE-02").StandbySeconds = 25; store.Save(settings);
+        var services = new[] { StereoService("_airplay", "AA:BB:CC:DD:EE:01", "127.0.0.1"), StereoService("_raop", "other-id", "127.0.0.1"), StereoService("_airplay", "AA-BB-CC-DD-EE-02", "127.0.0.2") };
+        var discovery = new UiSmoke.MockDiscovery { Items = ReceiverAggregator.Build(services) };
+        var engine = new UiSmoke.MockFactory();
+        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+        app.Start(); await app.Startup; await Until(() => app.AllReceivers.Count == 1);
+        var window = new SettingsWindow(app); window.Show(); await Pump(); var vm = window.ViewModel;
+        try
+        {
+            Check(vm.Receivers.Count == 1 && vm.Receivers[0].Detail.Contains("2/2", StringComparison.Ordinal) && app.Receivers.Count == 1, "stereo aliases count two physical members and do not add offline member cards", checks);
+            Check(app.Settings.ReadOptions("aabbccddee01").Hidden && app.Settings.ReadOptions("aabbccddee02").StandbySeconds == 25 && !app.Settings.ReadOptions("stereo:pair").Hidden, "stereo member preferences remain independent from the visible group", checks);
+            vm.SelectedPage = SettingsViewModel.ReceiversPage; await Pump(); UiSmoke.Render(window, Path.Combine(directory, "settings-identity-stereo.png"), 1);
+            await app.ToggleAsync(app.AllReceivers[0]); await Until(() => app.Snapshot.State == PlaybackState.Streaming);
+            discovery.Items = ReceiverAggregator.Build(services.Take(2)); discovery.Publish();
+            await Until(() => !app.Snapshot.IsActive && app.AllReceivers.Single().Members.Length == 1);
+            Check(app.AllReceivers.Single().Detail.Contains("1/2", StringComparison.Ordinal) && engine.CreatedCount == 1, "missing stereo member shows one of two and stops incomplete playback", checks);
+        }
+        finally { await vm.ApplicationCompleted; window.Close(); }
+
+        static ServiceRecord StereoService(string type, string id, string address) => new(type == "_raop" ? id + "@Office._raop._tcp.local" : address + "._airplay._tcp.local", type + "._tcp.local", address, 7000,
+            new Dictionary<string, string> { ["deviceid"] = id, ["model"] = "AudioAccessory6,1", ["tsid"] = "pair", ["gpn"] = "Office stereo" });
     }
     private static void Check(bool value, string name, List<string> checks) { if (!value) throw new InvalidOperationException(name); checks.Add(name); }
     private static async Task Pump() { await Application.Current.Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle); await Task.Delay(20); }

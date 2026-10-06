@@ -344,9 +344,15 @@ internal static class UiSmoke
     internal sealed class MockFactory : IEngineFactory
     {
         public int StopDelayMs;
+        public bool FailOpen;
         public ConcurrentQueue<JsonElement> Commands { get; } = new();
         public int CreatedCount, DisposedCount;
-        public IEngineConnection Open() { UiPerformance.Count("engine.open"); Interlocked.Increment(ref CreatedCount); return new MockConnection(this); }
+        public IEngineConnection Open()
+        {
+            UiPerformance.Count("engine.open"); Interlocked.Increment(ref CreatedCount);
+            if (FailOpen) throw new IOException("mock connection failed");
+            return new MockConnection(this);
+        }
     }
     private sealed class MockConnection(MockFactory factory) : IEngineConnection
     {

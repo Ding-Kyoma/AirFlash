@@ -13,6 +13,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private readonly Dispatcher _dispatcher;
     private readonly SemaphoreSlim _settingsGate = new(1, 1);
     private readonly Dictionary<string, Receiver> _known = [];
+    public IReadOnlyDictionary<string, string> ReceiverMigrations { get; private set; } = new Dictionary<string, string>();
     private readonly HashSet<string> _autoAttempted = [];
     private readonly DispatcherTimer _volumeTimer;
     private readonly DispatcherTimer _autoTimer;
@@ -152,34 +153,71 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         if (_closing) return;
         try
         {
-            var before = AllReceivers;
-            var discovered = list.ToDictionary(r => r.Id);
-            foreach (var key in _known.Keys.ToArray())
-                if (!_known[key].IsManual && !discovered.ContainsKey(key))
-                {
-                    if (_settings.DiscoveryInterfaceId.Length > 0) _known.Remove(key);
-                    else _known[key] = _known[key] with { Online = false };
-                }
-            foreach (var receiver in list)
+            await _settingsGate.WaitAsync();
+            try
             {
-                if (!_known.TryGetValue(receiver.Id, out var previous) || !previous.Online || !previous.Complete && receiver.Complete) _autoAttempted.Remove(receiver.Id);
-                _known[receiver.Id] = receiver;
+                if (_closing) return;
+                await ReconcileDiscoveryAsync(list);
             }
-            MergeManualReceivers();
-            if (!CatalogEqual(before, AllReceivers)) { RefreshReceivers(); CatalogChanged?.Invoke(); }
-            if (_snapshot.IsActive && _snapshot.Receiver is { IsManual: false } current)
-            {
-                if (!discovered.TryGetValue(current.Id, out var next) || !next.Complete) await StopAsync(false);
-                else if (next.TransportKey != current.TransportKey)
-                {
-                    await _settingsGate.WaitAsync();
-                    try { if (!_closing) await Session.StartAsync(next, _settings.Clone()); }
-                    finally { _settingsGate.Release(); }
-                }
-            }
-            ScheduleAutoConnect();
+            finally { _settingsGate.Release(); if (_volumeDirty && !_closing) { _volumeTimer.Stop(); _volumeTimer.Start(); } }
         }
         catch (Exception error) { ShowError(error); }
+    }
+    private async Task ReconcileDiscoveryAsync(IReadOnlyList<Receiver> list)
+    {
+        var currentSnapshot = Session.Snapshot;
+        var originalSettings = _settings.Clone();
+        var reconciliation = ReceiverCatalog.Reconcile(list, _settings, currentSnapshot.Receiver?.Id);
+        if (!SettingsMerge.Equal(_settings, reconciliation.Settings))
+        {
+            var revision = _editRevision;
+            await _store.SaveReceiverIdentityAsync(reconciliation.Settings, reconciliation.NeedsBackup);
+            var live = _settings.Clone(); var baseline = originalSettings.Clone();
+            ReceiverCatalog.ApplyMigrations(live, reconciliation.Migrations, currentSnapshot.Receiver?.Id);
+            ReceiverCatalog.ApplyMigrations(baseline, reconciliation.Migrations, currentSnapshot.Receiver?.Id);
+            _settings = SettingsMerge.Merge(baseline, live, reconciliation.Settings);
+            _volumeDirty = revision != _editRevision;
+            Notify(nameof(Settings)); SettingsChanged?.Invoke();
+            var migrated = reconciliation.Migrations.Where(p => p.Key != p.Value && (originalSettings.Receivers.ContainsKey(p.Key) || currentSnapshot.Receiver?.Id == p.Key)).ToArray();
+            if (migrated.Length > 0) AppPaths.Log("Receiver identity migrated: " + System.Text.Json.JsonSerializer.Serialize(migrated));
+        }
+        ReceiverMigrations = reconciliation.Migrations;
+        list = reconciliation.Receivers;
+        var before = AllReceivers;
+        var discovered = list.ToDictionary(r => r.Id);
+        foreach (var previous in before.Where(r => !r.IsManual))
+            if (ReceiverMigrations.TryGetValue(previous.Id, out var target) && previous.Id != target && discovered.TryGetValue(target, out var promoted))
+                AppPaths.Log("Receiver identity upgraded: " + System.Text.Json.JsonSerializer.Serialize(new { OldId = previous.Id, NewId = target, promoted.Address, promoted.Port, promoted.DeviceId, promoted.Model, promoted.StereoId,
+                    Reason = ReceiverIdentity.IsBroadcast(previous.Id) ? "confirmed_broadcast_alias" : "unique_endpoint" }));
+        foreach (var key in _known.Keys.ToArray())
+            if (!_known[key].IsManual && (ReceiverMigrations.TryGetValue(key, out var target) && target != key || ReceiverCatalog.IsCoveredMember(key, list))) _known.Remove(key);
+        foreach (var id in _autoAttempted.ToArray())
+            if (ReceiverMigrations.TryGetValue(id, out var target) && id != target) { _autoAttempted.Remove(id); _autoAttempted.Add(target); }
+        foreach (var key in _known.Keys.ToArray())
+            if (!_known[key].IsManual && !discovered.ContainsKey(key))
+            {
+                if (_settings.DiscoveryInterfaceId.Length > 0) _known.Remove(key);
+                else _known[key] = _known[key] with { Online = false };
+            }
+        foreach (var receiver in list)
+        {
+            var previous = before.Where(r => !r.IsManual && ReceiverMigrations.GetValueOrDefault(r.Id, r.Id) == receiver.Id)
+                .OrderByDescending(r => r.Online).ThenByDescending(r => r.Complete).FirstOrDefault();
+            if (previous is null || !previous.Online || !previous.Complete && receiver.Complete) _autoAttempted.Remove(receiver.Id);
+            _known[receiver.Id] = receiver;
+        }
+        MergeManualReceivers();
+        if (!CatalogEqual(before, AllReceivers)) { RefreshReceivers(); CatalogChanged?.Invoke(); }
+        if (currentSnapshot.Receiver is { IsManual: false } current)
+        {
+            var id = ReceiverMigrations.GetValueOrDefault(current.Id, current.Id);
+            if (!discovered.TryGetValue(id, out var next) || !next.Complete)
+            {
+                if (currentSnapshot.IsActive) await Session.StopAsync();
+            }
+            else if (!ReceiverEqual(current, next) || !SettingsMerge.Equal(originalSettings, _settings)) await Session.UpdateReceiverAsync(next, _settings.Clone());
+        }
+        ScheduleAutoConnect();
     }
     private void MergeManualReceivers()
     {
@@ -191,8 +229,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private static bool CatalogEqual(IReadOnlyList<Receiver> left, IReadOnlyList<Receiver> right)
         => left.Count == right.Count && left.Zip(right).All(p => ReceiverEqual(p.First, p.Second));
     internal static bool ReceiverEqual(Receiver left, Receiver right)
-        => (left with { Members = Array.Empty<Receiver>(), Codecs = Array.Empty<byte>() }) == (right with { Members = Array.Empty<Receiver>(), Codecs = Array.Empty<byte>() })
-            && left.Codecs.SequenceEqual(right.Codecs) && CatalogEqual(left.Members, right.Members);
+        => (left with { Members = Array.Empty<Receiver>(), Codecs = Array.Empty<byte>(), Aliases = Array.Empty<string>() }) == (right with { Members = Array.Empty<Receiver>(), Codecs = Array.Empty<byte>(), Aliases = Array.Empty<string>() })
+            && left.Codecs.SequenceEqual(right.Codecs) && left.Aliases.SequenceEqual(right.Aliases) && CatalogEqual(left.Members, right.Members);
     private void RefreshReceivers()
     {
         var visible = AllReceivers.Where(r => r.Online && !_settings.ReadOptions(r.Id).Hidden).ToArray();
@@ -326,6 +364,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         {
             if (_closing) throw new InvalidOperationException(L.Get("The application is closing."));
             _volumeTimer.Stop();
+            ReceiverCatalog.ApplyMigrations(baseline, ReceiverMigrations, Session.Snapshot.Receiver?.Id);
+            ReceiverCatalog.ApplyMigrations(draft, ReceiverMigrations, Session.Snapshot.Receiver?.Id);
             var before = _settings.Clone();
             var revision = _editRevision;
             AppSettings merged;

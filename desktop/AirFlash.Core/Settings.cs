@@ -69,6 +69,7 @@ public sealed class AppSettings : ObservableObject
     public int MasterVolume { get => _MasterVolume; set => Set(ref _MasterVolume, value); }
     public string? LastReceiverId { get; set; }
     public Dictionary<string, ReceiverOptions> Receivers { get; set; } = new(StringComparer.Ordinal);
+    public Dictionary<string, string> ReceiverAliases { get; set; } = new(StringComparer.Ordinal);
     public ObservableCollection<ManualReceiver> ManualReceivers { get; set; } = [];
     [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
     public ReceiverOptions Options(string id)
@@ -122,6 +123,7 @@ public sealed class AppSettings : ObservableObject
         CaptureMode = source.CaptureMode; CaptureEndpoint = source.CaptureEndpoint;
         MasterVolume = source.MasterVolume; LastReceiverId = source.LastReceiverId;
         Extra = source.Extra?.ToDictionary(p => p.Key, p => p.Value.Clone());
+        ReceiverAliases = new(source.ReceiverAliases, StringComparer.Ordinal);
         foreach (var id in Receivers.Keys.Except(source.Receivers.Keys).ToArray()) Receivers.Remove(id);
         foreach (var (id, options) in source.Receivers) Options(id).CopyFrom(options);
         foreach (var receiver in ManualReceivers.Where(r => !source.ManualReceivers.Contains(r)).ToArray()) ManualReceivers.Remove(receiver);

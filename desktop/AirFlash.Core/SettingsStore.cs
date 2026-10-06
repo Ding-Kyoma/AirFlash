@@ -7,6 +7,7 @@ public interface ISettingsStore
     AppSettings Load();
     void Save(AppSettings settings);
     Task SaveAsync(AppSettings settings) => Task.Run(() => Save(settings));
+    Task SaveReceiverIdentityAsync(AppSettings settings, bool backup) => SaveAsync(settings);
 }
 public sealed class SettingsStore(string path) : ISettingsStore
 {
@@ -42,6 +43,9 @@ public sealed class SettingsStore(string path) : ISettingsStore
             settings.Receivers ??= [];
             settings.Receivers = settings.Receivers.Where(pair => pair.Value is not null).ToDictionary(pair => pair.Key, pair => pair.Value);
             settings.ManualReceivers ??= [];
+            settings.ReceiverAliases ??= [];
+            settings.ReceiverAliases = settings.ReceiverAliases.Where(p => ReceiverIdentity.IsBroadcast(p.Key) && !string.IsNullOrWhiteSpace(p.Value) && ReceiverIdentity.IsBroadcast(p.Value))
+                .GroupBy(p => ReceiverIdentity.Normalize(p.Key)).ToDictionary(g => g.Key, g => ReceiverIdentity.Normalize(g.First().Value), StringComparer.Ordinal);
             return settings;
         }
         catch (Exception error) when (error is JsonException or IOException or UnauthorizedAccessException or InvalidOperationException)
@@ -73,4 +77,9 @@ public sealed class SettingsStore(string path) : ISettingsStore
         }
         finally { if (File.Exists(temp)) File.Delete(temp); }
     }
+    public Task SaveReceiverIdentityAsync(AppSettings settings, bool backup) => Task.Run(() =>
+    {
+        if (backup && File.Exists(path) && !File.Exists(path + ".pre-receiver-identity.bak")) File.Copy(path, path + ".pre-receiver-identity.bak");
+        Save(settings);
+    });
 }

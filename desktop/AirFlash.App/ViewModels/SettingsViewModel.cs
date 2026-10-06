@@ -9,7 +9,7 @@ namespace AirFlash.App.ViewModels;
 
 public sealed class SettingsViewModel : ObservableObject, IDisposable
 {
-    public const int EqualizerPage = 2, AudioCapturePage = 3, MonitorPage = 5, NetworkPage = 6;
+    public const int EqualizerPage = 2, AudioCapturePage = 3, ReceiversPage = 4, MonitorPage = 5, NetworkPage = 6;
     private readonly Guid _equalizerOwner = Guid.NewGuid();
     public EqualizerEditor Equalizer { get; }
     private string _equalizerError = "";
@@ -188,11 +188,16 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private void RefreshCatalog()
     {
         if (_disposed) return;
+        ReceiverCatalog.ApplyMigrations(Draft, App.ReceiverMigrations, App.Snapshot.Receiver?.Id);
+        ReceiverCatalog.ApplyMigrations(_baseline, App.ReceiverMigrations, App.Snapshot.Receiver?.Id);
+        Draft.ReceiverAliases = new(App.Settings.ReceiverAliases, StringComparer.Ordinal);
+        _baseline.ReceiverAliases = new(App.Settings.ReceiverAliases, StringComparer.Ordinal);
         var manualIds = Draft.ManualReceivers.Select(r => r.Id).ToHashSet();
         var catalog = App.AllReceivers.Where(r => !r.IsManual || manualIds.Contains(r.Id)).ToDictionary(r => r.Id);
         foreach (var manual in Draft.ManualReceivers) catalog[manual.Id] = new(manual.Id, manual.Name, manual.Host, manual.Port) { IsManual = true };
         if (Draft.DiscoveryInterfaceId.Length == 0)
-            foreach (var id in Draft.Receivers.Keys) catalog.TryAdd(id, new(id, L.Get("Offline receiver"), id) { Online = false });
+            foreach (var id in Draft.Receivers.Keys)
+                if (!ReceiverCatalog.IsCoveredMember(id, App.AllReceivers)) catalog.TryAdd(id, Receiver.Offline(id));
         foreach (var row in Receivers.Where(r => !catalog.ContainsKey(r.Receiver.Id)).ToArray()) Receivers.Remove(row);
         var index = 0;
         foreach (var receiver in catalog.Values.OrderBy(r => r.Name))
@@ -328,7 +333,7 @@ public sealed class ReceiverEditor : ObservableObject
         RemoveCommand = new(() => { if (canEdit()) remove(); }, canEdit);
     }
     public string Name => Receiver.Name;
-    public string Detail => $"{Receiver.Address}:{Receiver.Port} · {(Receiver.Online ? Receiver.Detail : L.Get("Offline"))}";
+    public string Detail => $"{(Receiver.Address.Length > 0 ? ReceiverIdentity.Endpoint(Receiver.Address, Receiver.Port) : Receiver.Id)} · {(Receiver.Online ? Receiver.Detail : L.Get("Offline"))}";
     public bool IsManual => Receiver.IsManual;
     public RelayCommand PairCommand { get; }
     public RelayCommand RemoveCommand { get; }

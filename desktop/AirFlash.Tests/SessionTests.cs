@@ -88,6 +88,41 @@ public sealed class SessionTests
         process.EmitData(new { @event = "equalizer_changed", sequence }); await Until(() => feedback.Contains(null));
     }
     [Fact]
+    public async Task IdentityUpgradeRetainsStreamAndUsesMigratedStandbySetting()
+    {
+        var connection = new FakeConnection(); var factory = new FakeFactory(connection);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        var settings = Settings(); settings.StandbyEnabled = true; settings.Options("old").StandbySeconds = 5; settings.Options("old").LatencyMode = "realtime";
+        await controller.StartAsync(Pod("old"), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        ReceiverCatalog.ApplyMigrations(settings, new Dictionary<string, string> { ["old"] = "new" });
+        await controller.UpdateReceiverAsync(Pod("new"), settings);
+        Assert.Equal(1, factory.OpenCount); Assert.Equal("new", controller.Snapshot.Receiver!.Id); Assert.Equal(120, controller.Snapshot.TargetLatency);
+        connection.Emit("capture_metrics", metrics: new { last_audio_qpc_ns = 1 });
+        await Until(() => controller.Snapshot.State == PlaybackState.Standby);
+        Assert.Equal(1, factory.OpenCount); Assert.False(connection.Disposed);
+    }
+    [Fact]
+    public async Task IdentityUpgradeWithChangedLatencyRestartsOnlyOnce()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection(); var factory = new FakeFactory(first, second);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        var settings = Settings(); await controller.StartAsync(Pod("old"), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        settings.Options("new").LatencyMode = "realtime";
+        await controller.UpdateReceiverAsync(Pod("new"), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.Equal(2, factory.OpenCount); Assert.Equal(120, second.Commands.Single(c => c.Command == "start").Parameters.Number("latency_ms"));
+    }
+    [Fact]
+    public async Task ReorderingRenamedStereoMembersDoesNotRestartTransport()
+    {
+        var connection = new FakeConnection(); var factory = new FakeFactory(connection);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        var pair = Pod("stereo:pair") with { Members = [Pod("old-a"), Pod("old-b") with { Address = "127.0.0.2" }] };
+        await controller.StartAsync(pair, Settings()); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var updated = pair with { Members = [pair.Members[1] with { Id = "new-a" }, pair.Members[0] with { Id = "new-b" }] };
+        await controller.UpdateReceiverAsync(updated, Settings());
+        Assert.Equal(1, factory.OpenCount); Assert.Equal("new-a", controller.Snapshot.Receiver!.Members[0].Id);
+    }
+    [Fact]
     public async Task StartIsNonblockingAndStopCancelsPendingConnection()
     {
         var process = new FakeConnection(false); var factory = new FakeFactory(process); await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);

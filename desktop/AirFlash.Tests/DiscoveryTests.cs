@@ -20,7 +20,7 @@ public sealed class DiscoveryTests
     [Fact]
     public void AggregatesBothServicesAndPreservesCodecList()
     {
-        var receivers = ReceiverAggregator.Build([Member("left._airplay._tcp.local", "10.0.0.1", "aa:bb", true), Member("right._airplay._tcp.local", "10.0.0.2", "cc:dd", false), Member("aabb@Cinema._raop._tcp.local", "10.0.0.1", "aabb", true, "_raop._tcp.local")]);
+        var receivers = ReceiverAggregator.Build([Member("left._airplay._tcp.local", "10.0.0.1", "aa:bb:cc:dd:ee:01", true), Member("right._airplay._tcp.local", "10.0.0.2", "aa:bb:cc:dd:ee:02", false), Member("aabbccddee01@Cinema._raop._tcp.local", "10.0.0.1", "aabbccddee01", true, "_raop._tcp.local")]);
         var pair = Assert.Single(receivers); Assert.Equal("stereo:stable", pair.Id); Assert.Equal("家庭影院", pair.Name); Assert.Equal(2, pair.Members.Length); Assert.True(pair.Complete); Assert.Equal(new byte[] { 0, 1, 2, 3 }, pair.Members[0].Codecs);
     }
     [Fact]
