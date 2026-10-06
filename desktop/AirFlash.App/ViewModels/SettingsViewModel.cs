@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Collections.Specialized;
 using System.ComponentModel;
+using System.Net.NetworkInformation;
 using System.Windows;
 using AirFlash.App.Services;
 using AirFlash.Core;
@@ -36,12 +37,17 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
             if (!Set(ref _selectedPage, value)) return;
             Notify(nameof(PageTitle)); Notify(nameof(PageDescription));
             if (value == 2) _ = LoadEndpointsAsync(false);
+            if (value == 5) RefreshAdapters();
         }
     }
-    public string[] Pages { get; } = [L.Get("General"), L.Get("AirFlash streaming"), L.Get("Audio capture"), L.Get("Receivers"), L.Get("Monitor"), L.Get("About")];
+    public string[] Pages { get; } = [L.Get("General"), L.Get("AirFlash streaming"), L.Get("Audio capture"), L.Get("Receivers"), L.Get("Monitor"), L.Get("Network"), L.Get("About")];
     public string PageTitle => Pages[Math.Clamp(SelectedPage, 0, Pages.Length - 1)];
-    public string PageDescription => new[] { L.Get("Customize startup and appearance"), L.Get("Balance responsiveness and connection stability"), L.Get("Choose the system audio to send to HomePod"), L.Get("Manage receivers, connections and per-device settings"), L.Get("Live statistics for the current session"), L.Get("Windows audio, wirelessly to HomePod") }[Math.Clamp(SelectedPage, 0, 5)];
+    public string PageDescription => new[] { L.Get("Customize startup and appearance"), L.Get("Balance responsiveness and connection stability"), L.Get("Choose the system audio to send to HomePod"), L.Get("Manage receivers, connections and per-device settings"), L.Get("Live statistics for the current session"), L.Get("Choose where AirPlay receivers are discovered"), L.Get("Windows audio, wirelessly to HomePod") }[Math.Clamp(SelectedPage, 0, 6)];
     public ObservableCollection<AudioEndpoint> Endpoints { get; } = [];
+    public ObservableCollection<DiscoveryAdapterOption> DiscoveryAdapters { get; } = [];
+    private string _networkStatus = "";
+    public string NetworkStatus { get => _networkStatus; private set => Set(ref _networkStatus, value); }
+    public RelayCommand RefreshAdaptersCommand { get; }
     public ObservableCollection<ReceiverEditor> Receivers { get; } = [];
     public AsyncCommand ApplyCommand { get; }
     public AsyncCommand OkCommand { get; }
@@ -71,6 +77,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         OkCommand = new(async () => { if (!HasChanges || await ApplyAsync()) CloseRequested?.Invoke(true); }, ShowError, () => CanEdit && _validationErrors == 0 && _validation is null);
         CancelCommand = new(() => { if (CanEdit) CloseRequested?.Invoke(false); }, () => CanEdit);
         RefreshEndpointsCommand = new(() => LoadEndpointsAsync(true), ShowError, () => CanEdit && !_endpointLoading);
+        RefreshAdaptersCommand = new(RefreshAdapters);
         OpenLogsCommand = new(() => { try { AppPaths.OpenLogs(); } catch (Exception error) { ShowError(error); } });
         CopyDiagnosticsCommand = new(() => { try { Clipboard.SetText(App.Diagnostics()); } catch (Exception error) { ShowError(error); } });
         AddReceiverCommand = new(() => { if (CanEdit) AddReceiverRequested?.Invoke(); }, () => CanEdit);
@@ -80,7 +87,9 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         RefreshCatalog(); RefreshValidation();
         App.CatalogChanged += RefreshCatalog;
         App.Endpoints.Changed += UpdateEndpoints;
-        UpdateEndpoints();
+        NetworkChange.NetworkAddressChanged += NetworkChanged;
+        NetworkChange.NetworkAvailabilityChanged += NetworkAvailabilityChanged;
+        UpdateEndpoints(); RefreshAdapters();
     }
     private void SyncSubscriptions()
     {
@@ -88,7 +97,12 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         foreach (var options in Draft.Receivers.Values) if (_subscribed.Add(options)) options.PropertyChanged += DraftChanged;
     }
     private void ManualChanged(object? sender, NotifyCollectionChangedEventArgs args) { if (!_updating) RefreshValidation(); }
-    private void DraftChanged(object? sender, PropertyChangedEventArgs args) { if (!_updating) RefreshValidation(); }
+    private void DraftChanged(object? sender, PropertyChangedEventArgs args)
+    {
+        if (_updating) return;
+        RefreshValidation();
+        if (args.PropertyName == nameof(AppSettings.DiscoveryInterfaceId)) RefreshAdapters();
+    }
     private void RefreshValidation(bool clearError = true)
     {
         if (_updating || _disposed) return;
@@ -139,7 +153,8 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         var manualIds = Draft.ManualReceivers.Select(r => r.Id).ToHashSet();
         var catalog = App.AllReceivers.Where(r => !r.IsManual || manualIds.Contains(r.Id)).ToDictionary(r => r.Id);
         foreach (var manual in Draft.ManualReceivers) catalog[manual.Id] = new(manual.Id, manual.Name, manual.Host, manual.Port) { IsManual = true };
-        foreach (var id in Draft.Receivers.Keys) catalog.TryAdd(id, new(id, L.Get("Offline receiver"), id) { Online = false });
+        if (Draft.DiscoveryInterfaceId.Length == 0)
+            foreach (var id in Draft.Receivers.Keys) catalog.TryAdd(id, new(id, L.Get("Offline receiver"), id) { Online = false });
         foreach (var row in Receivers.Where(r => !catalog.ContainsKey(r.Receiver.Id)).ToArray()) Receivers.Remove(row);
         var index = 0;
         foreach (var receiver in catalog.Values.OrderBy(r => r.Name))
@@ -215,10 +230,45 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         }
         finally { _updating = updating; }
     }
+    private void NetworkChanged(object? sender, EventArgs args) => Application.Current.Dispatcher.BeginInvoke(RefreshAdapters);
+    private void NetworkAvailabilityChanged(object? sender, NetworkAvailabilityEventArgs args) => Application.Current.Dispatcher.BeginInvoke(RefreshAdapters);
+    private void RefreshAdapters()
+    {
+        if (_disposed) return;
+        try
+        {
+            var adapters = NetworkAdapterCatalog.List();
+            var options = new List<DiscoveryAdapterOption> { new("", L.Get("All network interfaces (default)")) };
+            options.AddRange(adapters.OrderByDescending(a => a.Available)
+                .ThenBy(a => a.Name, StringComparer.CurrentCultureIgnoreCase)
+                .Select(a => new DiscoveryAdapterOption(a.Id, a.Label)));
+            var selected = Draft.DiscoveryInterfaceId;
+            if (selected.Length > 0 && options.All(a => !a.Id.Equals(selected, StringComparison.OrdinalIgnoreCase)))
+                options.Add(new(selected, L.Get("Unavailable · ") + selected));
+            for (var i = 0; i < options.Count; i++)
+            {
+                var option = options[i];
+                var current = DiscoveryAdapters.FirstOrDefault(a => a.Id == option.Id);
+                if (current is null) DiscoveryAdapters.Insert(i, option);
+                else
+                {
+                    if (current.Label != option.Label) current.Label = option.Label;
+                    var previous = DiscoveryAdapters.IndexOf(current);
+                    if (previous != i) DiscoveryAdapters.Move(previous, i);
+                }
+            }
+            while (DiscoveryAdapters.Count > options.Count) DiscoveryAdapters.RemoveAt(DiscoveryAdapters.Count - 1);
+            NetworkStatus = selected.Length == 0 ? L.Get("Discovery uses all network interfaces.") :
+                DiscoveryInterface.ResolveIndex(selected, adapters) is null ? L.Get("The selected network interface is unavailable. Discovery is paused.") :
+                L.Get("Discovery uses only the selected network interface.");
+        }
+        catch (NetworkInformationException error) { NetworkStatus = error.Message; }
+    }
     private void ShowError(Exception error) { Error = error.Message; AppPaths.Log(error.ToString()); }
     public void Dispose()
     {
         Updates.Dispose(); _disposed = true; App.CatalogChanged -= RefreshCatalog; App.Endpoints.Changed -= UpdateEndpoints;
+        NetworkChange.NetworkAddressChanged -= NetworkChanged; NetworkChange.NetworkAvailabilityChanged -= NetworkAvailabilityChanged;
         App.SetMonitorVisible(false);
         Draft.PropertyChanged -= DraftChanged; Draft.ManualReceivers.CollectionChanged -= ManualChanged;
         foreach (var options in _subscribed) options.PropertyChanged -= DraftChanged;

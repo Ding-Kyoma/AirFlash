@@ -1,7 +1,9 @@
 # Caller holds the local release lock throughout the build.
-function Reserve-ReleaseVersion([string]$Root, [string]$RequestedVersion = '') {
+function Reserve-ReleaseVersion([string]$Root, [string]$RequestedVersion = '', [string]$Channel = 'stable') {
+    if ($Channel -notin @('stable', 'preview')) { throw 'Unknown release channel.' }
     $branch = & git -C $Root branch --show-current
-    if ($LASTEXITCODE -ne 0 -or $branch -ne 'main') { throw 'Release builds require main.' }
+    $expectedBranch = if ($Channel -eq 'preview') { 'codex/nic-discovery-preview' } else { 'main' }
+    if ($LASTEXITCODE -ne 0 -or $branch -ne $expectedBranch) { throw "Release channel $Channel requires branch $expectedBranch." }
     $dirty = & git -C $Root status --porcelain --untracked-files=no
     if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'Release builds require a clean tracked tree.' }
     $head = & git -C $Root rev-parse HEAD

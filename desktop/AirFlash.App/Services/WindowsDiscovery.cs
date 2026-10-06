@@ -14,44 +14,79 @@ public sealed class WindowsDiscovery : IDiscoveryService
     private readonly Dictionary<string, long> _pending = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<Operation> _browsers = [];
     private System.Threading.Timer? _timer;
+    private readonly Func<IReadOnlyList<DiscoveryAdapter>> _adapters;
+    private string _interfaceId = "";
+    private uint? _interfaceIndex;
+    private bool _started;
     private bool _disposed;
     private long _epoch;
     public event Action<IReadOnlyList<Receiver>>? Changed;
     public event Action<string>? Failed;
+    public WindowsDiscovery(Func<IReadOnlyList<DiscoveryAdapter>>? adapters = null) => _adapters = adapters ?? NetworkAdapterCatalog.List;
+    public void SetInterface(string id)
+    {
+        lock (_sync)
+        {
+            if (_disposed || _interfaceId == id) return;
+            _interfaceId = id;
+            if (!_started) return;
+        }
+        Restart();
+    }
     public void Start()
     {
+        lock (_sync) { if (_disposed || _started) return; _started = true; }
         NetworkChange.NetworkAddressChanged += NetworkChanged;
+        NetworkChange.NetworkAvailabilityChanged += NetworkAvailabilityChanged;
         Restart();
         _timer = new(_ => Refresh(), null, TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(20));
     }
     private void NetworkChanged(object? sender, EventArgs args) => Restart();
+    private void NetworkAvailabilityChanged(object? sender, NetworkAvailabilityEventArgs args) => Restart();
     private void Restart()
     {
-        Operation[] old; long epoch;
+        Operation[] old; long epoch; string selected;
+        lock (_sync) selected = _interfaceId;
+        uint? index;
+        try { index = DiscoveryInterface.ResolveIndex(selected, _adapters()); }
+        catch (NetworkInformationException error) { Failed?.Invoke(error.Message); index = null; }
         lock (_sync)
         {
-            if (_disposed) return;
+            if (_disposed || !_started || selected != _interfaceId) return;
             epoch = ++_epoch;
+            _interfaceIndex = index;
             old = Operation.All.Values.Where(o => ReferenceEquals(o.Owner, this)).ToArray();
             _browsers.Clear(); _records.Clear(); _instances.Clear(); _pending.Clear();
         }
         // Cancel outside the cache lock: completion callbacks may need that lock.
         foreach (var operation in old) operation.Dispose();
+        Publish();
+        if (index is null)
+        {
+            Failed?.Invoke(L.Get("The selected network interface is unavailable. Discovery is paused."));
+            return;
+        }
         lock (_sync)
         {
-            if (_disposed || epoch != _epoch) return;
+            if (_disposed || epoch != _epoch || selected != _interfaceId) return;
             foreach (var type in new[] { "_airplay._tcp.local", "_raop._tcp.local" })
             {
-                var operation = new Operation(this, type, type, _epoch, false);
+                var operation = new Operation(this, type, type, _epoch, false, index.Value);
                 _browsers.Add(operation);
                 var status = operation.Start();
                 if (status is not (0 or 9506)) Failed?.Invoke(L.Format("Receiver discovery failed: {0}. You can add a receiver manually.", new Win32Exception((int)status).Message));
             }
         }
-        Publish();
     }
     private void Refresh()
     {
+        string selected; uint? previous;
+        lock (_sync) { selected = _interfaceId; previous = _interfaceIndex; }
+        if (selected.Length > 0)
+        {
+            try { if (DiscoveryInterface.ResolveIndex(selected, _adapters()) != previous) { Restart(); return; } }
+            catch (NetworkInformationException error) { Failed?.Invoke(error.Message); Restart(); return; }
+        }
         KeyValuePair<string, string>[] instances;
         lock (_sync)
         {
@@ -91,7 +126,7 @@ public sealed class WindowsDiscovery : IDiscoveryService
         lock (_sync)
         {
             if (_disposed || _pending.ContainsKey(instance)) return;
-            var operation = new Operation(this, instance, type, _epoch, true);
+            var operation = new Operation(this, instance, type, _epoch, true, _interfaceIndex!.Value);
             _pending[instance] = operation.Token;
             var status = operation.Start();
             if (status is not (0 or 9506)) { _pending.Remove(instance); operation.Dispose(); }
@@ -131,7 +166,8 @@ public sealed class WindowsDiscovery : IDiscoveryService
     }
     public void Dispose()
     {
-        NetworkChange.NetworkAddressChanged -= NetworkChanged; _timer?.Dispose();
+        NetworkChange.NetworkAddressChanged -= NetworkChanged;
+        NetworkChange.NetworkAvailabilityChanged -= NetworkAvailabilityChanged; _timer?.Dispose();
         Operation[] operations;
         lock (_sync)
         {
@@ -162,18 +198,19 @@ public sealed class WindowsDiscovery : IDiscoveryService
         public string Name { get; }
         public string Type { get; }
         public long Epoch { get; }
+        public uint InterfaceIndex { get; }
         private readonly bool _resolve;
         private IntPtr _name;
         private IntPtr _cancel;
         private bool _pending;
-        public Operation(WindowsDiscovery owner, string name, string type, long epoch, bool resolve)
+        public Operation(WindowsDiscovery owner, string name, string type, long epoch, bool resolve, uint interfaceIndex)
         {
-            Owner = owner; Name = name; Type = type; Epoch = epoch; _resolve = resolve;
+            Owner = owner; Name = name; Type = type; Epoch = epoch; _resolve = resolve; InterfaceIndex = interfaceIndex;
             _name = Marshal.StringToHGlobalUni(name); _cancel = Marshal.AllocHGlobal(IntPtr.Size); Marshal.WriteIntPtr(_cancel, IntPtr.Zero); All[Token] = this;
         }
         public uint Start()
         {
-            var request = new ServiceRequest { Version = 1, QueryName = _name, Callback = _resolve ? Marshal.GetFunctionPointerForDelegate(ResolveThunk) : Marshal.GetFunctionPointerForDelegate(BrowseThunk), Context = new(Token) };
+            var request = new ServiceRequest { Version = 1, InterfaceIndex = InterfaceIndex, QueryName = _name, Callback = _resolve ? Marshal.GetFunctionPointerForDelegate(ResolveThunk) : Marshal.GetFunctionPointerForDelegate(BrowseThunk), Context = new(Token) };
             var status = _resolve ? DnsServiceResolve(ref request, _cancel) : DnsServiceBrowse(ref request, _cancel);
             _pending = status == 9506;
             return status;

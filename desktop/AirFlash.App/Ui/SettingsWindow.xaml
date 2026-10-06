@@ -245,6 +245,20 @@
     </DataTemplate>
     <DataTemplate x:Key="Page5">
       <StackPanel>
+        <Border Style="{StaticResource Card}">
+          <StackPanel>
+            <TextBlock Text="{loc:Text 'AirPlay discovery interface'}" Style="{StaticResource SectionTitle}"/>
+            <TextBlock Text="{loc:Text 'Choose one network interface to discover AirPlay receivers. Manual receivers and audio routing are unchanged.'}" Style="{StaticResource Hint}" Margin="0,0,0,16"/>
+            <ComboBox ItemsSource="{Binding DiscoveryAdapters}" DisplayMemberPath="Label" SelectedValuePath="Id" SelectedValue="{Binding Draft.DiscoveryInterfaceId, Mode=TwoWay}" AutomationProperties.Name="{loc:Text 'Discovery network interface'}"/>
+            <Button Content="{loc:Text 'Refresh interfaces'}" Command="{Binding RefreshAdaptersCommand}" HorizontalAlignment="Left" Margin="0,14,0,0"/>
+            <TextBlock Text="{Binding NetworkStatus}" Style="{StaticResource Hint}" Margin="0,14,0,0" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite"/>
+            <TextBlock Text="{loc:Text 'If the selected interface disconnects, discovery pauses instead of searching other networks.'}" Style="{StaticResource Hint}" Margin="0,8,0,0"/>
+          </StackPanel>
+        </Border>
+      </StackPanel>
+    </DataTemplate>
+    <DataTemplate x:Key="Page6">
+      <StackPanel>
         <Border Style="{StaticResource Card}" Padding="24">
           <StackPanel>
             <TextBlock Text="AirFlash" FontSize="30" FontWeight="SemiBold" Foreground="{DynamicResource AccentBrush}"/>

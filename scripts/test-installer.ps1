@@ -62,6 +62,26 @@ Run-Msi @('/fa',"`"$msi`"") 'upgrade-repair'
 Check-Installed
 Run-Msi @('/x',"`"$msi`"") 'final-uninstall'
 if ((Test-Path $installed) -or @(Entries).Count -ne 0) { throw 'Uninstall left application or registration.' }
+# After distributing a preview, the next stable MSI must upgrade it cleanly.
+if ($env:RELEASE_CHANNEL -eq 'stable') {
+    $fileInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path dist/AirFlash.exe))
+    $current = [Version]('{0}.{1}.{2}' -f $fileInfo.FileMajorPart,$fileInfo.FileMinorPart,$fileInfo.FileBuildPart)
+    $preview = $releases | Where-Object { $_.prerelease -and $_.tag_name -match '^v(\d+\.\d+\.\d+)-rc\.1$' -and [Version]$Matches[1] -lt $current } | Select-Object -First 1
+    if ($preview) {
+        $previewDir = Join-Path $root 'artifacts/installer-test/preview'
+        New-Item $previewDir -ItemType Directory -Force | Out-Null
+        gh release download $preview.tag_name --repo Ding-Kyoma/AirFlash --pattern AirFlash.msi --dir $previewDir
+        if ($LASTEXITCODE) { throw 'Cannot download preceding preview MSI.' }
+        $previewMsi = Join-Path $previewDir 'AirFlash.msi'
+        Run-Msi @('/i',"`"$previewMsi`"") 'preview-install'
+        $previewCode = (Entries).PSChildName
+        Run-Msi @('/i',"`"$msi`"") 'preview-upgrade'
+        Check-Installed
+        if ((Entries).PSChildName -eq $previewCode) { throw 'Stable MSI did not replace preview registration.' }
+        Run-Msi @('/x',"`"$msi`"") 'preview-upgrade-uninstall'
+        if ((Test-Path $installed) -or @(Entries).Count -ne 0) { throw 'Preview upgrade uninstall left application or registration.' }
+    }
+}
 foreach ($folder in @([Environment]::GetFolderPath('Desktop'),[Environment]::GetFolderPath('CommonDesktopDirectory'),[Environment]::GetFolderPath('Programs'),[Environment]::GetFolderPath('CommonPrograms'))) {
     if (Get-ChildItem $folder -Filter AirFlash.lnk -Recurse -ErrorAction SilentlyContinue) { throw 'Uninstall left a shortcut.' }
 }
