@@ -359,6 +359,50 @@ public sealed class SessionTests
         await Until(() => controller.Snapshot.DeviceVolume?.Actual == 32);
         Assert.DoesNotContain(second.Commands, c => c.Command == "set_device_volume");
     }
+    [Fact]
+    public async Task NegotiationUpdatesBufferAndRateAndOverridesReachEngine()
+    {
+        var process = new FakeConnection(); var audio = new FakeAudio();
+        await using var controller = new SessionController(new FakeFactory(process), audio, timing: Fast);
+        var settings = Settings(); settings.StreamSampleRate = "48000";
+        settings.Options("a").TransportMode = "buffered"; settings.Options("a").TimingMode = "ptp";
+        await controller.StartAsync(Pod(), settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var start = Assert.Single(process.Commands, c => c.Command == "start");
+        Assert.Equal("buffered", start.Parameters.Text("transport")); Assert.Equal("ptp", start.Parameters.Text("timing"));
+        process.EmitData(new { @event = "negotiated", host = "127.0.0.1", transport = "buffered", timing = "ptp", codec = "alac", sample_rate = 44100, effective_latency_ms = 3000, fallback_reasons = new[] { "sample_rate_fallback" } });
+        await Until(() => controller.Snapshot.StreamRate == 44100);
+        Assert.Equal(3000, controller.Snapshot.TargetLatency);
+        Assert.Equal("alac", controller.Snapshot.Diagnostics!.Negotiated!.Codec);
+        await controller.StopAsync(); Assert.False(audio.Muted);
+    }
+
+    [Fact]
+    public async Task PairingRequirementIsTerminalAndRestoresAudio()
+    {
+        var process = new FakeConnection(); var factory = new FakeFactory(process); var audio = new FakeAudio();
+        await using var controller = new SessionController(factory, audio, timing: Fast);
+        var settings = Settings(); settings.ForceReconnect = true;
+        await controller.StartAsync(Pod(), settings); await Until(() => audio.Muted);
+        process.EmitData(new { @event = "error", code = "pairing_required", message = "PIN required", retryable = false });
+        await Until(() => controller.Snapshot.State == PlaybackState.Error);
+        Assert.False(audio.Muted); Assert.Equal(1, factory.OpenCount);
+        Assert.Contains("Settings > Receivers", controller.Snapshot.Message);
+    }
+
+    [Fact]
+    public async Task AlternateServiceAddressUpdatesVolumeAssociation()
+    {
+        var process = new FakeConnection(false);
+        await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast);
+        await controller.StartAsync(Pod(), Settings()); await process.Started.Task;
+        process.EmitData(new { @event = "peer_info", requested_host = "127.0.0.1", host = "127.0.0.2" });
+        process.Emit("streaming");
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        process.EmitData(new { @event = "device_volume", host = "127.0.0.2", volume = 28, sequence = 0, status = "confirmed", available = true });
+        await Until(() => controller.Snapshot.DeviceVolume?.Actual == 28);
+    }
+
     private sealed class FakeFactory(params FakeConnection[] processes) : IEngineFactory
     {
         private readonly ConcurrentQueue<FakeConnection> _processes = new(processes);

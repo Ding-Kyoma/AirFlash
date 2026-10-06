@@ -46,6 +46,10 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public string MonitorDrops => _snapshot.Metrics?.DroppedFrames?.ToString() ?? "—";
     public string MonitorRate => _snapshot.Metrics is { InputRate: > 0 } m ? $"{m.InputRate:N0} Hz" : "—";
     public string MonitorStreamRate => _snapshot.StreamRate is { } rate and > 0 ? $"{rate:N0} Hz · 16-bit" : "—";
+    public string MonitorRequestedLatency => _snapshot.Receiver is { } receiver ? $"{_settings.Latency(receiver.Id)} ms" : "—";
+    public string MonitorEffectiveBuffer => _snapshot.Diagnostics?.Negotiated is { } playback ? $"{playback.EffectiveLatency} ms" : "—";
+    public string MonitorNegotiated => _snapshot.Diagnostics?.Negotiated is { } playback ? $"{playback.Transport} · {playback.Timing.ToUpperInvariant()} · {playback.Codec.ToUpperInvariant()}" : "—";
+    public string MonitorFallback => _snapshot.Diagnostics?.Negotiated is { FallbackReasons.Length: > 0 } playback ? string.Join(", ", playback.FallbackReasons) : "—";
     public string MonitorRecoveries => _snapshot.Diagnostics?.Transport?.SenderLateRecoveries?.ToString() ?? "—";
     public string MonitorSkipped => _snapshot.Diagnostics?.Transport?.SkippedPackets?.ToString() ?? "—";
     public string MonitorReconnects => _snapshot.Diagnostics?.ReconnectCount.ToString() ?? "—";
@@ -229,7 +233,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private static bool CatalogEqual(IReadOnlyList<Receiver> left, IReadOnlyList<Receiver> right)
         => left.Count == right.Count && left.Zip(right).All(p => ReceiverEqual(p.First, p.Second));
     internal static bool ReceiverEqual(Receiver left, Receiver right)
-        => (left with { Members = Array.Empty<Receiver>(), Codecs = Array.Empty<byte>(), Aliases = Array.Empty<string>() }) == (right with { Members = Array.Empty<Receiver>(), Codecs = Array.Empty<byte>(), Aliases = Array.Empty<string>() })
+        => (left with { Members = Array.Empty<Receiver>(), Codecs = Array.Empty<byte>(), Aliases = Array.Empty<string>(), Services = Array.Empty<ServiceRecord>() }) == (right with { Members = Array.Empty<Receiver>(), Codecs = Array.Empty<byte>(), Aliases = Array.Empty<string>(), Services = Array.Empty<ServiceRecord>() })
+            && left.CapabilitiesKey == right.CapabilitiesKey
             && left.Codecs.SequenceEqual(right.Codecs) && left.Aliases.SequenceEqual(right.Aliases) && CatalogEqual(left.Members, right.Members);
     private void RefreshReceivers()
     {
@@ -274,6 +279,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             [nameof(MonitorLatency)] = MonitorLatency, [nameof(MonitorQueue)] = MonitorQueue,
             [nameof(MonitorUnderruns)] = MonitorUnderruns, [nameof(MonitorDrops)] = MonitorDrops,
             [nameof(MonitorRate)] = MonitorRate, [nameof(MonitorStreamRate)] = MonitorStreamRate,
+            [nameof(MonitorRequestedLatency)] = MonitorRequestedLatency, [nameof(MonitorEffectiveBuffer)] = MonitorEffectiveBuffer, [nameof(MonitorNegotiated)] = MonitorNegotiated,
+            [nameof(MonitorFallback)] = MonitorFallback,
             [nameof(MonitorRecoveries)] = MonitorRecoveries,
             [nameof(MonitorSkipped)] = MonitorSkipped, [nameof(MonitorReconnects)] = MonitorReconnects,
             [nameof(MonitorSessionUptime)] = MonitorSessionUptime, [nameof(MonitorWarnings)] = MonitorWarnings,

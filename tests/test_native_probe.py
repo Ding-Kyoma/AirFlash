@@ -54,3 +54,18 @@ async def test_unsafe_gain_rejected_before_starting_engine():
 async def test_unsafe_sample_rate_rejected_before_starting_engine(rate):
     with pytest.raises(ValueError):
         await run_probe(["127.0.0.1"], 5, 0.1, sample_rate=rate)
+
+
+@pytest.mark.parametrize("options", [
+    {"transport": "bad"}, {"timing": "bad"}, {"port": 0}, {"port": 65536},
+    {"latency_ms": 10001}, {"compatibility_buffer_ms": -1},
+    {"compatibility_buffer_ms": 10001},
+])
+async def test_invalid_compatibility_options_rejected_before_starting_engine(options):
+    with pytest.raises(ValueError):
+        await run_probe(["127.0.0.1"], 5, 0.1, **options)
+
+
+async def test_buffered_probe_rejects_multiple_targets():
+    with pytest.raises(ValueError):
+        await run_probe(["127.0.0.1", "127.0.0.2"], 5, 0.1, transport="buffered")

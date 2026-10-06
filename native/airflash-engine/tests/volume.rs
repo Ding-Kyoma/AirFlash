@@ -136,3 +136,60 @@ fn unsupported_query_does_not_invent_volume() {
     drop(worker);
     server.join().unwrap();
 }
+
+#[test]
+fn optional_queries_stop_on_unsupported_and_fail_on_authentication_rejection() {
+    for status in [404, 405, 501, 401, 403] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let connection =
+            Connection::connect(listener.local_addr().unwrap(), Cancellation::default()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let server = thread::spawn(move || {
+            let mut c = Connection::from_stream(socket, Cancellation::default()).unwrap();
+            let msg = c.read().unwrap();
+            assert!(msg.first.starts_with("GET /info"));
+            c.write(
+                format!(
+                    "RTSP/1.0 {status} Rejected\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",
+                    msg.headers["cseq"]
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            match c.read_for(Duration::from_millis(1100), None) {
+                Ok(reply) => assert!(reply.is_none()),
+                Err(error) => assert!(matches!(
+                    error.downcast_ref::<airflash_engine::rtsp::WireError>(),
+                    Some(airflash_engine::rtsp::WireError::PeerClosed)
+                )),
+            }
+        });
+        let health = airflash_engine::transport::Health::default();
+        let worker = Worker::start_with_health(
+            vec![(
+                "127.0.0.1".into(),
+                "rtsp://localhost/test".into(),
+                Arc::new(Mutex::new(connection)),
+            )],
+            Control::default(),
+            vec![health.clone()],
+        )
+        .unwrap();
+        let event = worker.events.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(event["available"], false);
+        if status == 401 || status == 403 {
+            let error = health.check().unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<airflash_engine::transport::Fault>()
+                    .unwrap()
+                    .code,
+                "authentication_failed"
+            );
+        } else {
+            health.check().unwrap();
+        }
+        server.join().unwrap();
+        drop(worker);
+    }
+}

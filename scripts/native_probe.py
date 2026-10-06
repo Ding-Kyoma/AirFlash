@@ -82,6 +82,9 @@ async def run_probe(
     record_mic_path: Path | None = None,
     source: str = "wav",
     sample_rate: int = DEFAULT_RATE,
+    transport: str = "legacy",
+    port: int = 7000,
+    compatibility_buffer_ms: int | None = None,
 ) -> int:
     if not math.isfinite(duration) or not 0 < duration <= MAX_SECONDS:
         raise ValueError("native probe duration must be >0 and <=5 seconds")
@@ -89,6 +92,18 @@ async def run_probe(
         raise ValueError("native probe gain must be between 0 and 0.1")
     if sample_rate not in SUPPORTED_RATES:
         raise ValueError(f"sample_rate must be one of {SUPPORTED_RATES}")
+    if timing not in {"auto", "ptp", "ntp"}:
+        raise ValueError("timing must be auto, ptp or ntp")
+    if transport not in {"legacy", "auto", "realtime", "buffered"}:
+        raise ValueError("unknown transport")
+    if not 1 <= port <= 65535:
+        raise ValueError("port must be 1..65535")
+    if not 0 <= latency_ms <= 10000:
+        raise ValueError("latency_ms must be 0..10000")
+    if compatibility_buffer_ms is not None and not 0 <= compatibility_buffer_ms <= 10000:
+        raise ValueError("compatibility_buffer_ms must be 0..10000")
+    if transport == "buffered" and len(hosts) != 1:
+        raise ValueError("buffered transport requires a single receiver")
     executable = engine_path()
     session_id = str(uuid.uuid4())
     report = {
@@ -97,6 +112,9 @@ async def run_probe(
         "source": source,
         "requested_latency_ms": latency_ms,
         "timing": timing,
+        "transport": transport,
+        "port": port,
+        "compatibility_buffer_ms": compatibility_buffer_ms,
         "gain": gain,
         "duration_seconds": duration,
         "sample_rate": sample_rate,
@@ -105,7 +123,7 @@ async def run_probe(
         "qualified": False,
         "events": [],
     }
-    previous_mute = None
+    mute_guard = None
     with tempfile.TemporaryDirectory(prefix="airplay-probe-") as directory:
         wav_path = Path(directory) / "quiet.wav"
         report["markers"] = write_probe_wav(wav_path, duration, sample_rate)
@@ -115,13 +133,15 @@ async def run_probe(
             "session_id": session_id,
             "command": "probe",
             "params": {
-                "peers": [{"host": host, "port": 7000} for host in hosts],
+                "peers": [{"host": host, "port": port} for host in hosts],
                 "source": source,
                 "wav_path": str(wav_path),
                 "duration_ms": round(duration * 1000),
                 "latency_ms": latency_ms,
                 "gain": gain,
                 "timing": timing,
+                "transport": transport,
+                "compatibility_buffer_ms": compatibility_buffer_ms,
                 "handshake_only": handshake_only,
                 "group_id": group_id,
                 "record_mic_path": str(record_mic_path.resolve()) if record_mic_path else None,
@@ -150,13 +170,14 @@ async def run_probe(
                     if event.get("event") == "streaming" and source == "loopback":
                         import winsound
 
-                        from app import audio_volume
+                        if __package__:
+                            from .windows_audio import MutedOutput
+                        else:
+                            from windows_audio import MutedOutput
 
-                        previous_mute = audio_volume.is_muted()
-                        if previous_mute is None or not audio_volume.set_muted(True):
-                            raise RuntimeError(
-                                "Cannot mute local output for unambiguous acoustic test"
-                            )
+                        candidate = MutedOutput()
+                        candidate.__enter__()
+                        mute_guard = candidate
                         report["local_output_muted"] = True
                         winsound.PlaySound(
                             str(wav_path), winsound.SND_ASYNC | winsound.SND_FILENAME
@@ -170,14 +191,22 @@ async def run_probe(
             report["error"] = "native qualification timed out"
             print(report["error"], flush=True)
         finally:
+            cleanup_error = None
             if source == "loopback":
                 import winsound
 
-                winsound.PlaySound(None, 0)
-                if previous_mute is not None:
-                    from app import audio_volume
-
-                    audio_volume.set_muted(previous_mute)
+                try:
+                    winsound.PlaySound(None, 0)
+                except Exception as error:
+                    cleanup_error = error
+                if mute_guard is not None:
+                    try:
+                        mute_guard.__exit__(None, None, None)
+                        report["local_output_restored"] = True
+                    except Exception as error:
+                        cleanup_error = error
+                        report["local_output_restored"] = False
+                        report["mute_restoration_error"] = str(error)
             if proc.returncode is None:
                 stop = {"version": 1, "id": "stop", "session_id": session_id, "command": "stop"}
                 try:
@@ -197,4 +226,6 @@ async def run_probe(
                 report_path.write_text(
                     json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
+            if cleanup_error is not None:
+                raise cleanup_error
     return 0 if report["transport_completed"] else 1

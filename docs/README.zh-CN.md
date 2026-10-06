@@ -11,6 +11,7 @@
 
 AirFlash 支持现有的双 HomePod 立体声组合和 Windows 低延迟播放。
 通过原生 AirPlay 2 发送端，将 Windows 桌面声音发送到 HomePod，支持 HomePod OS 27。
+现已加入单个第三方 AirPlay 2 接收器的实验性支持。
 
 AirFlash 是 TuneBlade（AirPlay 1）的 AirPlay 2 替代方案，旨在让 Windows
 能够向运行较新版本 HomePod 软件的设备流送音频。
@@ -30,6 +31,7 @@ AirFlash 提供 Windows x64 可执行文件和可独立运行的 MSI 安装包�
 - 支持自动发现设备、PIN 配对和手动添加设备。
 - 支持网卡过滤，可在设置中选择用于发现设备的网卡。
 - 提供延迟模式、托盘运行、静音恢复、自动重连和连接诊断。
+- 根据能力协商实时 UDP 或缓冲 TCP、NTP/PTP 时钟及 16 位立体声 ALAC/PCM；可在接收器设置中覆盖传输和时钟。
 - 在设置中提供 10 段均衡器，支持音效预设和即时试听。
 - 提供便携式 Windows x64 程序、英文和简体中文界面。
 
@@ -39,9 +41,9 @@ AirFlash 提供 Windows x64 可执行文件和可独立运行的 MSI 安装包�
 
 ## 使用方法
 
-1. 将电脑和两台 HomePod 连接到同一可互通的局域网。
+1. 将电脑和接收器连接到同一可互通的局域网。
 2. 启动 AirFlash，等待接收端列表出现。
-3. 选择完整的 `HomePod stereo · 2/2` 项目并点击播放。
+3. 选择一个接收器，或完整的 `HomePod stereo · 2/2` 项目，并点击播放。
 4. 如果接收端要求 PIN，在“设置 > 接收器”中完成配对。
 5. 如果默认设置不合适，在设置中选择采集端点和延迟模式。
 
@@ -51,7 +53,13 @@ AirFlash 使用全新的应用数据目录 `%APPDATA%/AirFlash` 和
 
 在 **设置 > 关于 > 检查更新** 中手动查询正式版本并打开下载页；程序不会自动联网检查或安装更新。
 
-实时模式目标延迟为 120 ms；目标值和本机传输统计不代表端到端声学延迟的实测值。
+HomePod 原有延迟预设保持不变。第三方设备默认采用 3 秒兼容缓冲，发送端上限为 10 秒。
+自动模式在明确支持缓冲音频和 PTP 时优先选择 TCP，否则使用 UDP；能力未知时先尝试 NTP、44.1 kHz ALAC。
+显式设备延迟、全局自定义或实时设置可以覆盖默认缓冲。“设置 > 监控”显示请求延迟、采用缓冲和实际协商结果，声学延迟保持“未测量”。
+
+本次修改尚未验证任何第三方音响的实际出声。不支持访问密码、家庭或当前用户访问限制，以及跨品牌多设备同步。
+AirPlay 2 标识不能保证兼容，也不保证达到 HomePod 的低延迟目标。
+实机验收记录和流程见 [兼容性与硬件验证](AIRPLAY-COMPATIBILITY.md)。
 
 版本预留与发布方法见 [发布流程](RELEASING.md)。
 
@@ -63,7 +71,7 @@ AirFlash 使用全新的应用数据目录 `%APPDATA%/AirFlash` 和
 - **Rust**：WASAPI 采集、AirPlay 2、HAP、PTP、RTP 和音频传输
 - **Windows DNS-SD**：接收端发现
 - **WASAPI loopback**：系统声音采集
-- **PCM 和 ALAC**：通过加密 RTP 发送到 HomePod
+- **PCM 和 ALAC**：通过 UDP 或 TCP 发送加密 RTP
 - **uv、pytest、Ruff**：限时验证工具和 Python 检查
 
 发布程序自包含，Rust 引擎静态链接 MSVC 运行库，不需要 Python、单独安装 .NET 运行时或单独安装 VC++ Redistributable。
@@ -98,8 +106,8 @@ uv run ruff check .
 pwsh scripts/build-native.ps1 -Check
 ```
 
-被忽略的 Rust 压力测试只使用 localhost UDP 接收端。真实 HomePod 测试严格
-遵守仓库规定的低音量、最长五秒流程。
+Rust 稳定性检查使用 localhost UDP/TCP 接收端，包括短时 TCP 检查和默认忽略的 30 分钟压力测试。
+真实接收器测试严格遵守仓库规定的低音量、最长五秒流程；模拟测试成功不能证明实机出声。
 
 ## 贡献
 

@@ -102,13 +102,18 @@ fn srp_handshake_prompt(
         ("X-Apple-HKP", if transient { "4" } else { "3" }.into()),
         ("Content-Type", "application/octet-stream".into()),
     ];
-    conn.request("POST", "/pair-pin-start", &headers, &[])?;
+    if !transient {
+        conn.request("POST", "/pair-pin-start", &headers, &[])?;
+    }
     let m1 = if transient {
         tlv_encode(&[(0, &[0]), (6, &[1]), (0x13, &[0x10])])
     } else {
         tlv_encode(&[(0, &[0]), (6, &[1])])
     };
-    let m2 = tlv_decode(&conn.request("POST", "/pair-setup", &headers, &m1)?.body)?;
+    let m2 = pairing_reply(
+        &conn.request("POST", "/pair-setup", &headers, &m1)?.body,
+        transient,
+    )?;
     ensure!(m2.get(&6) == Some(&vec![2]), "expected pairing M2");
     let pin = Zeroizing::new(get_pin()?);
     ensure!(
@@ -124,7 +129,10 @@ fn srp_handshake_prompt(
         &pin,
     )?;
     let m3 = tlv_encode(&[(6, &[3]), (3, &proof.public), (4, &proof.proof)]);
-    let m4 = tlv_decode(&conn.request("POST", "/pair-setup", &headers, &m3)?.body)?;
+    let m4 = pairing_reply(
+        &conn.request("POST", "/pair-setup", &headers, &m3)?.body,
+        transient,
+    )?;
     ensure!(m4.get(&6) == Some(&vec![4]), "expected pairing M4");
     ensure!(
         bool::from(
@@ -136,6 +144,17 @@ fn srp_handshake_prompt(
         "SRP server proof mismatch"
     );
     Ok(proof.key)
+}
+fn pairing_reply(body: &[u8], transient: bool) -> Result<std::collections::BTreeMap<u8, Vec<u8>>> {
+    tlv_decode(body).map_err(|error| {
+        if error.downcast_ref::<crate::crypto::PairingRejected>().is_none() { return error; }
+        let needs_pairing = transient && error.downcast_ref::<crate::crypto::PairingRejected>().is_some_and(|e| e.0 == 2);
+        crate::transport::Fault::new(
+            "", "authentication", if needs_pairing { "pairing_required" } else { "authentication_failed" },
+            false, if needs_pairing { "Receiver refused temporary authentication; complete PIN pairing before reconnecting" }
+                else { "Receiver rejected HAP authentication" }
+        ).into()
+    })
 }
 fn enable_control(conn: &mut Connection, key: &[u8]) {
     conn.encrypt(
@@ -327,7 +346,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod protocol_tests {
+pub(crate) mod protocol_tests {
     use super::*;
     use crate::{
         crypto::{auth_open, auth_seal},
@@ -335,7 +354,7 @@ mod protocol_tests {
     };
     use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
     use std::{net::TcpListener, thread};
-    fn respond(c: &mut Connection, request: &Message, body: &[u8]) {
+    pub(crate) fn respond(c: &mut Connection, request: &Message, body: &[u8]) {
         let seq = &request.headers["cseq"];
         c.write(
             format!(
@@ -347,11 +366,15 @@ mod protocol_tests {
         .unwrap();
         c.write(body).unwrap();
     }
-    fn server_srp(c: &mut Connection, pin: &str) -> Vec<u8> {
-        let request = c.read().unwrap();
-        assert!(request.first.contains("/pair-pin-start"));
-        respond(c, &request, &[]);
-        let request = c.read().unwrap();
+    pub(crate) fn server_srp(c: &mut Connection, pin: &str) -> Vec<u8> {
+        let mut request = c.read().unwrap();
+        if request.first.contains("/pair-pin-start") {
+            respond(c, &request, &[]);
+            request = c.read().unwrap();
+        } else {
+            assert!(request.first.contains("/pair-setup"));
+            assert_eq!(request.headers["x-apple-hkp"], "4");
+        }
         let m1 = tlv_decode(&request.body).unwrap();
         assert_eq!(m1[&6], vec![1]);
         let n = BigUint::parse_bytes(PRIME.as_bytes(), 16).unwrap();

@@ -1,4 +1,4 @@
-"""Native HomePod E2E: always <=5s, 440Hz/.05 WAV and sender gain <=.1."""
+"""Native receiver E2E: always <=5s, 440Hz/.05 WAV and sender gain <=.1."""
 
 import argparse
 import asyncio
@@ -19,7 +19,12 @@ def main():
     p.add_argument("--gain", type=float, default=0.1)
     p.add_argument("--sample-rate", type=int, choices=[44100, 48000], default=44100)
     p.add_argument("--latency-ms", type=int, default=150)
-    p.add_argument("--timing", choices=["ptp", "ntp"], default="ptp")
+    p.add_argument("--timing", choices=["auto", "ptp", "ntp"], default="ptp")
+    p.add_argument(
+        "--transport", choices=["legacy", "auto", "realtime", "buffered"], default="legacy"
+    )
+    p.add_argument("--port", type=int, default=7000)
+    p.add_argument("--compatibility-buffer-ms", type=int)
     p.add_argument("--handshake-only", action="store_true")
     p.add_argument("--group-id")
     p.add_argument("--report", type=Path)
@@ -42,6 +47,9 @@ def main():
                 a.record_mic,
                 a.source,
                 a.sample_rate,
+                a.transport,
+                a.port,
+                a.compatibility_buffer_ms,
             )
         )
     )

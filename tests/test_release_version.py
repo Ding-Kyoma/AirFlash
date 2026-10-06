@@ -177,19 +177,26 @@ def test_pre_reserved_build_checks_commit_publication_and_newer_versions(tmp_pat
     assert result["pushes"] == []
 
 
-@pytest.mark.parametrize("overrides", [{"branch": "codex/dev"}, {"dirty": True}])
+@pytest.mark.parametrize("overrides", [{"branch": "codex/dev"}, {"branch": "dev"}, {"dirty": True}])
 def test_release_requires_clean_channel_branch(tmp_path, overrides):
     result = reserve(tmp_path, new_version="0.3.0", **overrides)
     assert result["error"]
     assert result["pushes"] == []
 
 
-def test_preview_channel_still_reserves_without_publishing(tmp_path):
+@pytest.mark.parametrize("branch", ["dev", "codex/nic-discovery-preview"])
+def test_preview_channel_still_reserves_without_publishing(tmp_path, branch):
     result = reserve(
-        tmp_path, branch="codex/nic-discovery-preview", channel="preview", new_version="0.3.0",
+        tmp_path, branch=branch, channel="preview", new_version="0.3.0",
     )
     assert result["error"] is None
     assert result["version"] == "0.3.0"
+
+
+def test_preview_channel_rejects_stable_branch_before_reservation(tmp_path):
+    result = reserve(tmp_path, branch="main", channel="preview", new_version="0.3.0")
+    assert result["error"]
+    assert result["pushes"] == []
 
 
 @pytest.mark.parametrize(

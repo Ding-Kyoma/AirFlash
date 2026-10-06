@@ -10,7 +10,7 @@ public sealed class PinDialog : Window
     private readonly TextBox _code = new() { MaxLength = 16, FontSize = 24, HorizontalContentAlignment = HorizontalAlignment.Center };
     private PinDialog(Receiver receiver)
     {
-        Title = L.Get("Pair HomePod"); Width = 390; SizeToContent = SizeToContent.Height; ResizeMode = ResizeMode.NoResize; WindowStartupLocation = WindowStartupLocation.CenterOwner;
+        Title = L.Get("Pair AirPlay receiver"); Width = 390; SizeToContent = SizeToContent.Height; ResizeMode = ResizeMode.NoResize; WindowStartupLocation = WindowStartupLocation.CenterOwner;
         WindowThemeService.Track(this);
         AppIconService.Track(this);
         var panel = new StackPanel { Margin = new(24) };

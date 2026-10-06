@@ -95,7 +95,8 @@ public static class ReceiverCatalog
                 {
                     Hidden = options.Any(o => o.Hidden), AutoConnect = options.Any(o => o.AutoConnect == false) ? false : options.Select(o => o.AutoConnect).FirstOrDefault(v => v.HasValue),
                     Volume = options.Select(o => o.Volume).FirstOrDefault(v => v.HasValue), LatencyMode = options.Select(o => o.LatencyMode).FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)),
-                    CustomBufferMs = options.Select(o => o.CustomBufferMs).FirstOrDefault(v => v.HasValue), StandbySeconds = options.Select(o => o.StandbySeconds).FirstOrDefault(v => v.HasValue)
+                    CustomBufferMs = options.Select(o => o.CustomBufferMs).FirstOrDefault(v => v.HasValue), StandbySeconds = options.Select(o => o.StandbySeconds).FirstOrDefault(v => v.HasValue),
+                    TransportMode = options.Select(o => o.TransportMode).FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)), TimingMode = options.Select(o => o.TimingMode).FirstOrDefault(v => !string.IsNullOrWhiteSpace(v))
                 };
                 settings.Options(group.Key).CopyFrom(merged);
                 foreach (var key in keys.Where(k => k != group.Key)) settings.Receivers.Remove(key);

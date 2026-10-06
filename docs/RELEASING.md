@@ -31,3 +31,28 @@ The workflow deliberately does not create a GitHub Release for the preview. The 
 `gh release create v<version>-rc.1 AirFlash.exe AirFlash-X.Y.Z.msi SHA256SUMS.txt --target <verified-sha> --title "AirFlash <version> Preview" --notes-file docs/PREVIEW-NOTES.md --prerelease --latest=false`
 
 Verify the resulting release is marked prerelease, is not Latest, has the three assets, and its tag points to the verified SHA. The installed application displays **Preview**; its MSI ProductVersion and EXE file version are numeric `<version>`. The About update check still queries only the latest stable release. After validation, merge the PR and dispatch the stable workflow from `main`; it reserves a *new* higher numeric version. Never repurpose the preview tag or version. Test upgrading the preview MSI to that stable release in a disposable runner.
+
+## Dev test releases
+
+`dev` is also an explicit preview channel. Keep its PR to `main` in draft while
+users test third-party AirPlay compatibility. Dispatch
+`gh workflow run release.yml --ref dev -f publish=false`. The workflow reserves
+a fresh increasing numeric version and runs the same native/.NET/Python, build,
+checksum, and disposable installer checks as stable releases. It uploads
+`airflash-preview-<version>-<sha>` without automatically publishing a release.
+
+Download only the successful run's artifact. Confirm the workflow SHA equals the
+current `dev`/PR head and `reserved/<version>` tag, and independently verify both
+files against `SHA256SUMS.txt`. Publish those exact three files using a maintainer
+login with workflow-write permission:
+
+```powershell
+gh release create v<version>-rc.1 AirFlash.exe AirFlash-X.Y.Z.msi SHA256SUMS.txt --target <verified-sha> --title "AirFlash <version> Dev Preview" --notes-file docs/DEV-NOTES.md --prerelease --latest=false
+```
+
+Verify the release is a prerelease, is not Latest, has all three assets, and its
+tag points to the verified SHA. The app displays **Preview** and stable update
+checks remain unchanged. Failed builds consume their reservation; every new
+attempt must reserve a new version. After merging to `main`, publish a new higher
+stable version through the stable workflow. Keep real speaker probes quiet and
+at most five seconds; long stability tests use localhost only.

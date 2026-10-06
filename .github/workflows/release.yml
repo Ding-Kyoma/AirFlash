@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   release:
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/nic-discovery-preview'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/codex/nic-discovery-preview'
     runs-on: windows-2025
     env:
       RELEASE_CHANNEL: ${{ github.ref == 'refs/heads/main' && 'stable' || 'preview' }}
@@ -100,7 +100,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Preserve verified preview assets for maintainer publication
-        if: github.ref == 'refs/heads/codex/nic-discovery-preview'
+        if: github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/codex/nic-discovery-preview'
         uses: actions/upload-artifact@v4
         with:
           name: airflash-preview-${{ steps.version.outputs.version }}-${{ github.sha }}
@@ -108,6 +108,7 @@ jobs:
             dist/AirFlash.exe
             dist/AirFlash-${{ steps.version.outputs.version }}.msi
             dist/SHA256SUMS.txt
+          if-no-files-found: error
           retention-days: 14
       - name: Preserve failure diagnostics
         if: failure()

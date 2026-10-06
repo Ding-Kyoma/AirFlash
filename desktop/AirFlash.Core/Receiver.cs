@@ -12,12 +12,15 @@ public sealed record Receiver(string Id, string Name, string Address, int Port =
     public bool Online { get; init; } = true;
     public Receiver[] Members { get; init; } = [];
     public byte[] Codecs { get; init; } = [];
+    public ServiceRecord[] Services { get; init; } = [];
+    private static readonly HashSet<string> NegotiationFields = new(["features", "ft", "flags", "sf", "cn", "pw", "acl", "act", "sr", "model", "am", "deviceid"], StringComparer.OrdinalIgnoreCase);
+    [JsonIgnore] public string CapabilitiesKey => System.Text.Json.JsonSerializer.Serialize(Services.Select(s => new { s.ServiceType, s.Address, s.Port, Txt = s.Txt.Where(p => NegotiationFields.Contains(p.Key)).OrderBy(p => p.Key, StringComparer.Ordinal).ToArray() }));
     public string[] Aliases { get; init; } = [];
     public bool IsGroup => Members.Length > 0 || Id.StartsWith("stereo:", StringComparison.Ordinal);
     public bool Complete => !IsGroup || Members.Length == 2;
-    public string Detail => IsGroup ? L.Format("HomePod stereo · {0}/2", Members.Length) : Model.Length > 0 ? Model : L.Get("AirFlash receiver");
+    public string Detail => IsGroup ? L.Format("HomePod stereo · {0}/2", Members.Length) : Model.Length > 0 ? Model : L.Get("AirPlay receiver");
     [JsonIgnore] public IEnumerable<Receiver> Peers => IsGroup ? Members : [this];
-    public string TransportKey => string.Join(";", Peers.OrderBy(p => p.Address, StringComparer.Ordinal).ThenBy(p => p.Port).Select(p => $"{p.Address}:{p.Port}:{(IsGroup && p.IsLeader)}"));
+    public string TransportKey => string.Join(";", Peers.OrderBy(p => p.Address, StringComparer.Ordinal).ThenBy(p => p.Port).Select(p => $"{p.Address}:{p.Port}:{(IsGroup && p.IsLeader)}:{p.CapabilitiesKey}"));
     public static string PhysicalKey(string identity, string address) => string.IsNullOrWhiteSpace(identity) ? address : ReceiverIdentity.Normalize(identity);
     public static Receiver Offline(string id) => ReceiverIdentity.TryEndpoint(id, out var address, out var port)
         ? new(id, L.Get("Offline receiver"), address, port) { Online = false }
@@ -65,6 +68,7 @@ public static class ReceiverAggregator
                 GroupName = Field(group, "gpn"),
                 IsLeader = Field(group, "igl") == "1",
                 Aliases = aliases,
+                Services = group,
                 Codecs = codecText.Split(',').Select(x => byte.TryParse(x, out var value) ? (byte?)value : null).OfType<byte>().ToArray()
             };
         }).ToArray();

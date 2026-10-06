@@ -1,5 +1,5 @@
 //! HAP record framing. Cryptographic primitives are provided by RustCrypto.
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit, Nonce,
     aead::{Aead, Payload},
@@ -77,6 +77,14 @@ pub fn tlv_encode(items: &[(u8, &[u8])]) -> Vec<u8> {
     }
     out
 }
+#[derive(Debug)]
+pub struct PairingRejected(pub u8);
+impl std::fmt::Display for PairingRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pairing rejected (TLV error {})", self.0)
+    }
+}
+impl std::error::Error for PairingRejected {}
 pub fn tlv_decode(bytes: &[u8]) -> Result<std::collections::BTreeMap<u8, Vec<u8>>> {
     let mut out: std::collections::BTreeMap<u8, Vec<u8>> = Default::default();
     let mut pos = 0;
@@ -91,7 +99,8 @@ pub fn tlv_decode(bytes: &[u8]) -> Result<std::collections::BTreeMap<u8, Vec<u8>
         pos += len;
     }
     if let Some(error) = out.get(&7) {
-        bail!("pairing rejected (TLV error {error:?})");
+        ensure!(error.len() == 1, "invalid pairing error TLV");
+        return Err(PairingRejected(error[0]).into());
     }
     Ok(out)
 }

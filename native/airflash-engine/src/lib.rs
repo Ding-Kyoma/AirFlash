@@ -1,4 +1,6 @@
 pub mod auth;
+pub mod buffered;
+pub mod capabilities;
 pub mod clock;
 pub mod crypto;
 pub mod equalizer;
@@ -17,3 +19,6 @@ pub mod credentials;
 
 pub mod transport;
 pub mod volume;
+
+#[cfg(test)]
+mod receiver_tests;

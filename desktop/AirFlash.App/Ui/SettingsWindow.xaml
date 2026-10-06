@@ -182,9 +182,14 @@
                       <TextBlock Text="{loc:Text 'Latency mode'}" Style="{StaticResource Hint}"/>
                       <ComboBox ItemsSource="{x:Static vm:Choices.ReceiverLatencies}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.LatencyMode, Mode=TwoWay}" Margin="0,4,0,12"/>
                       <StackPanel IsEnabled="{Binding Options.LatencyMode, Converter={StaticResource Equal}, ConverterParameter=custom}">
-                        <TextBlock Text="{loc:Text 'Custom latency / ms (blank uses global)'}" Style="{StaticResource Hint}"/>
+                        <TextBlock Text="{loc:Text 'Custom latency / ms (0–10000, blank uses global)'}" Style="{StaticResource Hint}"/>
                         <TextBox Text="{Binding Options.CustomBufferMs, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" Margin="0,4,0,12"/>
                       </StackPanel>
+                      <TextBlock Text="{loc:Text 'AirPlay transport'}" Style="{StaticResource Hint}"/>
+                      <ComboBox ItemsSource="{x:Static vm:Choices.ReceiverTransports}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.TransportMode, Mode=TwoWay}" Margin="0,4,0,12"/>
+                      <TextBlock Text="{loc:Text 'Receiver clock'}" Style="{StaticResource Hint}"/>
+                      <ComboBox ItemsSource="{x:Static vm:Choices.ReceiverClocks}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.TimingMode, Mode=TwoWay}" Margin="0,4,0,12"/>
+                      <TextBlock Text="{loc:Text 'Third-party support is experimental. Automatic mode uses a 3-second compatibility buffer unless a latency override is selected.'}" Style="{StaticResource Hint}" TextWrapping="Wrap" Margin="0,0,0,12"/>
                       <TextBlock Text="{loc:Text 'Standby threshold / seconds (blank uses global)'}" Style="{StaticResource Hint}"/>
                       <TextBox Text="{Binding Options.StandbySeconds, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" Margin="0,4,0,0"/>
                     </StackPanel>
@@ -257,6 +262,22 @@
               <TextBlock Text="{loc:Text 'Stream sample rate'}" Style="{StaticResource Hint}"/>
               <TextBlock Text="{Binding App.MonitorStreamRate}" HorizontalAlignment="Right"/>
             </DockPanel>
+            <DockPanel Margin="0,0,0,12">
+              <TextBlock Text="{loc:Text 'Requested target latency'}" Style="{StaticResource Hint}"/>
+              <TextBlock Text="{Binding App.MonitorRequestedLatency}" HorizontalAlignment="Right"/>
+            </DockPanel>
+            <DockPanel Margin="0,0,0,12">
+              <TextBlock Text="{loc:Text 'Effective target buffer'}" Style="{StaticResource Hint}"/>
+              <TextBlock Text="{Binding App.MonitorEffectiveBuffer}" HorizontalAlignment="Right"/>
+            </DockPanel>
+            <DockPanel Margin="0,0,0,12">
+              <TextBlock Text="{loc:Text 'Negotiated playback'}" Style="{StaticResource Hint}"/>
+              <TextBlock Text="{Binding App.MonitorNegotiated}" HorizontalAlignment="Right"/>
+            </DockPanel>
+            <DockPanel Margin="0,0,0,12">
+              <TextBlock Text="{loc:Text 'Negotiation fallback'}" Style="{StaticResource Hint}"/>
+              <TextBlock Text="{Binding App.MonitorFallback}" HorizontalAlignment="Right" TextWrapping="Wrap" MaxWidth="320"/>
+            </DockPanel>
             <DockPanel>
               <TextBlock Text="{loc:Text 'End-to-end acoustic latency'}" Style="{StaticResource Hint}"/>
               <TextBlock Text="{loc:Text 'Not measured'}" HorizontalAlignment="Right"/>
@@ -323,7 +344,7 @@
             </WrapPanel>
             <ProgressBar Height="3" IsIndeterminate="True" Visibility="{Binding Updates.IsChecking, Converter={StaticResource BoolVisibility}}" Margin="0,0,0,8"/>
             <TextBlock Text="{Binding Updates.Status}" Style="{StaticResource Hint}" Margin="0,0,0,12" AutomationProperties.LiveSetting="Polite"/>
-            <TextBlock Text="{loc:Text 'Send Windows system audio to an AirFlash receiver or an existing HomePod stereo pair.'}" Style="{StaticResource Body}"/>
+            <TextBlock Text="{loc:Text 'Send Windows system audio to an AirPlay receiver or an existing HomePod stereo pair. Third-party support is experimental.'}" Style="{StaticResource Body}"/>
             <TextBlock Text="{loc:Text 'GPLv3 or later, or commercial license · .NET / WPF / NAudio / Rust'}" Style="{StaticResource Hint}" Margin="0,20,0,0"/>
           </StackPanel>
         </Border>

@@ -2,7 +2,7 @@
 use crate::{
     crypto::derive,
     rtp::{self, FRAMES, Packetizer, Retransmit},
-    rtsp::{Cancellation, Connection, WireError},
+    rtsp::{Cancellation, Connection, Rejected, WireError},
 };
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -62,7 +62,11 @@ impl Fault {
     }
     pub fn from_error(host: impl ToString, channel: &str, error: &anyhow::Error) -> Self {
         if let Some(fault) = error.downcast_ref::<Self>() {
-            return fault.clone();
+            let mut fault = fault.clone();
+            if fault.host.is_empty() {
+                fault.host = host.to_string();
+            }
+            return fault;
         }
         let (code, retryable) = if let Some(wire) = error.downcast_ref::<WireError>() {
             match wire {
@@ -71,6 +75,17 @@ impl Fault {
                 WireError::ReadTimeout => ("read_timeout", true),
                 WireError::WriteTimeout | WireError::Poisoned => ("write_failed", true),
                 WireError::Authentication => ("authentication_failed", false),
+            }
+        } else if let Some(rejected) = error.downcast_ref::<Rejected>() {
+            if matches!(rejected.status, 401 | 403) {
+                ("authentication_failed", false)
+            } else if rejected.status == 470 {
+                ("pairing_required", false)
+            } else {
+                (
+                    "session_rejected",
+                    rejected.status == 454 || rejected.status >= 500,
+                )
             }
         } else if let Some(io) = error.downcast_ref::<std::io::Error>() {
             match io.kind() {
@@ -138,7 +153,7 @@ impl Health {
     pub fn notices(&self) -> Vec<Value> {
         self.0.lock().unwrap().notices.drain(..).collect()
     }
-    fn fail(&self, fault: Fault) {
+    pub(crate) fn fail(&self, fault: Fault) {
         let mut state = self.0.lock().unwrap();
         if state.failure.is_none() {
             state.failure = Some(fault);
@@ -318,7 +333,9 @@ fn feedback_loop(
             if let Some(response) =
                 connection.read_for(POLL.min(timing.hard - elapsed), Some(stop))?
             {
-                if !connection.stale_response(&response) { break response; }
+                if !connection.stale_response(&response) {
+                    break response;
+                }
             }
         };
         connection.validate_cseq(&response)?;
@@ -342,6 +359,15 @@ fn feedback_loop(
                     true,
                 );
             }
+        } else if matches!(status, 404 | 405 | 501) {
+            health.notice(
+                host,
+                "feedback",
+                "feedback_unsupported",
+                "Receiver does not support feedback; optional polling disabled",
+                false,
+            );
+            return Ok(());
         } else if matches!(status, 500 | 502 | 503 | 504) {
             failures += 1;
             {

@@ -34,6 +34,7 @@ pub struct Packetizer {
     pub timestamp: u32,
     pub ssrc: u32,
     pub rate: u32,
+    payload_type: u8,
     cipher: Cipher,
     history: VecDeque<CachedPacket>,
     retention: Duration,
@@ -50,6 +51,7 @@ impl Packetizer {
             timestamp,
             ssrc,
             rate,
+            payload_type: 96,
             cipher: Cipher::new(key),
             history: VecDeque::with_capacity(MAX_HISTORY),
             retention: Duration::from_secs(1),
@@ -61,6 +63,9 @@ impl Packetizer {
         self.alac = Some(Box::new(alac_encoder::AlacEncoder::new(
             &alac_encoder::FormatDescription::alac(self.rate as f64, FRAMES as u32, 2),
         )));
+    }
+    pub fn buffered(&mut self) {
+        self.payload_type = 103;
     }
     pub fn packet(&mut self, pcm: &[u8], first: bool) -> Result<Vec<u8>> {
         let now = Instant::now();
@@ -85,7 +90,7 @@ impl Packetizer {
         deadline: Instant,
     ) -> Result<Vec<u8>> {
         ensure!(pcm.len() == PCM_BYTES, "wrong PCM packet length");
-        let mut out = vec![0x80, if first { 0xe0 } else { 0x60 }];
+        let mut out = vec![0x80, self.payload_type | if first { 0x80 } else { 0 }];
         out.extend(self.seq.to_be_bytes());
         out.extend(self.timestamp.to_be_bytes());
         out.extend(self.ssrc.to_be_bytes());
@@ -105,20 +110,22 @@ impl Packetizer {
         };
         out.extend(audio);
         out.extend(nonce.to_le_bytes());
-        while self
-            .history
-            .front()
-            .is_some_and(|p| now.saturating_duration_since(p.sent_at) >= self.retention)
-            || self.history.len() >= MAX_HISTORY
-        {
-            self.history.pop_front();
+        if self.payload_type == 96 {
+            while self
+                .history
+                .front()
+                .is_some_and(|p| now.saturating_duration_since(p.sent_at) >= self.retention)
+                || self.history.len() >= MAX_HISTORY
+            {
+                self.history.pop_front();
+            }
+            self.history.push_back(CachedPacket {
+                seq: self.seq,
+                bytes: out.clone(),
+                sent_at: now,
+                deadline,
+            });
         }
-        self.history.push_back(CachedPacket {
-            seq: self.seq,
-            bytes: out.clone(),
-            sent_at: now,
-            deadline,
-        });
         self.seq = self.seq.wrapping_add(1);
         self.timestamp = self.timestamp.wrapping_add(FRAMES as u32);
         Ok(out)
