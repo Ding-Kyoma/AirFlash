@@ -47,6 +47,7 @@ pub struct Metrics {
     pub input_rate: u32,
 }
 struct State {
+    equalizer: crate::equalizer::Processor,
     frames: VecDeque<Frame>,
     capacity: usize,
     target: usize,
@@ -64,15 +65,17 @@ impl State {
     }
 }
 pub struct Loopback {
+    equalizer_control: crate::equalizer::Control,
     state: Arc<Mutex<State>>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 impl Loopback {
-    pub fn start(endpoint: Option<String>, rate: u32) -> Result<Self> {
+    pub fn start(endpoint: Option<String>, rate: u32, equalizer: crate::equalizer::Control) -> Result<Self> {
         let capacity = rate as usize * 60 / 1000;
         let target = rate as usize * 20 / 1000;
         let state = Arc::new(Mutex::new(State {
+            equalizer: crate::equalizer::Processor::new(equalizer.initial(), rate),
             frames: VecDeque::with_capacity(capacity),
             capacity,
             target,
@@ -95,6 +98,7 @@ impl Loopback {
             })?;
         match rx.recv_timeout(Duration::from_secs(3)) {
             Ok(Ok(())) => Ok(Self {
+                equalizer_control: equalizer,
                 state,
                 stop,
                 worker: Some(worker),
@@ -115,6 +119,7 @@ impl Loopback {
     }
     pub fn packet(&self, gain: f32) -> Result<(Vec<u8>, Option<u64>)> {
         let mut s = self.state.lock().unwrap();
+        if let Some((sequence, prepared)) = self.equalizer_control.latest() { s.equalizer.update(sequence, prepared); }
         if let Some(e) = &s.error {
             anyhow::bail!("capture stopped: {e}");
         }
@@ -143,7 +148,7 @@ impl Loopback {
                 s.ages.pop_front();
             }
             s.ages.push_back(age);
-            for sample in [frame.left, frame.right] {
+            for sample in s.equalizer.frame([frame.left, frame.right]) {
                 let value = (sample * gain).clamp(-1.0, 1.0);
                 out.extend(((value * 32767.0).round() as i16).to_be_bytes());
             }
@@ -418,8 +423,10 @@ mod tests {
     const CAPACITY: usize = crate::rtp::RATE as usize * 60 / 1000;
     const TARGET: usize = crate::rtp::RATE as usize * 20 / 1000;
     fn source() -> Loopback {
+        let equalizer_control = crate::equalizer::Control::new(crate::equalizer::Settings::default(), crate::rtp::RATE).unwrap();
         Loopback {
             state: Arc::new(Mutex::new(State {
+                equalizer: crate::equalizer::Processor::new(equalizer_control.initial(), crate::rtp::RATE),
                 frames: VecDeque::new(),
                 capacity: CAPACITY,
                 target: TARGET,
@@ -429,6 +436,7 @@ mod tests {
             })),
             stop: Arc::new(AtomicBool::new(false)),
             worker: None,
+            equalizer_control,
         }
     }
     #[test]
@@ -445,6 +453,20 @@ mod tests {
         }
         assert!(source.packet(0.1).unwrap().0.iter().any(|b| *b != 0));
         assert_eq!(source.metrics().underrun_packets, 1);
+    }
+    #[test]
+    fn equalizer_precedes_master_gain_and_pcm_conversion() {
+        let source = source();
+        let settings = crate::equalizer::Settings { enabled: true, preamp_db: -12.0, ..Default::default() };
+        source.equalizer_control.set(1, crate::equalizer::Prepared::new(settings, crate::rtp::RATE).unwrap());
+        for _ in 0..FRAMES * 3 { source.state.lock().unwrap().push_frame(Frame { left: 0.25, right: -0.25, qpc: qpc_ns() }); }
+        source.packet(0.5).unwrap(); source.packet(0.5).unwrap();
+        let (pcm, marker) = source.packet(0.5).unwrap();
+        let last = &pcm[pcm.len() - 4..];
+        let expected = (0.25 * 10f32.powf(-12.0 / 20.0) * 0.5 * 32767.0).round() as i16;
+        assert_eq!(i16::from_be_bytes([last[0], last[1]]), expected);
+        assert_eq!(i16::from_be_bytes([last[2], last[3]]), -expected);
+        assert!(marker.is_some());
     }
     #[test]
     fn overflow_and_scheduler_recovery_drop_old_frames_without_failure() {

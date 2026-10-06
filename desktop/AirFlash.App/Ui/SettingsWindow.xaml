@@ -75,7 +75,61 @@
         </Border>
       </StackPanel>
     </DataTemplate>
+    <Style x:Key="EqualizerSlider" TargetType="Slider" BasedOn="{StaticResource {x:Type Slider}}">
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}"/>
+      <Style.Resources>
+        <SolidColorBrush x:Key="ControlElevationBorderBrush" Color="{Binding BorderBrush.Color, RelativeSource={RelativeSource AncestorType={x:Type Slider}}}"/>
+      </Style.Resources>
+    </Style>
     <DataTemplate x:Key="Page2">
+      <StackPanel>
+        <Border Style="{StaticResource Card}">
+          <StackPanel>
+            <CheckBox Content="{loc:Text 'Enable equalizer'}" IsChecked="{Binding Equalizer.Enabled}" AutomationProperties.Name="{loc:Text 'Enable equalizer'}"/>
+            <Grid Margin="0,4,0,0">
+              <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel IsEnabled="{Binding Equalizer.Enabled}">
+                <TextBlock Text="{loc:Text 'Preset'}" Style="{StaticResource Hint}" Margin="0,0,0,6"/>
+                <ComboBox x:Name="EqualizerPreset" ItemsSource="{Binding Equalizer.Presets}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Equalizer.SelectedPreset, Mode=TwoWay}" AutomationProperties.Name="{loc:Text 'Equalizer preset'}"/>
+              </StackPanel>
+              <Button Grid.Column="1" Content="{loc:Text 'Reset'}" Command="{Binding Equalizer.ResetCommand}" VerticalAlignment="Bottom" Margin="12,0,0,0"/>
+            </Grid>
+          </StackPanel>
+        </Border>
+        <Border Style="{StaticResource Card}">
+          <StackPanel>
+            <TextBlock Text="{loc:Text 'Frequency bands'}" Style="{StaticResource SectionTitle}"/>
+            <ScrollViewer x:Name="EqualizerBandScroll" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+              <ItemsControl ItemsSource="{Binding Equalizer.Bands}" IsEnabled="{Binding Equalizer.Enabled}">
+                <ItemsControl.ItemsPanel><ItemsPanelTemplate><StackPanel Orientation="Horizontal"/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate>
+                    <StackPanel Width="56">
+                      <TextBlock Text="{Binding GainLabel}" HorizontalAlignment="Center" FontSize="11" Margin="0,0,0,8"/>
+                      <Slider Style="{StaticResource EqualizerSlider}" Orientation="Vertical" Height="162" HorizontalAlignment="Center" Minimum="-12" Maximum="12" TickFrequency="0.5" SmallChange="0.5" LargeChange="3" IsSnapToTickEnabled="True" Value="{Binding Gain, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="{Binding AutomationName}" ToolTip="{Binding GainLabel}"/>
+                      <TextBlock Text="{Binding Label}" HorizontalAlignment="Center" FontSize="11" Margin="0,10,0,0"/>
+                    </StackPanel>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </ScrollViewer>
+          </StackPanel>
+        </Border>
+        <Border Style="{StaticResource Card}">
+          <StackPanel IsEnabled="{Binding Equalizer.Enabled}">
+            <DockPanel Margin="0,0,0,10">
+              <TextBlock Text="{loc:Text 'Preamp'}" Style="{StaticResource SectionTitle}" Margin="0"/>
+              <TextBlock Text="{Binding Equalizer.PreampLabel}" HorizontalAlignment="Right"/>
+            </DockPanel>
+            <Slider Style="{StaticResource EqualizerSlider}" Minimum="-12" Maximum="12" TickFrequency="0.5" SmallChange="0.5" LargeChange="3" IsSnapToTickEnabled="True" Value="{Binding Equalizer.PreampDb, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="{loc:Text 'Equalizer preamp'}"/>
+            <TextBlock Text="{Binding Equalizer.HeadroomLabel}" Style="{StaticResource Hint}" Margin="0,12,0,0"/>
+          </StackPanel>
+        </Border>
+        <TextBlock Text="{loc:Text 'Changes are previewed during playback. Apply saves them; Cancel or closing restores the last saved sound. Automatic attenuation reduces clipping risk and may lower the volume.'}" Style="{StaticResource Hint}"/>
+        <TextBlock Text="{Binding EqualizerError}" Foreground="{DynamicResource ErrorBrush}" TextWrapping="Wrap" Margin="0,12,0,0"/>
+      </StackPanel>
+    </DataTemplate>
+    <DataTemplate x:Key="Page3">
       <StackPanel>
         <Border Style="{StaticResource Card}">
           <StackPanel>
@@ -104,7 +158,7 @@
         </Border>
       </StackPanel>
     </DataTemplate>
-    <DataTemplate x:Key="Page3">
+    <DataTemplate x:Key="Page4">
       <StackPanel>
         <Button Content="{loc:Text '＋ Add receiver manually'}" HorizontalAlignment="Left" Command="{Binding AddReceiverCommand}" Margin="0,0,0,16"/>
         <ItemsControl ItemsSource="{Binding Receivers}">
@@ -147,7 +201,7 @@
         <TextBlock Text="{loc:Text 'Hidden devices remain here. Additions, removals and device settings are saved when you click Apply. Pairing starts immediately.'}" Style="{StaticResource Hint}"/>
       </StackPanel>
     </DataTemplate>
-    <DataTemplate x:Key="Page4">
+    <DataTemplate x:Key="Page5">
       <StackPanel>
         <Border Style="{StaticResource Card}">
           <StackPanel>
@@ -243,7 +297,7 @@
         <TextBlock Text="{loc:Text 'Local queue and transport statistics update about once per second. Resent packets are sent, not confirmed received. Delay parameters are not acoustic measurements. The last failure snapshot survives reconnection.'}" Style="{StaticResource Hint}"/>
       </StackPanel>
     </DataTemplate>
-    <DataTemplate x:Key="Page5">
+    <DataTemplate x:Key="Page6">
       <StackPanel>
         <Border Style="{StaticResource Card}">
           <StackPanel>
@@ -257,7 +311,7 @@
         </Border>
       </StackPanel>
     </DataTemplate>
-    <DataTemplate x:Key="Page6">
+    <DataTemplate x:Key="Page7">
       <StackPanel>
         <Border Style="{StaticResource Card}" Padding="24">
           <StackPanel>

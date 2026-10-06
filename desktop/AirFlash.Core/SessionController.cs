@@ -27,6 +27,88 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private Receiver? _receiver;
     private long _generation;
     private bool _muted;
+    private readonly SemaphoreSlim _equalizerWriter = new(1, 1);
+    private EqualizerSettings? _equalizerPreview;
+    private Guid? _equalizerOwner;
+    private long _equalizerSequence;
+    private CancellationTokenSource? _equalizerEdit;
+    private Task? _equalizerEditTask;
+    private bool _equalizerReady, _equalizerDisposed;
+    public event Action<string?>? EqualizerFeedback;
+    public Task PreviewEqualizerAsync(Guid owner, EqualizerSettings equalizer)
+    {
+        if (equalizer.Validate() is { } error) throw new ArgumentException(error, nameof(equalizer));
+        lock (_sync)
+        {
+            if (_equalizerDisposed) return Task.CompletedTask;
+            if (_equalizerOwner != owner) { _equalizerEdit?.Cancel(); _equalizerEdit = null; _equalizerEditTask = null; }
+            _equalizerOwner = owner; _equalizerPreview = equalizer.Clone(); ++_equalizerSequence;
+            if (_equalizerEdit is not null) return _equalizerEditTask!;
+            _equalizerEdit = new();
+            return _equalizerEditTask = PreviewEqualizerLoopAsync(_equalizerEdit);
+        }
+    }
+    private async Task PreviewEqualizerLoopAsync(CancellationTokenSource edit)
+    {
+        var token = edit.Token;
+        try
+        {
+            while (true)
+            {
+                await Task.Delay(50, token).ConfigureAwait(false);
+                long sequence;
+                lock (_sync) sequence = _equalizerSequence;
+                await SendEqualizerAsync(sequence, token).ConfigureAwait(false);
+                lock (_sync)
+                {
+                    if (!ReferenceEquals(_equalizerEdit, edit)) return;
+                    if (sequence != _equalizerSequence) continue;
+                    _equalizerEdit = null; _equalizerEditTask = null; return;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        finally
+        {
+            lock (_sync) { if (ReferenceEquals(_equalizerEdit, edit)) { _equalizerEdit = null; _equalizerEditTask = null; } }
+            edit.Dispose();
+        }
+    }
+    public async Task ClearEqualizerPreviewAsync(Guid owner)
+    {
+        long sequence;
+        lock (_sync)
+        {
+            if (_equalizerDisposed || _equalizerOwner != owner) return;
+            _equalizerEdit?.Cancel(); _equalizerEdit = null; _equalizerEditTask = null;
+            _equalizerOwner = null; _equalizerPreview = null; sequence = ++_equalizerSequence;
+        }
+        await SendEqualizerAsync(sequence, CancellationToken.None).ConfigureAwait(false);
+    }
+    private EqualizerSettings EffectiveEqualizer() { lock (_sync) return (_equalizerPreview ?? _settings.Equalizer).Clone(); }
+    private async Task SendEqualizerAsync(long? expectedSequence = null, CancellationToken cancellation = default)
+    {
+        await _equalizerWriter.WaitAsync(cancellation).ConfigureAwait(false);
+        try
+        {
+            IEngineConnection? connection; string? session; EqualizerSettings equalizer; long sequence, epoch;
+            lock (_sync)
+            {
+                if (_equalizerDisposed || !_equalizerReady || expectedSequence is { } expected && expected != _equalizerSequence) return;
+                connection = _connection; session = _sessionId; epoch = _generation;
+                equalizer = (_equalizerPreview ?? _settings.Equalizer).Clone(); sequence = _equalizerSequence;
+                if (sequence == 0) sequence = ++_equalizerSequence;
+            }
+            if (connection is null || session is null) return;
+            try { await connection.SendAsync(session, "set_equalizer", new { sequence, equalizer = equalizer.WireParameters() }, cancellation).ConfigureAwait(false); }
+            catch (Exception error) when (error is IOException or ObjectDisposedException or InvalidOperationException)
+            {
+                lock (_sync) { if (epoch != _generation || sequence != _equalizerSequence) return; }
+                log?.Invoke($"Equalizer update deferred: {error.Message}"); EqualizerFeedback?.Invoke(error.Message);
+            }
+        }
+        finally { _equalizerWriter.Release(); }
+    }
     private DeviceVolumeState _deviceVolume = new();
     private long _volumeSequence;
     private CancellationTokenSource? _volumeEdit;
@@ -148,6 +230,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         {
             var old = _settings;
             _settings = settings.Clone();
+            lock (_sync) ++_equalizerSequence;
             if (_receiver is { } receiver && Snapshot.IsActive && Snapshot.State != PlaybackState.Pairing && Signature(receiver, old) != Signature(receiver, settings))
                 await StartLockedAsync(receiver, settings, null).ConfigureAwait(false);
             else
@@ -155,6 +238,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                 if (!settings.MuteWhileStreaming) await RestoreAudioAsync().ConfigureAwait(false);
                 else if (Snapshot.State is PlaybackState.Streaming or PlaybackState.Standby) await audio.MuteAsync(settings.EffectiveEndpoint).ConfigureAwait(false);
                 await SendGainAsync().ConfigureAwait(false);
+                await SendEqualizerAsync().ConfigureAwait(false);
             }
         }
         finally { _serial.Release(); }
@@ -199,7 +283,14 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                     lock (_sync) { if (epoch == _generation) { _diagnostics = _diagnostics with { Transport = null, Warnings = [] }; _warnings.Clear(); _deviceVolume = new(); _volumeEdit?.Cancel(); _snapshot = _snapshot with { Metrics = null }; } }
                     Publish(epoch, PlaybackState.Connecting, attempts > 0 ? L.Format("Reconnecting ({0}/{1})", attempts, settings.MaxReconnectAttempts) : L.Get("Connecting…"));
                     var deadline = DateTime.UtcNow + _timing.Connect;
-                    await connection.SendAsync(session, "start", new { peers, source = "loopback", duration_ms = 0, latency_ms = settings.Latency(receiver.Id), gain = Gain(receiver), timing = "ptp", capture_endpoint = settings.EffectiveEndpoint, sample_rate = int.Parse(settings.StreamSampleRate) }, cancellation).ConfigureAwait(false);
+                    await _equalizerWriter.WaitAsync(cancellation).ConfigureAwait(false);
+                    try
+                    {
+                        await connection.SendAsync(session, "start", new { peers, source = "loopback", duration_ms = 0, latency_ms = settings.Latency(receiver.Id), gain = Gain(receiver), timing = "ptp", capture_endpoint = settings.EffectiveEndpoint, sample_rate = int.Parse(settings.StreamSampleRate), equalizer = EffectiveEqualizer().WireParameters() }, cancellation).ConfigureAwait(false);
+                        lock (_sync) { if (epoch == _generation && ReferenceEquals(_connection, connection)) _equalizerReady = true; }
+                    }
+                    finally { _equalizerWriter.Release(); }
+                    await SendEqualizerAsync(cancellation: cancellation).ConfigureAwait(false);
                     while (true)
                     {
                         cancellation.ThrowIfCancellationRequested();
@@ -209,6 +300,11 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         var kind = item.Text("event");
                         if (kind == "error") throw new EngineFailure(EngineNotice.Parse(item));
                         if (kind == "stopped") throw new IOException(L.Get("The audio session ended unexpectedly."));
+                        if (kind is "equalizer_changed" or "equalizer_error")
+                        {
+                            lock (_sync) { if (epoch != _generation || item.Integer("sequence") != _equalizerSequence) continue; }
+                            EqualizerFeedback?.Invoke(kind == "equalizer_error" ? item.Text("message", L.Get("Could not update the equalizer.")) : null);
+                        }
                         if (kind == "streaming")
                         {
                             startedAt = Stopwatch.GetTimestamp();
@@ -317,8 +413,8 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private sealed class EngineFailure(EngineNotice notice) : IOException(notice.Detail) { public EngineNotice Notice { get; } = notice; }
     private sealed class PairCancelledException : OperationCanceledException;
     private static bool IsAuthenticationFailure(string message) => new[] { "pairing", "srp", "verification", "credentials", "signature", "identity", "authentication" }.Any(word => message.Contains(word, StringComparison.OrdinalIgnoreCase));
-    private void SetConnection(IEngineConnection connection, string session) { lock (_sync) { _connection = connection; _sessionId = session; } }
-    private void ClearConnection(IEngineConnection connection) { lock (_sync) if (ReferenceEquals(_connection, connection)) { _connection = null; _sessionId = null; } }
+    private void SetConnection(IEngineConnection connection, string session) { lock (_sync) { _connection = connection; _sessionId = session; _equalizerReady = false; } }
+    private void ClearConnection(IEngineConnection connection) { lock (_sync) if (ReferenceEquals(_connection, connection)) { _connection = null; _sessionId = null; _equalizerReady = false; } }
     private static async Task RequestStopAsync(IEngineConnection connection, string session)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
@@ -360,5 +456,10 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         }
         Changed?.Invoke(snapshot);
     }
-    public async ValueTask DisposeAsync() { await StopAsync().ConfigureAwait(false); _serial.Dispose(); }
+    public async ValueTask DisposeAsync()
+    {
+        lock (_sync) { _equalizerDisposed = true; _equalizerEdit?.Cancel(); _equalizerEdit = null; _equalizerEditTask = null; }
+        await StopAsync().ConfigureAwait(false);
+        _serial.Dispose();
+    }
 }

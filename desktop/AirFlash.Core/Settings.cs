@@ -50,6 +50,8 @@ public sealed class AppSettings : ObservableObject
     public string DiscoveryInterfaceId { get => _DiscoveryInterfaceId; set => Set(ref _DiscoveryInterfaceId, value ?? ""); }
     private string _StreamSampleRate = "44100";
     public string StreamSampleRate { get => _StreamSampleRate; set => Set(ref _StreamSampleRate, value); }
+    private EqualizerSettings _equalizer = new();
+    public EqualizerSettings Equalizer { get => _equalizer; set => Set(ref _equalizer, value ?? new()); }
     private string _LatencyMode = "normal";
     public string LatencyMode { get => _LatencyMode; set => Set(ref _LatencyMode, value); }
     private int _CustomBufferMs = 1000;
@@ -91,6 +93,7 @@ public sealed class AppSettings : ObservableObject
         if (MaxReconnectAttempts is < 1 or > 20) return L.Get("Retry attempts must be between 1 and 20.");
         if (!Modes.Contains(LatencyMode)) return L.Get("Select a valid latency mode.");
         if (!SampleRates.Contains(StreamSampleRate)) return L.Get("Select a valid stream sample rate.");
+        if (Equalizer.Validate() is { } equalizerError) return equalizerError;
         if (CustomBufferMs is < 0 or > 2000) return L.Get("Custom latency must be between 0 and 2000 ms.");
         if (!double.IsFinite(StandbySilenceSeconds) || StandbySilenceSeconds is < 5 or > 300) return L.Get("Standby threshold must be between 5 and 300 seconds.");
         if (CaptureMode is not ("loopback" or "endpoint")) return L.Get("Select a valid capture mode.");
@@ -113,6 +116,7 @@ public sealed class AppSettings : ObservableObject
         MaxReconnectAttempts = source.MaxReconnectAttempts; UiLanguage = source.UiLanguage; Theme = source.Theme;
         DiscoveryInterfaceId = source.DiscoveryInterfaceId;
         StreamSampleRate = source.StreamSampleRate;
+        Equalizer.CopyFrom(source.Equalizer);
         LatencyMode = source.LatencyMode; CustomBufferMs = source.CustomBufferMs;
         StandbyEnabled = source.StandbyEnabled; StandbySilenceSeconds = source.StandbySilenceSeconds;
         CaptureMode = source.CaptureMode; CaptureEndpoint = source.CaptureEndpoint;

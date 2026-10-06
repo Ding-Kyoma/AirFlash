@@ -47,7 +47,7 @@ internal static class UiPerf
             await Measure("panel.first", () => panel.ShowPanel());
             panel.Hide();
             await Measure("settings.first", () => { settings = new(app); settings.Show(); });
-            for (var page = 0; page < 7; page++)
+            for (var page = 0; page < settings!.ViewModel.Pages.Length; page++)
             {
                 var selected = page;
                 await Measure($"page.{page}.first", () => settings!.ViewModel.SelectedPage = selected);
@@ -55,7 +55,7 @@ internal static class UiPerf
             for (var sample = 0; sample < 30; sample++)
             {
                 phase = "warm";
-                for (var page = 0; page < 7; page++)
+                for (var page = 0; page < settings!.ViewModel.Pages.Length; page++)
                 {
                     var selected = page;
                     await Measure("page.cached", () => settings!.ViewModel.SelectedPage = selected);
@@ -80,6 +80,16 @@ internal static class UiPerf
             _stage = "playback.start";
             await app.ToggleAsync(app.AllReceivers.First(r => r.Online));
             await Task.Delay(100);
+            settings!.ViewModel.SelectedPage = SettingsViewModel.EqualizerPage;
+            settings.ViewModel.Equalizer.Enabled = true;
+            var equalizerStarts = engine.CreatedCount;
+            for (var i = 0; i < 30; i++)
+            {
+                var gain = -12 + i * 0.5;
+                await Measure("equalizer.drag", () => settings.ViewModel.Equalizer.Bands[0].Gain = gain);
+                await Task.Delay(15);
+            }
+            if (engine.CreatedCount != equalizerStarts) throw new InvalidOperationException("Equalizer preview restarted playback.");
             settings!.ViewModel.Draft.CaptureMode = "endpoint";
             settings.ViewModel.Draft.CaptureEndpoint = "endpoint-b";
             settings.ViewModel.Draft.LatencyMode = "buffered";
@@ -93,6 +103,7 @@ internal static class UiPerf
                 apply_feedback_under_100ms = P95("apply.feedback") < 100,
                 cached_pages_under_100ms = P95("page.cached") < 100,
                 warm_dispatcher_under_50ms = P95("dispatcher.warm") < 50,
+                equalizer_edits_under_100ms = P95("equalizer.drag") < 100,
                 endpoint_enumerations = UiPerformance.ReadCount("audio.enumerate") == 2
             };
             App.WriteOutput(args, new { ok = true, targets, injected = new { enumerate_ms = 300, save_ms = 500, stop_ms = 300 }, performance = UiPerformance.Report() });

@@ -92,7 +92,7 @@ internal static class UiSmoke
             SendMessage(tray.WindowHandle, RegisterWindowMessage("TaskbarCreated"), IntPtr.Zero, IntPtr.Zero); await Pump();
             Check(tray.IsRegisteredForVerification, "repeated Explorer notification retains one registered tray icon", checks);
             Check(!settings.ApplyButton.IsEnabled, "apply initially disabled", checks);
-            settings.ViewModel.SelectedPage = 2; await Pump();
+            settings.ViewModel.SelectedPage = SettingsViewModel.AudioCapturePage; await Pump();
             var radio = Descendants(settings).OfType<RadioButton>().Single(r => (string?)r.Content == L.Get("Specific output endpoint"));
             var radioPeer = UIElementAutomationPeer.CreatePeerForElement(radio)!;
             ((ISelectionItemProvider)radioPeer.GetPattern(PatternInterface.SelectionItem)!).Select();
@@ -115,7 +115,7 @@ internal static class UiSmoke
             settings.ViewModel.SelectedPage = 0; await Pump();
             var retries = Descendants(settings).OfType<TextBox>().Single(t => System.Windows.Automation.AutomationProperties.GetName(t) == L.Get("Maximum retry attempts"));
             retries.Text = "invalid"; await Pump();
-            settings.ViewModel.SelectedPage = 2; await Pump(); settings.ViewModel.SelectedPage = 0; await Pump();
+            settings.ViewModel.SelectedPage = SettingsViewModel.AudioCapturePage; await Pump(); settings.ViewModel.SelectedPage = 0; await Pump();
             Check(retries.Text == "invalid", "invalid edits survive page switches", checks);
             Check(!settings.ApplyButton.IsEnabled && !settings.OkButton.IsEnabled, "invalid number blocks save", checks);
             retries.Text = "5"; await Pump();
@@ -132,11 +132,11 @@ internal static class UiSmoke
             {
                 ThemeService.SetForVerification(dark); await Pump();
                 CheckThemeColors(dark, checks);
-                for (var page = 0; page < 7; page++)
+                for (var page = 0; page < settings!.ViewModel.Pages.Length; page++)
                 {
                     settings.ViewModel.SelectedPage = page; await Pump();
                     Render(settings, Path.Combine(directory, $"settings-{(dark ? "dark" : "light")}-{page}.png"), 1);
-                    if (page == 4)
+                    if (page == SettingsViewModel.MonitorPage)
                     {
                         var scroll = Descendants(settings).OfType<ScrollViewer>().First(v => v.ScrollableHeight > 0);
                         scroll.ScrollToEnd(); await Pump();
@@ -156,10 +156,11 @@ internal static class UiSmoke
                 settings.Show();
             }
             Check(app.MonitorMembers.Count == 1 && app.MonitorRecoveries == "2", "transport metrics reach monitoring view", checks);
-            checks.Add("seven pages rendered in light/dark; panel at 100/125/150/175/200 percent");
+            checks.Add("eight pages rendered in light/dark; panel at 100/125/150/175/200 percent");
             await app.StopAsync(); await Until(() => app.Snapshot.State == PlaybackState.Idle);
             Check(engine.DisposedCount == engine.CreatedCount, "stop releases mock engine", checks);
             await UiRegression.RunAsync(checks, directory);
+            await UiEqualizer.RunAsync(checks, directory);
             App.WriteOutput(args, new { ok = true, checks, icon_environment = iconEnvironment, note = "All engine/audio/discovery/autostart services are simulated. DPI renders do not replace physical multimonitor QA." });
             return 0;
         }

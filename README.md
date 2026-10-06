@@ -41,6 +41,8 @@ source you trust.
 - Provides transient or PIN pairing, DNS-SD discovery, and manual receiver setup.
 - Includes selectable latency profiles, tray operation, mute restoration,
   reconnects, and transport diagnostics.
+- Offers a global ten-band equalizer in Settings, with presets, live preview,
+  preamp control, and automatic headroom attenuation.
 - Uses bounded buffering, Rubato resampling, PTP timing, and PCM/ALAC packetization.
 - Ships as a portable Windows x64 app with English and Simplified Chinese UI.
 

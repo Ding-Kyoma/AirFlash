@@ -50,6 +50,8 @@ pub struct ProbeOptions {
     pub duration_ms: u32,
     pub latency_ms: u32,
     pub gain: f32,
+    #[serde(default)]
+    pub equalizer: crate::equalizer::Settings,
     #[serde(default = "default_sample_rate")]
     pub sample_rate: u32,
     #[serde(default = "default_timing")]
@@ -80,9 +82,13 @@ impl ProbeOptions {
         let mut bounded = self.clone();
         bounded.duration_ms = 5000;
         bounded.gain = 0.1;
+        self.equalizer.validate()?;
+        bounded.equalizer = crate::equalizer::Settings::default();
         bounded.validate()
     }
     pub fn validate(&self) -> Result<()> {
+        self.equalizer.validate()?;
+        ensure!(!self.equalizer.enabled, "finite probes require the equalizer to be disabled");
         ensure!(
             self.source == "wav" || self.source == "loopback",
             "unknown audio source"
@@ -484,6 +490,18 @@ pub fn probe_with_volume(
     volume: crate::volume::Control,
     emit: impl Fn(Json),
 ) -> Result<()> {
+    let equalizer = crate::equalizer::Control::new(options.equalizer, options.sample_rate)?;
+    probe_with_controls(options, cancel, gain, volume, equalizer, emit)
+}
+
+pub fn probe_with_controls(
+    options: ProbeOptions,
+    cancel: Cancellation,
+    gain: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    volume: crate::volume::Control,
+    equalizer: crate::equalizer::Control,
+    emit: impl Fn(Json),
+) -> Result<()> {
     if options.duration_ms == 0 {
         options.validate_start()?;
     } else {
@@ -546,6 +564,7 @@ pub fn probe_with_volume(
         Some(crate::live::Loopback::start(
             options.capture_endpoint.clone(),
             rate,
+            equalizer,
         )?)
     } else {
         None
@@ -702,6 +721,7 @@ mod tests {
             duration_ms: 5001,
             latency_ms: 200,
             gain: 0.1,
+            equalizer: crate::equalizer::Settings::default(),
             sample_rate: 44100,
             timing: "ptp".into(),
             group_id: None,
@@ -716,6 +736,14 @@ mod tests {
         assert!(o.validate().is_err());
         o.gain = 0.1;
         assert!(o.validate().is_ok());
+        o.equalizer.enabled = true;
+        assert!(o.validate().is_err());
+        o.source = "loopback".into(); o.duration_ms = 0;
+        assert!(o.validate_start().is_ok());
+        o.equalizer.preamp_db = f64::NAN;
+        assert!(o.validate_start().is_err());
+        o.equalizer = crate::equalizer::Settings::default();
+        o.source = "wav".into(); o.duration_ms = 5000;
         o.latency_ms = 0;
         assert!(o.validate().is_ok());
         o.sample_rate = 48000;
