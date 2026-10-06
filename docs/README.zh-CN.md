@@ -9,9 +9,8 @@
   <img src="images/airflash-zh-CN.png" alt="AirFlash 中文界面" width="550" />
 </p>
 
-通过原生 AirPlay 2 发送端，将 Windows 桌面声音低延迟发送到 HomePod。
-AirFlash 支持现有的双 HomePod 立体声组合，并针对 Windows 音频播放场景
-优化延迟。
+AirFlash 支持现有的双 HomePod 立体声组合和 Windows 低延迟播放。
+通过原生 AirPlay 2 发送端，将 Windows 桌面声音发送到 HomePod，支持 HomePod OS 27。
 
 AirFlash 是 TuneBlade（AirPlay 1）的 AirPlay 2 替代方案，旨在让 Windows
 能够向运行较新版本 HomePod 软件的设备流送音频。
@@ -24,21 +23,19 @@ AirFlash 提供 Windows x64 可执行文件和可独立运行的 MSI 安装包�
 可能显示 SmartScreen 警告。只有在确认下载文件来源可信时，才使用“更多信息”
 和“仍要运行”。
 
-### 环境要求
-
-- Windows 10 或 Windows 11，x64
-- 可通过 WASAPI 使用的 Windows 音频端点
-- 电脑与 HomePod 位于可互通的同一局域网
-
 ## 主要功能
 
-- 使用原生 Rust AirPlay 2 引擎，通过 WASAPI 将 Windows 系统声音发送到 HomePod。
-- 支持完整的双 HomePod 立体声组合，并使用同步的加密 RTP 会话。
-- 支持临时或 PIN 配对、DNS-SD 发现和手动添加接收端。
-- 提供延迟模式、托盘运行、静音恢复、断线重连和传输诊断。
-- 在设置中提供全局 10 段均衡器，支持音效预设、即时试听、前级增益和自动余量衰减。
-- 使用有界缓冲、Rubato 重采样、PTP 时序以及 PCM/ALAC 封包。
+- 通过 AirPlay 2 将 Windows 系统声音发送到 HomePod。
+- 支持现有双 HomePod 立体声组合的同步播放。
+- 支持自动发现设备、PIN 配对和手动添加设备。
+- 支持网卡过滤，可在设置中选择用于发现设备的网卡。
+- 提供延迟模式、托盘运行、静音恢复、自动重连和连接诊断。
+- 在设置中提供 10 段均衡器，支持音效预设和即时试听。
 - 提供便携式 Windows x64 程序、英文和简体中文界面。
+
+## 功能计划
+
+- [ ] 支持杜比 Atmos。
 
 ## 使用方法
 
@@ -106,8 +103,7 @@ pwsh scripts/build-native.ps1 -Check
 
 ## 贡献
 
-修改时请明确协议行为、配对边界和测量限制。接收端协商成功或数据包发送成功，
-不能直接证明声音已经播放或端到端延迟达标。
+修改时请明确协议行为、配对边界和测量限制。欢迎提交 PR！
 
 ## 许可证
 

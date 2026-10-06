@@ -9,9 +9,9 @@
   <img src="docs/images/airflash-en.png" alt="AirFlash English interface" width="550" />
 </p>
 
-Windows desktop audio streaming to HomePod over a native AirPlay 2 sender.
-AirFlash supports existing two-device stereo pairs and low-latency playback
-from Windows.
+AirFlash supports existing two-device stereo pairs and low-latency playback from Windows.
+Stream Windows desktop audio to HomePod through a native AirPlay 2 sender,
+with support for HomePod OS 27.
 
 AirFlash is an AirPlay 2 alternative to TuneBlade (AirPlay 1), designed to bring
 Windows audio streaming to HomePods running newer versions of HomePod software.
@@ -26,25 +26,20 @@ a SmartScreen warning because release binaries are not code-signed. Use
 **More info** and **Run anyway** only when the downloaded files are from a
 source you trust.
 
-### Requirements
-
-- Windows 10 or Windows 11, x64
-- A Windows audio endpoint available through WASAPI
-- Windows and HomePod on the same reachable local network
-
 ## Key features
 
-- Captures Windows system audio through WASAPI and sends it to HomePod over a
-  native Rust AirPlay 2 engine.
-- Supports complete two-device HomePod stereo pairs with synchronized encrypted
-  RTP sessions.
-- Provides transient or PIN pairing, DNS-SD discovery, and manual receiver setup.
-- Includes selectable latency profiles, tray operation, mute restoration,
-  reconnects, and transport diagnostics.
-- Offers a global ten-band equalizer in Settings, with presets, live preview,
-  preamp control, and automatic headroom attenuation.
-- Uses bounded buffering, Rubato resampling, PTP timing, and PCM/ALAC packetization.
-- Ships as a portable Windows x64 app with English and Simplified Chinese UI.
+- Streams Windows system audio to HomePod over AirPlay 2.
+- Supports synchronized playback on existing two-device HomePod stereo pairs.
+- Offers automatic device discovery, PIN pairing, and manual device setup.
+- Lets you filter device discovery by selecting a network adapter in Settings.
+- Includes selectable latency modes, tray operation, mute restoration,
+  automatic reconnection, and connection diagnostics.
+- Provides a ten-band equalizer with presets and live preview in Settings.
+- Available as a portable Windows x64 app with English and Simplified Chinese UI.
+
+## Feature plan
+
+- [ ] Dolby Atmos support.
 
 ## Usage
 
@@ -117,8 +112,7 @@ are intentionally limited to the repository's low-volume, five-second procedure.
 ## Contributing
 
 Keep protocol behavior, pairing boundaries, and measurement limits explicit in
-changes. Do not describe receiver negotiation or packet delivery as proof of
-acoustic playback or end-to-end latency.
+changes. Pull requests are welcome!
 
 ## License
 
