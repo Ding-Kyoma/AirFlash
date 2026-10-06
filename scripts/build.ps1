@@ -43,13 +43,14 @@ $buildInstaller = Join-Path $PSScriptRoot 'build-installer.ps1'
 if ($LASTEXITCODE -ne 0) { throw 'Installer build failed.' }
 
 Remove-SafeDirectory (Join-Path $repoRoot 'build')
-$expected = @('AirFlash.exe', 'AirFlash.msi')
+$msiName = "AirFlash-$releaseVersion.msi"
+$expected = @('AirFlash.exe', $msiName)
 $actual = @(Get-ChildItem -LiteralPath $output -Force | Select-Object -ExpandProperty Name)
 $actualSorted = @($actual | Sort-Object)
 $expectedSorted = @($expected | Sort-Object)
 if (($actualSorted -join '|') -cne ($expectedSorted -join '|')) {
     throw "Unexpected release outputs: $($actual -join ', ')"
 }
-Get-Item -LiteralPath (Join-Path $output 'AirFlash.exe'), (Join-Path $output 'AirFlash.msi') | Select-Object Name, Length, LastWriteTime
+Get-Item -LiteralPath (Join-Path $output 'AirFlash.exe'), (Join-Path $output $msiName) | Select-Object Name, Length, LastWriteTime
 
 } finally { $releaseLock.Dispose() }

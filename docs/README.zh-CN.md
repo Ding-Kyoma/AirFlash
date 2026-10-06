@@ -17,7 +17,7 @@ AirFlash 是 TuneBlade（AirPlay 1）的 AirPlay 2 替代方案，旨在让 Wind
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/Ding-Kyoma/AirFlash/releases/latest) 下载并运行 `AirFlash.msi` 安装，或直接运行便携版 `AirFlash.exe`。
+从 [GitHub Releases](https://github.com/Ding-Kyoma/AirFlash/releases/latest) 下载并运行 `AirFlash-X.Y.Z.msi` 安装，或直接运行便携版 `AirFlash.exe`。
 
 AirFlash 提供 Windows x64 可执行文件和可独立运行的 MSI 安装包。由于发布文件没有代码签名，Windows
 可能显示 SmartScreen 警告。只有在确认下载文件来源可信时，才使用“更多信息”
@@ -84,7 +84,7 @@ pwsh scripts/build.ps1
 构建生成：
 
 - `dist/AirFlash.exe`
-- `dist/AirFlash.msi`
+- `dist/AirFlash-X.Y.Z.msi`
 
 Rust 引擎会嵌入 WPF 可执行文件，运行时释放到
 `%LOCALAPPDATA%/AirFlash/engine/<hash>` 内容寻址缓存。

@@ -19,7 +19,7 @@ Windows audio streaming to HomePods running newer versions of HomePod software.
 ## Installation
 
 Download the latest release from [GitHub Releases](https://github.com/Ding-Kyoma/AirFlash/releases/latest), run
-`AirFlash.msi`, and launch AirFlash from the installed shortcut. Apps and Features provides repair and uninstall.
+`AirFlash-X.Y.Z.msi`, and launch AirFlash from the installed shortcut. Apps and Features provides repair and uninstall.
 
 AirFlash is distributed as a Windows x64 executable and standalone MSI. Windows may show
 a SmartScreen warning because release binaries are not code-signed. Use
@@ -91,9 +91,9 @@ pwsh scripts/build.ps1
 The build produces:
 
 - `dist/AirFlash.exe`
-- `dist/AirFlash.msi`
+- `dist/AirFlash-X.Y.Z.msi`
 
-Run `AirFlash.msi` directly. It installs the self-contained executable and provides optional desktop and Start menu shortcuts.
+Run `AirFlash-X.Y.Z.msi` directly. It installs the self-contained executable and provides optional desktop and Start menu shortcuts.
 AirFlash uses the Windows DNS-SD API and does not require Bonjour or install a background service.
 The Rust engine is embedded in the WPF executable and extracted to a content-addressed cache under `%LOCALAPPDATA%/AirFlash/engine/<hash>` at runtime.
 

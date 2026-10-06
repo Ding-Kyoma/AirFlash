@@ -1,7 +1,7 @@
 param([Parameter(Mandatory)][string]$Version, [string]$Directory = 'dist')
 $ErrorActionPreference = 'Stop'
 $exe = Join-Path $Directory 'AirFlash.exe'
-$msi = Join-Path $Directory 'AirFlash.msi'
+$msi = Join-Path $Directory "AirFlash-$Version.msi"
 $info = [Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path $exe))
 $actual = '{0}.{1}.{2}' -f $info.FileMajorPart,$info.FileMinorPart,$info.FileBuildPart
 if ($actual -ne $Version) { throw "EXE version mismatch: $actual" }

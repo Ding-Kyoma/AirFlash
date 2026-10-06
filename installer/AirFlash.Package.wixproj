@@ -3,7 +3,7 @@
   <PropertyGroup>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <InstallerPlatform>x64</InstallerPlatform>
-    <OutputName>AirFlash</OutputName>
+    <OutputName>AirFlash-$(ProductVersion)</OutputName>
     <OutputPath>$(OutputPath)</OutputPath>
     <DebugType>none</DebugType>
   </PropertyGroup>

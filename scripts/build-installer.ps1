@@ -44,6 +44,6 @@ else {
 }
 if ($LASTEXITCODE -ne 0) { throw 'MSI build failed.' }
 
-$msi = Join-Path $outputRoot 'AirFlash.msi'
+$msi = Join-Path $outputRoot "AirFlash-$productVersion.msi"
 if (-not (Test-Path -LiteralPath $msi -PathType Leaf)) { throw "MSI output missing: $msi" }
 Write-Output $msi

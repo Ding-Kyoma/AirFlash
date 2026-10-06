@@ -3,7 +3,12 @@ $ErrorActionPreference = 'Stop'
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'Run installer lifecycle tests only in a disposable GitHub-hosted runner.' }
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 Set-Location $root
-$msi = (Resolve-Path dist/AirFlash.msi).Path
+function Find-Msi([string]$Directory) {
+    $packages = @(Get-ChildItem -LiteralPath $Directory -Filter 'AirFlash*.msi' -File)
+    if ($packages.Count -ne 1) { throw "Expected exactly one AirFlash MSI in $Directory; found $($packages.Count)." }
+    return $packages[0].FullName
+}
+$msi = Find-Msi 'dist'
 $exeHash = (Get-FileHash dist/AirFlash.exe).Hash
 $msiHash = (Get-FileHash $msi).Hash
 $installed = Join-Path $env:ProgramFiles 'AirFlash/AirFlash.exe'
@@ -39,7 +44,7 @@ $previous = $releases | Where-Object { -not $_.draft -and -not $_.prerelease } |
 $oldDir = Join-Path $root 'artifacts/installer-test/previous'
 New-Item $oldDir -ItemType Directory -Force | Out-Null
 if ($previous) {
-    gh release download $previous.tag_name --repo Ding-Kyoma/AirFlash --pattern AirFlash.msi --dir $oldDir
+    gh release download $previous.tag_name --repo Ding-Kyoma/AirFlash --pattern 'AirFlash*.msi' --dir $oldDir
     if ($LASTEXITCODE) { throw 'Cannot download previous MSI.' }
 } else {
     # WiX can hardlink its output from obj. Never reuse that intermediate tree for a different package.
@@ -52,7 +57,7 @@ if ($previous) {
     if ($LASTEXITCODE) { throw 'Cannot build upgrade fixture.' }
 }
 if ((Get-FileHash $msi).Hash -ne $msiHash -or (Get-FileHash dist/AirFlash.exe).Hash -ne $exeHash) { throw 'Fixture build changed release assets.' }
-$oldMsi = Join-Path $oldDir 'AirFlash.msi'
+$oldMsi = Find-Msi $oldDir
 Run-Msi @('/i',"`"$oldMsi`"") 'old-install'
 $oldCode = (Entries).PSChildName
 Run-Msi @('/i',"`"$msi`"") 'upgrade'
@@ -70,9 +75,9 @@ if ($env:RELEASE_CHANNEL -eq 'stable') {
     if ($preview) {
         $previewDir = Join-Path $root 'artifacts/installer-test/preview'
         New-Item $previewDir -ItemType Directory -Force | Out-Null
-        gh release download $preview.tag_name --repo Ding-Kyoma/AirFlash --pattern AirFlash.msi --dir $previewDir
+        gh release download $preview.tag_name --repo Ding-Kyoma/AirFlash --pattern 'AirFlash*.msi' --dir $previewDir
         if ($LASTEXITCODE) { throw 'Cannot download preceding preview MSI.' }
-        $previewMsi = Join-Path $previewDir 'AirFlash.msi'
+        $previewMsi = Find-Msi $previewDir
         Run-Msi @('/i',"`"$previewMsi`"") 'preview-install'
         $previewCode = (Entries).PSChildName
         Run-Msi @('/i',"`"$msi`"") 'preview-upgrade'

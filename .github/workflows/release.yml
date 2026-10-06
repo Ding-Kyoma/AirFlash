@@ -86,7 +86,7 @@ jobs:
         run: |
           $tag = 'v' + $env:RELEASE_VERSION
           $sha = git rev-parse HEAD
-          gh release create $tag dist/AirFlash.exe dist/AirFlash.msi dist/SHA256SUMS.txt --target $sha --title "AirFlash $env:RELEASE_VERSION" --notes-file docs/RELEASE-NOTES.md --latest
+          gh release create $tag dist/AirFlash.exe "dist/AirFlash-$env:RELEASE_VERSION.msi" dist/SHA256SUMS.txt --target $sha --title "AirFlash $env:RELEASE_VERSION" --notes-file docs/RELEASE-NOTES.md --latest
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Preserve verified stable assets for maintainer publication
         if: github.ref == 'refs/heads/main' && !inputs.publish
@@ -95,7 +95,7 @@ jobs:
           name: airflash-release-${{ steps.version.outputs.version }}-${{ github.sha }}
           path: |
             dist/AirFlash.exe
-            dist/AirFlash.msi
+            dist/AirFlash-${{ steps.version.outputs.version }}.msi
             dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 14
@@ -106,7 +106,7 @@ jobs:
           name: airflash-preview-${{ steps.version.outputs.version }}-${{ github.sha }}
           path: |
             dist/AirFlash.exe
-            dist/AirFlash.msi
+            dist/AirFlash-${{ steps.version.outputs.version }}.msi
             dist/SHA256SUMS.txt
           retention-days: 14
       - name: Preserve failure diagnostics

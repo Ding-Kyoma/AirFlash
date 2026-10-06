@@ -17,6 +17,6 @@ Windows x64 · Windows 10/11 · English and Simplified Chinese
 
 ## Downloads
 
-- Download **AirFlash.msi** to install, or **AirFlash.exe** for portable use. Verify downloads with **SHA256SUMS.txt**.
+- Download **AirFlash-X.Y.Z.msi** to install, or **AirFlash.exe** for portable use. Verify downloads with **SHA256SUMS.txt**.
 - Check for stable updates in Settings → About.
 - Binaries are unsigned. Target latency is not a measurement of end-to-end acoustic latency.
