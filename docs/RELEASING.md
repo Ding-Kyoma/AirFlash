@@ -1,6 +1,6 @@
 # Releasing AirFlash
 
-Stable releases are built from `main` by the manually dispatched **Release** GitHub Actions workflow. It reserves a version before tests, runs native/.NET/Python checks, builds fresh Windows x64 binaries, verifies versions and checksums, exercises MSI installation in a disposable runner, and publishes the release only after success.
+Stable releases are built from `main` by the manually dispatched **Release** GitHub Actions workflow. It installs and validates the selected .NET SDK before reserving a version, then runs native/.NET/Python checks, builds fresh Windows x64 binaries, verifies versions and checksums, exercises MSI installation in a disposable runner, and publishes the release only after success.
 
 Desktop tray verification is documented in [TRAY-DIAGNOSTICS.md](TRAY-DIAGNOSTICS.md).
 
@@ -15,6 +15,8 @@ When the release commit modifies workflows, use a maintainer login with workflow
 Complete local validation builds before reserving the intended public version, so that the workflow can reserve it as a fresh version.
 
 For local SDK/cache reuse use the checkout's ignored `artifacts` directory or the shared Git integration checkout. `DOTNET_CLI_HOME` and `NUGET_PACKAGES` can override cache locations. Install the .NET 10 SDK, Rust MSVC toolchain and Visual Studio C++ tools before building.
+
+Run `pwsh scripts/check-dotnet.ps1` to check the selected host without starting a release build. Selection prefers the checkout's `artifacts/dotnet/dotnet.exe`, then the integration checkout's equivalent, then `dotnet` on PATH. The selected host resolves `desktop/global.json` from `desktop`, allowing its configured SDK roll-forward. A runtime-only or incompatible preferred installation fails with its path and policy; replace or remove that installation rather than expecting fallback to PATH. `scripts/build.ps1` performs this check before the release lock, reservation, output cleanup or native work, and keeps the same selected host for desktop publish and MSI build. `scripts/dotnet.ps1 --info`, `--list-sdks` and `--list-runtimes` remain available without a compatible SDK. Later build failures still consume a reserved version.
 
 Release assets are `AirFlash.exe`, `AirFlash-X.Y.Z.msi`, and `SHA256SUMS.txt`. Validate a downloaded asset with `Get-FileHash -Algorithm SHA256`. The binaries are currently unsigned.
 

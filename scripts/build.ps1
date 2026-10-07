@@ -3,6 +3,9 @@ param([switch]$Console, [string]$ReservedVersion, [ValidateSet('stable','preview
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 Set-Location -LiteralPath $repoRoot
+. (Join-Path $PSScriptRoot 'dotnet-common.ps1')
+$dotnetContext = Get-AirFlashDotnetContext -RepoRoot $repoRoot
+$null = Assert-AirFlashDotnetSdk -Context $dotnetContext
 
 function Remove-SafeDirectory([string]$Path) {
     $target = [IO.Path]::GetFullPath($Path)
@@ -29,7 +32,15 @@ $publish = Join-Path $repoRoot 'build/wpf-publish'
 $project = Join-Path $repoRoot 'desktop/AirFlash.App/AirFlash.App.csproj'
 $consoleFlag = if ($Console) { 'true' } else { 'false' }
 $informationalVersion = if ($ReleaseChannel -eq 'preview') { "$releaseVersion-rc.1" } else { $releaseVersion }
-& (Join-Path $PSScriptRoot 'dotnet.ps1') publish $project -c Release -r win-x64 --self-contained true '-p:IncludeNativeLibrariesForSelfExtract=true' '-p:PublishTrimmed=false' '-p:EnableCompressionInSingleFile=true' '-p:RestoreLockedMode=true' '-p:DebugType=None' '-p:DebugSymbols=false' "-p:PathMap=$repoRoot=/_/" "-p:AirFlashConsole=$consoleFlag" "-p:Version=$releaseVersion" "-p:InformationalVersion=$informationalVersion" "-p:FileVersion=$releaseVersion.0" "-p:AssemblyVersion=$releaseVersion.0" -o $publish
+Invoke-AirFlashDotnet -Context $dotnetContext -Arguments @(
+    'publish', $project, '-c', 'Release', '-r', 'win-x64', '--self-contained', 'true',
+    '-p:IncludeNativeLibrariesForSelfExtract=true', '-p:PublishTrimmed=false',
+    '-p:EnableCompressionInSingleFile=true', '-p:RestoreLockedMode=true',
+    '-p:DebugType=None', '-p:DebugSymbols=false', "-p:PathMap=$repoRoot=/_/",
+    "-p:AirFlashConsole=$consoleFlag", "-p:Version=$releaseVersion",
+    "-p:InformationalVersion=$informationalVersion", "-p:FileVersion=$releaseVersion.0",
+    "-p:AssemblyVersion=$releaseVersion.0", '-o', $publish
+)
 if ($LASTEXITCODE -ne 0) { throw 'WPF publish failed; do not use residual dist files' }
 $builtExe = Join-Path $publish 'AirFlash.exe'
 if (-not (Test-Path -LiteralPath $builtExe -PathType Leaf)) { throw 'Published executable missing' }
@@ -39,7 +50,7 @@ New-Item -ItemType Directory -Path $output -Force | Out-Null
 $exe = Join-Path $output 'AirFlash.exe'
 Copy-Item -LiteralPath $builtExe -Destination $exe
 $buildInstaller = Join-Path $PSScriptRoot 'build-installer.ps1'
-& $buildInstaller -PublishPath $publish -OutputPath $output
+& $buildInstaller -PublishPath $publish -OutputPath $output -DotnetPath $dotnetContext.Path
 if ($LASTEXITCODE -ne 0) { throw 'Installer build failed.' }
 
 Remove-SafeDirectory (Join-Path $repoRoot 'build')
