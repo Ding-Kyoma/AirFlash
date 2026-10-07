@@ -1,6 +1,7 @@
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
+using System.Windows.Input;
 using AirFlash.App.Services;
 using AirFlash.App.ViewModels;
 namespace AirFlash.App.Ui;
@@ -44,6 +45,16 @@ public partial class SettingsWindow : Window
     private void OnSourceInitialized(object? sender, EventArgs args)
     {
         NativeWindowPlacement.CenterSettings(this);
+    }
+    private void OnEqualizerMouseWheel(object sender, MouseWheelEventArgs args)
+    {
+        // The horizontal band viewer consumes wheel input even with vertical scrolling disabled.
+        // Let the page apply WPF's normal wheel behavior, preserving the user's wheel settings.
+        args.Handled = true;
+        PageScroll.RaiseEvent(new MouseWheelEventArgs(args.MouseDevice, args.Timestamp, args.Delta)
+        {
+            RoutedEvent = Mouse.MouseWheelEvent
+        });
     }
     private void OnCoffeeClick(object sender, RoutedEventArgs args)
     {

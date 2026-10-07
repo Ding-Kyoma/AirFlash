@@ -99,7 +99,7 @@
         <Border Style="{StaticResource Card}">
           <StackPanel>
             <TextBlock Text="{loc:Text 'Frequency bands'}" Style="{StaticResource SectionTitle}"/>
-            <ScrollViewer x:Name="EqualizerBandScroll" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+            <ScrollViewer x:Name="EqualizerBandScroll" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled" Padding="0,0,0,24" PreviewMouseWheel="OnEqualizerMouseWheel">
               <ItemsControl ItemsSource="{Binding Equalizer.Bands}" IsEnabled="{Binding Equalizer.Enabled}">
                 <ItemsControl.ItemsPanel><ItemsPanelTemplate><StackPanel Orientation="Horizontal"/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
                 <ItemsControl.ItemTemplate>
@@ -386,7 +386,7 @@
         <TextBlock Text="{Binding PageTitle}" FontSize="24" FontWeight="SemiBold"/>
         <TextBlock Text="{Binding PageDescription}" Style="{StaticResource Hint}" Margin="0,5,0,0"/>
       </StackPanel>
-      <ScrollViewer x:Name="PageScroll" Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="0,0,6,10">
+      <ScrollViewer x:Name="PageScroll" Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="0,0,24,10">
         <Grid x:Name="PageContainer"/>
       </ScrollViewer>
     </Grid>
