@@ -1,4 +1,7 @@
 {
+  "Discovery unavailable": "发现信息暂不可用",
+  "The receiver is unavailable.": "接收设备当前不可用。",
+  "The receiver selection is ambiguous.": "无法确定所选接收设备的唯一归属。",
   "Check for updates": "检查更新",
   "Open download page": "打开下载页",
   "Checking for updates…": "正在检查更新…",

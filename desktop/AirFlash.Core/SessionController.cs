@@ -10,6 +10,8 @@ public sealed record SessionSnapshot(PlaybackState State, Receiver? Receiver = n
 {
     public bool IsActive => State is PlaybackState.Connecting or PlaybackState.Streaming or PlaybackState.Standby or PlaybackState.Pairing;
 }
+// The desktop lifecycle owner is independent of metrics and native process/session retries.
+public sealed record SessionCapture(SessionSnapshot Snapshot, long Owner, long AutomaticIntent);
 public sealed record SessionTiming(TimeSpan Connect, TimeSpan Read, TimeSpan Pin, TimeSpan Retry)
 {
     public static SessionTiming Default { get; } = new(TimeSpan.FromSeconds(40), TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(120), TimeSpan.FromSeconds(1));
@@ -26,6 +28,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private AppSettings _settings = new();
     private Receiver? _receiver;
     private long _generation;
+    private long _automaticIntent;
     private bool _muted;
     private readonly SemaphoreSlim _equalizerWriter = new(1, 1);
     private EqualizerSettings? _equalizerPreview;
@@ -170,11 +173,15 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private readonly Dictionary<string, EngineNotice> _warnings = [];
     private SessionSnapshot _snapshot = new(PlaybackState.Idle);
     public SessionSnapshot Snapshot { get { lock (_sync) return _snapshot; } }
+    public SessionCapture Capture() { lock (_sync) return new(_snapshot, _generation, _automaticIntent); }
+    public void InvalidateAutomaticIntent() { lock (_sync) ++_automaticIntent; }
     public event Action<SessionSnapshot>? Changed;
     public bool Muted => _muted;
     private string Signature(Receiver receiver, AppSettings settings) => $"{receiver.TransportKey}|{settings.EffectiveEndpoint}|{settings.Latency(receiver.Id)}|{settings.StreamSampleRate}";
     public async Task StartAsync(Receiver receiver, AppSettings settings)
     {
+        InvalidateAutomaticIntent();
+        if (!receiver.Online) throw new InvalidOperationException(L.Get("The receiver is unavailable."));
         if (!receiver.Complete) throw new InvalidOperationException(L.Get("Both stereo pair members must be online."));
         await _serial.WaitAsync().ConfigureAwait(false);
         try { await StartLockedAsync(receiver, settings, null).ConfigureAwait(false); }
@@ -182,19 +189,41 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     }
     public async Task PairAsync(Receiver receiver, AppSettings settings, Func<Receiver, CancellationToken, Task<string?>> requestPin)
     {
+        InvalidateAutomaticIntent();
+        if (!receiver.Online) throw new InvalidOperationException(L.Get("The receiver is unavailable."));
         if (!receiver.Complete) throw new InvalidOperationException(L.Get("Wait until both stereo pair members are online before pairing."));
         await _serial.WaitAsync().ConfigureAwait(false);
         try { await StartLockedAsync(receiver, settings, requestPin).ConfigureAwait(false); }
         finally { _serial.Release(); }
     }
-    private async Task StartLockedAsync(Receiver receiver, AppSettings settings, Func<Receiver, CancellationToken, Task<string?>>? requestPin)
+    public async Task<bool> TryStartAutomaticAsync(Receiver receiver, AppSettings settings, long expectedOwner, long expectedIntent)
+    {
+        if (!receiver.Online || !receiver.Complete) return false;
+        await _serial.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            lock (_sync)
+                if (_generation != expectedOwner || _automaticIntent != expectedIntent || _snapshot.IsActive) return false;
+            return await StartLockedAsync(receiver, settings, null, expectedIntent).ConfigureAwait(false);
+        }
+        finally { _serial.Release(); }
+    }
+    private async Task<bool> StartLockedAsync(Receiver receiver, AppSettings settings, Func<Receiver, CancellationToken, Task<string?>>? requestPin, long? expectedIntent = null)
     {
         await StopLockedAsync().ConfigureAwait(false);
-        _settings = settings.Clone(); _receiver = receiver;
-        var epoch = ++_generation;
-        lock (_sync) { _diagnostics = new(); _warnings.Clear(); _snapshot = new(PlaybackState.Idle); }
-        _lifetime = new();
-        var cancellation = _lifetime.Token;
+        long epoch;
+        CancellationToken cancellation;
+        lock (_sync)
+        {
+            // Explicit intent can change synchronously while old-worker cleanup awaits.
+            if (expectedIntent is { } intent && _automaticIntent != intent) return false;
+            _settings = settings.Clone(); _receiver = receiver; epoch = ++_generation;
+            _diagnostics = new(); _warnings.Clear();
+            _snapshot = new(requestPin is null ? PlaybackState.Connecting : PlaybackState.Pairing, receiver,
+                TargetLatency: _settings.Latency(receiver.Id), Diagnostics: _diagnostics,
+                StreamRate: int.TryParse(_settings.StreamSampleRate, out var rate) ? rate : 0, DeviceVolume: _deviceVolume);
+            _lifetime = new(); cancellation = _lifetime.Token;
+        }
         Publish(epoch, requestPin is null ? PlaybackState.Connecting : PlaybackState.Pairing);
         _work = Task.Run(async () =>
         {
@@ -208,11 +237,17 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             catch (Exception error) { log?.Invoke(error.ToString()); Publish(epoch, PlaybackState.Error, error.Message); }
             finally { await RestoreAudioAsync().ConfigureAwait(false); }
         }, CancellationToken.None);
+        return true;
     }
     public async Task StopAsync()
     {
+        InvalidateAutomaticIntent();
         await _serial.WaitAsync().ConfigureAwait(false);
-        try { await StopLockedAsync().ConfigureAwait(false); _receiver = null; Publish(_generation, PlaybackState.Idle); }
+        try
+        {
+            await StopLockedAsync().ConfigureAwait(false);
+            lock (_sync) { _receiver = null; Publish(_generation, PlaybackState.Idle); }
+        }
         finally { _serial.Release(); }
     }
     private async Task StopLockedAsync()
@@ -228,9 +263,8 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         await _serial.WaitAsync().ConfigureAwait(false);
         try
         {
-            var old = _settings;
-            _settings = settings.Clone();
-            lock (_sync) ++_equalizerSequence;
+            AppSettings old;
+            lock (_sync) { old = _settings; _settings = settings.Clone(); ++_equalizerSequence; }
             if (_receiver is { } receiver && Snapshot.IsActive && Snapshot.State != PlaybackState.Pairing && Signature(receiver, old) != Signature(receiver, settings))
                 await StartLockedAsync(receiver, settings, null).ConfigureAwait(false);
             else
@@ -246,18 +280,30 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     public async Task UpdateReceiverAsync(Receiver receiver, AppSettings settings)
     {
         await _serial.WaitAsync().ConfigureAwait(false);
+        try { await UpdateReceiverLockedAsync(receiver, settings).ConfigureAwait(false); }
+        finally { _serial.Release(); }
+    }
+    public async Task<bool> TryUpdateReceiverAsync(Receiver receiver, AppSettings settings, long expectedOwner)
+    {
+        if (!receiver.Online || !receiver.Complete) return false;
+        await _serial.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (_receiver is not { } previous) return;
-            if (Snapshot.IsActive && Snapshot.State != PlaybackState.Pairing && Signature(previous, _settings) != Signature(receiver, settings))
-                await StartLockedAsync(receiver, settings, null).ConfigureAwait(false);
-            else
-            {
-                lock (_sync) { _receiver = receiver; _settings = settings.Clone(); }
-                PublishCurrent(_generation);
-            }
+            lock (_sync) if (_generation != expectedOwner || _receiver is null) return false;
+            await UpdateReceiverLockedAsync(receiver, settings).ConfigureAwait(false);
+            return true;
         }
         finally { _serial.Release(); }
+    }
+    private async Task UpdateReceiverLockedAsync(Receiver receiver, AppSettings settings)
+    {
+        if (_receiver is not { } previous) return;
+        if (Snapshot.IsActive && Snapshot.State != PlaybackState.Pairing && Signature(previous, _settings) != Signature(receiver, settings))
+            await StartLockedAsync(receiver, settings, null).ConfigureAwait(false);
+        else
+        {
+            lock (_sync) { _receiver = receiver; _settings = settings.Clone(); PublishCurrent(_generation); }
+        }
     }
     public async Task SetMutedAsync(bool muted)
     {
