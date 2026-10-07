@@ -178,6 +178,7 @@ internal static class UiSmoke
             await app.StopAsync(); await Until(() => app.Snapshot.State == PlaybackState.Idle);
             Check(engine.DisposedCount == engine.CreatedCount, "stop releases mock engine", checks);
             await UiRegression.RunAsync(checks, directory);
+            await UiSessionLifecycle.RunAsync(checks, directory);
             await UiEqualizer.RunAsync(checks, directory);
             await VerifyTrayLifecycleAsync(tray, app, trayGuid, () => menuOpened, () => quitRequestedFromTray, checks);
             App.WriteOutput(args, new { ok = true, checks, icon_environment = iconEnvironment, note = "All engine/audio/discovery/autostart services are simulated. DPI renders do not replace physical multimonitor QA." });

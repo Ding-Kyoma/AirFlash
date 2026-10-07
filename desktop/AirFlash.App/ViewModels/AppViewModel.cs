@@ -21,6 +21,9 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private SessionSnapshot _snapshot = new(PlaybackState.Idle);
     private string _notice = "";
     private bool _volumeDirty, _autoSuppressed, _closing;
+    private bool _controlledScheduling;
+    internal Func<Task>? BeforeAutomaticAdmission { get; set; }
+    internal void UseControlledScheduling() { _controlledScheduling = true; _volumeTimer.Stop(); _autoTimer.Stop(); }
     private string? _defaultEndpoint;
     private long _editRevision;
     private Task _startup = Task.CompletedTask;
@@ -150,22 +153,24 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     }
     private async void OnDiscovered(IReadOnlyList<Receiver> list)
     {
+        try { await ApplyDiscoveryAsync(list); }
+        catch (Exception error) { ShowError(error); }
+    }
+    internal async Task ApplyDiscoveryAsync(IReadOnlyList<Receiver> list)
+    {
         if (_closing) return;
+        await _settingsGate.WaitAsync();
         try
         {
-            await _settingsGate.WaitAsync();
-            try
-            {
-                if (_closing) return;
-                await ReconcileDiscoveryAsync(list);
-            }
-            finally { _settingsGate.Release(); if (_volumeDirty && !_closing) { _volumeTimer.Stop(); _volumeTimer.Start(); } }
+            if (_closing) return;
+            await ReconcileDiscoveryAsync(list);
         }
-        catch (Exception error) { ShowError(error); }
+        finally { _settingsGate.Release(); if (_volumeDirty && !_closing && !_controlledScheduling) { _volumeTimer.Stop(); _volumeTimer.Start(); } }
     }
     private async Task ReconcileDiscoveryAsync(IReadOnlyList<Receiver> list)
     {
-        var currentSnapshot = Session.Snapshot;
+        var captured = Session.Capture();
+        var currentSnapshot = captured.Snapshot;
         var originalSettings = _settings.Clone();
         var reconciliation = ReceiverCatalog.Reconcile(list, _settings, currentSnapshot.Receiver?.Id);
         if (!SettingsMerge.Equal(_settings, reconciliation.Settings))
@@ -211,11 +216,10 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         if (currentSnapshot.Receiver is { IsManual: false } current)
         {
             var id = ReceiverMigrations.GetValueOrDefault(current.Id, current.Id);
-            if (!discovered.TryGetValue(id, out var next) || !next.Complete)
-            {
-                if (currentSnapshot.IsActive) await Session.StopAsync();
-            }
-            else if (!ReceiverEqual(current, next) || !SettingsMerge.Equal(originalSettings, _settings)) await Session.UpdateReceiverAsync(next, _settings.Clone());
+            // Browse availability does not revoke an already owned transport/handshake.
+            if (discovered.TryGetValue(id, out var next) && next.Online && next.Complete
+                && (!ReceiverEqual(current, next) || !SettingsMerge.Equal(originalSettings, _settings)))
+                await Session.TryUpdateReceiverAsync(next, _settings.Clone(), captured.Owner);
         }
         ScheduleAutoConnect();
     }
@@ -233,9 +237,12 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             && left.Codecs.SequenceEqual(right.Codecs) && left.Aliases.SequenceEqual(right.Aliases) && CatalogEqual(left.Members, right.Members);
     private void RefreshReceivers()
     {
-        var visible = AllReceivers.Where(r => r.Online && !_settings.ReadOptions(r.Id).Hidden).ToArray();
+        var visible = AllReceivers.Where(r => r.Online && !_settings.ReadOptions(r.Id).Hidden).ToList();
+        if (_snapshot.IsActive && _snapshot.Receiver is { } active && visible.All(r => r.Id != active.Id))
+            visible.Add(_known.GetValueOrDefault(active.Id) ?? active with { Online = false });
+        visible = visible.OrderBy(r => r.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
         foreach (var row in Receivers.Where(row => visible.All(r => r.Id != row.Receiver.Id)).ToArray()) Receivers.Remove(row);
-        for (var i = 0; i < visible.Length; i++)
+        for (var i = 0; i < visible.Count; i++)
         {
             var row = Receivers.FirstOrDefault(r => r.Receiver.Id == visible[i].Id);
             if (row is null) { row = new(this, visible[i]); Receivers.Insert(i, row); }
@@ -256,7 +263,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         if (errors != ErrorDetails) Notify(nameof(ErrorDetails));
         if (previous.State != snapshot.State || previous.Receiver?.Id != snapshot.Receiver?.Id)
         {
-            foreach (var row in Receivers) row.Refresh();
+            if (previous.IsActive != snapshot.IsActive || previous.Receiver?.Id != snapshot.Receiver?.Id) RefreshReceivers();
             StopCommand.Refresh();
         }
         foreach (var row in Receivers) row.Refresh();
@@ -291,18 +298,25 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     }
     public async Task ToggleAsync(Receiver receiver)
     {
+        Session.InvalidateAutomaticIntent();
         if (_closing) return;
-        if (_snapshot.IsActive && _snapshot.Receiver?.Id == receiver.Id) { await StopAsync(); return; }
-        var group = AllReceivers.FirstOrDefault(r => r.IsGroup && r.Members.Any(m => m.Address == receiver.Address));
-        if (group is not null) receiver = group;
+        var current = Session.Capture().Snapshot;
+        if (current.IsActive && current.Receiver?.Id == receiver.Id) { await StopAsync(); return; }
+        receiver = ResolvePlayback(receiver);
+        // Clear only the suppression preceding this explicit click, before any await.
+        _autoSuppressed = false;
         await FlushVolumeAsync();
         await _settingsGate.WaitAsync();
         try
         {
             if (_closing) return;
-            _autoSuppressed = false; Notice = "";
-            _autoAttempted.Add(receiver.Id);
+            if (!receiver.IsManual)
+                receiver = AllReceivers.FirstOrDefault(r => r.Id == receiver.Id && r.Online && r.Complete)
+                    ?? throw new InvalidOperationException(L.Get("The receiver is unavailable."));
+            if (_settings.ReadOptions(receiver.Id).Hidden) throw new InvalidOperationException(L.Get("The receiver is unavailable."));
+            Notice = "";
             await Session.StartAsync(receiver, _settings.Clone());
+            _autoAttempted.Add(receiver.Id);
             _settings.LastReceiverId = receiver.Id;
             VolumeChanged();
         }
@@ -311,16 +325,43 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     }
     public async Task StopAsync(bool userInitiated = true)
     {
+        Session.InvalidateAutomaticIntent();
         if (userInitiated) _autoSuppressed = true;
         await Session.StopAsync();
     }
-    private void ScheduleAutoConnect() { _autoTimer.Stop(); if (!_closing) _autoTimer.Start(); }
-    private async Task TryAutoConnectAsync()
+    public Task PairAsync(Receiver receiver, Func<Receiver, CancellationToken, Task<string?>> requestPin)
     {
-        if (_closing || _autoSuppressed || Session.Snapshot.IsActive) return;
-        var eligible = AllReceivers.Where(r => r.Online && r.Complete && !_settings.ReadOptions(r.Id).Hidden && (_settings.ReadOptions(r.Id).AutoConnect ?? _settings.AutoConnectOnDiscover));
-        var receiver = eligible.OrderByDescending(r => r.Id == _settings.LastReceiverId).FirstOrDefault();
-        if (receiver is not null && !_autoAttempted.Contains(receiver.Id)) await ToggleAsync(receiver);
+        Session.InvalidateAutomaticIntent();
+        if (_closing) return Task.CompletedTask;
+        return Session.PairAsync(ResolvePlayback(receiver), _settings.Clone(), requestPin);
+    }
+    private Receiver ResolvePlayback(Receiver receiver) => ReceiverSelection.ResolvePlayback(receiver, AllReceivers)
+        ?? throw new InvalidOperationException(L.Get("The receiver selection is ambiguous."));
+    private void ScheduleAutoConnect() { _autoTimer.Stop(); if (!_closing && !_controlledScheduling) _autoTimer.Start(); }
+    internal async Task TryAutoConnectAsync()
+    {
+        var captured = Session.Capture();
+        if (_closing || _autoSuppressed || captured.Snapshot.IsActive) return;
+        var selected = ReceiverSelection.SelectAutoConnect(AllReceivers, _settings, _autoAttempted);
+        if (selected is null) return;
+        await FlushVolumeAsync();
+        if (BeforeAutomaticAdmission is { } beforeAdmission) await beforeAdmission();
+        await _settingsGate.WaitAsync();
+        try
+        {
+            if (_closing || _autoSuppressed) return;
+            var id = ReceiverMigrations.GetValueOrDefault(selected.Id, selected.Id);
+            id = ReceiverIdentity.Resolve(id, _settings.ReceiverAliases);
+            var receiver = AllReceivers.FirstOrDefault(r => r.Id == id);
+            if (receiver is null || !ReceiverSelection.IsAutoConnectEligible(receiver, _settings, _autoAttempted)) return;
+            // Keep catalog/options stable until serialized admission commits or rejects.
+            if (!await Session.TryStartAutomaticAsync(receiver, _settings.Clone(), captured.Owner, captured.AutomaticIntent)) return;
+            Notice = ""; _autoAttempted.Add(receiver.Id);
+            _settings.LastReceiverId = receiver.Id;
+            VolumeChanged();
+        }
+        finally { _settingsGate.Release(); }
+        await FlushVolumeAsync();
     }
     public DeviceVolumeState ReceiverVolume(string id) => _snapshot.Receiver?.Id == id &&
         _snapshot.State is PlaybackState.Streaming or PlaybackState.Standby ? _snapshot.DeviceVolume ?? new() : new();
@@ -335,7 +376,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         else await Session.SetDeviceVolumeAsync(id, 0);
     }
     public Task SetReceiverVolumeAsync(string id, int value) => Session.SetDeviceVolumeAsync(id, value);
-    private void VolumeChanged() { _editRevision++; _volumeDirty = true; _volumeTimer.Stop(); if (!_closing) _volumeTimer.Start(); }
+    private void VolumeChanged() { _editRevision++; _volumeDirty = true; _volumeTimer.Stop(); if (!_closing && !_controlledScheduling) _volumeTimer.Start(); }
     public async Task FlushVolumeAsync()
     {
         _volumeTimer.Stop();
@@ -352,7 +393,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             if (revision == _editRevision) _volumeDirty = false;
             await Session.UpdateSettingsAsync(current);
         }
-        finally { _settingsGate.Release(); if (saved && _volumeDirty && !_closing) { _volumeTimer.Stop(); _volumeTimer.Start(); } }
+        finally { _settingsGate.Release(); if (saved && _volumeDirty && !_closing && !_controlledScheduling) { _volumeTimer.Stop(); _volumeTimer.Start(); } }
     }
     public async Task<SettingsApplyResult> ApplyAsync(AppSettings baseline, AppSettings draft, Action<string>? progress = null)
     {
@@ -412,14 +453,14 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             ScheduleAutoConnect();
             return new(merged, audioError);
         }
-        finally { _settingsGate.Release(); if (_volumeDirty && !_closing) { _volumeTimer.Stop(); _volumeTimer.Start(); } }
+        finally { _settingsGate.Release(); if (_volumeDirty && !_closing && !_controlledScheduling) { _volumeTimer.Stop(); _volumeTimer.Start(); } }
     }
     public void ShowError(Exception error) { AppPaths.Log(error.ToString()); Notice = error.Message; }
     public string Diagnostics() => $"AirFlash {AppPaths.Version} / WPF\n" + L.Format("Engine: {0}\nStatus: {1}\n{2}\nLocal p95: {3}\nQueue age: {4}\nUnderruns: {5}; drops: {6}\nEnd-to-end latency: not measured", EngineVersion, StatusTitle, StatusDetail, MonitorLatency, MonitorQueue, MonitorUnderruns, MonitorDrops) + "\n" + System.Text.Json.JsonSerializer.Serialize(_snapshot.Diagnostics, AppSettings.JsonOptions);
     public ValueTask DisposeAsync() => new(_disposeTask ??= DisposeCoreAsync());
     private async Task DisposeCoreAsync()
     {
-        _closing = true; _volumeTimer.Stop(); _autoTimer.Stop(); _discovery.Dispose();
+        _closing = true; Session.InvalidateAutomaticIntent(); _volumeTimer.Stop(); _autoTimer.Stop(); _discovery.Dispose();
         await _startup;
         Endpoints.Dispose();
         try { await Endpoints.DrainAsync(); } catch (Exception error) { AppPaths.Log(error.ToString()); }
@@ -465,7 +506,9 @@ public sealed class ReceiverViewModel : ObservableObject
     public bool CanPlay => Active || Receiver.Online && Receiver.Complete;
     public string PlayGlyph => Active ? "■" : "▶";
     public string PlayHint => Active ? L.Get("Stop playback / disconnect") : L.Get("Play on this device");
-    public string StateText => (Active ? _app.StatusTitle : !Receiver.Online ? L.Get("Offline") : !Receiver.Complete ? L.Get("Waiting for the other member") : L.Get("Disconnected")) + (Receiver.IsGroup ? $" · {Receiver.Members.Length}/2" : "");
+    public string StateText => (Active ? _app.StatusTitle : !Receiver.Online ? L.Get("Offline") : !Receiver.Complete ? L.Get("Waiting for the other member") : L.Get("Disconnected"))
+        + (Receiver.IsGroup ? $" · {Receiver.Members.Length}/2" : "")
+        + (Active && (!Receiver.Online || !Receiver.Complete) ? " · " + L.Get("Discovery unavailable") : "");
     public AsyncCommand ToggleCommand { get; }
     public AsyncCommand MuteCommand { get; }
     public void Refresh()
