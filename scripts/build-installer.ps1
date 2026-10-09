@@ -24,6 +24,11 @@ if ($fileVersion.FileMajorPart -gt 255 -or $fileVersion.FileMinorPart -gt 255 -o
     throw 'Application file version exceeds MSI version limits.'
 }
 
+. (Join-Path $PSScriptRoot 'dotnet-common.ps1')
+# Explicit overrides and default selection both adopt the desktop SDK resolver policy.
+$dotnetContext = Get-AirFlashDotnetContext -RepoRoot $repoRoot -DotnetPath $DotnetPath
+$null = Assert-AirFlashDotnetSdk -Context $dotnetContext
+
 New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 $outputWithSlash = $outputRoot.TrimEnd('\') + '\'
 $arguments = @(
@@ -36,12 +41,7 @@ $arguments = @(
     '-p:DebugType=none'
 )
 
-if ($DotnetPath) {
-    & (Resolve-RepoPath $DotnetPath) build (Join-Path $repoRoot 'installer/AirFlash.Package.wixproj') @arguments
-}
-else {
-    & (Join-Path $PSScriptRoot 'dotnet.ps1') build (Join-Path $repoRoot 'installer/AirFlash.Package.wixproj') @arguments
-}
+Invoke-AirFlashDotnet -Context $dotnetContext -Arguments (@('build', (Join-Path $repoRoot 'installer/AirFlash.Package.wixproj')) + $arguments)
 if ($LASTEXITCODE -ne 0) { throw 'MSI build failed.' }
 
 $msi = Join-Path $outputRoot "AirFlash-$productVersion.msi"
