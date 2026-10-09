@@ -430,6 +430,8 @@ public sealed class SessionLifecycleTests
             Assert.True(connection.Disposed);
             Assert.Equal(1, factory.OpenCount);
             Assert.NotEqual("b", controller.Snapshot.Receiver?.Id);
+            Assert.Same(captured.Snapshot, controller.Snapshot);
+            Assert.Equal(PlaybackState.Error, controller.Snapshot.State);
             Assert.Equal("peer_closed", controller.Snapshot.Diagnostics!.LastFault!.Code);
         }
         finally
@@ -439,6 +441,518 @@ public sealed class SessionLifecycleTests
             if (automatic is not null) await automatic.WaitAsync(Deadline);
         }
     }
+
+    [Theory]
+    [InlineData("pair")]
+    [InlineData("stop")]
+    public async Task NewExplicitIntentDuringRetargetCleanupPreventsSupersededRestart(string action)
+    {
+        var first = new Connection(); var replacement = new Connection(); var factory = new Factory(first, replacement); var audio = new Audio();
+        await using var controller = new SessionController(factory, audio, timing: Timing);
+        await StartStreamingAsync(controller, first, Pod());
+        var captured = controller.Capture(); var gate = audio.PauseNextRestore();
+        var obsolete = Pod() with { Address = "192.0.2.30" };
+        var obsoletePublished = false;
+        void Observe(SessionSnapshot snapshot)
+        {
+            if (snapshot.IsActive && snapshot.Receiver?.Address == obsolete.Address) obsoletePublished = true;
+        }
+        controller.Changed += Observe;
+        Task<bool>? retarget = null; Task? explicitAction = null;
+        try
+        {
+            retarget = controller.TryUpdateReceiverAsync(obsolete, Settings(), captured.Owner);
+            await gate.Entered.Task.WaitAsync(Deadline);
+            explicitAction = action == "pair" ? controller.PairAsync(Pod("b"), Settings(), (_, _) => Task.FromResult<string?>(null)) : controller.StopAsync();
+            Assert.False(explicitAction.IsCompleted);
+            Assert.NotEqual(captured.AutomaticIntent, controller.Capture().AutomaticIntent);
+            gate.Release.TrySetResult();
+            var admitted = await retarget.WaitAsync(Deadline); await explicitAction.WaitAsync(Deadline);
+            Assert.False(admitted);
+            Assert.False(obsoletePublished);
+            Assert.Equal(action == "pair" ? PlaybackState.Pairing : PlaybackState.Idle, controller.Snapshot.State);
+            Assert.Equal(action == "pair" ? "b" : null, controller.Snapshot.Receiver?.Id);
+        }
+        finally
+        {
+            controller.Changed -= Observe; gate.Release.TrySetResult();
+            if (retarget is not null) await retarget.WaitAsync(Deadline);
+            if (explicitAction is not null) await explicitAction.WaitAsync(Deadline);
+        }
+    }
+
+    [Theory]
+    [InlineData("pair")]
+    [InlineData("stop")]
+    public async Task NewExplicitIntentDuringSettingsCleanupPreventsSupersededRestart(string action)
+    {
+        var first = new Connection(); var replacement = new Connection(); var factory = new Factory(first, replacement); var audio = new Audio();
+        await using var controller = new SessionController(factory, audio, timing: Timing);
+        await StartStreamingAsync(controller, first, Pod());
+        var captured = controller.Capture(); var gate = audio.PauseNextRestore();
+        var settings = Settings(); settings.LatencyMode = "buffered"; settings.StreamSampleRate = "48000";
+        var obsoletePublished = false;
+        void Observe(SessionSnapshot snapshot)
+        {
+            if (snapshot.IsActive && snapshot.Receiver?.Id == "a" && snapshot.TargetLatency == 500) obsoletePublished = true;
+        }
+        controller.Changed += Observe;
+        Task? update = null; Task? explicitAction = null;
+        try
+        {
+            update = controller.UpdateSettingsAsync(settings);
+            await gate.Entered.Task.WaitAsync(Deadline);
+            explicitAction = action == "pair" ? controller.PairAsync(Pod("b"), Settings(), (_, _) => Task.FromResult<string?>(null)) : controller.StopAsync();
+            Assert.False(explicitAction.IsCompleted);
+            Assert.NotEqual(captured.AutomaticIntent, controller.Capture().AutomaticIntent);
+            gate.Release.TrySetResult();
+            await update.WaitAsync(Deadline); await explicitAction.WaitAsync(Deadline);
+            Assert.False(obsoletePublished);
+            Assert.Equal(action == "pair" ? PlaybackState.Pairing : PlaybackState.Idle, controller.Snapshot.State);
+            Assert.Equal(action == "pair" ? "b" : null, controller.Snapshot.Receiver?.Id);
+            if (action == "stop") Assert.Equal(48000, controller.Snapshot.StreamRate);
+        }
+        finally
+        {
+            controller.Changed -= Observe; gate.Release.TrySetResult();
+            if (update is not null) await update.WaitAsync(Deadline);
+            if (explicitAction is not null) await explicitAction.WaitAsync(Deadline);
+        }
+    }
+
+    [Theory]
+    [InlineData(PlaybackState.Connecting, true)]
+    [InlineData(PlaybackState.Streaming, true)]
+    [InlineData(PlaybackState.Standby, true)]
+    [InlineData(PlaybackState.Pairing, false)]
+    [InlineData(PlaybackState.Error, false)]
+    [InlineData(PlaybackState.Idle, false)]
+    public async Task EndpointRestartAdmitsOnlyOwnedActiveNonPairingState(PlaybackState state, bool admitted)
+    {
+        var first = new Connection { AutoStreaming = state is not PlaybackState.Connecting };
+        var second = new Connection(); var factory = new Factory(first, second); var audio = new Audio();
+        await using var controller = new SessionController(factory, audio, timing: Timing);
+        var settings = Settings(); settings.StandbyEnabled = state == PlaybackState.Standby;
+        if (state == PlaybackState.Pairing)
+        {
+            await controller.PairAsync(Pod(), settings, (_, _) => Task.FromResult<string?>(null));
+            await first.PairSent.Task.WaitAsync(Deadline);
+        }
+        else if (state != PlaybackState.Idle)
+        {
+            await controller.StartAsync(Pod(), settings); await first.Started.Task.WaitAsync(Deadline);
+            if (state == PlaybackState.Standby)
+            {
+                await SnapshotAsync(controller, snapshot => snapshot.State == PlaybackState.Streaming);
+                first.Emit(new { @event = "capture_metrics", metrics = new { last_audio_qpc_ns = 1 } });
+            }
+            else if (state == PlaybackState.Error)
+            {
+                await SnapshotAsync(controller, snapshot => snapshot.State == PlaybackState.Streaming);
+                first.Emit(new { @event = "error", message = "scripted endpoint precondition", retryable = false });
+            }
+        }
+        await SnapshotAsync(controller, snapshot => snapshot.State == state);
+        var captured = controller.Capture(); var restores = audio.RestoreCount;
+
+        Assert.Equal(admitted, await controller.TryRestartForEndpointAsync(settings, captured.Owner, captured.AutomaticIntent));
+
+        if (admitted)
+        {
+            await second.Started.Task.WaitAsync(Deadline);
+            Assert.Equal(2, factory.OpenCount); Assert.True(first.Disposed);
+            Assert.NotEqual(captured.Owner, controller.Capture().Owner);
+            Assert.Equal(captured.AutomaticIntent, controller.Capture().AutomaticIntent);
+            Assert.Equal("a", controller.Snapshot.Receiver!.Id);
+        }
+        else
+        {
+            Assert.Same(captured.Snapshot, controller.Snapshot);
+            Assert.Equal(state == PlaybackState.Idle ? 0 : 1, factory.OpenCount);
+            if (state != PlaybackState.Error) Assert.Equal(restores, audio.RestoreCount);
+        }
+    }
+
+    [Fact]
+    public async Task EndpointRestartUsesCurrentOwnedIdentityAfterSameOwnerPromotion()
+    {
+        var first = new Connection(); var second = new Connection(); var factory = new Factory(first, second);
+        await using var controller = new SessionController(factory, new Audio(), timing: Timing);
+        await StartStreamingAsync(controller, first, Pod("old"));
+        var captured = controller.Capture();
+        var promoted = Pod("new") with { Name = "Promoted owner" };
+        Assert.True(await controller.TryUpdateReceiverAsync(promoted, Settings(), captured.Owner, captured.AutomaticIntent));
+        Assert.Equal(captured.Owner, controller.Capture().Owner);
+
+        Assert.True(await controller.TryRestartForEndpointAsync(Settings(), captured.Owner, captured.AutomaticIntent));
+        await second.Started.Task.WaitAsync(Deadline);
+
+        Assert.Equal(promoted, controller.Snapshot.Receiver);
+        Assert.Equal(2, factory.OpenCount); Assert.True(first.Disposed);
+        Assert.Equal("192.0.2.10", second.Commands.Single(command => command.Name == "start").Parameters.GetProperty("peers")[0].Text("host"));
+    }
+
+    [Fact]
+    public async Task PassiveEndpointAndRetargetCallsRejectOldIntentWithoutOwnerChange()
+    {
+        var connection = new Connection(); var factory = new Factory(connection); var audio = new Audio();
+        await using var controller = new SessionController(factory, audio, timing: Timing);
+        await StartStreamingAsync(controller, connection, Pod());
+        var captured = controller.Capture(); var restores = audio.RestoreCount;
+        controller.InvalidateAutomaticIntent();
+
+        Assert.False(await controller.TryRestartForEndpointAsync(Settings(), captured.Owner, captured.AutomaticIntent));
+        Assert.False(await controller.TryRestoreAudioIfInactiveAsync(captured.Owner, captured.AutomaticIntent));
+        Assert.False(await controller.TryUpdateReceiverAsync(Pod() with { Name = "Obsolete metadata" }, Settings(), captured.Owner, captured.AutomaticIntent));
+
+        Assert.Same(captured.Snapshot, controller.Snapshot); Assert.Equal(captured.Owner, controller.Capture().Owner);
+        Assert.Equal(1, factory.OpenCount); Assert.Equal(restores, audio.RestoreCount); Assert.False(connection.Disposed);
+    }
+
+    [Fact]
+    public async Task PassiveEndpointCallsCannotTouchSameIdReplacementOwner()
+    {
+        var first = new Connection(); var second = new Connection(); var factory = new Factory(first, second); var audio = new Audio();
+        await using var controller = new SessionController(factory, audio, timing: Timing);
+        await StartStreamingAsync(controller, first, Pod()); var captured = controller.Capture();
+        await StartStreamingAsync(controller, second, Pod() with { Address = "192.0.2.20" });
+        var current = controller.Capture(); var restores = audio.RestoreCount;
+
+        Assert.False(await controller.TryRestartForEndpointAsync(Settings(), captured.Owner, current.AutomaticIntent));
+        Assert.False(await controller.TryRestoreAudioIfInactiveAsync(captured.Owner, current.AutomaticIntent));
+
+        Assert.Same(current.Snapshot, controller.Snapshot); Assert.Equal(2, factory.OpenCount);
+        Assert.Equal(restores, audio.RestoreCount); Assert.False(second.Disposed);
+    }
+
+    [Theory]
+    [InlineData("pair")]
+    [InlineData("stop")]
+    public async Task NewExplicitIntentDuringEndpointCleanupPreventsSupersededRestart(string action)
+    {
+        var first = new Connection(); var replacement = new Connection(); var factory = new Factory(first, replacement); var audio = new Audio();
+        await using var controller = new SessionController(factory, audio, timing: Timing);
+        await StartStreamingAsync(controller, first, Pod());
+        var captured = controller.Capture(); var gate = audio.PauseNextRestore(); var obsoletePublished = false;
+        void Observe(SessionSnapshot snapshot)
+        {
+            if (snapshot.IsActive && snapshot.Receiver?.Id == "a" && controller.Capture().Owner != captured.Owner) obsoletePublished = true;
+        }
+        controller.Changed += Observe; Task<bool>? endpoint = null; Task? explicitAction = null;
+        try
+        {
+            endpoint = controller.TryRestartForEndpointAsync(Settings(), captured.Owner, captured.AutomaticIntent);
+            await gate.Entered.Task.WaitAsync(Deadline);
+            explicitAction = action == "pair" ? controller.PairAsync(Pod("b"), Settings(), (_, _) => Task.FromResult<string?>(null)) : controller.StopAsync();
+            Assert.False(explicitAction.IsCompleted); gate.Release.TrySetResult();
+
+            Assert.False(await endpoint.WaitAsync(Deadline)); await explicitAction.WaitAsync(Deadline);
+
+            Assert.False(obsoletePublished);
+            Assert.Equal(action == "pair" ? PlaybackState.Pairing : PlaybackState.Idle, controller.Snapshot.State);
+            Assert.Equal(action == "pair" ? "b" : null, controller.Snapshot.Receiver?.Id);
+        }
+        finally
+        {
+            controller.Changed -= Observe; gate.Release.TrySetResult();
+            if (endpoint is not null) await endpoint.WaitAsync(Deadline);
+            if (explicitAction is not null) await explicitAction.WaitAsync(Deadline);
+        }
+    }
+
+    [Fact]
+    public async Task InactiveEndpointRestoreSerializesBeforeNewOwnerCanMute()
+    {
+        var connection = new Connection(); var factory = new Factory(connection); var audio = new Audio();
+        await using var controller = new SessionController(factory, audio, timing: Timing);
+        await audio.MuteAsync("fake-endpoint");
+        var captured = controller.Capture(); var gate = audio.PauseNextRestore();
+        Task<bool>? restore = null; Task? start = null;
+        try
+        {
+            restore = controller.TryRestoreAudioIfInactiveAsync(captured.Owner, captured.AutomaticIntent);
+            await gate.Entered.Task.WaitAsync(Deadline);
+            var settings = Settings(); settings.MuteWhileStreaming = true;
+            start = controller.StartAsync(Pod("b"), settings);
+            Assert.False(start.IsCompleted); Assert.Equal(0, factory.OpenCount); Assert.Equal(captured.Owner, controller.Capture().Owner);
+            gate.Release.TrySetResult(); Assert.True(await restore.WaitAsync(Deadline)); await start.WaitAsync(Deadline);
+            await connection.Started.Task.WaitAsync(Deadline); await SnapshotAsync(controller, snapshot => snapshot.State == PlaybackState.Streaming);
+            Assert.True(audio.Muted); Assert.Equal("b", controller.Snapshot.Receiver!.Id);
+            await controller.StopAsync(); Assert.False(audio.Muted);
+        }
+        finally
+        {
+            gate.Release.TrySetResult();
+            if (restore is not null) await restore.WaitAsync(Deadline);
+            if (start is not null) await start.WaitAsync(Deadline);
+        }
+    }
+
+    [Fact]
+    public async Task InactiveEndpointRestorePropagatesFailureAndAllowsRecoveryRetry()
+    {
+        var audio = new Audio(); await using var controller = new SessionController(new Factory(), audio, timing: Timing);
+        await audio.MuteAsync("fake-endpoint"); var captured = controller.Capture(); audio.FailRestore = true;
+
+        await Assert.ThrowsAsync<IOException>(() => controller.TryRestoreAudioIfInactiveAsync(captured.Owner, captured.AutomaticIntent));
+
+        Assert.True(audio.Muted); Assert.Equal(captured.Owner, controller.Capture().Owner);
+        audio.FailRestore = false;
+        Assert.True(await controller.TryRestoreAudioIfInactiveAsync(captured.Owner, captured.AutomaticIntent));
+        Assert.False(audio.Muted); Assert.Equal(2, audio.RestoreCount);
+    }
+
+    [Fact]
+    public async Task EndpointRestoreRejectsInactiveSnapshotWhileWorkerCleanupIsUnsettled()
+    {
+        var first = new Connection(); var audio = new Audio();
+        await using var controller = new SessionController(new Factory(first), audio, timing: Timing);
+        await StartStreamingAsync(controller, first, Pod());
+        var gate = audio.PauseNextRestore();
+        try
+        {
+            var error = SnapshotAsync(controller, snapshot => snapshot.State == PlaybackState.Error);
+            first.Emit(new { @event = "error", message = "scripted terminal failure", retryable = false });
+            await gate.Entered.Task.WaitAsync(Deadline);
+            // RunStream restores before publishing Error; release that first restore and hold the worker's final restore.
+            var final = audio.PauseNextRestore(); gate.Release.TrySetResult(); await error;
+            try
+            {
+                await final.Entered.Task.WaitAsync(Deadline); var captured = controller.Capture(); var restores = audio.RestoreCount;
+                Assert.False(await controller.TryRestoreAudioIfInactiveAsync(captured.Owner, captured.AutomaticIntent));
+                Assert.Equal(restores, audio.RestoreCount); Assert.Equal(PlaybackState.Error, controller.Snapshot.State);
+            }
+            finally { final.Release.TrySetResult(); }
+        }
+        finally { gate.Release.TrySetResult(); }
+    }
+
+    [Theory]
+    [InlineData("endpoint", "invalidate")]
+    [InlineData("retarget", "invalidate")]
+    [InlineData("settings", "invalidate")]
+    [InlineData("endpoint", "offline start")]
+    [InlineData("retarget", "offline start")]
+    [InlineData("settings", "offline start")]
+    [InlineData("endpoint", "incomplete pair")]
+    [InlineData("retarget", "incomplete pair")]
+    [InlineData("settings", "incomplete pair")]
+    public async Task InvalidatedCleanupWithoutReplacementPublishesTruthfulIdle(string operation, string rejection)
+    {
+        var connection = new Connection(); var factory = new Factory(connection); var audio = new Audio();
+        await using var controller = new SessionController(factory, audio, timing: Timing);
+        await StartStreamingAsync(controller, connection, Pod());
+        var captured = controller.Capture(); var gate = audio.PauseNextRestore();
+        var settings = Settings(); settings.StreamSampleRate = "48000";
+        Task? cleanup = null;
+        try
+        {
+            cleanup = operation switch
+            {
+                "endpoint" => controller.TryRestartForEndpointAsync(settings, captured.Owner, captured.AutomaticIntent),
+                "retarget" => controller.TryUpdateReceiverAsync(Pod() with { Address = "192.0.2.30" }, settings, captured.Owner, captured.AutomaticIntent),
+                _ => controller.UpdateSettingsAsync(settings)
+            };
+            await gate.Entered.Task.WaitAsync(Deadline);
+            if (rejection == "offline start")
+                await Assert.ThrowsAsync<InvalidOperationException>(() => controller.StartAsync(Pod("rejected") with { Online = false }, Settings()));
+            else if (rejection == "incomplete pair")
+                await Assert.ThrowsAsync<InvalidOperationException>(() => controller.PairAsync(Pod("stereo:rejected") with { Members = [Pod()] }, Settings(), (_, _) => Task.FromResult<string?>(null)));
+            else controller.InvalidateAutomaticIntent();
+            gate.Release.TrySetResult(); await cleanup.WaitAsync(Deadline);
+
+            Assert.False(controller.Snapshot.IsActive);
+            Assert.Equal(PlaybackState.Idle, controller.Snapshot.State); Assert.Null(controller.Snapshot.Receiver);
+            Assert.True(connection.Disposed); Assert.Equal(1, factory.OpenCount);
+            Assert.Equal(operation == "settings" ? 48000 : 44100, controller.Snapshot.StreamRate);
+        }
+        finally { gate.Release.TrySetResult(); if (cleanup is not null) await cleanup.WaitAsync(Deadline); }
+    }
+
+    [Fact]
+    public async Task EndpointReturnDuringLastWorkerRestoreSchedulesOneRecoveryAfterCompletion()
+    {
+        var connection = new Connection(); var factory = new Factory(connection); var audio = new Audio();
+        SessionController? controller = null;
+        var notification = NewSignal(); TaskCompletionSource? recovered = null;
+        var failureRestoreCount = 0; var deferredCalls = new List<Task<bool>>();
+        void Log(string message)
+        {
+            if (!message.StartsWith("Failed to restore local mute state:", StringComparison.Ordinal) || controller!.Snapshot.State != PlaybackState.Error) return;
+            audio.FailRestore = false; recovered = audio.ObserveNextRestore(); failureRestoreCount = audio.RestoreCount;
+            var captured = controller.Capture();
+            for (var i = 0; i < 10; i++) deferredCalls.Add(controller.TryRestoreAudioIfInactiveAsync(captured.Owner, captured.AutomaticIntent));
+            notification.TrySetResult();
+        }
+        controller = new SessionController(factory, audio, Log, Timing);
+        await using (controller)
+        {
+            var settings = Settings(); settings.MuteWhileStreaming = true;
+            await StartStreamingAsync(controller, connection, Pod(), settings); audio.FailRestore = true;
+            connection.Emit(new { @event = "error", message = "scripted endpoint unavailable", retryable = false });
+            await notification.Task.WaitAsync(Deadline);
+            Assert.All(deferredCalls, task => Assert.True(task.IsCompletedSuccessfully && !task.Result));
+            Assert.NotNull(recovered); await recovered.Task.WaitAsync(Deadline);
+            Assert.Equal(failureRestoreCount + 1, audio.RestoreCount); Assert.False(audio.Muted);
+            Assert.Equal(1, factory.OpenCount); Assert.Equal(PlaybackState.Error, controller.Snapshot.State);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DeferredEndpointRestoreRejectsSupersededIntentOrOwner(bool replaceOwner)
+    {
+        var first = new Connection(); var second = new Connection(); var factory = new Factory(first, second); var audio = new Audio();
+        await using var controller = new SessionController(factory, audio, timing: Timing);
+        var final = await HoldFinalRestoreAsync(controller, first, audio);
+        Task? replacement = null;
+        try
+        {
+            var captured = controller.Capture();
+            Assert.False(await controller.TryRestoreAudioIfInactiveAsync(captured.Owner, captured.AutomaticIntent));
+            var consumer = DeferredRecovery(controller); var restores = audio.RestoreCount;
+            if (replaceOwner) replacement = controller.StartAsync(Pod("b"), Settings());
+            else controller.InvalidateAutomaticIntent();
+            final.Release.TrySetResult(); await consumer.WaitAsync(Deadline);
+            if (replacement is not null)
+            {
+                await replacement.WaitAsync(Deadline); await second.Started.Task.WaitAsync(Deadline);
+                Assert.Equal(restores + 1, audio.RestoreCount); Assert.Equal(2, factory.OpenCount);
+            }
+            else { Assert.Equal(restores, audio.RestoreCount); Assert.Equal(1, factory.OpenCount); }
+        }
+        finally { final.Release.TrySetResult(); if (replacement is not null) await replacement.WaitAsync(Deadline); }
+    }
+
+    [Fact]
+    public async Task FreshEndpointIntentReplacesStaleRecoveryForTheSameWorker()
+    {
+        var connection = new Connection(); var audio = new Audio();
+        await using var controller = new SessionController(new Factory(connection), audio, timing: Timing);
+        var final = await HoldFinalRestoreAsync(controller, connection, audio);
+        try
+        {
+            var old = controller.Capture();
+            Assert.False(await controller.TryRestoreAudioIfInactiveAsync(old.Owner, old.AutomaticIntent));
+            var consumer = DeferredRecovery(controller);
+            await Assert.ThrowsAsync<InvalidOperationException>(() => controller.StartAsync(Pod("rejected") with { Online = false }, Settings()));
+            var current = controller.Capture(); var restores = audio.RestoreCount;
+            Assert.Equal(old.Owner, current.Owner); Assert.NotEqual(old.AutomaticIntent, current.AutomaticIntent);
+            for (var i = 0; i < 10; ++i)
+                Assert.False(await controller.TryRestoreAudioIfInactiveAsync(current.Owner, current.AutomaticIntent));
+            final.Release.TrySetResult(); await consumer.WaitAsync(Deadline);
+            Assert.Equal(restores + 1, audio.RestoreCount); Assert.Equal(PlaybackState.Error, controller.Snapshot.State);
+        }
+        finally { final.Release.TrySetResult(); }
+    }
+
+    [Fact]
+    public async Task DeferredEndpointFailureIsObservableAndDoesNotFaultItsConsumer()
+    {
+        var connection = new Connection(); var audio = new Audio();
+        await using var controller = new SessionController(new Factory(connection), audio, timing: Timing);
+        var final = await HoldFinalRestoreAsync(controller, connection, audio);
+        var failure = new TaskCompletionSource<Exception>(TaskCreationOptions.RunContinuationsAsynchronously);
+        controller.EndpointRecoveryFailed += error => failure.TrySetResult(error);
+        try
+        {
+            var captured = controller.Capture(); audio.FailRestore = true; var restores = audio.RestoreCount;
+            Assert.False(await controller.TryRestoreAudioIfInactiveAsync(captured.Owner, captured.AutomaticIntent));
+            var consumer = DeferredRecovery(controller); final.Release.TrySetResult();
+            Assert.IsType<IOException>(await failure.Task.WaitAsync(Deadline)); await consumer.WaitAsync(Deadline);
+            Assert.Equal(restores + 1, audio.RestoreCount); Assert.Equal(captured.Owner, controller.Capture().Owner);
+            audio.FailRestore = false;
+            Assert.True(await controller.TryRestoreAudioIfInactiveAsync(captured.Owner, captured.AutomaticIntent));
+        }
+        finally { audio.FailRestore = false; final.Release.TrySetResult(); }
+    }
+
+    [Fact]
+    public async Task DeferredEndpointRecoveryDoesNotHoldSerializationWhileNativeRetryRuns()
+    {
+        var connection = new Connection(); var factory = new Factory(connection); var audio = new Audio();
+        await using var controller = new SessionController(factory, audio, timing: Timing with { Retry = TimeSpan.FromMinutes(1) });
+        var settings = Settings(); settings.ForceReconnect = true;
+        await StartStreamingAsync(controller, connection, Pod(), settings);
+        var queued = NewSignal(); Task<bool>? passive = null;
+        void QueueOnError(SessionSnapshot snapshot)
+        {
+            if (snapshot.State != PlaybackState.Error) return;
+            var captured = controller.Capture(); passive = controller.TryRestoreAudioIfInactiveAsync(captured.Owner, captured.AutomaticIntent); queued.TrySetResult();
+        }
+        controller.Changed += QueueOnError;
+        try
+        {
+            var restores = audio.RestoreCount;
+            connection.Emit(new { @event = "error", message = "synthetic retry", retryable = true });
+            await queued.Task.WaitAsync(Deadline);
+            Assert.NotNull(passive); Assert.False(await passive.WaitAsync(Deadline));
+            var consumer = DeferredRecovery(controller);
+            await SnapshotAsync(controller, snapshot => snapshot.State == PlaybackState.Connecting && snapshot.Message.Contains("reconnecting", StringComparison.OrdinalIgnoreCase));
+            await controller.StopAsync().WaitAsync(Deadline); await consumer.WaitAsync(Deadline);
+            Assert.Equal(restores + 3, audio.RestoreCount); Assert.Equal(1, factory.OpenCount); Assert.Equal(PlaybackState.Idle, controller.Snapshot.State);
+        }
+        finally { controller.Changed -= QueueOnError; }
+    }
+
+    [Fact]
+    public async Task DisposeDrainsQueuedEndpointRecoveryBeforeDisposingSerialization()
+    {
+        var connection = new Connection(); var audio = new Audio(); var factory = new Factory(connection);
+        var controller = new SessionController(factory, audio, timing: Timing);
+        var final = await HoldFinalRestoreAsync(controller, connection, audio);
+        Task? disposal = null;
+        try
+        {
+            var captured = controller.Capture(); var restores = audio.RestoreCount;
+            Assert.False(await controller.TryRestoreAudioIfInactiveAsync(captured.Owner, captured.AutomaticIntent));
+            var consumer = DeferredRecovery(controller); disposal = controller.DisposeAsync().AsTask();
+            Assert.False(disposal.IsCompleted);
+            Assert.False(await controller.TryRestoreAudioIfInactiveAsync(captured.Owner, captured.AutomaticIntent));
+            final.Release.TrySetResult(); await disposal.WaitAsync(Deadline); await consumer.WaitAsync(Deadline);
+            Assert.Equal(restores + 1, audio.RestoreCount); Assert.Equal(1, factory.OpenCount);
+            Assert.False(await controller.TryRestoreAudioIfInactiveAsync(captured.Owner, captured.AutomaticIntent));
+        }
+        finally { final.Release.TrySetResult(); if (disposal is null) await controller.DisposeAsync(); else await disposal.WaitAsync(Deadline); }
+    }
+
+    [Fact]
+    public async Task DisposeWaitsForAlreadyAdmittedDeferredRestore()
+    {
+        var connection = new Connection(); var audio = new Audio(); var controller = new SessionController(new Factory(connection), audio, timing: Timing);
+        var final = await HoldFinalRestoreAsync(controller, connection, audio); var recovery = audio.PauseNextRestore(); Task? disposal = null;
+        try
+        {
+            var captured = controller.Capture();
+            Assert.False(await controller.TryRestoreAudioIfInactiveAsync(captured.Owner, captured.AutomaticIntent));
+            var consumer = DeferredRecovery(controller); final.Release.TrySetResult(); await recovery.Entered.Task.WaitAsync(Deadline);
+            disposal = controller.DisposeAsync().AsTask(); Assert.False(disposal.IsCompleted);
+            recovery.Release.TrySetResult(); await disposal.WaitAsync(Deadline); await consumer.WaitAsync(Deadline);
+            Assert.Equal(PlaybackState.Idle, controller.Snapshot.State);
+        }
+        finally
+        {
+            final.Release.TrySetResult(); recovery.Release.TrySetResult();
+            if (disposal is null) await controller.DisposeAsync(); else await disposal.WaitAsync(Deadline);
+        }
+    }
+
+    private static async Task<Gate> HoldFinalRestoreAsync(SessionController controller, Connection connection, Audio audio)
+    {
+        await StartStreamingAsync(controller, connection, Pod());
+        var first = audio.PauseNextRestore();
+        try
+        {
+            connection.Emit(new { @event = "error", message = "synthetic terminal failure", retryable = false });
+            await first.Entered.Task.WaitAsync(Deadline);
+            var final = audio.PauseNextRestore(); first.Release.TrySetResult(); await final.Entered.Task.WaitAsync(Deadline);
+            Assert.Equal(PlaybackState.Error, controller.Snapshot.State); return final;
+        }
+        finally { first.Release.TrySetResult(); }
+    }
+    private static Task DeferredRecovery(SessionController controller)
+        => (Task)typeof(SessionController).GetField("_endpointRecoveryTask", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.GetValue(controller)!;
 
     [Theory]
     [InlineData(false)]
@@ -560,6 +1074,9 @@ public sealed class SessionLifecycleTests
         private int _restoreCount;
         public bool Muted { get { lock (_sync) return _muted; } }
         public int RestoreCount => Volatile.Read(ref _restoreCount);
+        public bool FailRestore { get; set; }
+        private TaskCompletionSource? _observedRestore;
+        public TaskCompletionSource ObserveNextRestore() => _observedRestore = NewSignal();
         public event Action? EndpointsChanged { add { } remove { } }
         public Task<string?> GetDefaultEndpointIdAsync() => Task.FromResult<string?>("fake-endpoint");
         public Task<IReadOnlyList<AudioEndpoint>> GetEndpointsAsync() => Task.FromResult<IReadOnlyList<AudioEndpoint>>([]);
@@ -580,11 +1097,13 @@ public sealed class SessionLifecycleTests
                 gate.Entered.TrySetResult();
                 await gate.Release.Task;
             }
+            if (FailRestore) throw new IOException("synthetic endpoint restore failure");
             lock (_sync)
             {
                 if (_savedMute is not { } original) return;
                 _muted = original; _savedMute = null;
             }
+            _observedRestore?.TrySetResult();
         }
     }
 }

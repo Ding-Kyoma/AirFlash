@@ -30,6 +30,11 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private long _generation;
     private long _automaticIntent;
     private bool _muted;
+    private sealed record EndpointRecovery(Task Worker, long Owner, long Intent);
+    private EndpointRecovery? _pendingEndpointRecovery, _activeEndpointRecovery;
+    private Task? _endpointRecoveryTask;
+    private bool _passiveDisposed;
+    public event Action<Exception>? EndpointRecoveryFailed;
     private readonly SemaphoreSlim _equalizerWriter = new(1, 1);
     private EqualizerSettings? _equalizerPreview;
     private Guid? _equalizerOwner;
@@ -208,6 +213,84 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         }
         finally { _serial.Release(); }
     }
+    public async Task<bool> TryRestartForEndpointAsync(AppSettings settings, long expectedOwner, long expectedIntent)
+    {
+        await _serial.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            Receiver receiver;
+            lock (_sync)
+            {
+                if (_generation != expectedOwner || _automaticIntent != expectedIntent || !_snapshot.IsActive
+                    || _snapshot.State == PlaybackState.Pairing || _receiver is null) return false;
+                receiver = _receiver;
+            }
+            return await StartLockedAsync(receiver, settings, null, expectedIntent).ConfigureAwait(false);
+        }
+        finally { _serial.Release(); }
+    }
+    public async Task<bool> TryRestoreAudioIfInactiveAsync(long expectedOwner, long expectedIntent)
+    {
+        lock (_sync) { if (_passiveDisposed) return false; }
+        await _serial.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            lock (_sync)
+            {
+                if (_passiveDisposed || _generation != expectedOwner || _automaticIntent != expectedIntent || _snapshot.IsActive) return false;
+                if (_work is { IsCompleted: false } worker)
+                {
+                    // The last worker restore may have failed just before its task settles. Keep one
+                    // endpoint-return notification without competing with that worker or a retry.
+                    if (!MatchesRecovery(_activeEndpointRecovery, worker, expectedOwner, expectedIntent)
+                        && !MatchesRecovery(_pendingEndpointRecovery, worker, expectedOwner, expectedIntent))
+                        _pendingEndpointRecovery = new(worker, expectedOwner, expectedIntent);
+                    _endpointRecoveryTask ??= Task.Run(RecoverEndpointAfterWorkerAsync);
+                    return false;
+                }
+            }
+            // A new owner cannot commit while an inactive endpoint-recovery restore is awaited.
+            await audio.RestoreAsync().ConfigureAwait(false);
+            return true;
+        }
+        finally { _serial.Release(); }
+    }
+    private static bool MatchesRecovery(EndpointRecovery? recovery, Task worker, long owner, long intent)
+        => recovery is not null && ReferenceEquals(recovery.Worker, worker) && recovery.Owner == owner && recovery.Intent == intent;
+    private async Task RecoverEndpointAfterWorkerAsync()
+    {
+        while (true)
+        {
+            EndpointRecovery recovery;
+            lock (_sync)
+            {
+                if (_passiveDisposed || _pendingEndpointRecovery is not { } pending)
+                {
+                    _activeEndpointRecovery = null; _endpointRecoveryTask = null; return;
+                }
+                recovery = pending; _pendingEndpointRecovery = null; _activeEndpointRecovery = recovery;
+            }
+            // Never await an unsettled worker under _serial: its retry can run until Stop cancels it.
+            try { await recovery.Worker.ConfigureAwait(false); }
+            catch (Exception error) { log?.Invoke(error.ToString()); }
+            Exception? failure = null;
+            await _serial.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                lock (_sync)
+                    if (_passiveDisposed || _generation != recovery.Owner || _automaticIntent != recovery.Intent
+                        || _snapshot.IsActive || _work is { IsCompleted: false }) continue;
+                await audio.RestoreAsync().ConfigureAwait(false);
+            }
+            catch (Exception error) { failure = error; }
+            finally
+            {
+                _serial.Release();
+                lock (_sync) _activeEndpointRecovery = null;
+            }
+            if (failure is not null) EndpointRecoveryFailed?.Invoke(failure);
+        }
+    }
     private async Task<bool> StartLockedAsync(Receiver receiver, AppSettings settings, Func<Receiver, CancellationToken, Task<string?>>? requestPin, long? expectedIntent = null)
     {
         await StopLockedAsync().ConfigureAwait(false);
@@ -216,7 +299,13 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         lock (_sync)
         {
             // Explicit intent can change synchronously while old-worker cleanup awaits.
-            if (expectedIntent is { } intent && _automaticIntent != intent) return false;
+            if (expectedIntent is { } intent && _automaticIntent != intent)
+            {
+                // Cleanup has already ended the old owner. A rejected explicit action may not
+                // create a replacement, so do not leave a ghost Connecting/Streaming snapshot.
+                if (_snapshot.IsActive) { _receiver = null; Publish(_generation, PlaybackState.Idle); }
+                return false;
+            }
             _settings = settings.Clone(); _receiver = receiver; epoch = ++_generation;
             _diagnostics = new(); _warnings.Clear();
             _snapshot = new(requestPin is null ? PlaybackState.Connecting : PlaybackState.Pairing, receiver,
@@ -225,7 +314,9 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             _lifetime = new(); cancellation = _lifetime.Token;
         }
         Publish(epoch, requestPin is null ? PlaybackState.Connecting : PlaybackState.Pairing);
-        _work = Task.Run(async () =>
+        // Publishing a terminal error can trigger an endpoint notification immediately. Make
+        // the worker visible before it can acquire the state lock and publish that error.
+        lock (_sync) _work = Task.Run(async () =>
         {
             try
             {
@@ -263,10 +354,10 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         await _serial.WaitAsync().ConfigureAwait(false);
         try
         {
-            AppSettings old;
-            lock (_sync) { old = _settings; _settings = settings.Clone(); ++_equalizerSequence; }
+            AppSettings old; long intent;
+            lock (_sync) { old = _settings; _settings = settings.Clone(); intent = _automaticIntent; ++_equalizerSequence; }
             if (_receiver is { } receiver && Snapshot.IsActive && Snapshot.State != PlaybackState.Pairing && Signature(receiver, old) != Signature(receiver, settings))
-                await StartLockedAsync(receiver, settings, null).ConfigureAwait(false);
+                await StartLockedAsync(receiver, settings, null, intent).ConfigureAwait(false);
             else
             {
                 if (!settings.MuteWhileStreaming) await RestoreAudioAsync().ConfigureAwait(false);
@@ -283,27 +374,37 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         try { await UpdateReceiverLockedAsync(receiver, settings).ConfigureAwait(false); }
         finally { _serial.Release(); }
     }
-    public async Task<bool> TryUpdateReceiverAsync(Receiver receiver, AppSettings settings, long expectedOwner)
+    public Task<bool> TryUpdateReceiverAsync(Receiver receiver, AppSettings settings, long expectedOwner)
+        => TryUpdateReceiverCoreAsync(receiver, settings, expectedOwner, null);
+    public Task<bool> TryUpdateReceiverAsync(Receiver receiver, AppSettings settings, long expectedOwner, long expectedIntent)
+        => TryUpdateReceiverCoreAsync(receiver, settings, expectedOwner, expectedIntent);
+    private async Task<bool> TryUpdateReceiverCoreAsync(Receiver receiver, AppSettings settings, long expectedOwner, long? expectedIntent)
     {
         if (!receiver.Online || !receiver.Complete) return false;
         await _serial.WaitAsync().ConfigureAwait(false);
         try
         {
-            lock (_sync) if (_generation != expectedOwner || _receiver is null) return false;
-            await UpdateReceiverLockedAsync(receiver, settings).ConfigureAwait(false);
-            return true;
+            long admittedIntent;
+            lock (_sync)
+            {
+                if (_generation != expectedOwner || _receiver is null || expectedIntent is { } intent && _automaticIntent != intent) return false;
+                admittedIntent = _automaticIntent;
+            }
+            return await UpdateReceiverLockedAsync(receiver, settings, admittedIntent).ConfigureAwait(false);
         }
         finally { _serial.Release(); }
     }
-    private async Task UpdateReceiverLockedAsync(Receiver receiver, AppSettings settings)
+    private async Task<bool> UpdateReceiverLockedAsync(Receiver receiver, AppSettings settings, long? expectedIntent = null)
     {
-        if (_receiver is not { } previous) return;
-        if (Snapshot.IsActive && Snapshot.State != PlaybackState.Pairing && Signature(previous, _settings) != Signature(receiver, settings))
-            await StartLockedAsync(receiver, settings, null).ConfigureAwait(false);
-        else
+        lock (_sync)
         {
-            lock (_sync) { _receiver = receiver; _settings = settings.Clone(); PublishCurrent(_generation); }
+            if (_receiver is not { } previous || expectedIntent is { } intent && _automaticIntent != intent) return false;
+            if (!_snapshot.IsActive || _snapshot.State == PlaybackState.Pairing || Signature(previous, _settings) == Signature(receiver, settings))
+            {
+                _receiver = receiver; _settings = settings.Clone(); PublishCurrent(_generation); return true;
+            }
         }
+        return await StartLockedAsync(receiver, settings, null, expectedIntent).ConfigureAwait(false);
     }
     public async Task SetMutedAsync(bool muted)
     {
@@ -521,8 +622,15 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     }
     public async ValueTask DisposeAsync()
     {
-        lock (_sync) { _equalizerDisposed = true; _equalizerEdit?.Cancel(); _equalizerEdit = null; _equalizerEditTask = null; }
+        lock (_sync)
+        {
+            _passiveDisposed = true; _pendingEndpointRecovery = null;
+            _equalizerDisposed = true; _equalizerEdit?.Cancel(); _equalizerEdit = null; _equalizerEditTask = null;
+        }
         await StopAsync().ConfigureAwait(false);
+        Task? endpointRecovery;
+        lock (_sync) endpointRecovery = _endpointRecoveryTask;
+        if (endpointRecovery is not null) await endpointRecovery.ConfigureAwait(false);
         _serial.Dispose();
     }
 }

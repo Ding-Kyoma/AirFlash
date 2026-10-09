@@ -88,6 +88,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         _discovery.SetInterface(_settings.DiscoveryInterfaceId);
         Session = new(factory, audio, AppPaths.Log);
         Session.Changed += SessionChanged;
+        Session.EndpointRecoveryFailed += error => _dispatcher.BeginInvoke(() => { if (!_closing) ShowError(error); });
         _discovery.Changed += list => _dispatcher.BeginInvoke(() => OnDiscovered(list));
         _discovery.Failed += message => _dispatcher.BeginInvoke(() => ShowError(new IOException(message)));
         _volumeTimer = new(TimeSpan.FromMilliseconds(200), DispatcherPriority.Background, async (_, _) => { _volumeTimer!.Stop(); try { await FlushVolumeAsync(); } catch (Exception error) { ShowError(error); } }, dispatcher);
@@ -138,15 +139,18 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private async Task OnEndpointsChangedAsync()
     {
         if (_closing) return;
+        var captured = Session.Capture();
         await _settingsGate.WaitAsync();
         try
         {
             if (_closing) return;
             var next = await _audio.GetDefaultEndpointIdAsync();
             if (_closing) return;
-            if (_settings.CaptureMode == "loopback" && next != _defaultEndpoint && _snapshot.IsActive && _snapshot.State != PlaybackState.Pairing && _snapshot.Receiver is { } receiver) await Session.StartAsync(receiver, _settings.Clone());
+            var changed = next != _defaultEndpoint;
             _defaultEndpoint = next;
-            if (!_snapshot.IsActive) await _audio.RestoreAsync();
+            if (_settings.CaptureMode == "loopback" && changed)
+                await Session.TryRestartForEndpointAsync(_settings.Clone(), captured.Owner, captured.AutomaticIntent);
+            await Session.TryRestoreAudioIfInactiveAsync(captured.Owner, captured.AutomaticIntent);
         }
         catch (Exception error) { ShowError(error); }
         finally { _settingsGate.Release(); }
@@ -219,7 +223,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             // Browse availability does not revoke an already owned transport/handshake.
             if (discovered.TryGetValue(id, out var next) && next.Online && next.Complete
                 && (!ReceiverEqual(current, next) || !SettingsMerge.Equal(originalSettings, _settings)))
-                await Session.TryUpdateReceiverAsync(next, _settings.Clone(), captured.Owner);
+                await Session.TryUpdateReceiverAsync(next, _settings.Clone(), captured.Owner, captured.AutomaticIntent);
         }
         ScheduleAutoConnect();
     }

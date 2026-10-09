@@ -17,6 +17,10 @@ internal static class UiSessionLifecycle
     private static readonly TimeSpan Limit = TimeSpan.FromSeconds(6);
     public static async Task RunAsync(List<string> checks, string directory)
     {
+        await EndpointOwnershipAsync(checks, directory);
+        await EndpointRestoreAsync(checks);
+        await DeferredEndpointRestoreAsync(checks);
+        await SettingsRestartIntentAsync(checks);
         await IdentityOwnershipAsync(checks);
         await IdentityPromotionAsync(checks);
         await AutomaticOwnershipAsync(checks);
@@ -66,6 +70,179 @@ internal static class UiSessionLifecycle
         finally { fixture.App.Session.Changed -= Changed; }
     }
     private static Task StateAsync(Fixture fixture, PlaybackState state) => StateAsync(fixture, snapshot => snapshot.State == state);
+    private static Task EndpointChangedAsync(AppViewModel app)
+        => (Task)typeof(AppViewModel).GetMethod("OnEndpointsChangedAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.Invoke(app, null)!;
+
+    private static async Task EndpointOwnershipAsync(List<string> checks, string directory)
+    {
+        var observations = new List<object>();
+        var respectedOwnership = true;
+        foreach (var action in new[] { "pair", "stop" })
+        {
+            var a = Pod("endpoint-old");
+            var b = Pod("endpoint-manual", "192.0.2.20", 7001) with { IsManual = true };
+            var settings = Settings(); settings.ManualReceivers.Add(new(b.Id, b.Name, b.Address, b.Port)); SeedAliases(settings, a);
+            await using var fixture = await Fixture.CreateAsync(settings, [a]);
+            await fixture.App.ToggleAsync(a); await StateAsync(fixture, PlaybackState.Streaming);
+            var original = fixture.App.Session.Capture();
+            var restores = fixture.Audio.RestoreCalls;
+            var enumeration = fixture.Audio.HoldDefaultEndpoint(); fixture.Audio.DefaultEndpoint = "synthetic-new-endpoint";
+            var restore = fixture.Audio.HoldRestore();
+            var pairing = new ScriptedConnection(false) { CompletePair = true }; var pin = new PendingPin();
+            if (action == "pair") fixture.Engine.Enqueue(pairing);
+            var committed = new TaskCompletionSource<SessionCapture>(TaskCreationOptions.RunContinuationsAsynchronously);
+            void Changed(SessionSnapshot snapshot)
+            {
+                if (action == "pair" && snapshot.State == PlaybackState.Pairing && snapshot.Receiver?.Id == b.Id
+                    || action == "stop" && snapshot.State == PlaybackState.Idle && snapshot.Receiver is null)
+                    committed.TrySetResult(fixture.App.Session.Capture());
+            }
+            fixture.App.Session.Changed += Changed;
+            Task? endpoint = null; Task? explicitAction = null;
+            try
+            {
+                endpoint = EndpointChangedAsync(fixture.App);
+                await enumeration.Entered.Task.WaitAsync(Limit);
+                explicitAction = action == "pair" ? fixture.App.PairAsync(b, pin.RequestAsync) : fixture.App.StopAsync();
+                await restore.Entered.Task.WaitAsync(Limit);
+                var pending = fixture.App.Session.Capture();
+                Check(fixture.App.Snapshot.State == PlaybackState.Streaming && fixture.App.Snapshot.Receiver?.Id == a.Id &&
+                    pending.Owner != original.Owner && !explicitAction.IsCompleted,
+                    "endpoint regression holds newer " + action + " cleanup while the dispatcher still presents the old stream", checks);
+                enumeration.Release.TrySetResult(); await DrainAsync();
+                Check(!endpoint.IsCompleted && fixture.App.Session.Capture().AutomaticIntent == pending.AutomaticIntent,
+                    "passive endpoint work waits behind newer " + action + " without creating explicit intent", checks);
+                restore.Release.TrySetResult(); await Task.WhenAll(explicitAction, endpoint).WaitAsync(Limit);
+                var owned = await committed.Task.WaitAsync(Limit); await DrainAsync();
+                var current = fixture.App.Session.Capture();
+                var correct = current.Owner == owned.Owner && (action == "pair"
+                    ? current.Snapshot.State == PlaybackState.Pairing && current.Snapshot.Receiver?.Id == b.Id
+                    : current.Snapshot.State == PlaybackState.Idle && current.Snapshot.Receiver is null);
+                respectedOwnership &= correct;
+                Check(fixture.Audio.RestoreCalls == restores + 2,
+                    "discarded endpoint work adds no mute restores to newer " + action + " cleanup", checks);
+                if (action == "pair" && correct)
+                {
+                    await pairing.PairSent.Task.WaitAsync(Limit); pairing.Emit(new { @event = "pin_required" }); await pin.Entered.Task.WaitAsync(Limit);
+                    Check(!pin.Cancelled && !pairing.Disposed && !pairing.Commands.Any(command => command.Name == "stop"),
+                        "discarded endpoint work leaves the new native pairing and pending PIN owned", checks);
+                }
+                observations.Add(new { action, original_owner = original.Owner, committed_owner = owned.Owner,
+                    committed_receiver = owned.Snapshot.Receiver?.Id, current_owner = current.Owner,
+                    current_state = current.Snapshot.State.ToString(), current_receiver = current.Snapshot.Receiver?.Id,
+                    correct, native_pair_commands = fixture.Engine.Connections.SelectMany(c => c.Commands).Count(c => c.Name == "pair") });
+                if (action == "pair" && correct)
+                {
+                    pin.Release.TrySetResult("1234"); await StateAsync(fixture, PlaybackState.Streaming);
+                    var streaming = fixture.App.Session.Capture(); var opens = fixture.Engine.OpenCount;
+                    await EndpointChangedAsync(fixture.App); await DrainAsync();
+                    Check(fixture.App.Session.Capture().Owner == streaming.Owner && fixture.App.Session.Snapshot.Receiver?.Id == b.Id &&
+                        fixture.Engine.OpenCount == opens, "discarded endpoint restart still records the observed default and does not restart the completed new pair", checks);
+                }
+            }
+            finally
+            {
+                fixture.App.Session.Changed -= Changed; pin.Release.TrySetResult(null); enumeration.Release.TrySetResult(); restore.Release.TrySetResult();
+                if (explicitAction is not null) await explicitAction.WaitAsync(Limit);
+                if (endpoint is not null) await endpoint.WaitAsync(Limit);
+            }
+        }
+        File.WriteAllText(Path.Combine(directory, "endpoint-ownership-observations.json"), JsonSerializer.Serialize(observations, new JsonSerializerOptions { WriteIndented = true }));
+        Check(respectedOwnership, "delayed default-endpoint restart preserves newer Pair and user Stop ownership", checks);
+    }
+
+    private static async Task EndpointRestoreAsync(List<string> checks)
+    {
+        foreach (var original in new[] { false, true })
+        {
+            await using var fixture = await Fixture.CreateAsync(Settings(), [], original);
+            await fixture.Audio.MuteAsync("synthetic-endpoint"); fixture.Audio.FailRestore = true;
+            fixture.Audio.DefaultEndpoint = "synthetic-returned-endpoint";
+            await EndpointChangedAsync(fixture.App);
+            Check(fixture.App.Notice == "synthetic endpoint restore failure" && fixture.Audio.MuteBit && fixture.Audio.HasSavedBit && fixture.Engine.OpenCount == 0,
+                "inactive endpoint restore failure preserves its saved bit and surfaces the existing error notice (original " + original + ")", checks);
+            fixture.Audio.FailRestore = false; var restores = fixture.Audio.RestoreCalls;
+            await EndpointChangedAsync(fixture.App);
+            Check(fixture.Audio.RestoreCalls == restores + 1 && fixture.Audio.MuteBit == original && !fixture.Audio.HasSavedBit && fixture.Engine.OpenCount == 0,
+                "an unchanged returned endpoint can retry inactive cleanup and restore the exact original " + original + " mute bit", checks);
+        }
+    }
+
+    private static async Task SettingsRestartIntentAsync(List<string> checks)
+    {
+        foreach (var action in new[] { "pair", "stop", "rejected pair" })
+        {
+            var a = Pod("apply-old"); var b = Pod("apply-manual", "192.0.2.20", 7001) with { IsManual = true };
+            var settings = Settings(); settings.ManualReceivers.Add(new(b.Id, b.Name, b.Address, b.Port)); SeedAliases(settings, a);
+            await using var fixture = await Fixture.CreateAsync(settings, [a]);
+            await fixture.App.ToggleAsync(a); await StateAsync(fixture, PlaybackState.Streaming);
+            var baseline = fixture.App.Settings.Clone(); var draft = baseline.Clone(); draft.LatencyMode = "buffered"; draft.StreamSampleRate = "48000";
+            var restore = fixture.Audio.HoldRestore(); var obsoletePublished = false;
+            void Observe(SessionSnapshot snapshot)
+            {
+                if (snapshot.IsActive && snapshot.Receiver?.Id == a.Id && snapshot.TargetLatency == 500) obsoletePublished = true;
+            }
+            fixture.App.Session.Changed += Observe; Task<SettingsApplyResult>? apply = null; Task? explicitAction = null;
+            try
+            {
+                apply = fixture.App.ApplyAsync(baseline, draft); await restore.Entered.Task.WaitAsync(Limit);
+                if (action == "rejected pair")
+                {
+                    try { await fixture.App.PairAsync(Pod("unavailable") with { Online = false }, (_, _) => Task.FromResult<string?>(null)); throw new InvalidOperationException("Expected unavailable pairing to be rejected."); }
+                    catch (InvalidOperationException error) when (error.Message != "Expected unavailable pairing to be rejected.") { explicitAction = Task.CompletedTask; }
+                }
+                else explicitAction = action == "pair" ? fixture.App.PairAsync(b, (_, _) => Task.FromResult<string?>(null)) : fixture.App.StopAsync();
+                Check((action == "rejected pair" || !explicitAction.IsCompleted) && fixture.Store.Saved.StreamSampleRate == "48000",
+                    "accepted settings persist before newer " + action + " waits behind old-session cleanup", checks);
+                restore.Release.TrySetResult(); await Task.WhenAll(apply, explicitAction); await DrainAsync();
+                var current = fixture.App.Session.Snapshot;
+                Check(!obsoletePublished && (await apply).AudioUpdated && fixture.App.Settings.StreamSampleRate == "48000" &&
+                    fixture.Store.Saved.LatencyMode == "buffered" && current.StreamRate == 48000 &&
+                    (action == "pair" ? current.State == PlaybackState.Pairing && current.Receiver?.Id == b.Id : current.State == PlaybackState.Idle && current.Receiver is null),
+                    "accepted settings survive newer " + action + " without publishing a superseded signature restart", checks);
+            }
+            finally
+            {
+                fixture.App.Session.Changed -= Observe; restore.Release.TrySetResult();
+                if (apply is not null) await apply.WaitAsync(Limit);
+                if (explicitAction is not null) await explicitAction.WaitAsync(Limit);
+            }
+        }
+    }
+
+    private static async Task DeferredEndpointRestoreAsync(List<string> checks)
+    {
+        foreach (var original in new[] { false, true })
+        {
+            var receiver = Pod("deferred-endpoint"); var settings = Settings(); settings.MuteWhileStreaming = true; SeedAliases(settings, receiver);
+            await using var fixture = await Fixture.CreateAsync(settings, [receiver], original);
+            await fixture.App.ToggleAsync(receiver); await StateAsync(fixture, PlaybackState.Streaming);
+            var process = fixture.Engine.Connections.Single(); var first = fixture.Audio.HoldNextRestore(); Gate? final = null;
+            try
+            {
+                fixture.Audio.FailRestore = true;
+                process.Emit(new { @event = "error", message = "synthetic endpoint unavailable", retryable = false });
+                await first.Entered.Task.WaitAsync(Limit); final = fixture.Audio.HoldNextRestore(); first.Release.TrySetResult();
+                await final.Entered.Task.WaitAsync(Limit); await StateAsync(fixture, PlaybackState.Error);
+                var owned = fixture.App.Session.Capture(); var restores = fixture.Audio.RestoreCalls;
+                await EndpointChangedAsync(fixture.App);
+                Check(fixture.Audio.RestoreCalls == restores && fixture.Audio.HasSavedBit,
+                    "endpoint return queues recovery without competing with unsettled final worker cleanup (original " + original + ")", checks);
+                var failed = new TaskCompletionSource<Exception>(TaskCreationOptions.RunContinuationsAsynchronously);
+                fixture.App.Session.EndpointRecoveryFailed += error => failed.TrySetResult(error);
+                fixture.Audio.FailRestore = true; final.Release.TrySetResult();
+                await failed.Task.WaitAsync(Limit); await DrainAsync();
+                Check(fixture.App.Notice == "synthetic endpoint restore failure" && fixture.Audio.HasSavedBit &&
+                    fixture.App.Session.Capture().Owner == owned.Owner && fixture.Engine.OpenCount == 1,
+                    "deferred endpoint failure reaches the dispatcher error notice and preserves ownership plus the saved mute bit (original " + original + ")", checks);
+                fixture.Audio.FailRestore = false; restores = fixture.Audio.RestoreCalls;
+                await EndpointChangedAsync(fixture.App); await DrainAsync();
+                Check(fixture.Audio.RestoreCalls == restores + 1 && fixture.Audio.MuteBit == original && !fixture.Audio.HasSavedBit && fixture.Engine.OpenCount == 1,
+                    "another endpoint return retries deferred cleanup without starting playback and restores original " + original + " mute", checks);
+            }
+            finally { fixture.Audio.FailRestore = false; first.Release.TrySetResult(); final?.Release.TrySetResult(); }
+        }
+    }
 
     private static async Task IdentityOwnershipAsync(List<string> checks)
     {
@@ -622,11 +799,21 @@ internal static class UiSessionLifecycle
         public int RestoreCalls { get; private set; }
         public List<bool> RestoredBits { get; } = [];
         private Gate? _restoreGate;
+        private readonly ConcurrentQueue<Gate> _nextRestores = new();
+        private Gate? _defaultEndpointGate;
+        public string? DefaultEndpoint { get; set; } = "synthetic-endpoint";
+        public bool FailRestore { get; set; }
         public Gate HoldRestore() => _restoreGate = new();
-        public void Release() => _restoreGate?.Release.TrySetResult();
+        public Gate HoldNextRestore() { var gate = new Gate(); _nextRestores.Enqueue(gate); return gate; }
+        public Gate HoldDefaultEndpoint() => _defaultEndpointGate = new();
+        public void Release() { _restoreGate?.Release.TrySetResult(); _defaultEndpointGate?.Release.TrySetResult(); }
         public event Action? EndpointsChanged { add { } remove { } }
         public Task<IReadOnlyList<AudioEndpoint>> GetEndpointsAsync() => Task.FromResult<IReadOnlyList<AudioEndpoint>>([]);
-        public Task<string?> GetDefaultEndpointIdAsync() => Task.FromResult<string?>("synthetic-endpoint");
+        public async Task<string?> GetDefaultEndpointIdAsync()
+        {
+            if (_defaultEndpointGate is { } gate) await gate.WaitAsync();
+            return DefaultEndpoint;
+        }
         public Task MuteAsync(string? endpointId)
         {
             _saved ??= MuteBit; MuteBit = true; return Task.CompletedTask;
@@ -634,7 +821,9 @@ internal static class UiSessionLifecycle
         public async Task RestoreAsync()
         {
             RestoreCalls++;
-            if (_restoreGate is { } gate) await gate.WaitAsync();
+            if (_nextRestores.TryDequeue(out var next)) await next.WaitAsync();
+            else if (_restoreGate is { } gate) await gate.WaitAsync();
+            if (FailRestore) throw new IOException("synthetic endpoint restore failure");
             if (_saved is { } saved) { MuteBit = saved; RestoredBits.Add(saved); _saved = null; }
         }
     }
