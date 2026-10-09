@@ -49,7 +49,7 @@
             </Border.Style>
             <StackPanel>
               <TextBlock Text="{loc:Text 'Searching for receivers'}" FontWeight="SemiBold" TextAlignment="Center"/>
-              <TextBlock Text="{loc:Text 'Connect your PC and HomePod to the same network,&#10;or add a receiver in settings.'}" TextAlignment="Center" Style="{StaticResource Hint}" Margin="0,8,0,0"/>
+              <TextBlock Text="{loc:Text 'Connect your PC and AirPlay receiver to the same network,&#10;or add a receiver in settings.'}" TextAlignment="Center" Style="{StaticResource Hint}" Margin="0,8,0,0"/>
             </StackPanel>
           </Border>
           <ItemsControl ItemsSource="{Binding Receivers}">

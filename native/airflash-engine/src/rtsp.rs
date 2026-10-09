@@ -54,6 +54,23 @@ impl std::fmt::Display for WireError {
 impl std::error::Error for WireError {}
 
 #[derive(Debug)]
+pub struct Rejected {
+    pub status: u16,
+    pub method: String,
+    pub path: String,
+}
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} rejected (status {})",
+            self.method, self.path, self.status
+        )
+    }
+}
+impl std::error::Error for Rejected {}
+
+#[derive(Debug)]
 pub struct Message {
     pub first: String,
     pub headers: BTreeMap<String, String>,
@@ -296,7 +313,11 @@ impl Connection {
         self.write(&bytes)
     }
     pub fn stale_response(&self, response: &Message) -> bool {
-        response.headers.get("cseq").and_then(|s| s.parse::<u32>().ok()).is_some_and(|seq| seq < self.cseq)
+        response
+            .headers
+            .get("cseq")
+            .and_then(|s| s.parse::<u32>().ok())
+            .is_some_and(|seq| seq < self.cseq)
     }
     pub fn validate_cseq(&self, response: &Message) -> Result<()> {
         if let Some(seq) = response.headers.get("cseq") {
@@ -315,16 +336,24 @@ impl Connection {
         let deadline = Instant::now() + self.timeout;
         let response = loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let response = self.read_for(remaining, None)?.ok_or(WireError::ReadTimeout)
+            let response = self
+                .read_for(remaining, None)?
+                .ok_or(WireError::ReadTimeout)
                 .with_context(|| format!("{method} {path}"))?;
-            if !self.stale_response(&response) { break response; }
+            if !self.stale_response(&response) {
+                break response;
+            }
         };
         self.validate_cseq(&response)?;
-        ensure!(
-            response.status()? == 200,
-            "{method} {path}: {}",
-            response.first
-        );
+        let status = response.status()?;
+        if status != 200 {
+            return Err(Rejected {
+                status,
+                method: method.into(),
+                path: path.into(),
+            }
+            .into());
+        }
         Ok(response)
     }
     /// Cancellation stops media immediately, but leaves a short teardown budget.
@@ -332,6 +361,14 @@ impl Connection {
         let cancellation = std::mem::take(&mut self.cancel);
         let timeout = std::mem::replace(&mut self.timeout, Duration::from_millis(300));
         let result = self.request("TEARDOWN", uri, &[], &[]).map(|_| ());
+        self.cancel = cancellation;
+        self.timeout = timeout;
+        result
+    }
+    pub fn finish_buffered(&mut self, uri: &str, body: &plist::Value) -> Result<()> {
+        let cancellation = std::mem::take(&mut self.cancel);
+        let timeout = std::mem::replace(&mut self.timeout, Duration::from_millis(300));
+        let result = self.plist_request("FLUSHBUFFERED", uri, body).map(|_| ());
         self.cancel = cancellation;
         self.timeout = timeout;
         result

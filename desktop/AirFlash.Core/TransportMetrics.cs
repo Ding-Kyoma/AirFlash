@@ -26,5 +26,14 @@ public sealed record EngineNotice(string Code, string Host, string Channel, stri
     public static EngineNotice Parse(JsonElement item) => new(item.Text("code", "engine_error"), item.Text("host"), item.Text("channel"), item.Text("message", L.Get("Audio engine error.")), item.Boolean("retryable"));
     public string Detail => string.Join(" · ", new[] { Message, Host, Channel, Code }.Where(s => !string.IsNullOrWhiteSpace(s)));
 }
+public sealed record NegotiatedPlayback(string Host, string Timing, string Transport, string Codec, int SampleRate, int EffectiveLatency, string[] FallbackReasons)
+{
+    public static NegotiatedPlayback? Parse(JsonElement item)
+    {
+        if (item.Integer("sample_rate") is not (44100 or 48000) || item.Integer("effective_latency_ms") is not (>= 0 and <= 10000)) return null;
+        return new(item.Text("host"), item.Text("timing"), item.Text("transport"), item.Text("codec"), (int)item.Integer("sample_rate")!, (int)item.Integer("effective_latency_ms")!,
+            item.TryGetProperty("fallback_reasons", out var reasons) && reasons.ValueKind == JsonValueKind.Array ? reasons.EnumerateArray().Where(v => v.ValueKind == JsonValueKind.String).Select(v => v.GetString()!).ToArray() : []);
+    }
+}
 public sealed record PlaybackDiagnostics(long ReconnectCount = 0, EngineNotice? LastFault = null, StreamMetrics? CaptureBeforeFault = null,
-    TransportMetrics? TransportBeforeFault = null, TransportMetrics? Transport = null, IReadOnlyList<EngineNotice>? Warnings = null);
+    TransportMetrics? TransportBeforeFault = null, TransportMetrics? Transport = null, IReadOnlyList<EngineNotice>? Warnings = null, NegotiatedPlayback? Negotiated = null);

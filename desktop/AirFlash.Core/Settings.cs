@@ -10,6 +10,7 @@ public sealed class ReceiverOptions : ObservableObject
     {
         AutoConnect = source.AutoConnect; Hidden = source.Hidden; Volume = source.Volume;
         LatencyMode = source.LatencyMode; CustomBufferMs = source.CustomBufferMs; StandbySeconds = source.StandbySeconds;
+        TransportMode = source.TransportMode; TimingMode = source.TimingMode;
     }
     private bool? _AutoConnect = null;
     public bool? AutoConnect { get => _AutoConnect; set => Set(ref _AutoConnect, value); }
@@ -23,6 +24,10 @@ public sealed class ReceiverOptions : ObservableObject
     public int? CustomBufferMs { get => _CustomBufferMs; set => Set(ref _CustomBufferMs, value); }
     private double? _StandbySeconds = null;
     public double? StandbySeconds { get => _StandbySeconds; set => Set(ref _StandbySeconds, value); }
+    private string? _TransportMode;
+    public string? TransportMode { get => _TransportMode; set => Set(ref _TransportMode, value == "auto" ? null : value); }
+    private string? _TimingMode;
+    public string? TimingMode { get => _TimingMode; set => Set(ref _TimingMode, value == "auto" ? null : value); }
 }
 public sealed record ManualReceiver(string Id, string Name, string Host, int Port);
 public sealed class AppSettings : ObservableObject
@@ -81,7 +86,12 @@ public sealed class AppSettings : ObservableObject
     public int Latency(string id)
     {
         var options = ReadOptions(id);
-        return (options.LatencyMode ?? LatencyMode) switch { "realtime" => 120, "buffered" => 500, "custom" => Math.Clamp(options.CustomBufferMs ?? CustomBufferMs, 0, 2000), _ => 200 };
+        return (options.LatencyMode ?? LatencyMode) switch { "realtime" => 120, "buffered" => 500, "custom" => Math.Clamp(options.CustomBufferMs ?? CustomBufferMs, 0, 10000), _ => 200 };
+    }
+    public int? CompatibilityBuffer(string id)
+    {
+        var options = ReadOptions(id);
+        return options.LatencyMode is not null || LatencyMode is "custom" or "realtime" ? Latency(id) : null;
     }
     public double Gain(string id) => Math.Clamp(MasterVolume, 0, 100) / 100d;
     public string? EffectiveEndpoint => CaptureMode == "loopback" ? null : CaptureEndpoint;
@@ -103,7 +113,9 @@ public sealed class AppSettings : ObservableObject
         {
             if (options.Volume is < 0 or > 100) return L.Get("Device volume must be between 0 and 100.");
             if (options.LatencyMode is not null && !Modes.Contains(options.LatencyMode)) return L.Get("Invalid device latency mode.");
-            if (options.CustomBufferMs is < 0 or > 2000) return L.Get("Device custom latency must be between 0 and 2000 ms.");
+            if (options.CustomBufferMs is < 0 or > 10000) return L.Get("Device custom latency must be between 0 and 10000 ms.");
+            if (options.TransportMode is not (null or "auto" or "realtime" or "buffered")) return L.Get("Select a valid receiver transport.");
+            if (options.TimingMode is not (null or "auto" or "ptp" or "ntp")) return L.Get("Select a valid receiver clock.");
             if (options.StandbySeconds is { } seconds && (!double.IsFinite(seconds) || seconds is < 5 or > 300)) return L.Get("Device standby threshold must be between 5 and 300 seconds.");
         }
         if (ManualReceivers.Any(r => string.IsNullOrWhiteSpace(r.Host) || r.Port is < 1 or > 65535)) return L.Get("Manual receivers require a valid address and port (1–65535).");

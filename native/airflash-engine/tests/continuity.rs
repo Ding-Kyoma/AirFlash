@@ -51,6 +51,53 @@ fn fast() -> FeedbackTiming {
     }
 }
 #[test]
+fn unsupported_feedback_stops_polling_but_authentication_is_terminal() {
+    for status in [404, 405, 501, 401, 403] {
+        let (conn, peer) = pair();
+        let health = Health::default();
+        let server = thread::spawn(move || {
+            let mut c = Connection::from_stream(peer, Cancellation::default()).unwrap();
+            let msg = c.read().unwrap();
+            assert!(msg.first.starts_with("POST /feedback"));
+            c.write(
+                format!(
+                    "RTSP/1.0 {status} Rejected\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",
+                    msg.headers["cseq"]
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            assert!(
+                c.read_for(Duration::from_millis(80), None)
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let connection = Arc::new(Mutex::new(conn));
+        let worker = FeedbackWorker::start(
+            connection.clone(),
+            "localhost".into(),
+            health.clone(),
+            fast(),
+        )
+        .unwrap();
+        if status == 401 || status == 403 {
+            until(|| health.check().is_err());
+            let fault = health.check().unwrap_err();
+            assert_eq!(
+                fault.downcast_ref::<Fault>().unwrap().code,
+                "authentication_failed"
+            );
+            assert!(!fault.downcast_ref::<Fault>().unwrap().retryable);
+        } else {
+            until(|| !health.notices().is_empty());
+            health.check().unwrap();
+        }
+        server.join().unwrap();
+        drop(worker);
+    }
+}
+#[test]
 fn feedback_grace_keeps_one_request_and_accepts_late_encrypted_reply() {
     let (mut conn, peer) = pair();
     conn.encrypt([1; 32], [2; 32]);
@@ -447,33 +494,69 @@ fn retransmit_flood_is_bounded_and_does_not_prevent_new_audio() {
 
 #[test]
 fn events_report_real_eof_and_stop_without_waiting_for_idle_timeout() {
-    let (conn, peer) = pair(); let health = Health::default();
-    let worker = EventWorker::start(conn, "test".into(), health.clone(), Cancellation::default()).unwrap();
-    drop(peer); until(|| health.check().is_err());
-    let error = health.check().unwrap_err(); let fault = error.downcast_ref::<Fault>().unwrap();
-    assert_eq!(fault.code,"peer_closed"); assert_eq!(fault.channel,"events"); assert!(fault.retryable);
+    let (conn, peer) = pair();
+    let health = Health::default();
+    let worker =
+        EventWorker::start(conn, "test".into(), health.clone(), Cancellation::default()).unwrap();
+    drop(peer);
+    until(|| health.check().is_err());
+    let error = health.check().unwrap_err();
+    let fault = error.downcast_ref::<Fault>().unwrap();
+    assert_eq!(fault.code, "peer_closed");
+    assert_eq!(fault.channel, "events");
+    assert!(fault.retryable);
     drop(worker);
     let (conn, _peer) = pair();
-    let worker = EventWorker::start(conn, "test".into(), Health::default(), Cancellation::default()).unwrap();
-    let now=Instant::now(); drop(worker); assert!(now.elapsed()<Duration::from_millis(250));
+    let worker = EventWorker::start(
+        conn,
+        "test".into(),
+        Health::default(),
+        Cancellation::default(),
+    )
+    .unwrap();
+    let now = Instant::now();
+    drop(worker);
+    assert!(now.elapsed() < Duration::from_millis(250));
 }
 #[test]
 fn requested_packets_arrive_as_original_ciphertext_out_of_order_and_across_wrap() {
-    let (mut m,a,c)=media(); m.configure_latency(Duration::from_secs(2),false);
-    a.set_read_timeout(Some(Duration::from_secs(1))).unwrap(); c.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-    let mut originals=std::collections::BTreeMap::new(); let h=Health::default(); let mut buffer=[0;2048];
-    for value in [1,2,3] {
-        m.send(&vec![value;PCM_BYTES],false,Instant::now(),Instant::now(),&h).unwrap();
-        let n=a.recv(&mut buffer).unwrap(); originals.insert(u16::from_be_bytes([buffer[2],buffer[3]]),buffer[..n].to_vec());
+    let (mut m, a, c) = media();
+    m.configure_latency(Duration::from_secs(2), false);
+    a.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let mut originals = std::collections::BTreeMap::new();
+    let h = Health::default();
+    let mut buffer = [0; 2048];
+    for value in [1, 2, 3] {
+        m.send(
+            &vec![value; PCM_BYTES],
+            false,
+            Instant::now(),
+            Instant::now(),
+            &h,
+        )
+        .unwrap();
+        let n = a.recv(&mut buffer).unwrap();
+        originals.insert(
+            u16::from_be_bytes([buffer[2], buffer[3]]),
+            buffer[..n].to_vec(),
+        );
     }
-    let next_seq=m.packetizer.seq;
-    let address=std::net::SocketAddr::from(([127,0,0,1],m.control_port().unwrap()));
-    for seq in [0u16,65535,65534,0] {
-        let [hi,lo]=seq.to_be_bytes(); c.send_to(&[0x80,0xd5,0,1,hi,lo,0,1],address).unwrap();
-        let before=m.metrics.retransmits_sent;
-        until(||{m.service_retransmits();m.metrics.retransmits_sent>before});
-        let n=c.recv(&mut buffer).unwrap(); assert_eq!(&buffer[..2],&[0x80,0xd6]);
-        assert_eq!(&buffer[4..n],originals.get(&seq).unwrap());
+    let next_seq = m.packetizer.seq;
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], m.control_port().unwrap()));
+    for seq in [0u16, 65535, 65534, 0] {
+        let [hi, lo] = seq.to_be_bytes();
+        c.send_to(&[0x80, 0xd5, 0, 1, hi, lo, 0, 1], address)
+            .unwrap();
+        let before = m.metrics.retransmits_sent;
+        until(|| {
+            m.service_retransmits();
+            m.metrics.retransmits_sent > before
+        });
+        let n = c.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..2], &[0x80, 0xd6]);
+        assert_eq!(&buffer[4..n], originals.get(&seq).unwrap());
     }
-    assert_eq!(m.packetizer.seq,next_seq); assert_eq!(m.metrics.retransmits_sent,4);
+    assert_eq!(m.packetizer.seq, next_seq);
+    assert_eq!(m.metrics.retransmits_sent, 4);
 }

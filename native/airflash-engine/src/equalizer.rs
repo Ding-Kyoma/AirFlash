@@ -67,6 +67,8 @@ impl Coefficients {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Prepared {
+    settings: Settings,
+    rate: u32,
     coefficients: [Coefficients; 10],
     gain: f64,
     bypass: bool,
@@ -111,6 +113,8 @@ impl Prepared {
             0.0
         };
         Ok(Self {
+            settings,
+            rate,
             coefficients,
             gain: 10f64.powf(effective_preamp_db / 20.0),
             bypass: !settings.enabled
@@ -133,8 +137,28 @@ impl Control {
     pub fn set(&self, sequence: u64, prepared: Prepared) {
         let mut latest = self.0.lock().unwrap();
         if sequence > latest.0 {
+            let prepared = if prepared.rate != latest.1.rate {
+                Prepared::new(prepared.settings, latest.1.rate)
+                    .expect("validated equalizer settings")
+            } else {
+                prepared
+            };
             *latest = (sequence, prepared);
         }
+    }
+    /// Called before capture starts, retaining edits received during negotiation.
+    pub fn reconfigure(&self, rate: u32) -> Result<()> {
+        let mut latest = self.0.lock().unwrap();
+        latest.1 = Prepared::new(latest.1.settings, rate)?;
+        Ok(())
+    }
+    pub fn update_settings(&self, sequence: u64, settings: Settings) -> Result<Prepared> {
+        let mut latest = self.0.lock().unwrap();
+        let prepared = Prepared::new(settings, latest.1.rate)?;
+        if sequence > latest.0 {
+            *latest = (sequence, prepared);
+        }
+        Ok(prepared)
     }
     // No waiting for the IPC thread on the audio path.
     pub fn latest(&self) -> Option<(u64, Prepared)> {
@@ -246,6 +270,24 @@ impl Processor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn negotiation_retains_latest_edits_and_prepares_updates_at_actual_rate() {
+        let control = Control::new(Settings::default(), 48000).unwrap();
+        let mut settings = Settings {
+            enabled: true,
+            ..Default::default()
+        };
+        settings.band_gains_db[8] = 6.0;
+        control.update_settings(1, settings).unwrap();
+        control.reconfigure(44100).unwrap();
+        assert_eq!(control.initial(), Prepared::new(settings, 44100).unwrap());
+        settings.band_gains_db[9] = -4.0;
+        let updated = control.update_settings(2, settings).unwrap();
+        assert_eq!(updated, Prepared::new(settings, 44100).unwrap());
+        assert_eq!(control.latest().unwrap().0, 2);
+        control.set(1, Prepared::new(Settings::default(), 48000).unwrap());
+        assert_eq!(control.initial(), updated);
+    }
     #[test]
     fn flat_and_disabled_are_bit_exact() {
         for rate in [44100, 48000] {

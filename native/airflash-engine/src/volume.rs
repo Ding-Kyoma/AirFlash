@@ -1,6 +1,9 @@
 //! Device volume is receiver state, independent of PCM gain. All RTSP I/O stays
 //! off the media thread and shares the feedback connection's transaction lock.
-use crate::rtsp::{Cancellation, Connection};
+use crate::{
+    rtsp::{Cancellation, Connection, Rejected},
+    transport::{Fault, Health},
+};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -43,12 +46,29 @@ pub fn from_db(db: f64) -> Result<u8> {
         ((db + 30.0) / 0.3).round() as u8
     })
 }
+#[derive(Debug)]
+struct UnsupportedVolume;
+impl std::fmt::Display for UnsupportedVolume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("receiver does not support volume queries")
+    }
+}
+impl std::error::Error for UnsupportedVolume {}
 fn read(connection: &mut Connection) -> Result<u8> {
-    let info = connection.request("GET", "/info", &[], &[])?.plist()?;
+    let response = connection.request("GET", "/info", &[], &[]).map_err(|e| {
+        if e.downcast_ref::<Rejected>()
+            .is_some_and(|r| matches!(r.status, 404 | 405 | 501))
+        {
+            anyhow::Error::from(UnsupportedVolume)
+        } else {
+            e
+        }
+    })?;
+    let info = response.plist()?;
     let value = info
         .as_dictionary()
         .and_then(|d| d.get("initialVolume"))
-        .context("receiver does not report initialVolume")?;
+        .ok_or(UnsupportedVolume)?;
     let db = value
         .as_real()
         .or_else(|| value.as_signed_integer().map(|n| n as f64))
@@ -96,13 +116,26 @@ pub struct Worker {
 impl Worker {
     /// Peers are ordered with the stereo leader first by the desktop controller.
     pub fn start(peers: Vec<Peer>, control: Control) -> Result<Self> {
+        let health = vec![Health::default(); peers.len()];
+        Self::start_with_health(peers, control, health)
+    }
+    pub fn start_with_health(
+        peers: Vec<Peer>,
+        control: Control,
+        health: Vec<Health>,
+    ) -> Result<Self> {
         ensure!(!peers.is_empty(), "volume worker requires a receiver");
+        ensure!(
+            peers.len() == health.len(),
+            "volume health must match receivers"
+        );
         let stop = Cancellation::default();
         let done = stop.clone();
         let (tx, events) = mpsc::sync_channel(32);
         let worker = thread::Builder::new().name("airplay-volume".into()).spawn(move || {
             let mut pending = Pending::default();
             let mut next = Instant::now();
+            let mut queries = vec![true; peers.len()];
             while !done.is_cancelled() {
                 let command = control.latest();
                 let changed = command.map(|c| c.sequence) != pending.command.map(|c| c.sequence);
@@ -114,12 +147,15 @@ impl Worker {
                 if changed {
                     pending = Pending { command, sent: Some(Instant::now()), ..Pending::default() };
                     if let Some(command) = command {
-                        for (host, uri, connection) in &peers {
+                        for (index, (host, uri, connection)) in peers.iter().enumerate() {
                             if done.is_cancelled() { return; }
                             let result = connection.lock().unwrap().request("SET_PARAMETER", uri,
                                 &[("Content-Type", "text/parameters".into())],
                                 format!("volume: {:.6}\r\n", to_db(command.percent)).as_bytes());
                             if let Err(error) = result {
+                                if !error.downcast_ref::<Rejected>().is_some_and(|r| matches!(r.status, 404 | 405 | 501)) {
+                                    health[index].fail(Fault::from_error(host, "volume", &error));
+                                }
                                 pending.write_failed = true;
                                 errors.push(format!("{host}: {error:#}"));
                             }
@@ -127,11 +163,16 @@ impl Worker {
                     }
                 }
                 let mut values = Vec::new();
-                for (host, _, connection) in &peers {
+                for (index, (host, _, connection)) in peers.iter().enumerate() {
                     if done.is_cancelled() { return; }
+                    if !queries[index] || health[index].check().is_err() { values.push(None); continue; }
                     match read(&mut connection.lock().unwrap()) {
                         Ok(value) => values.push(Some(value)),
-                        Err(error) => { values.push(None); errors.push(format!("{host}: {error:#}")); }
+                        Err(error) => {
+                            if error.downcast_ref::<UnsupportedVolume>().is_some() { queries[index] = false; }
+                            else { health[index].fail(Fault::from_error(host, "volume", &error)); }
+                            values.push(None); errors.push(format!("{host}: {error:#}"));
+                        }
                     }
                 }
                 let status = pending.status(&values, Instant::now());
@@ -141,6 +182,7 @@ impl Worker {
                     "status":status, "message":errors.join("; "),
                     "members":peers.iter().zip(&values).map(|((host,_,_),v)| json!({"host":host,"volume":v})).collect::<Vec<_>>()});
                 let _ = tx.try_send(event);
+                if health.iter().any(|h| h.check().is_err()) { return; }
                 next = Instant::now() + Duration::from_secs(1);
             }
         })?;

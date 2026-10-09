@@ -86,21 +86,68 @@ pub fn sync_pair(clock: u64, seq: u16, ns: u64) -> (Vec<u8>, Vec<u8>) {
     follow[76..].copy_from_slice(&tlv(&cid));
     (sync, follow)
 }
+/// Grant only the unicast message types this master actually sends.
+pub fn unicast_grant(request: &[u8], clock: u64) -> Option<Vec<u8>> {
+    if request.len() < 54 || request[0] & 0xf != 12 {
+        return None;
+    }
+    let declared = u16::from_be_bytes([request[2], request[3]]) as usize;
+    if declared > request.len() || declared < 54 {
+        return None;
+    }
+    let mut offset = 44;
+    while offset + 4 <= declared {
+        let kind = u16::from_be_bytes([request[offset], request[offset + 1]]);
+        let length = u16::from_be_bytes([request[offset + 2], request[offset + 3]]) as usize;
+        if offset + 4 + length > declared {
+            return None;
+        }
+        if kind == 4 && length == 6 {
+            let message = request[offset + 4] >> 4;
+            if !matches!(message, 0 | 8 | 9 | 11) {
+                return None;
+            }
+            let duration =
+                u32::from_be_bytes(request[offset + 6..offset + 10].try_into().ok()?).clamp(1, 60);
+            let sequence = u16::from_be_bytes([request[30], request[31]]);
+            let mut reply = header(12, 56, clock, sequence, 0x0408, 0);
+            reply[34..44].copy_from_slice(&request[20..30]);
+            reply[44..48].copy_from_slice(&[0, 5, 0, 8]);
+            reply[48] = message << 4;
+            reply[49] = if message == 11 { 0 } else { (-3i8) as u8 };
+            reply[50..54].copy_from_slice(&duration.to_be_bytes());
+            return Some(reply);
+        }
+        offset += 4 + length;
+    }
+    None
+}
 pub struct PtpMaster {
     pub clock_id: u64,
     pub received: Arc<AtomicU64>,
+    pub exchanges: Arc<AtomicU64>,
     cancel: Cancellation,
     worker: Option<JoinHandle<()>>,
 }
 impl PtpMaster {
     pub fn start(peers: Vec<IpAddr>, clock: Clock) -> Result<Self> {
-        let event = UdpSocket::bind("0.0.0.0:319").context("PTP event port 319 unavailable")?;
-        let general = UdpSocket::bind("0.0.0.0:320").context("PTP general port 320 unavailable")?;
+        Self::start_with_ports(peers, clock, [319, 320])
+    }
+    pub(crate) fn start_with_ports(
+        peers: Vec<IpAddr>,
+        clock: Clock,
+        ports: [u16; 2],
+    ) -> Result<Self> {
+        let event = UdpSocket::bind(("0.0.0.0", ports[0])).context("PTP event port unavailable")?;
+        let general =
+            UdpSocket::bind(("0.0.0.0", ports[1])).context("PTP general port unavailable")?;
         event.set_nonblocking(true)?;
         general.set_nonblocking(true)?;
         let clock_id = rand::random::<u64>() & 0x7fff_ffff_ffff_ffff;
         let received = Arc::new(AtomicU64::new(0));
         let rx = received.clone();
+        let exchanges = Arc::new(AtomicU64::new(0));
+        let exchange = exchanges.clone();
         let cancel = Cancellation::default();
         let stop = cancel.clone();
         let worker = thread::Builder::new()
@@ -115,12 +162,12 @@ impl PtpMaster {
                     if now >= next_sync {
                         for peer in &peers {
                             let (sync, follow) = sync_pair(clock_id, seq, clock.now_ns());
-                            let _ = event.send_to(&sync, (*peer, 319));
-                            let _ = general.send_to(&follow, (*peer, 320));
+                            let _ = event.send_to(&sync, (*peer, ports[0]));
+                            let _ = general.send_to(&follow, (*peer, ports[1]));
                             if now.duration_since(last_announce) >= Duration::from_secs(1) {
                                 let _ = general.send_to(
                                     &announce(clock_id, seq, clock.now_ns()),
-                                    (*peer, 320),
+                                    (*peer, ports[1]),
                                 );
                             }
                         }
@@ -142,7 +189,13 @@ impl PtpMaster {
                             rx.fetch_add(1, Ordering::Relaxed);
                             let kind = buf[0] & 0xf;
                             let request_seq = u16::from_be_bytes([buf[30], buf[31]]);
-                            if (kind == 1 || kind == 2) && n >= 44 {
+                            if let Some(grant) = unicast_grant(&buf[..length], clock_id) {
+                                if general.send_to(&grant, (addr.ip(), ports[1])).is_ok() {
+                                    exchange.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            if (kind == 1 || kind == 2) && length >= 44 {
+                                exchange.fetch_add(1, Ordering::Relaxed);
                                 let response_kind = if kind == 1 { 9 } else { 3 };
                                 let mut response = header(
                                     response_kind,
@@ -155,14 +208,14 @@ impl PtpMaster {
                                 timestamp(&mut response[34..44], clock.now_ns());
                                 response[44..54].copy_from_slice(&buf[20..30]);
                                 if kind == 1 {
-                                    let _ = general.send_to(&response, (addr.ip(), 320));
+                                    let _ = general.send_to(&response, (addr.ip(), ports[1]));
                                 } else {
-                                    let _ = event.send_to(&response, (addr.ip(), 319));
+                                    let _ = event.send_to(&response, (addr.ip(), ports[0]));
                                     let mut follow =
                                         header(10, 54, clock_id, request_seq, 0x0408, -3);
                                     timestamp(&mut follow[34..44], clock.now_ns());
                                     follow[44..54].copy_from_slice(&buf[20..30]);
-                                    let _ = general.send_to(&follow, (addr.ip(), 320));
+                                    let _ = general.send_to(&follow, (addr.ip(), ports[1]));
                                 }
                             }
                         }
@@ -173,6 +226,7 @@ impl PtpMaster {
         Ok(Self {
             clock_id,
             received,
+            exchanges,
             cancel,
             worker: Some(worker),
         })
@@ -198,5 +252,20 @@ mod tests {
         assert_eq!(f.len(), 96);
         assert_eq!(&f[34..44], &[0, 0, 0, 0, 0, 1, 13, 251, 56, 210]);
         assert_eq!(announce(id, 0, 0).len(), 76);
+    }
+    #[test]
+    fn signaling_is_bounded_and_names_requester() {
+        let mut request = header(12, 54, 11, 7, 0, 0);
+        request[44..48].copy_from_slice(&[0, 4, 0, 6]);
+        request[48] = 0xb0;
+        request[50..54].copy_from_slice(&120u32.to_be_bytes());
+        let reply = unicast_grant(&request, 22).unwrap();
+        assert_eq!(&reply[34..44], &request[20..30]);
+        assert_eq!(&reply[50..54], &60u32.to_be_bytes());
+        assert!(unicast_grant(&request[..53], 22).is_none());
+        request[48] = 0x90;
+        assert!(unicast_grant(&request, 22).is_some());
+        request[48] = 0x60;
+        assert!(unicast_grant(&request, 22).is_none());
     }
 }

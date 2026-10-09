@@ -12,8 +12,8 @@ function Reserve-ReleaseVersion([string]$Root, [string]$RequestedVersion = '', [
     }
     if ($Channel -notin @('stable', 'preview')) { throw 'Unknown release channel.' }
     $branch = & git -C $Root branch --show-current
-    $expectedBranch = if ($Channel -eq 'preview') { 'codex/nic-discovery-preview' } else { 'main' }
-    if ($LASTEXITCODE -ne 0 -or $branch -ne $expectedBranch) { throw "Release channel $Channel requires branch $expectedBranch." }
+    $allowedBranches = if ($Channel -eq 'preview') { @('dev', 'codex/nic-discovery-preview') } else { @('main') }
+    if ($LASTEXITCODE -ne 0 -or $branch -notin $allowedBranches) { throw "Release channel $Channel requires branch $($allowedBranches -join ' or ')." }
     $dirty = & git -C $Root status --porcelain --untracked-files=no
     if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'Release builds require a clean tracked tree.' }
     $head = & git -C $Root rev-parse HEAD
