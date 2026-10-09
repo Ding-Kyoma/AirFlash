@@ -107,12 +107,21 @@ public sealed class SettingsStore : ISettingsStore
         if (document.RootElement.ValueKind != JsonValueKind.Object) throw new JsonException(L.Get("Configuration must be a JSON object."));
         var versions = document.RootElement.EnumerateObject().Where(p => p.Name.Equals("schema_version", StringComparison.OrdinalIgnoreCase)).Select(p => p.Value).ToArray();
         // Never hide a future schema behind another spelling or a duplicate property.
-        if (versions.Any(v => v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var n) && n > 2))
+        if (versions.Any(IsFutureVersion))
             throw new NotSupportedException(L.Get("This configuration is from a newer version. Update the app first."));
         if (versions.Length > 1) throw new JsonException(L.Get("Configuration contains ambiguous schema version fields."));
         if (versions.Length == 0 || versions[0].ValueKind == JsonValueKind.Null) return 1;
         if (versions[0].ValueKind != JsonValueKind.Number || !versions[0].TryGetInt32(out var version)) throw new JsonException(L.Get("Configuration schema version must be an integer."));
         return version;
+    }
+    private static bool IsFutureVersion(JsonElement value)
+    {
+        if (value.ValueKind != JsonValueKind.Number) return false;
+        var token = value.GetRawText();
+        // JSON forbids leading zeroes. Compare positive integer tokens without a bounded
+        // numeric conversion, so a future schema cannot become recoverable through overflow.
+        // Fractional/exponent spellings still follow the existing integer validation below.
+        return (token.Length > 1 || token[0] > '2') && token.All(char.IsAsciiDigit);
     }
     private static void ClampBuffer(JsonObject json)
     {

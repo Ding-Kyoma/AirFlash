@@ -336,6 +336,78 @@ public sealed class SettingsRecoveryTests
         fixture.AssertNoTemps();
     }
 
+    [Theory]
+    [InlineData("3", false)]
+    [InlineData("3", true)]
+    [InlineData("2147483648", false)]
+    [InlineData("2147483648", true)]
+    [InlineData("18446744073709551615", false)]
+    [InlineData("18446744073709551615", true)]
+    [InlineData("999999999999999999999999999999999999999999999999999999999999999999999999", false)]
+    [InlineData("999999999999999999999999999999999999999999999999999999999999999999999999", true)]
+    public void EveryPositiveFutureIntegerIsFatalEvenOutsideInt32AndBesideASupportedDuplicate(string version, bool duplicate)
+    {
+        using var fixture = new Fixture();
+        var original = Encoding.UTF8.GetBytes(duplicate
+            ? "{\"SCHEMA_VERSION\":" + version + ",\"schema_version\":2,\"master_volume\":37}"
+            : "{\"schema_version\":" + version + ",\"master_volume\":37}");
+        File.WriteAllBytes(fixture.Path, original); var store = new SettingsStore(fixture.Path);
+        var load = Record.Exception(() => store.Load());
+        var save = Record.Exception(() => store.Save(new() { MasterVolume = 13 }));
+        var unchanged = original.SequenceEqual(File.ReadAllBytes(fixture.Path));
+        Assert.True(load is NotSupportedException && save is NotSupportedException && unchanged && fixture.Backups().Length == 0,
+            $"future integer {version}, duplicate {duplicate}: load={load?.GetType().Name ?? "accepted"}; save={save?.GetType().Name ?? "accepted"}; original unchanged={unchanged}; recovery backups={fixture.Backups().Length}");
+        fixture.AssertNoTemps();
+    }
+
+    [Theory]
+    [InlineData("2147483648", false)]
+    [InlineData("2147483648", true)]
+    [InlineData("18446744073709551615", false)]
+    [InlineData("18446744073709551615", true)]
+    public void ACurrentOverflowingFutureSchemaBlocksRecoverySaveBeforeAnyBackup(string version, bool originalCaptured)
+    {
+        using var fixture = new Fixture(); var files = new DeniedReads(fixture.Path);
+        var store = new SettingsStore(fixture.Path, files);
+        File.WriteAllText(fixture.Path, "{ earlier malformed source }");
+        files.Denied = !originalCaptured; AssertDefaults(store.Load()); files.Denied = false;
+        var future = Encoding.UTF8.GetBytes("{\"schema_version\":" + version + "}"); File.WriteAllBytes(fixture.Path, future);
+        Assert.Throws<NotSupportedException>(() => store.Save(new()));
+        Assert.Throws<NotSupportedException>(() => store.Save(new()));
+        Assert.Equal(future, File.ReadAllBytes(fixture.Path)); Assert.Empty(fixture.Backups()); fixture.AssertNoTemps();
+    }
+
+    [Theory]
+    [InlineData("2147483648", false)]
+    [InlineData("2147483648", true)]
+    [InlineData("18446744073709551615", false)]
+    [InlineData("18446744073709551615", true)]
+    public async Task IdentitySaveRejectsAnOverflowingFutureSchemaBeforeItsBackupOrReplacement(string version, bool identityBackup)
+    {
+        using var fixture = new Fixture(); File.WriteAllText(fixture.Path, "{ malformed before identity save }");
+        var store = new SettingsStore(fixture.Path); AssertDefaults(store.Load());
+        var future = Encoding.UTF8.GetBytes("{\"SCHEMA_VERSION\":" + version + ",\"schema_version\":2}"); File.WriteAllBytes(fixture.Path, future);
+        await Assert.ThrowsAsync<NotSupportedException>(() => store.SaveReceiverIdentityAsync(new(), identityBackup));
+        Assert.Throws<NotSupportedException>(() => store.Save(new()));
+        Assert.Equal(future, File.ReadAllBytes(fixture.Path)); Assert.Empty(fixture.Backups());
+        Assert.False(File.Exists(fixture.Path + ".pre-receiver-identity.bak")); fixture.AssertNoTemps();
+    }
+
+    [Theory]
+    [InlineData("2.0")]
+    [InlineData("3.0")]
+    [InlineData("2e0")]
+    [InlineData("3e0")]
+    [InlineData("-2147483649")]
+    [InlineData("\"18446744073709551615\"")]
+    public void NonIntegerSchemaSpellingsKeepTheirExistingRecoverableValidation(string version)
+    {
+        using var fixture = new Fixture(); var original = Encoding.UTF8.GetBytes("{\"schema_version\":" + version + "}");
+        File.WriteAllBytes(fixture.Path, original); var store = new SettingsStore(fixture.Path);
+        AssertDefaults(store.Load()); Assert.False(string.IsNullOrWhiteSpace(store.LoadWarning)); store.Save(new());
+        Assert.Equal(original, File.ReadAllBytes(fixture.Path + ".pre-wpf.bak")); fixture.AssertNoTemps();
+    }
+
     [Fact]
     public void AValidLoadCanClearAnEarlierFutureSchemaBlock()
     {
