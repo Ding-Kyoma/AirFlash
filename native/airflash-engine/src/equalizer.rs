@@ -123,6 +123,22 @@ impl Prepared {
 
 #[derive(Clone)]
 pub struct Control(Arc<Mutex<(u64, Prepared)>>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetOutcome {
+    Accepted,
+    Idempotent,
+    Stale,
+    Conflict,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SetResult {
+    pub outcome: SetOutcome,
+    pub sequence: u64,
+    pub prepared: Prepared,
+}
+
 impl Control {
     pub fn new(settings: Settings, rate: u32) -> Result<Self> {
         Ok(Self(Arc::new(Mutex::new((
@@ -130,10 +146,24 @@ impl Control {
             Prepared::new(settings, rate)?,
         )))))
     }
-    pub fn set(&self, sequence: u64, prepared: Prepared) {
+    // This reports mailbox adoption, not audio pickup or fade completion.
+    // Replay identity is equality of the prepared coefficients and headroom.
+    pub fn set(&self, sequence: u64, prepared: Prepared) -> SetResult {
         let mut latest = self.0.lock().unwrap();
-        if sequence > latest.0 {
+        let outcome = if sequence > latest.0 {
             *latest = (sequence, prepared);
+            SetOutcome::Accepted
+        } else if sequence < latest.0 {
+            SetOutcome::Stale
+        } else if prepared == latest.1 {
+            SetOutcome::Idempotent
+        } else {
+            SetOutcome::Conflict
+        };
+        SetResult {
+            outcome,
+            sequence: latest.0,
+            prepared: latest.1,
         }
     }
     // No waiting for the IPC thread on the audio path.
@@ -370,5 +400,54 @@ mod tests {
         c.set(3, p);
         c.set(2, p);
         assert_eq!(c.latest().unwrap().0, 3);
+    }
+
+    #[test]
+    fn mailbox_results_include_the_retained_preparation_for_every_outcome() {
+        for rate in [44100, 48000] {
+            let control = Control::new(Settings::default(), rate).unwrap();
+            let flat = Prepared::new(Settings::default(), rate).unwrap();
+            let quiet = Prepared::new(
+                Settings {
+                    enabled: true,
+                    preamp_db: -12.0,
+                    ..Settings::default()
+                },
+                rate,
+            )
+            .unwrap();
+            for (sequence, submitted, outcome, retained_sequence, retained) in [
+                (10, flat, SetOutcome::Accepted, 10, flat),
+                (9, quiet, SetOutcome::Stale, 10, flat),
+                (10, quiet, SetOutcome::Conflict, 10, flat),
+                (10, flat, SetOutcome::Idempotent, 10, flat),
+                (11, quiet, SetOutcome::Accepted, 11, quiet),
+            ] {
+                assert_eq!(
+                    control.set(sequence, submitted),
+                    SetResult {
+                        outcome,
+                        sequence: retained_sequence,
+                        prepared: retained,
+                    }
+                );
+                assert_eq!(control.latest(), Some((retained_sequence, retained)));
+            }
+            // Equality belongs to the prepared result, not the input JSON.
+            let equivalent_disabled = Prepared::new(
+                Settings {
+                    preamp_db: 6.0,
+                    ..Settings::default()
+                },
+                rate,
+            )
+            .unwrap();
+            assert_eq!(flat, equivalent_disabled);
+            assert_eq!(control.set(12, flat).outcome, SetOutcome::Accepted);
+            assert_eq!(
+                control.set(12, equivalent_disabled).outcome,
+                SetOutcome::Idempotent
+            );
+        }
     }
 }
