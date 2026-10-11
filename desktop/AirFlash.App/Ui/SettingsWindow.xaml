@@ -146,7 +146,7 @@
               <Button Grid.Column="1" Content="{loc:Text 'Refresh'}" Margin="8,0,0,0" Command="{Binding RefreshEndpointsCommand}"/>
             </Grid>
             <ProgressBar IsIndeterminate="True" Height="3" Margin="26,0,0,12" Visibility="{Binding IsEndpointLoading, Converter={StaticResource BoolVisibility}}"/>
-            <TextBlock Text="{loc:Text 'Choose a playback or recording device. For Voicemeeter, select its recording endpoint and route audio to the matching B1/B2/B3 bus in Voicemeeter.'}" Style="{StaticResource Hint}" Margin="26,0,0,0"/>
+            <TextBlock Text="{loc:Text 'Choose a playback or recording device endpoint.'}" Style="{StaticResource Hint}" Margin="26,0,0,0"/>
           </StackPanel>
         </Border>
         <Border Style="{StaticResource Card}">
@@ -331,7 +331,7 @@
         <WrapPanel>
           <Button Content="{loc:Text 'Third-party licenses'}" Command="{Binding LicensesCommand}" Margin="0,0,10,10"/>
           <Button Content="{loc:Text 'Open log folder'}" Command="{Binding OpenLogsCommand}" Margin="0,0,10,10"/>
-          <Button x:Name="CoffeeButton" Content="请作者喝一杯咖啡~" Click="OnCoffeeClick" Visibility="{Binding Source={x:Static core:L.IsChinese}, Converter={StaticResource BoolVisibility}}" Margin="0,0,10,10"/>
+          <Button x:Name="CoffeeButton" Content="{loc:Text 'Buy the author a cup of milk tea~'}" Click="OnCoffeeClick" Visibility="{Binding Source={x:Static core:L.IsChinese}, Converter={StaticResource BoolVisibility}}" Margin="0,0,10,10"/>
         </WrapPanel>
       </StackPanel>
     </DataTemplate>

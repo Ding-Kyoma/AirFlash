@@ -31,6 +31,11 @@ a SmartScreen warning because release binaries are not code-signed. Use
 **More info** and **Run anyway** only when the downloaded files are from a
 source you trust.
 
+For audio capture, we recommend **Settings > Audio capture > Specific audio endpoint**.
+If you do not have an unused audio endpoint available, install a virtual endpoint
+with [Virtual Audio Cable (VAC Lite)](https://software.muzychenko.net/freeware/vac471lite.zip)
+or a similar tool, and route the audio you want to stream to that endpoint.
+
 ## Key features
 
 - Streams Windows system audio to HomePod over AirPlay 2.
@@ -40,10 +45,12 @@ source you trust.
 - Includes selectable latency modes, tray operation, mute restoration,
   automatic reconnection, and connection diagnostics.
 - Provides a ten-band equalizer with presets and live preview in Settings.
-- Available as a portable Windows x64 app with English and Simplified Chinese UI.
+- Captures playback or recording endpoints, including virtual audio devices.
+- Available as a portable Windows x64 app with English, Simplified Chinese, and Traditional Chinese UI.
 
 ## Feature plan
 
+- [ ] Select an application as the audio source ([#18](https://github.com/Ding-Kyoma/AirFlash/issues/18)).
 - [ ] Dolby Atmos support.
 
 ## Usage
