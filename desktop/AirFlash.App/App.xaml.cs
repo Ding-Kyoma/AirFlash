@@ -18,7 +18,13 @@ public partial class App : Application
             if (_viewModel is not null) _viewModel.ShowError(eventArgs.Exception);
             else
             {
-                MessageBox.Show(eventArgs.Exception.Message + "\n\n" + AppPaths.LogDirectory,
+                var args = Environment.GetCommandLineArgs().Skip(1).ToArray();
+                if (Program.IsDiagnostic(args))
+                {
+                    try { WriteOutput(args, new { ok = false, stage = "wpf-dispatcher", error = eventArgs.Exception.ToString() }); }
+                    catch (Exception error) { AppPaths.Log($"Diagnostic output failed: {error.Message}"); }
+                }
+                else MessageBox.Show(eventArgs.Exception.Message + "\n\n" + AppPaths.LogDirectory,
                     "AirFlash startup failed", MessageBoxButton.OK, MessageBoxImage.Error);
                 Shutdown(1);
             }
@@ -93,7 +99,7 @@ public partial class App : Application
         catch (Exception error)
         {
             AppPaths.Log(error.ToString());
-            if (args.Args.Any(a => a.EndsWith("-check", StringComparison.Ordinal) || a is "--ui-smoke" or "--tray-smoke" or "--ui-perf" or "--discovery-perf")) { WriteOutput(args.Args, new { ok = false, error = error.ToString() }); Shutdown(1); return; }
+            if (Program.IsDiagnostic(args.Args)) { WriteOutput(args.Args, new { ok = false, error = error.ToString() }); Shutdown(1); return; }
             MessageBox.Show(error.Message + "\n\n" + AppPaths.LogDirectory, L.Get("AirFlash startup failed"), MessageBoxButton.OK, MessageBoxImage.Error);
             Quit();
         }

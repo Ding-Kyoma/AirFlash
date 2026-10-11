@@ -5,6 +5,8 @@ namespace AirFlash.App;
 
 internal static class Program
 {
+    internal static bool IsDiagnostic(string[] args) => args.Any(a => a.EndsWith("-check", StringComparison.Ordinal)
+        || a is "--ui-smoke" or "--tray-smoke" or "--ui-perf" or "--discovery-perf");
     [STAThread]
     public static int Main(string[] args)
     {
@@ -34,7 +36,7 @@ internal static class Program
             AppPaths.Log($"Startup stage={stage} failed {error}");
             try { App.WriteOutput(args, new { ok = false, stage, error = error.ToString(), hresult = $"0x{error.HResult:X8}" }); }
             catch (Exception reportError) { AppPaths.Log($"Diagnostic output failed: {reportError.Message}"); }
-            if (!args.Any(a => a.EndsWith("-check", StringComparison.Ordinal) || a is "--ui-smoke" or "--tray-smoke" or "--ui-perf"))
+            if (!IsDiagnostic(args))
                 MessageBox(IntPtr.Zero, $"{error.Message}\n\nLogs: {AppPaths.LogDirectory}", "AirFlash startup failed", 0x10);
             return 1;
         }

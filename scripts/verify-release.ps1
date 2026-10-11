@@ -27,5 +27,13 @@ Copy-Item -LiteralPath $output -Destination 'artifacts/compatibility/host-check.
 Remove-Item -LiteralPath $output
 $audit = Get-Content 'artifacts/compatibility/bundle-audit.json' -Raw | ConvertFrom-Json
 if (-not $audit.ok -or $audit.published_exe_sha256 -ne (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'Compatibility audit does not match release EXE.' }
+# An existing directory cannot be a JSON file. Exercise the early dispatcher error
+# path without changing permissions, user settings, system DLLs or WPF resources.
+$invalidOutput = [IO.Path]::GetFullPath((Join-Path 'artifacts/compatibility' ('invalid-output-' + [Guid]::NewGuid().ToString('N'))))
+New-Item -ItemType Directory -Path $invalidOutput | Out-Null
+$process = Start-Process -FilePath (Resolve-Path $exe) -ArgumentList @('--compat-check', '--output', "`"$invalidOutput`"") -PassThru -WindowStyle Hidden
+if (-not $process.WaitForExit(30000)) { $process.Kill(); throw 'Early diagnostic failure opened a blocking dialog or failed to exit.' }
+if ($process.ExitCode -ne 1) { throw "Unexpected early diagnostic failure exit: $($process.ExitCode)" }
+Remove-Item -LiteralPath $invalidOutput
 $hashes = foreach ($file in @($exe,$msi)) { '{0}  {1}' -f (Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant(),(Split-Path $file -Leaf) }
 $hashes | Set-Content (Join-Path $Directory 'SHA256SUMS.txt') -Encoding ascii
