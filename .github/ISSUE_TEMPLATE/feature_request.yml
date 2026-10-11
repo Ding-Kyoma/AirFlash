@@ -1,0 +1,51 @@
+name: Feature request
+description: Suggest a feature for AirFlash and explain the problem it would solve.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for sharing an idea for AirFlash. Please search existing issues and check the [feature plan](https://github.com/Ding-Kyoma/AirFlash#feature-plan) before submitting a request.
+        AirFlash focuses on capturing Windows audio and streaming it to HomePod over AirPlay 2, including related playback and device management features.
+
+  - type: textarea
+    id: feature-description
+    attributes:
+      label: Describe the feature
+      description: Explain the feature you would like and how it should work.
+      placeholder: A clear and concise description of the proposed feature.
+    validations:
+      required: true
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: Describe a concrete situation where you would use this feature, the problem you face today, and how the feature would help.
+      placeholder: |
+        When I ...
+        I currently have to ...
+        This feature would help by ...
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: broader-demand
+    attributes:
+      label: Demand from other users
+      description: Consider whether other AirFlash users could encounter the same problem or benefit from this feature.
+      options:
+        - label: I have considered whether other AirFlash users may have a similar need for this feature.
+          required: true
+
+  - type: checkboxes
+    id: request-policy
+    attributes:
+      label: Feature request policy
+      description: Please acknowledge both statements before submitting your request.
+      options:
+        - label: I understand that requests outside AirFlash's scope will be closed.
+          required: true
+        - label: I understand that the author is under no obligation to implement this feature, and that submitting a request does not guarantee implementation or a delivery date.
+          required: true
