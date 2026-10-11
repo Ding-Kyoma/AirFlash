@@ -19,6 +19,11 @@ AirFlash 是 TuneBlade（AirPlay 1）的 AirPlay 2 替代方案，旨在让 Wind
 
 从 [GitHub Releases](https://github.com/Ding-Kyoma/AirFlash/releases/latest) 下载并运行 `AirFlash-X.Y.Z.msi` 安装，或直接运行便携版 `AirFlash.exe`。
 
+最低兼容目标为 **Windows x64，Windows 10 1809 / Build 17763（LTSC 2019）**，
+同时覆盖 LTSC 2021、22H2 和 Windows 11。当前仍为兼容候选版本，需受影响用户实机验收。
+启动失败时可使用 Windows 自带 PowerShell 5.1 收集报告；步骤与验收范围见
+[Windows 兼容性与启动诊断](WINDOWS-COMPATIBILITY.md)。程序自包含，无需另装 .NET、Python 或 VC++ 运行库。
+
 AirFlash 提供 Windows x64 可执行文件和可独立运行的 MSI 安装包。由于发布文件没有代码签名，Windows
 可能显示 SmartScreen 警告。只有在确认下载文件来源可信时，才使用“更多信息”
 和“仍要运行”。
@@ -44,6 +49,10 @@ AirFlash 提供 Windows x64 可执行文件和可独立运行的 MSI 安装包�
 3. 选择完整的 `HomePod stereo · 2/2` 项目并点击播放。
 4. 如果接收端要求 PIN，在“设置 > 接收器”中完成配对。
 5. 如果默认设置不合适，在设置中选择采集端点和延迟模式。
+
+设备发现仅在控制面板或“设置 > 接收器”页面可见时运行，两处都隐藏后暂停。
+暂停时保留上次结果，不会中断播放。如果启用了全局或单个设备的自动连接，
+程序启动后还会扫描 10 秒；之后打开设备列表即可恢复发现。
 
 AirFlash 使用全新的应用数据目录 `%APPDATA%/AirFlash` 和
 `%LOCALAPPDATA%/AirFlash`。它不会读取旧产品名称创建的配置、凭据或引擎

@@ -6,6 +6,9 @@ The installer is built with WiX Toolset 6.0.2.
 - The MSI installs the self-contained `AirFlash.exe` under `Program Files\AirFlash`.
 - The standard installer UI lets the user change the install directory and optionally creates desktop and Start menu shortcuts. Both shortcut options are enabled by default.
 - The installed package appears in Windows Apps and Features and does not require a separate Setup.exe, .NET runtime, Rust runtime, or VC++ Redistributable.
+- New installations require an x64 system and Windows build 17763 or newer. The installer reads `CurrentBuildNumber` from the 64-bit registry view; maintenance and removal remain available for installed products.
+
+Windows 10 execution is pending affected-user verification. See [compatibility diagnostics and acceptance](../docs/WINDOWS-COMPATIBILITY.md).
 
 Build the release outputs with:
 

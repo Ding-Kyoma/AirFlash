@@ -160,6 +160,7 @@
     </DataTemplate>
     <DataTemplate x:Key="Page4">
       <StackPanel>
+        <TextBlock Text="{Binding App.DiscoveryStatus}" Style="{StaticResource Hint}" Margin="0,0,0,12"/>
         <Button Content="{loc:Text '＋ Add receiver manually'}" HorizontalAlignment="Left" Command="{Binding AddReceiverCommand}" Margin="0,0,0,16"/>
         <ItemsControl ItemsSource="{Binding Receivers}">
           <ItemsControl.ItemTemplate>

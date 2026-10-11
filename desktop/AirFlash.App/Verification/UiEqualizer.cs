@@ -14,7 +14,7 @@ internal static class UiEqualizer
     {
         var store = new UiSmoke.MemoryStore(); var audio = new UiSmoke.MockAudio(); var engine = new UiSmoke.MockFactory();
         await using var app = new AppViewModel(store, new UiSmoke.MockDiscovery(), new UiSmoke.MockAutostart(), audio, engine, Application.Current.Dispatcher);
-        app.Start(); await app.Startup;
+        app.SetPanelVisible(true); app.Start(); await app.Startup;
         var window = new SettingsWindow(app); window.Show(); await Pump();
         try
         {

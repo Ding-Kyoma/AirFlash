@@ -32,7 +32,13 @@
     <WixVariable Id="WixUILicenseRtf" Value="$(var.UiLicenseFile)"/>
     <ui:WixUI Id="WixUI_FeatureTree"/>
 
-    <Launch Condition="VersionNT64" Message="Windows 10 or later on a 64-bit system is required."/>
+    <Property Id="AIRFLASH_OS_BUILD">
+      <RegistrySearch Id="ReadWindowsBuild" Root="HKLM" Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" Name="CurrentBuildNumber" Type="raw" Bitness="always64"/>
+    </Property>
+    <Property Id="AIRFLASH_OS_ARCH">
+      <RegistrySearch Id="ReadWindowsArchitecture" Root="HKLM" Key="SYSTEM\CurrentControlSet\Control\Session Manager\Environment" Name="PROCESSOR_ARCHITECTURE" Type="raw" Bitness="always64"/>
+    </Property>
+    <Launch Condition="Installed OR (VersionNT64 AND AIRFLASH_OS_ARCH = &quot;AMD64&quot; AND AIRFLASH_OS_BUILD &gt;= 17763)" Message="Windows 10 version 1809 (build 17763) or later on an x64 system is required."/>
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="AirFlash"/>

@@ -20,13 +20,13 @@ public partial class SettingsWindow : Window
         ViewModel.AddReceiverRequested += () => { var dialog = new ManualReceiverDialog { Owner = this }; if (dialog.ShowDialog() == true) ViewModel.AddManual(dialog.DeviceName, dialog.Host, dialog.Port); };
         ViewModel.PairRequested += async receiver =>
         {
-            try { await app.Session.PairAsync(receiver, app.Settings.Clone(), (member, token) => PinDialog.RequestAsync(this, member, token)); }
+            try { if (app.EngineReady && !app.IsClosing) await app.Session.PairAsync(receiver, app.Settings.Clone(), (member, token) => PinDialog.RequestAsync(this, member, token)); }
             catch (Exception error) { app.ShowError(error); }
         };
         ViewModel.PropertyChanged += (_, args) => { if (args.PropertyName == nameof(SettingsViewModel.SelectedPage)) ShowPage(); };
-        IsVisibleChanged += (_, _) => app.SetMonitorVisible(IsVisible && ViewModel.SelectedPage == SettingsViewModel.MonitorPage);
+        IsVisibleChanged += (_, _) => UpdatePageVisibility();
         Closing += (_, args) => { if (ViewModel.IsApplying) args.Cancel = true; };
-        Closed += (_, _) => ViewModel.Dispose();
+        Closed += (_, _) => { app.SetReceiversPageVisible(false); app.SetMonitorVisible(false); ViewModel.Dispose(); };
         ShowPage();
     }
     private void ShowPage()
@@ -39,8 +39,13 @@ public partial class SettingsWindow : Window
             _pages.Add(selected, page); PageContainer.Children.Add(page);
         }
         foreach (var (index, view) in _pages) view.Visibility = index == selected ? Visibility.Visible : Visibility.Collapsed;
-        ViewModel.App.SetMonitorVisible(IsVisible && selected == SettingsViewModel.MonitorPage);
+        UpdatePageVisibility();
         PageScroll.ScrollToTop();
+    }
+    private void UpdatePageVisibility()
+    {
+        ViewModel.App.SetMonitorVisible(IsVisible && ViewModel.SelectedPage == SettingsViewModel.MonitorPage);
+        ViewModel.App.SetReceiversPageVisible(IsVisible && ViewModel.SelectedPage == SettingsViewModel.ReceiversPage);
     }
     private void OnSourceInitialized(object? sender, EventArgs args)
     {

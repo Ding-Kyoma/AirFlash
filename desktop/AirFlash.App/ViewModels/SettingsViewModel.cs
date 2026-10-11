@@ -207,7 +207,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
             var row = Receivers.FirstOrDefault(r => r.Receiver.Id == receiver.Id);
             if (row is null)
             {
-                row = new(receiver, options, current => PairRequested?.Invoke(current), () => RemoveManual(receiver.Id), () => CanEdit);
+                row = new(receiver, options, current => PairRequested?.Invoke(current), () => RemoveManual(receiver.Id), () => CanEdit, () => App.EngineReady && !App.IsClosing);
                 Receivers.Insert(index, row);
             }
             else
@@ -215,6 +215,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
                 row.SetOptions(options);
                 if (!AppViewModel.ReceiverEqual(row.Receiver, receiver)) { row.Receiver = receiver; row.Refresh(); }
                 var oldIndex = Receivers.IndexOf(row); if (oldIndex != index) Receivers.Move(oldIndex, index);
+                row.Refresh();
             }
             index++;
         }
@@ -326,10 +327,10 @@ public sealed class ReceiverEditor : ObservableObject
     public Receiver Receiver { get; set; }
     public ReceiverOptions Options { get; private set; }
     public void SetOptions(ReceiverOptions options) { if (ReferenceEquals(Options, options)) return; Options = options; Notify(nameof(Options)); }
-    public ReceiverEditor(Receiver receiver, ReceiverOptions options, Action<Receiver> pair, Action remove, Func<bool> canEdit)
+    public ReceiverEditor(Receiver receiver, ReceiverOptions options, Action<Receiver> pair, Action remove, Func<bool> canEdit, Func<bool>? canPair = null)
     {
         Receiver = receiver; Options = options;
-        PairCommand = new(() => { if (canEdit()) pair(Receiver); }, () => canEdit() && Receiver.Online && Receiver.Complete);
+        PairCommand = new(() => { if (canEdit() && (canPair?.Invoke() ?? true)) pair(Receiver); }, () => canEdit() && (canPair?.Invoke() ?? true) && Receiver.Online && Receiver.Complete);
         RemoveCommand = new(() => { if (canEdit()) remove(); }, canEdit);
     }
     public string Name => Receiver.Name;

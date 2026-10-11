@@ -515,6 +515,9 @@ def test_build_keeps_the_preflight_host_when_checkout_host_appears_later(fixture
     selected = fixture.host("integration", publish_output=True)
     fixture.host("path")
     fixture.stop_after_installer()
+    audit = fixture.root / "artifacts/compatibility/bundle-audit.json"
+    audit.parent.mkdir(parents=True)
+    audit.write_text(json.dumps({"ok": True}), encoding="utf-8")
     result = fixture.run("build.ps1", add_checkout_host=True)
     assert result["error"] == "Fixture stopped after installer admission."
     assert [call["path"] for call in host_calls(result)] == [str(selected), str(selected)]
