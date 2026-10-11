@@ -113,7 +113,8 @@ internal static class StabilityCheck
             else
                 await app.Session.StartAsync(replacement, app.Settings.Clone());
             var state = pairing ? PlaybackState.Pairing : PlaybackState.Streaming;
-            await Until(() => app.Snapshot.State == state && app.Snapshot.Receiver?.Id == replacement.Id);
+            await Until(() => app.Snapshot.State == state && app.Snapshot.Receiver?.Id == replacement.Id
+                && (!pairing || engine.Commands.Any(c => c.Text("command") == "pair")));
             var starts = engine.CreatedCount;
             store.SaveGate.TrySetResult();
             await Until(() => app.AllReceivers.Any(r => r.Id == promoted.Id));
