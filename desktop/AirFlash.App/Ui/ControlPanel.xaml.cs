@@ -26,6 +26,7 @@ public partial class ControlPanel : Window
         InitializeComponent(); _viewModel = viewModel; DataContext = viewModel; WindowThemeService.Track(this); AppIconService.Track(this);
         viewModel.SettingsChanged += UpdateLayoutSettings;
         viewModel.Receivers.CollectionChanged += OnReceiversChanged;
+        IsVisibleChanged += (_, _) => viewModel.SetPanelVisible(IsVisible);
         SizeChanged += (_, _) => { if (!_placing) RequestPlacement(); };
         DpiChanged += (_, _) => RequestPlacement();
         UpdateLayoutSettings();

@@ -30,6 +30,12 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Verify selected .NET SDK before reservation
+        shell: pwsh
+        run: ./scripts/check-dotnet.ps1
       - name: Reserve an increasing version
         id: version
         shell: pwsh
@@ -40,9 +46,6 @@ jobs:
           . ./scripts/release-version.ps1
           $version = Reserve-ReleaseVersion (Get-Location).Path '' $env:RELEASE_CHANNEL -NewVersion $env:NEW_RELEASE_VERSION
           "version=$version" >> $env:GITHUB_OUTPUT
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.x'
       - name: Verify generated icons
         shell: pwsh
         run: pwsh -NoProfile -STA -File scripts/generate-icons.ps1 -Check
@@ -77,6 +80,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/test-installer.ps1
+      - name: Preserve compatibility evidence and diagnostic collector
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: airflash-compatibility-${{ steps.version.outputs.version }}
+          path: |
+            artifacts/compatibility/*.json
+            scripts/collect-startup-diagnostics.ps1
+            docs/WINDOWS-COMPATIBILITY.md
+          retention-days: 30
       - name: Publish verified stable release
         if: github.ref == 'refs/heads/main' && inputs.publish
         shell: pwsh

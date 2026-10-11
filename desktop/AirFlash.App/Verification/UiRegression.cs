@@ -14,7 +14,7 @@ internal static class UiRegression
         var autostart = new UiSmoke.MockAutostart(); var discovery = new UiSmoke.MockDiscovery();
         var engine = new UiSmoke.MockFactory();
         await using var app = new AppViewModel(store, discovery, autostart, audio, engine, Application.Current.Dispatcher);
-        app.Start(); await app.Startup; await Pump();
+        app.SetPanelVisible(true); app.Start(); await app.Startup; await Pump();
         var window = new SettingsWindow(app); window.Show(); await Pump();
         var vm = window.ViewModel;
         try
@@ -157,6 +157,7 @@ internal static class UiRegression
         finally { store.SaveGate?.TrySetResult(); audio.EnumerationGate?.TrySetResult(); await vm.ApplicationCompleted; window.Close(); }
         await RunIdentityRegressionAsync(checks, directory);
         await RunAutoConnectIdentityRegressionAsync(checks);
+        await RunDiscoveryDemandRegressionAsync(checks);
         await RunStereoIdentityRegressionAsync(checks, directory);
     }
     private static async Task RunIdentityRegressionAsync(List<string> checks, string directory)
@@ -168,7 +169,7 @@ internal static class UiRegression
         var discovery = new UiSmoke.MockDiscovery { Items = [new("127.0.0.1:7000", "Office", "127.0.0.1")] };
         var engine = new UiSmoke.MockFactory();
         await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
-        app.Start(); await app.Startup; await Until(() => app.AllReceivers.Count == 1);
+        app.SetPanelVisible(true); app.Start(); await app.Startup; await Until(() => app.AllReceivers.Count == 1);
         var window = new SettingsWindow(app); window.Show(); await Pump(); var vm = window.ViewModel;
         try
         {
@@ -227,7 +228,7 @@ internal static class UiRegression
         var discovery = new UiSmoke.MockDiscovery { Items = ReceiverAggregator.Build(services) };
         var engine = new UiSmoke.MockFactory();
         await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
-        app.Start(); await app.Startup; await Until(() => app.AllReceivers.Count == 1);
+        app.SetPanelVisible(true); app.Start(); await app.Startup; await Until(() => app.AllReceivers.Count == 1);
         var window = new SettingsWindow(app); window.Show(); await Pump(); var vm = window.ViewModel;
         try
         {
@@ -236,8 +237,8 @@ internal static class UiRegression
             vm.SelectedPage = SettingsViewModel.ReceiversPage; await Pump(); UiSmoke.Render(window, Path.Combine(directory, "settings-identity-stereo.png"), 1);
             await app.ToggleAsync(app.AllReceivers[0]); await Until(() => app.Snapshot.State == PlaybackState.Streaming);
             discovery.Items = ReceiverAggregator.Build(services.Take(2)); discovery.Publish();
-            await Until(() => !app.Snapshot.IsActive && app.AllReceivers.Single().Members.Length == 1);
-            Check(app.AllReceivers.Single().Detail.Contains("1/2", StringComparison.Ordinal) && engine.CreatedCount == 1, "missing stereo member shows one of two and stops incomplete playback", checks);
+            await Until(() => app.AllReceivers.Single().Members.Length == 1);
+            Check(app.Snapshot.IsActive && app.AllReceivers.Single().Detail.Contains("1/2", StringComparison.Ordinal) && engine.CreatedCount == 1, "missing discovery member shows one of two without stopping active transport", checks);
         }
         finally { await vm.ApplicationCompleted; window.Close(); }
 
@@ -245,6 +246,57 @@ internal static class UiRegression
             new Dictionary<string, string> { ["deviceid"] = id, ["model"] = "AudioAccessory6,1", ["tsid"] = "pair", ["gpn"] = "Office stereo" });
     }
     private static void Check(bool value, string name, List<string> checks) { if (!value) throw new InvalidOperationException(name); checks.Add(name); }
+    private static async Task RunDiscoveryDemandRegressionAsync(List<string> checks)
+    {
+        var discovery = new UiSmoke.MockDiscovery(); var engine = new UiSmoke.MockFactory();
+        await using var app = new AppViewModel(new UiSmoke.MemoryStore(), discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+        app.Start(); await app.Startup; await Pump();
+        Check(!discovery.Running && discovery.Starts == 0, "tray startup without automatic connection never starts discovery", checks);
+        var panel = new ControlPanel(app); var settings = new SettingsWindow(app);
+        try
+        {
+            panel.ShowPanel(); await Pump();
+            Check(discovery.Running && discovery.Starts == 1 && app.Receivers.Count == 2, "visible panel starts discovery and displays results", checks);
+            settings.ViewModel.SelectedPage = SettingsViewModel.ReceiversPage; settings.Show(); await Pump();
+            panel.Hide(); await Pump();
+            Check(discovery.Running && discovery.Starts == 1 && discovery.Stops == 0, "receiver page shares discovery after panel hides", checks);
+            settings.ViewModel.SelectedPage = 0; await Pump();
+            Check(!discovery.Running && discovery.Stops == 1 && app.Receivers.Count == 2, "last receiver list hiding stops discovery and preserves cache", checks);
+            panel.ShowPanel(); await Pump();
+            await app.ToggleAsync(app.AllReceivers.First(r => r.Online)); await Until(() => app.Snapshot.State == PlaybackState.Streaming);
+            panel.Hide(); await Pump();
+            discovery.Items = []; discovery.Publish(); await Pump();
+            Check(app.Snapshot.IsActive && !discovery.Running && engine.CreatedCount == 1, "suspension and absent discovery results do not interrupt playback", checks);
+            for (var i = 0; i < 10; i++) { panel.ShowPanel(); await Pump(); panel.Hide(); await Pump(); }
+            Check(discovery.Starts == discovery.Stops, "repeated panel visibility releases every discovery session", checks);
+        }
+        finally { settings.Close(); panel.ShutdownPanel(); }
+
+        var startupStore = new UiSmoke.MemoryStore(); var startupSettings = startupStore.Load();
+        startupSettings.Options("a").AutoConnect = true; startupStore.Save(startupSettings);
+        var startupDiscovery = new UiSmoke.MockDiscovery();
+        await using var startupApp = new AppViewModel(startupStore, startupDiscovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), new UiSmoke.MockFactory(), Application.Current.Dispatcher);
+        startupApp.Start(); await startupApp.Startup; await Pump();
+        Check(startupDiscovery.Running && startupDiscovery.Starts == 1, "per-device automatic connection starts bounded startup discovery", checks);
+
+        var visibleStore = new UiSmoke.MemoryStore(); var visibleSettings = visibleStore.Load();
+        visibleSettings.AutoConnectOnDiscover = true; visibleStore.Save(visibleSettings);
+        var visibleDiscovery = new UiSmoke.MockDiscovery { Items = [] };
+        await using var visibleApp = new AppViewModel(visibleStore, visibleDiscovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), new UiSmoke.MockFactory(), Application.Current.Dispatcher);
+        visibleApp.SetPanelVisible(true); visibleApp.Start(); await visibleApp.Startup; await Pump();
+        await Task.Delay(TimeSpan.FromMilliseconds(10500)); await Pump();
+        Check(!startupDiscovery.Running && startupDiscovery.Stops == 1, "startup discovery stops after ten seconds without visible receiver lists", checks);
+        Check(visibleDiscovery.Running && visibleDiscovery.Starts == 1 && visibleApp.DiscoveryEmptyTitle == L.Get("No receivers found"), "visible list outlives startup scan and empty search settles after ten seconds", checks);
+        visibleApp.SetPanelVisible(false); await Pump();
+        Check(!visibleDiscovery.Running && visibleDiscovery.Stops == 1, "hiding list after startup deadline stops its remaining discovery demand", checks);
+
+        var hiddenStore = new UiSmoke.MemoryStore(); var hiddenSettings = hiddenStore.Load();
+        hiddenSettings.Options("a").AutoConnect = true; hiddenSettings.Options("a").Hidden = true; hiddenStore.Save(hiddenSettings);
+        var hiddenDiscovery = new UiSmoke.MockDiscovery();
+        await using var hiddenApp = new AppViewModel(hiddenStore, hiddenDiscovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), new UiSmoke.MockFactory(), Application.Current.Dispatcher);
+        hiddenApp.Start(); await hiddenApp.Startup; await Pump();
+        Check(hiddenDiscovery.Starts == 0, "hidden per-device automatic connection does not request startup discovery", checks);
+    }
     private static async Task Pump() { await Application.Current.Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle); await Task.Delay(20); }
     private static async Task Until(Func<bool> condition)
     {

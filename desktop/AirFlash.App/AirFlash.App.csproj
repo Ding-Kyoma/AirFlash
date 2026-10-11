@@ -7,6 +7,7 @@
     <UseWPF>true</UseWPF>
     <AssemblyName>AirFlash</AssemblyName>
     <RootNamespace>AirFlash.App</RootNamespace>
+    <StartupObject>AirFlash.App.Program</StartupObject>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
@@ -29,5 +30,13 @@
   </ItemGroup>
   <Target Name="RequireEngineForPublish" BeforeTargets="PrepareForPublish">
     <Error Condition="!Exists('../../native/airflash-engine/target/release/airflash-engine.exe')" Text="Build the Rust engine first with scripts/build-native.ps1."/>
+  </Target>
+  <Target Name="AuditWindowsCompatibility" BeforeTargets="GenerateSingleFileBundle" DependsOnTargets="PrepareForBundle" Condition="'$(PublishSingleFile)' == 'true'">
+    <PropertyGroup>
+      <CompatibilityArtifacts>$(MSBuildProjectDirectory)/../../artifacts/compatibility</CompatibilityArtifacts>
+    </PropertyGroup>
+    <MakeDir Directories="$(CompatibilityArtifacts)"/>
+    <WriteLinesToFile File="$(CompatibilityArtifacts)/bundle-inputs.txt" Lines="@(FilesToBundle->'%(FullPath)')" Overwrite="true" Encoding="UTF-8"/>
+    <Exec WorkingDirectory="$(MSBuildProjectDirectory)/../.." Command="uv run --no-sync python -m scripts.compatibility_audit --manifest &quot;$(CompatibilityArtifacts)/bundle-inputs.txt&quot; --file &quot;$(MSBuildProjectDirectory)/../../native/airflash-engine/target/release/airflash-engine.exe&quot; --source-root . --output &quot;$(CompatibilityArtifacts)/bundle-audit.json&quot;"/>
   </Target>
 </Project>

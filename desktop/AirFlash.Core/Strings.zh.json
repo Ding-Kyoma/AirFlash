@@ -1,4 +1,6 @@
 {
+  "No receivers found": "未找到接收器",
+  "Discovery paused. Showing previous results.": "已暂停发现，显示上次结果。",
   "Check for updates": "检查更新",
   "Open download page": "打开下载页",
   "Checking for updates…": "正在检查更新…",
@@ -261,5 +263,10 @@
   "The previous configuration was preserved in a recovery backup: {0}": "原配置已保存在恢复备份中：{0}",
   "Could not verify the configuration backup.": "无法验证配置备份。",
   "Configuration contains invalid receiver or manual-receiver collections.": "配置包含无效的接收器或手动接收器列表。",
-  "Manual receivers require unique, nonempty identifiers and a valid address and port (1–65535).": "手动接收器需要唯一且非空的标识符，以及有效的地址和端口（1–65535）。"
+  "Manual receivers require unique, nonempty identifiers and a valid address and port (1–65535).": "手动接收器需要唯一且非空的标识符，以及有效的地址和端口（1–65535）。",
+  "Initializing audio engine…": "正在初始化音频引擎…",
+  "The audio engine could not start: {0}": "音频引擎无法启动：{0}",
+  "Retry audio engine": "重试音频引擎",
+  "Audio engine initialization timed out after 10 seconds.": "音频引擎初始化超过 10 秒，已超时。",
+  "Windows DNS-SD is unavailable. You can add a receiver manually and collect startup diagnostics.": "Windows DNS-SD 不可用。可以手动添加接收器，并收集启动诊断信息。"
 }

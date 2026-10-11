@@ -35,3 +35,26 @@ jobs:
       - name: .NET tests
         shell: pwsh
         run: ./scripts/dotnet.ps1 test AirFlash.sln '-p:RestoreLockedMode=true'
+      - name: Audit self-contained bundle
+        shell: pwsh
+        run: ./scripts/dotnet.ps1 publish AirFlash.App/AirFlash.App.csproj -c Release -r win-x64 --self-contained true '-p:IncludeNativeLibrariesForSelfExtract=true' '-p:RestoreLockedMode=true' -o (Join-Path (Get-Location).Path 'artifacts/compatibility-publish')
+      - name: Verify packaged startup and compatibility
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path artifacts/compatibility-publish/AirFlash.exe).Path
+          foreach ($check in @('self-check', 'compat-check')) {
+            $report = [IO.Path]::GetFullPath("artifacts/compatibility/$check.json")
+            $process = Start-Process -FilePath $exe -ArgumentList @("--$check", '--output', ('"' + $report + '"')) -PassThru -WindowStyle Hidden
+            if (-not $process.WaitForExit(30000)) { $process.Kill(); throw "$check timed out" }
+            if ($process.ExitCode -ne 0 -or -not (Get-Content $report -Raw | ConvertFrom-Json).ok) { throw "$check failed" }
+          }
+          $audit = Get-Content artifacts/compatibility/bundle-audit.json -Raw | ConvertFrom-Json
+          $audit | Add-Member -NotePropertyName published_exe_sha256 -NotePropertyValue (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant() -Force
+          $audit | ConvertTo-Json -Depth 20 | Set-Content artifacts/compatibility/bundle-audit.json -Encoding utf8
+      - name: Preserve compatibility audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-compatibility-audit
+          path: artifacts/compatibility/*.json
+          retention-days: 14

@@ -54,8 +54,10 @@ internal static class UiSettingsRecovery
         {
             Check(app.Settings.Validate() is null && app.Settings.ManualReceivers.Count == 0 && app.Settings.StreamSampleRate == "44100", name + ": second constructor load cannot expose invalid manual entries or rates", checks);
             app.Start(); await app.Startup.WaitAsync(TimeSpan.FromSeconds(5));
+            Check(discovery.StartCount == 0, name + ": recovered defaults do not request a background startup browse", checks);
+            panel.ShowPanel();
             await Until(() => app.AllReceivers.Any(r => r.Id == FixtureDiscovery.ReceiverId));
-            panel.ShowPanel(); await Pump();
+            await Pump();
             Check(!string.IsNullOrEmpty(app.Notice) && app.Notice == store.LoadWarning, name + ": startup retains the recovery notice across both loads", checks);
             Check(UiSmoke.Descendants(panel).OfType<TextBlock>().Any(t => t.IsVisible && t.Text == app.Notice), name + ": recovery notice reaches the panel text binding", checks);
             await app.TryAutoConnectAsync(); await Pump();
@@ -85,6 +87,8 @@ internal static class UiSettingsRecovery
                 Check(initial.Validate() is null && !initial.AutoConnectOnDiscover && !initial.StartAtLogin && !string.IsNullOrEmpty(store.LoadWarning), "locked settings: shell load recovers without an escaping reread", checks);
                 app = new(store, discovery, autostart, audio, engine, Application.Current.Dispatcher);
                 app.Start(); await app.Startup.WaitAsync(TimeSpan.FromSeconds(5));
+                Check(discovery.StartCount == 0, "locked settings: recovered defaults do not request a background startup browse", checks);
+                app.SetPanelVisible(true);
                 await Until(() => app.AllReceivers.Any(r => r.Id == FixtureDiscovery.ReceiverId));
                 await app.TryAutoConnectAsync(); await Pump();
                 Check(app.Settings.Validate() is null && !string.IsNullOrEmpty(app.Notice) && app.Notice == store.LoadWarning && autostart.Values.SequenceEqual(new[] { false }), "locked settings: second load and startup retain safe defaults and a controlled warning", checks);
@@ -124,6 +128,8 @@ internal static class UiSettingsRecovery
         var discovery = new FixtureDiscovery(); var audio = new FixtureAudio(); var engine = new UiSmoke.MockFactory();
         await using var app = new AppViewModel(store, discovery, new FixtureAutostart(), audio, engine, Application.Current.Dispatcher);
         app.Start(); await app.Startup.WaitAsync(TimeSpan.FromSeconds(5)); await Pump();
+        Check(discovery.StartCount == 0, "valid settings: an inactive hidden panel does not browse without automatic demand", checks);
+        app.SetPanelVisible(true); await Pump();
         Check(app.Notice.Length == 0 && store.LoadWarning is null, "valid settings: repeated migration load does not produce a recovery warning", checks);
         Check(discovery.SelectedInterface == offlineInterface && app.Settings.DiscoveryInterfaceId == offlineInterface && discovery.Publications == 1 && app.AllReceivers.Count == 1 && app.AllReceivers[0].IsManual, "valid settings: an unavailable selected interface is retained without fallback while manual receivers remain", checks);
         Check(app.Settings.ManualReceivers.Single() == initial.ManualReceivers.Single() && app.Settings.ReadOptions("manual:fixture").AutoConnect is null && app.Settings.ReadOptions("manual:fixture").CustomBufferMs is null && app.Settings.ReadOptions("manual:fixture").LatencyMode is null, "valid settings: manual records and nullable legacy receiver overrides survive both loads", checks);
@@ -174,15 +180,21 @@ internal static class UiSettingsRecovery
         public const string ReceiverId = "192.0.2.10:7000";
         public int StartCount { get; private set; }
         public int Publications { get; private set; }
+        private bool _requested;
         public string SelectedInterface { get; private set; } = "";
         public event Action<IReadOnlyList<Receiver>>? Changed;
         public event Action<string>? Failed { add { } remove { } }
+        public event Action<bool>? RunningChanged;
         public void SetInterface(string id) => SelectedInterface = id;
         public void Start()
         {
+            if (_requested) return;
+            _requested = true;
             StartCount++; Publications++;
+            RunningChanged?.Invoke(SelectedInterface.Length == 0);
             Changed?.Invoke(SelectedInterface.Length == 0 ? [new(ReceiverId, "Fixture receiver", "192.0.2.10")] : []);
         }
-        public void Dispose() { }
+        public void Stop() { if (!_requested) return; _requested = false; RunningChanged?.Invoke(false); }
+        public void Dispose() => Stop();
     }
 }
