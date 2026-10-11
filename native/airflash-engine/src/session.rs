@@ -88,7 +88,10 @@ impl ProbeOptions {
     }
     pub fn validate(&self) -> Result<()> {
         self.equalizer.validate()?;
-        ensure!(!self.equalizer.enabled, "finite probes require the equalizer to be disabled");
+        ensure!(
+            !self.equalizer.enabled,
+            "finite probes require the equalizer to be disabled"
+        );
         ensure!(
             self.source == "wav" || self.source == "loopback",
             "unknown audio source"
@@ -194,6 +197,29 @@ impl Drop for NtpServer {
         }
     }
 }
+fn authenticate_with<C, T>(
+    host: IpAddr,
+    connection: &mut C,
+    saved: Result<Option<auth::Credentials>>,
+    verify: impl FnOnce(&mut C, &auth::Credentials) -> Result<T>,
+    transient: impl FnOnce(&mut C) -> Result<T>,
+) -> Result<T> {
+    // Storage errors precede the authentication wrapper and retain setup classification.
+    let saved = saved?;
+    (if let Some(credentials) = saved {
+        verify(connection, &credentials)
+    } else {
+        transient(connection)
+    })
+    .map_err(|error| {
+        let mut fault = Fault::from_error(host, "authentication", &error);
+        if fault.code == "protocol_error" {
+            fault.code = "authentication_failed".into();
+        }
+        fault.into()
+    })
+}
+
 struct Member {
     peer: Peer,
     conn: std::sync::Arc<std::sync::Mutex<Connection>>,
@@ -233,29 +259,19 @@ impl Member {
             .and_then(Value::as_string)
             .unwrap_or("");
         let saved = if device_id.is_empty() {
-            None
+            Ok(None)
         } else {
-            crate::credentials::load(&crate::credentials::directory(), device_id)?
+            crate::credentials::load(&crate::credentials::directory(), device_id)
         };
-        let secret = (if let Some(credentials) = saved {
-            auth::verify(&mut conn, &credentials)
-        } else {
-            auth::transient(&mut conn)
-        })
-        .map_err(|error| {
-            let mut fault = Fault::from_error(peer.host, "authentication", &error);
-            if fault.code == "protocol_error" {
-                fault.code = "authentication_failed".into();
-            }
-            fault
-        })?;
+        let secret = authenticate_with(peer.host, &mut conn, saved, auth::verify, auth::transient)?;
         emit(json!({"event":"phase","host":peer.host,"phase":"authenticated"}));
         let control = UdpSocket::bind(SocketAddr::new(local, 0))?;
         control.set_nonblocking(true)?;
         let audio = UdpSocket::bind(SocketAddr::new(local, 0))?;
         let audio_key = derive(&secret, "Events-Salt", "Events-Write-Encryption-Key");
         let rate = options.sample_rate;
-        let mut packetizer = Packetizer::with_rate(audio_key, rand::random(), initial_rtp, ssrc, rate);
+        let mut packetizer =
+            Packetizer::with_rate(audio_key, rand::random(), initial_rtp, ssrc, rate);
         let use_alac =
             !peer.codecs.is_empty() && !peer.codecs.contains(&0) && peer.codecs.contains(&1);
         ensure!(
@@ -337,7 +353,10 @@ impl Member {
         }
         let latency = (options.latency_ms as u64 * rate as u64) / 1000;
         let stream = dictionary(vec![
-            ("audioFormat", number(crate::rtp::audio_format(use_alac, rate))),
+            (
+                "audioFormat",
+                number(crate::rtp::audio_format(use_alac, rate)),
+            ),
             ("audioMode", string("default")),
             ("controlPort", number(member.media.control_port()? as u64)),
             ("ct", number(if use_alac { 2 } else { 1 })),
@@ -480,7 +499,13 @@ pub fn probe(
     gain: std::sync::Arc<std::sync::atomic::AtomicU32>,
     emit: impl Fn(Json),
 ) -> Result<()> {
-    probe_with_volume(options, cancel, gain, crate::volume::Control::default(), emit)
+    probe_with_volume(
+        options,
+        cancel,
+        gain,
+        crate::volume::Control::default(),
+        emit,
+    )
 }
 
 pub fn probe_with_volume(
@@ -584,8 +609,13 @@ pub fn probe_with_controls(
     for member in &mut members {
         member.start_feedback(start)?;
     }
-    let volume_worker = crate::volume::Worker::start(members.iter().map(|m|
-        (m.peer.host.to_string(), m.uri.clone(), m.conn.clone())).collect(), volume)?;
+    let volume_worker = crate::volume::Worker::start(
+        members
+            .iter()
+            .map(|m| (m.peer.host.to_string(), m.uri.clone(), m.conn.clone()))
+            .collect(),
+        volume,
+    )?;
     let mut next_metrics = start + Duration::from_secs(1);
     let mut last_marker = 0u64;
     let mut next_sync = start;
@@ -595,7 +625,9 @@ pub fn probe_with_controls(
     let mut pcm = vec![0; PCM_BYTES];
     let outcome = (|| -> Result<()> {
         while (options.duration_ms == 0 || start.elapsed() < duration) && !cancel.is_cancelled() {
-            for event in volume_worker.events.try_iter() { emit(event); }
+            for event in volume_worker.events.try_iter() {
+                emit(event);
+            }
             for member in &members {
                 for notice in member.health.notices() {
                     emit(notice);
@@ -707,6 +739,147 @@ fn transport_metrics(members: &[Member], schedule: &MediaSchedule) -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct TemporaryRoot(PathBuf);
+    impl TemporaryRoot {
+        fn new() -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("airflash-authentication-tests-{}", Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+    }
+    impl Drop for TemporaryRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[derive(Default)]
+    struct AuthenticationCalls {
+        verify: usize,
+        transient: usize,
+    }
+    fn synthetic_credentials() -> auth::Credentials {
+        auth::Credentials {
+            accessory_id: b"synthetic-accessory".to_vec(),
+            accessory_public: [11; 32],
+            controller_id: b"synthetic-controller".to_vec(),
+            controller_secret: [22; 32],
+        }
+    }
+    fn select_authentication(
+        calls: &mut AuthenticationCalls,
+        saved: Result<Option<auth::Credentials>>,
+        fail_verify: bool,
+    ) -> Result<()> {
+        authenticate_with(
+            "127.0.0.1".parse().unwrap(),
+            calls,
+            saved,
+            |calls, credentials| {
+                calls.verify += 1;
+                assert_eq!(credentials.accessory_id, b"synthetic-accessory");
+                if fail_verify {
+                    anyhow::bail!("synthetic verification failure");
+                }
+                Ok(())
+            },
+            |calls| {
+                calls.transient += 1;
+                Ok(())
+            },
+        )
+    }
+    #[test]
+    fn absent_and_saved_credentials_select_exactly_one_authentication_method() {
+        let root = TemporaryRoot::new();
+        let id = "synthetic-accessory";
+        let mut calls = AuthenticationCalls::default();
+        let saved = crate::credentials::load(&root.0, id);
+        select_authentication(&mut calls, saved, false).unwrap();
+        assert_eq!((calls.verify, calls.transient), (0, 1));
+        crate::credentials::save(&root.0, id, &synthetic_credentials()).unwrap();
+        let saved = crate::credentials::load(&root.0, id);
+        let mut calls = AuthenticationCalls::default();
+        select_authentication(&mut calls, saved, false).unwrap();
+        assert_eq!((calls.verify, calls.transient), (1, 0));
+    }
+    #[test]
+    fn credential_io_errors_precede_both_authentication_methods_and_keep_setup_classification() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            let mut calls = AuthenticationCalls::default();
+            let error = select_authentication(
+                &mut calls,
+                Err(std::io::Error::new(kind, "synthetic credential read failure").into()),
+                false,
+            )
+            .unwrap_err();
+            assert_eq!((calls.verify, calls.transient), (0, 0));
+            assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), kind);
+            let fault = Fault::from_error("127.0.0.1", "setup", &error);
+            assert_eq!(fault.channel, "setup");
+            assert_eq!(fault.code, "socket_error");
+            assert!(fault.retryable);
+        }
+    }
+    #[test]
+    fn invalid_loaded_credentials_precede_both_authentication_methods() {
+        let root = TemporaryRoot::new();
+        let id = "synthetic-accessory";
+        for invalid in [
+            "unsupported",
+            "tampered",
+            "malformed-json",
+            "empty-accessory",
+            "empty-controller",
+        ] {
+            let mut credentials = synthetic_credentials();
+            match invalid {
+                "empty-accessory" => credentials.accessory_id.clear(),
+                "empty-controller" => credentials.controller_id.clear(),
+                _ => {}
+            }
+            crate::credentials::save(&root.0, id, &credentials).unwrap();
+            let target = crate::credentials::path(&root.0, id);
+            if invalid == "unsupported" {
+                std::fs::write(&target, b"W2AP\x02").unwrap();
+            } else if invalid == "tampered" {
+                let mut data = std::fs::read(&target).unwrap();
+                let last = data.len() - 1;
+                data[last] ^= 1;
+                std::fs::write(&target, data).unwrap();
+            } else if invalid == "malformed-json" {
+                crate::credentials::write_test_payload(&root.0, id, b"not-json").unwrap();
+            }
+            let saved = crate::credentials::load(&root.0, id);
+            assert!(saved.is_err(), "fixture must fail credential loading");
+            if invalid == "malformed-json" {
+                assert!(saved.as_ref().err().unwrap().is::<serde_json::Error>());
+            }
+            let mut calls = AuthenticationCalls::default();
+            let error = select_authentication(&mut calls, saved, false).unwrap_err();
+            assert_eq!((calls.verify, calls.transient), (0, 0));
+            let fault = Fault::from_error("127.0.0.1", "setup", &error);
+            assert_eq!(fault.channel, "setup");
+            assert_eq!(fault.code, "protocol_error");
+            assert!(!fault.retryable);
+        }
+    }
+    #[test]
+    fn failed_verification_never_falls_back_to_transient() {
+        let mut calls = AuthenticationCalls::default();
+        let error =
+            select_authentication(&mut calls, Ok(Some(synthetic_credentials())), true).unwrap_err();
+        assert_eq!((calls.verify, calls.transient), (1, 0));
+        let fault = error.downcast_ref::<Fault>().unwrap();
+        assert_eq!(fault.channel, "authentication");
+        assert_eq!(fault.code, "authentication_failed");
+        assert_eq!(fault.message, "synthetic verification failure");
+        assert!(!fault.retryable);
+    }
     #[test]
     fn unsafe_probe_rejected() {
         let mut o = ProbeOptions {
@@ -738,12 +911,14 @@ mod tests {
         assert!(o.validate().is_ok());
         o.equalizer.enabled = true;
         assert!(o.validate().is_err());
-        o.source = "loopback".into(); o.duration_ms = 0;
+        o.source = "loopback".into();
+        o.duration_ms = 0;
         assert!(o.validate_start().is_ok());
         o.equalizer.preamp_db = f64::NAN;
         assert!(o.validate_start().is_err());
         o.equalizer = crate::equalizer::Settings::default();
-        o.source = "wav".into(); o.duration_ms = 5000;
+        o.source = "wav".into();
+        o.duration_ms = 5000;
         o.latency_ms = 0;
         assert!(o.validate().is_ok());
         o.sample_rate = 48000;
