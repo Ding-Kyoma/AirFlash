@@ -38,6 +38,12 @@ $output = Join-Path $repoRoot 'dist'
 New-Item -ItemType Directory -Path $output -Force | Out-Null
 $exe = Join-Path $output 'AirFlash.exe'
 Copy-Item -LiteralPath $builtExe -Destination $exe
+$auditPath = Join-Path $repoRoot 'artifacts/compatibility/bundle-audit.json'
+if (-not (Test-Path -LiteralPath $auditPath)) { throw 'Missing bundle compatibility audit.' }
+$audit = Get-Content -LiteralPath $auditPath -Raw | ConvertFrom-Json
+$audit | Add-Member -NotePropertyName published_exe_sha256 -NotePropertyValue (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant() -Force
+$audit | Add-Member -NotePropertyName published_version -NotePropertyValue $releaseVersion -Force
+$audit | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $auditPath -Encoding utf8
 $buildInstaller = Join-Path $PSScriptRoot 'build-installer.ps1'
 & $buildInstaller -PublishPath $publish -OutputPath $output
 if ($LASTEXITCODE -ne 0) { throw 'Installer build failed.' }

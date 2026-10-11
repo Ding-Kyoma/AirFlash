@@ -1,0 +1,23 @@
+{
+  "baseline_build": 17763,
+  "policy": "Only individually documented API entries are classified. DLL presence is not proof that every export exists.",
+  "apis": {
+    "user32.dll!GetDpiForWindow": {"minimum_build": 14393, "source": "https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-getdpiforwindow"},
+    "user32.dll!GetDpiForSystem": {"minimum_build": 14393, "source": "https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-getdpiforsystem"},
+    "user32.dll!GetSystemMetricsForDpi": {"minimum_build": 14393, "source": "https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-getsystemmetricsfordpi"},
+    "user32.dll!SetProcessDpiAwarenessContext": {"minimum_build": 15063, "source": "https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-setprocessdpiawarenesscontext"},
+    "shcore.dll!GetDpiForMonitor": {"minimum_build": 9600, "source": "https://learn.microsoft.com/windows/win32/api/shellscalingapi/nf-shellscalingapi-getdpiformonitor"},
+    "dwmapi.dll!DwmSetWindowAttribute": {"minimum_build": 6000, "source": "https://learn.microsoft.com/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute"},
+    "dnsapi.dll!DnsServiceBrowse": {"minimum_build": 10240, "source": "https://learn.microsoft.com/windows/win32/api/windns/nf-windns-dnsservicebrowse"},
+    "dnsapi.dll!DnsServiceResolve": {"minimum_build": 10240, "source": "https://learn.microsoft.com/windows/win32/api/windns/nf-windns-dnsserviceresolve"},
+    "dnsapi.dll!DnsServiceBrowseCancel": {"minimum_build": 10240, "source": "https://learn.microsoft.com/windows/win32/api/windns/nf-windns-dnsservicebrowsecancel"},
+    "dnsapi.dll!DnsServiceResolveCancel": {"minimum_build": 10240, "source": "https://learn.microsoft.com/windows/win32/api/windns/nf-windns-dnsserviceresolvecancel"},
+    "kernel32.dll!GetSystemTimePreciseAsFileTime": {"minimum_build": 9200, "source": "https://learn.microsoft.com/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemtimepreciseasfiletime"},
+    "kernel32.dll!WaitOnAddress": {"minimum_build": 9200, "source": "https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-waitonaddress"},
+    "api-ms-win-core-synch-l1-2-0.dll!WaitOnAddress": {"minimum_build": 9200, "source": "https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-waitonaddress"},
+    "api-ms-win-core-synch-l1-2-0.dll!WakeByAddressAll": {"minimum_build": 9200, "source": "https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-wakebyaddressall"},
+    "api-ms-win-core-synch-l1-2-0.dll!WakeByAddressSingle": {"minimum_build": 9200, "source": "https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-wakebyaddresssingle"},
+    "bcryptprimitives.dll!ProcessPrng": {"minimum_build": 9200, "source": "https://learn.microsoft.com/windows/win32/seccng/processprng"},
+    "kernel32.dll!GetMachineTypeAttributes": {"minimum_build": 22000, "source": "https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-getmachinetypeattributes"}
+  }
+}

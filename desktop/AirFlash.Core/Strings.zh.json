@@ -251,5 +251,10 @@
   "Changes are previewed during playback. Apply saves them; Cancel or closing restores the last saved sound. Automatic attenuation reduces clipping risk and may lower the volume.": "播放时可即时试听。点击应用保存，取消或关闭恢复最近保存的音效。自动衰减可降低削波风险，可能使整体音量变小。",
   "Equalizer requires ten finite band gains and a preamp between -12 and +12 dB.": "均衡器需要 10 个有效频段增益，频段和前级增益须在 -12 至 +12 dB 之间。",
   "Could not update the equalizer.": "无法更新均衡器。",
-  "Could not update the equalizer: {0}": "无法更新均衡器：{0}"
+  "Could not update the equalizer: {0}": "无法更新均衡器：{0}",
+  "Initializing audio engine…": "正在初始化音频引擎…",
+  "The audio engine could not start: {0}": "音频引擎无法启动：{0}",
+  "Retry audio engine": "重试音频引擎",
+  "Audio engine initialization timed out after 10 seconds.": "音频引擎初始化超过 10 秒，已超时。",
+  "Windows DNS-SD is unavailable. You can add a receiver manually and collect startup diagnostics.": "Windows DNS-SD 不可用。可以手动添加接收器，并收集启动诊断信息。"
 }

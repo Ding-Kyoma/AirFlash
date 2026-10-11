@@ -31,9 +31,17 @@
         <Button Grid.Column="1" Style="{StaticResource IconButton}"  ToolTip="{loc:Text 'Settings'}" AutomationProperties.Name="{loc:Text 'Settings'}" Click="OnSettings" Margin="0,0,7,0"><TextBlock Text="" FontFamily="Segoe Fluent Icons"/></Button>
         <Button Grid.Column="2" Style="{StaticResource IconButton}" ToolTip="{loc:Text 'Quit'}" AutomationProperties.Name="{loc:Text 'Quit'}" Click="OnQuit" Margin="0,0,0,0"><Viewbox Width="18" Height="18"><Path Data="M 10,3 L 3,3 3,21 10,21 M 8,12 L 22,12 M 17,7 L 22,12 17,17" Stroke="{DynamicResource TextBrush}" StrokeThickness="1.6" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"/></Viewbox></Button>
       </Grid>
-      <Border Grid.Row="1" Padding="10" CornerRadius="6" Background="{DynamicResource TintBrush}" Margin="0,0,0,12" Visibility="{Binding Notice, Converter={StaticResource NonEmpty}}">
+      <StackPanel Grid.Row="1">
+      <Border Padding="10" CornerRadius="6" Background="{DynamicResource TintBrush}" Margin="0,0,0,12" Visibility="{Binding Notice, Converter={StaticResource NonEmpty}}">
         <TextBlock Text="{Binding Notice}" Style="{StaticResource Hint}"/>
       </Border>
+      <Border Padding="10" CornerRadius="6" Background="{DynamicResource TintBrush}" Margin="0,0,0,12" Visibility="{Binding EngineMessage, Converter={StaticResource NonEmpty}}">
+        <StackPanel>
+          <TextBlock Text="{Binding EngineMessage}" Style="{StaticResource Hint}"/>
+          <Button Content="{loc:Text 'Retry audio engine'}" Command="{Binding RetryEngineCommand}" HorizontalAlignment="Left" Margin="0,8,0,0" Visibility="{Binding EngineFailed, Converter={StaticResource BoolVisibility}}"/>
+        </StackPanel>
+      </Border>
+      </StackPanel>
       <ScrollViewer x:Name="DeviceScroll" Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" MaxHeight="480">
         <StackPanel>
           <Border x:Name="EmptyState" Padding="18,28">

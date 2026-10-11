@@ -179,12 +179,65 @@ internal static class UiSmoke
             Check(engine.DisposedCount == engine.CreatedCount, "stop releases mock engine", checks);
             await UiRegression.RunAsync(checks, directory);
             await UiEqualizer.RunAsync(checks, directory);
+            await VerifyStartupFailureAsync(checks, directory);
             await VerifyTrayLifecycleAsync(tray, app, trayGuid, () => menuOpened, () => quitRequestedFromTray, checks);
             App.WriteOutput(args, new { ok = true, checks, icon_environment = iconEnvironment, note = "All engine/audio/discovery/autostart services are simulated. DPI renders do not replace physical multimonitor QA." });
             return 0;
         }
         catch (Exception error) { App.WriteOutput(args, new { ok = false, checks, error = error.ToString() }); return 1; }
         finally { settings?.Close(); panel.ShutdownPanel(); }
+    }
+    private static async Task VerifyStartupFailureAsync(List<string> checks, string directory)
+    {
+        var attempts = 0;
+        await using var engine = new EngineInitialization(_ => ++attempts == 1
+            ? Task.FromException<string>(new UnauthorizedAccessException("simulated cache access denied"))
+            : Task.FromResult("0.1.0"));
+        var factory = new MockFactory();
+        await using var app = new AppViewModel(new MemoryStore(), new MockDiscovery(), new MockAutostart(), new MockAudio(), factory, Application.Current.Dispatcher, engine);
+        var panel = new ControlPanel(app);
+        try
+        {
+            panel.ShowPanel(); app.Start(); await app.Startup; await Pump();
+            var receiver = app.Receivers.First(r => r.Receiver.Online && r.Receiver.Complete);
+            Check(panel.IsVisible && !receiver.CanPlay, "shell is visible before engine initialization", checks);
+            await app.ToggleAsync(receiver.Receiver);
+            Check(factory.CreatedCount == 0, "initializing engine rejects playback without spawning a process", checks);
+            await engine.InitializeAsync(); await Pump();
+            using var settings = new SettingsViewModel(app);
+            var row = settings.Receivers.First(r => r.Receiver.Online && r.Receiver.Complete);
+            Check(app.EngineFailed && !receiver.ToggleCommand.CanExecute(null) && !row.PairCommand.CanExecute(null), "failed engine disables playback and pairing", checks);
+            Check(app.RetryEngineCommand.CanExecute(null) && settings.CancelCommand.CanExecute(null), "failed engine preserves retry and settings", checks);
+            using var missingDns = new WindowsDiscovery(dnsAvailable: () => false);
+            string? failure = null; missingDns.Failed += value => failure = value; missingDns.Start();
+            Check(failure is not null, "missing DNS-SD produces a recoverable diagnostic", checks);
+            app.ShowError(new IOException("simulated discovery failure")); await Pump();
+            Render(panel, Path.Combine(directory, "startup-failure.png"), 1);
+            var messages = Descendants(panel).OfType<TextBlock>().Where(t => t.Text == app.Notice || t.Text == app.EngineMessage).ToArray();
+            Check(messages.Length == 2 && messages[0].TranslatePoint(new(0, messages[0].ActualHeight), panel).Y <= messages[1].TranslatePoint(new(0, 0), panel).Y,
+                "engine and discovery error banners remain readable without overlap", checks);
+            var calls = 0; var dwmErrors = new List<string>();
+            foreach (var build in new[] { 17763, 19044, 19045 })
+                WindowThemeService.ApplyAttributes(new(new(10, 0, build), Architecture.X64, Architecture.X64, true), ThemeService.CurrentPalette,
+                    (_, _) => { calls++; return 0; }, dwmErrors.Add);
+            Check(calls == 0, "Windows 10 skips Windows 11 DWM attributes", checks);
+            WindowThemeService.ApplyAttributes(new(new(10, 0, 22000), Architecture.X64, Architecture.X64, true), ThemeService.CurrentPalette,
+                (_, _) => { calls++; return unchecked((int)0x80070057); }, dwmErrors.Add);
+            Check(calls == 3 && dwmErrors.Count == 3 && panel.IsVisible, "failed optional DWM attributes are logged without closing the shell", checks);
+            await engine.InitializeAsync(); await Pump();
+            Check(app.EngineReady && receiver.ToggleCommand.CanExecute(null) && row.PairCommand.CanExecute(null), "successful retry restores playback and pairing", checks);
+        }
+        finally { panel.ShutdownPanel(); }
+        var store = new MemoryStore(); var preferences = store.Load(); preferences.StartAtLogin = true; store.Save(preferences);
+        var startup = new MockAutostart();
+        await using var audioFailure = new AppViewModel(store, new MockDiscovery(), startup, new MockAudio { FailDefault = true }, new MockFactory(), Application.Current.Dispatcher);
+        audioFailure.Start(); await audioFailure.Startup; await Pump();
+        Check(startup.Enabled && audioFailure.Receivers.Count > 0 && audioFailure.Notice.Contains("mock audio failed", StringComparison.Ordinal),
+            "audio initialization failure preserves autostart and discovery initialization", checks);
+        await using var startupFailure = new AppViewModel(store, new MockDiscovery(), new MockAutostart { FailEnable = true }, new MockAudio(), new MockFactory(), Application.Current.Dispatcher);
+        startupFailure.Start(); await startupFailure.Startup; await Pump();
+        Check(startupFailure.Receivers.Count > 0 && startupFailure.Notice.Contains("mock startup failed", StringComparison.Ordinal),
+            "autostart initialization failure preserves discovery and the shell model", checks);
     }
     private static async Task VerifyTrayLifecycleAsync(TrayService tray, AppViewModel app, Guid guid, Func<bool> settingsRequested, Func<bool> quitRequested, List<string> checks, bool windowIdentityForVerification = false)
     {
@@ -313,7 +366,8 @@ internal static class UiSmoke
         public IReadOnlyList<AudioEndpoint> Items = [new("endpoint-a", "扬声器 · Realtek Audio"), new("endpoint-b", "虚拟声卡 · VB-CABLE")];
         public void NotifyEndpoints() => EndpointsChanged?.Invoke();
         public string? DefaultEndpoint { get; set; } = "endpoint-a";
-        public Task<string?> GetDefaultEndpointIdAsync() => Task.FromResult(DefaultEndpoint);
+        public bool FailDefault { get; set; }
+        public Task<string?> GetDefaultEndpointIdAsync() => FailDefault ? Task.FromException<string?>(new IOException("mock audio failed")) : Task.FromResult(DefaultEndpoint);
         public async Task<IReadOnlyList<AudioEndpoint>> GetEndpointsAsync()
         {
             UiPerformance.Count("audio.enumerate"); Enumerations++;

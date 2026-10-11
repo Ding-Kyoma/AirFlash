@@ -77,6 +77,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/test-installer.ps1
+      - name: Preserve compatibility evidence and diagnostic collector
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: airflash-compatibility-${{ steps.version.outputs.version }}
+          path: |
+            artifacts/compatibility/*.json
+            scripts/collect-startup-diagnostics.ps1
+            docs/WINDOWS-COMPATIBILITY.md
+          retention-days: 30
       - name: Publish verified stable release
         if: github.ref == 'refs/heads/main' && inputs.publish
         shell: pwsh

@@ -15,6 +15,7 @@ public sealed class WindowsDiscovery : IDiscoveryService
     private readonly List<Operation> _browsers = [];
     private System.Threading.Timer? _timer;
     private readonly Func<IReadOnlyList<DiscoveryAdapter>> _adapters;
+    private readonly Func<bool> _dnsAvailable;
     private string _interfaceId = "";
     private uint? _interfaceIndex;
     private bool _started;
@@ -23,7 +24,11 @@ public sealed class WindowsDiscovery : IDiscoveryService
     private HashSet<string> _diagnostics = new(StringComparer.Ordinal);
     public event Action<IReadOnlyList<Receiver>>? Changed;
     public event Action<string>? Failed;
-    public WindowsDiscovery(Func<IReadOnlyList<DiscoveryAdapter>>? adapters = null) => _adapters = adapters ?? NetworkAdapterCatalog.List;
+    public WindowsDiscovery(Func<IReadOnlyList<DiscoveryAdapter>>? adapters = null, Func<bool>? dnsAvailable = null)
+    {
+        _adapters = adapters ?? NetworkAdapterCatalog.List;
+        _dnsAvailable = dnsAvailable ?? (() => WindowsCapabilities.Current.DnsSdAvailable);
+    }
     public void SetInterface(string id)
     {
         lock (_sync)
@@ -32,18 +37,24 @@ public sealed class WindowsDiscovery : IDiscoveryService
             _interfaceId = id;
             if (!_started) return;
         }
-        Restart();
+        RunSafely(Restart);
     }
     public void Start()
     {
+        if (!_dnsAvailable()) { Failed?.Invoke(L.Get("Windows DNS-SD is unavailable. You can add a receiver manually and collect startup diagnostics.")); return; }
         lock (_sync) { if (_disposed || _started) return; _started = true; }
         NetworkChange.NetworkAddressChanged += NetworkChanged;
         NetworkChange.NetworkAvailabilityChanged += NetworkAvailabilityChanged;
-        Restart();
-        _timer = new(_ => Refresh(), null, TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(20));
+        RunSafely(Restart);
+        _timer = new(_ => RunSafely(Refresh), null, TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(20));
     }
-    private void NetworkChanged(object? sender, EventArgs args) => Restart();
-    private void NetworkAvailabilityChanged(object? sender, NetworkAvailabilityEventArgs args) => Restart();
+    private void NetworkChanged(object? sender, EventArgs args) => RunSafely(Restart);
+    private void NetworkAvailabilityChanged(object? sender, NetworkAvailabilityEventArgs args) => RunSafely(Restart);
+    private void RunSafely(Action operation)
+    {
+        try { operation(); }
+        catch (Exception error) { AppPaths.Log($"Discovery operation failed: {error}"); Failed?.Invoke(L.Format("Receiver discovery: {0}", error.Message)); }
+    }
     private void Restart()
     {
         Operation[] old; long epoch; string selected;
@@ -73,9 +84,13 @@ public sealed class WindowsDiscovery : IDiscoveryService
             foreach (var type in new[] { "_airplay._tcp.local", "_raop._tcp.local" })
             {
                 var operation = new Operation(this, type, type, _epoch, false, index.Value);
-                _browsers.Add(operation);
-                var status = operation.Start();
-                if (status is not (0 or 9506)) Failed?.Invoke(L.Format("Receiver discovery failed: {0}. You can add a receiver manually.", new Win32Exception((int)status).Message));
+                try
+                {
+                    var status = operation.Start();
+                    if (status is not (0 or 9506)) { operation.Dispose(); Failed?.Invoke(L.Format("Receiver discovery failed: {0}. You can add a receiver manually.", new Win32Exception((int)status).Message)); }
+                    else _browsers.Add(operation);
+                }
+                catch { operation.Dispose(); throw; }
             }
         }
     }
@@ -102,7 +117,12 @@ public sealed class WindowsDiscovery : IDiscoveryService
     {
         try
         {
-            if (status != 0) return;
+            if (status != 0)
+            {
+                lock (_sync) { if (_disposed || operation.Epoch != _epoch) return; }
+                Failed?.Invoke(L.Format("Receiver discovery: {0}", new Win32Exception((int)status).Message));
+                return;
+            }
             for (var item = records; item != IntPtr.Zero; item = Marshal.ReadIntPtr(item))
             {
                 // DNS_RECORDW x64: next/name pointers, type/data size, flags/TTL/reserved, data union.
@@ -129,8 +149,16 @@ public sealed class WindowsDiscovery : IDiscoveryService
             if (_disposed || _pending.ContainsKey(instance)) return;
             var operation = new Operation(this, instance, type, _epoch, true, _interfaceIndex!.Value);
             _pending[instance] = operation.Token;
-            var status = operation.Start();
-            if (status is not (0 or 9506)) { _pending.Remove(instance); operation.Dispose(); }
+            try
+            {
+                var status = operation.Start();
+                if (status is not (0 or 9506))
+                {
+                    _pending.Remove(instance); operation.Dispose();
+                    Failed?.Invoke(L.Format("Resolving receiver: {0}", new Win32Exception((int)status).Message));
+                }
+            }
+            catch { _pending.Remove(instance); operation.Dispose(); throw; }
         }
     }
     private void Resolved(Operation operation, uint status, IntPtr result)
@@ -141,7 +169,12 @@ public sealed class WindowsDiscovery : IDiscoveryService
             {
                 if (_disposed || operation.Epoch != _epoch || !_pending.TryGetValue(operation.Name, out var token) || token != operation.Token) return;
                 _pending.Remove(operation.Name);
-                if (status != 0 || result == IntPtr.Zero || !_instances.ContainsKey(operation.Name)) return;
+                if (status != 0)
+                {
+                    Failed?.Invoke(L.Format("Resolving receiver: {0}", new Win32Exception((int)status).Message));
+                    return;
+                }
+                if (result == IntPtr.Zero || !_instances.ContainsKey(operation.Name)) return;
                 var info = Marshal.PtrToStructure<ServiceInstance>(result);
                 if (info.Ipv4 == IntPtr.Zero || info.Port == 0 || info.Count > 256) return;
                 var address = new byte[4]; Marshal.Copy(info.Ipv4, address, 0, 4);
@@ -193,13 +226,21 @@ public sealed class WindowsDiscovery : IDiscoveryService
     [UnmanagedFunctionPointer(CallingConvention.Winapi)] private delegate void ResolveCallback(uint status, IntPtr context, IntPtr instance);
     private static readonly BrowseCallback BrowseThunk = (status, context, records) =>
     {
-        if (Operation.All.TryGetValue(context.ToInt64(), out var op)) op.Owner.Browse(op, status, records);
-        else if (records != IntPtr.Zero) DnsRecordListFree(records, 1);
+        try
+        {
+            if (Operation.All.TryGetValue(context.ToInt64(), out var op)) op.Owner.Browse(op, status, records);
+            else if (records != IntPtr.Zero) DnsRecordListFree(records, 1);
+        }
+        catch (Exception error) { AppPaths.Log($"Discovery callback failed: {error}"); }
     };
     private static readonly ResolveCallback ResolveThunk = (status, context, result) =>
     {
-        if (Operation.All.TryGetValue(context.ToInt64(), out var op)) op.Owner.Resolved(op, status, result);
-        else if (result != IntPtr.Zero) DnsServiceFreeInstance(result);
+        try
+        {
+            if (Operation.All.TryGetValue(context.ToInt64(), out var op)) op.Owner.Resolved(op, status, result);
+            else if (result != IntPtr.Zero) DnsServiceFreeInstance(result);
+        }
+        catch (Exception error) { AppPaths.Log($"Discovery callback failed: {error}"); }
     };
     private sealed class Operation : IDisposable
     {
@@ -231,8 +272,9 @@ public sealed class WindowsDiscovery : IDiscoveryService
         public void Dispose()
         {
             if (!All.TryRemove(Token, out _)) return;
-            if (_pending) { if (_resolve) DnsServiceResolveCancel(_cancel); else DnsServiceBrowseCancel(_cancel); }
-            Marshal.FreeHGlobal(_name); Marshal.FreeHGlobal(_cancel); _name = _cancel = IntPtr.Zero;
+            try { if (_pending) { if (_resolve) DnsServiceResolveCancel(_cancel); else DnsServiceBrowseCancel(_cancel); } }
+            catch (Exception error) { AppPaths.Log($"Discovery cancellation failed: {error}"); }
+            finally { Marshal.FreeHGlobal(_name); Marshal.FreeHGlobal(_cancel); _name = _cancel = IntPtr.Zero; }
         }
     }
     [StructLayout(LayoutKind.Sequential)] private struct ServiceRequest { public uint Version, InterfaceIndex; public IntPtr QueryName, Callback, Context; }

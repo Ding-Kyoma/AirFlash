@@ -9,12 +9,28 @@ namespace AirFlash.App;
 
 public partial class App : Application
 {
+    public App()
+    {
+        DispatcherUnhandledException += (_, eventArgs) =>
+        {
+            AppPaths.Log($"Dispatcher failure: {eventArgs.Exception}");
+            eventArgs.Handled = true;
+            if (_viewModel is not null) _viewModel.ShowError(eventArgs.Exception);
+            else
+            {
+                MessageBox.Show(eventArgs.Exception.Message + "\n\n" + AppPaths.LogDirectory,
+                    "AirFlash startup failed", MessageBoxButton.OK, MessageBoxImage.Error);
+                Shutdown(1);
+            }
+        };
+    }
     private SingleInstance? _instance;
     private ThemeService? _theme;
     private AppViewModel? _viewModel;
     private ControlPanel? _panel;
     private SettingsWindow? _settings;
     private TrayService? _tray;
+    private EngineInitialization? _engine;
     private bool _quitting;
     private string _uiLanguage = "system";
     private string _uiTheme = "system";
@@ -24,10 +40,10 @@ public partial class App : Application
         var languageIndex = Array.IndexOf(args.Args, "--ui-language");
         var smokeLanguage = (args.Args.Contains("--ui-smoke") || args.Args.Contains("--tray-smoke") || args.Args.Contains("--ui-perf")) && languageIndex >= 0 && languageIndex + 1 < args.Args.Length
             ? new[] { args.Args[languageIndex + 1] } : null;
-        L.Initialize(smokeLanguage);
-        base.OnStartup(args);
         try
         {
+            L.Initialize(smokeLanguage);
+            base.OnStartup(args);
             Resources["LatencyChoices"] = Choices.Latencies;
             if (args.Args.Contains("--update-check"))
             {
@@ -37,6 +53,7 @@ public partial class App : Application
                 Shutdown(0); return;
             }
             if (args.Args.Contains("--self-check")) { Shutdown(await SelfCheckAsync(args.Args)); return; }
+            if (args.Args.Contains("--compat-check")) { Shutdown(await CompatibilityCheckAsync(args.Args)); return; }
             if (args.Args.Contains("--discovery-check")) { Shutdown(await DiscoveryCheckAsync(args.Args)); return; }
             if (args.Args.Contains("--audio-check")) { Shutdown(await AudioCheckAsync(args.Args)); return; }
             if (args.Args.Contains("--ui-smoke")) { Shutdown(await UiSmoke.RunAsync(args.Args)); return; }
@@ -53,24 +70,24 @@ public partial class App : Application
             L.Initialize(_uiLanguage == "system" ? null : [_uiLanguage]);
             Resources["LatencyChoices"] = Choices.Latencies;
             var audio = new AudioService();
-            var factory = new ProcessEngineFactory(AppPaths.ExtractEngine(), AppPaths.Log);
-            _viewModel = new(store, new WindowsDiscovery(), new Autostart(), audio, factory, Dispatcher);
-            _viewModel.EngineVersion = await QueryEngineAsync(factory);
+            var factory = new ExtractingEngineFactory();
+            _engine = new(token => QueryEngineAsync(factory, token), AppPaths.Log);
+            _viewModel = new(store, new WindowsDiscovery(), new Autostart(), audio, factory, Dispatcher, _engine);
             _panel = new(_viewModel); MainWindow = _panel;
             _panel.SettingsRequested += ShowSettings; _panel.QuitRequested += Quit;
             _tray = new(_panel, _viewModel, ShowSettings, Quit); _panel.Tray = _tray;
             _instance.Listen(() => Dispatcher.BeginInvoke(() => { if (_settings is not null) _settings.Activate(); else _panel.ShowPanel(); }));
-            DispatcherUnhandledException += (_, eventArgs) => { AppPaths.Log(eventArgs.Exception.ToString()); _viewModel.ShowError(eventArgs.Exception); eventArgs.Handled = true; };
             _viewModel.SettingsChanged += OnSettingsChanged;
             _viewModel.Start();
             if (!args.Args.Contains("--startup")) _panel.ShowPanel();
-            AppPaths.Log("WPF host started, JSONL v1.");
+            AppPaths.Log("WPF host started, JSONL v1. Startup stage=shell ready");
+            await _engine.InitializeAsync();
         }
         catch (Exception error)
         {
             AppPaths.Log(error.ToString());
             if (args.Args.Any(a => a.EndsWith("-check", StringComparison.Ordinal) || a is "--ui-smoke" or "--tray-smoke" or "--ui-perf")) { WriteOutput(args.Args, new { ok = false, error = error.ToString() }); Shutdown(1); return; }
-            MessageBox.Show(error.Message, L.Get("AirFlash startup failed"), MessageBoxButton.OK, MessageBoxImage.Error);
+            MessageBox.Show(error.Message + "\n\n" + AppPaths.LogDirectory, L.Get("AirFlash startup failed"), MessageBoxButton.OK, MessageBoxImage.Error);
             Quit();
         }
     }
@@ -114,6 +131,7 @@ public partial class App : Application
         {
             if (_settings is { } applying) await applying.ViewModel.ApplicationCompleted;
             _settings?.Close();
+            if (_engine is not null) await _engine.DisposeAsync();
             if (_viewModel is not null) await _viewModel.DisposeAsync();
             _tray?.Dispose(); _panel?.ShutdownPanel();
             if (_instance is not null) await _instance.DisposeAsync();
@@ -122,15 +140,41 @@ public partial class App : Application
         catch (Exception error) { AppPaths.Log(error.ToString()); }
         finally { Shutdown(); }
     }
-    internal static async Task<string> QueryEngineAsync(IEngineFactory factory) => (await QueryHelloAsync(factory)).Text("engine_version", L.Get("Unknown"));
-    private static async Task<JsonElement> QueryHelloAsync(IEngineFactory factory)
+    internal static async Task<string> QueryEngineAsync(IEngineFactory factory, CancellationToken cancellation = default) => (await QueryHelloAsync(factory, cancellation)).Text("engine_version", L.Get("Unknown"));
+    private static async Task<JsonElement> QueryHelloAsync(IEngineFactory factory, CancellationToken cancellation = default)
     {
-        await using var connection = factory.Open();
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        await connection.SendAsync("check", "hello", null, timeout.Token);
-        var hello = await connection.ReadAsync(timeout.Token) ?? throw new IOException(L.Get("The engine did not return hello."));
-        if (hello.Text("event") != "hello" || hello.Number("version") != 1) throw new IOException(L.Get("Incompatible engine protocol version."));
-        return hello;
+        return await EngineHandshake.HelloAsync(factory, cancellation);
+    }
+    private sealed class ExtractingEngineFactory : IEngineFactory
+    {
+        public IEngineConnection Open()
+        {
+            AppPaths.Log("Startup stage=engine-extract started");
+            var executable = AppPaths.ExtractEngine();
+            AppPaths.Log("Startup stage=engine-extract ready");
+            return new ProcessEngineFactory(executable, AppPaths.Log).Open();
+        }
+    }
+    private static async Task<int> CompatibilityCheckAsync(string[] args)
+    {
+        var capabilities = WindowsCapabilities.Current;
+        var stage = "engine-extract";
+        try
+        {
+            var executable = AppPaths.ExtractEngine();
+            stage = "engine-hello";
+            var hello = await QueryHelloAsync(new ProcessEngineFactory(executable, AppPaths.Log));
+            WriteOutput(args, new { ok = capabilities.Supported && capabilities.DnsSdAvailable, version = AppPaths.Version, capabilities,
+                requirement = WindowsCompatibility.Requirement, native = hello,
+                qualification = "Win10 execution pending; this check does not exercise discovery, pairing or playback." });
+            return capabilities.Supported && capabilities.DnsSdAvailable ? 0 : 1;
+        }
+        catch (Exception error)
+        {
+            AppPaths.Log($"Compatibility stage={stage} failed {error}");
+            WriteOutput(args, new { ok = false, version = AppPaths.Version, capabilities, stage, error = error.ToString(), hresult = $"0x{error.HResult:X8}" });
+            return 1;
+        }
     }
     private static async Task<int> SelfCheckAsync(string[] args)
     {

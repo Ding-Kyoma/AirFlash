@@ -19,6 +19,11 @@ AirFlash 是 TuneBlade（AirPlay 1）的 AirPlay 2 替代方案，旨在让 Wind
 
 从 [GitHub Releases](https://github.com/Ding-Kyoma/AirFlash/releases/latest) 下载并运行 `AirFlash-X.Y.Z.msi` 安装，或直接运行便携版 `AirFlash.exe`。
 
+最低兼容目标为 **Windows x64，Windows 10 1809 / Build 17763（LTSC 2019）**，
+同时覆盖 LTSC 2021、22H2 和 Windows 11。当前仍为兼容候选版本，需受影响用户实机验收。
+启动失败时可使用 Windows 自带 PowerShell 5.1 收集报告；步骤与验收范围见
+[Windows 兼容性与启动诊断](WINDOWS-COMPATIBILITY.md)。程序自包含，无需另装 .NET、Python 或 VC++ 运行库。
+
 AirFlash 提供 Windows x64 可执行文件和可独立运行的 MSI 安装包。由于发布文件没有代码签名，Windows
 可能显示 SmartScreen 警告。只有在确认下载文件来源可信时，才使用“更多信息”
 和“仍要运行”。

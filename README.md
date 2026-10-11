@@ -21,6 +21,11 @@ Windows audio streaming to HomePods running newer versions of HomePod software.
 Download the latest release from [GitHub Releases](https://github.com/Ding-Kyoma/AirFlash/releases/latest), run
 `AirFlash-X.Y.Z.msi`, and launch AirFlash from the installed shortcut. Apps and Features provides repair and uninstall.
 
+The minimum target is **Windows x64, Windows 10 1809 / build 17763** (LTSC 2019),
+including LTSC 2021, 22H2 and Windows 11. Windows 10 qualification is pending
+affected-user testing. See [Windows compatibility and startup diagnostics](docs/WINDOWS-COMPATIBILITY.md)
+for the candidate status and the PowerShell 5.1 diagnostic collector.
+
 AirFlash is distributed as a Windows x64 executable and standalone MSI. Windows may show
 a SmartScreen warning because release binaries are not code-signed. Use
 **More info** and **Run anyway** only when the downloaded files are from a

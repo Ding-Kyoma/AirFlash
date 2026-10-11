@@ -17,5 +17,15 @@ if ($process.ExitCode -ne 0) { throw 'Application self-check failed.' }
 $result = Get-Content $output -Raw | ConvertFrom-Json
 if (-not $result.ok -or $result.version -ne $Version) { throw 'Self-check version mismatch.' }
 Remove-Item -LiteralPath $output
+$output = Join-Path $Directory 'compat-check.json'
+$process = Start-Process -FilePath (Resolve-Path $exe) -ArgumentList @('--compat-check', '--output', "`"$([IO.Path]::GetFullPath($output))`"") -PassThru -WindowStyle Hidden
+if (-not $process.WaitForExit(30000)) { $process.Kill(); throw 'Compatibility check timed out.' }
+if ($process.ExitCode -ne 0) { throw 'Application compatibility check failed.' }
+$result = Get-Content $output -Raw | ConvertFrom-Json
+if (-not $result.ok -or $result.version -ne $Version) { throw 'Compatibility check version mismatch.' }
+Copy-Item -LiteralPath $output -Destination 'artifacts/compatibility/host-check.json' -Force
+Remove-Item -LiteralPath $output
+$audit = Get-Content 'artifacts/compatibility/bundle-audit.json' -Raw | ConvertFrom-Json
+if (-not $audit.ok -or $audit.published_exe_sha256 -ne (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'Compatibility audit does not match release EXE.' }
 $hashes = foreach ($file in @($exe,$msi)) { '{0}  {1}' -f (Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant(),(Split-Path $file -Leaf) }
 $hashes | Set-Content (Join-Path $Directory 'SHA256SUMS.txt') -Encoding ascii
