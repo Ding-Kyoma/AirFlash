@@ -200,7 +200,7 @@ public partial class App : Application
         await using var audio = new AudioService();
         var endpoints = await audio.GetEndpointsAsync();
         var defaultId = await audio.GetDefaultEndpointIdAsync();
-        WriteOutput(args, new { ok = true, endpoints = endpoints.Count, default_endpoint_found = endpoints.Any(e => e.Id == defaultId), note = "Read-only MTA audio enumeration; no playback or mute changes." });
+        WriteOutput(args, new { ok = true, endpoints = endpoints.Count, devices = endpoints.Select(e => new { e.Id, e.Name, kind = e.Kind.ToString() }), default_endpoint_found = endpoints.Any(e => e.Id == defaultId), note = "Read-only MTA audio enumeration; no playback or mute changes." });
         return 0;
     }
     private static async Task<int> DiscoveryCheckAsync(string[] args)

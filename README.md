@@ -55,6 +55,13 @@ source you trust.
 5. Choose the capture endpoint and latency profile in Settings when the defaults
    are not suitable.
 
+In **Settings > Audio capture**, **Specific audio endpoint** lists active playback
+and recording devices with their type. For Voicemeeter, select the recording
+endpoint corresponding to its B1/B2/B3 bus (for example, Voicemeeter Output)
+and enable that bus for the desired audio in Voicemeeter. Playback devices use
+loopback; recording devices capture their input directly. Automatic local mute
+applies only to playback devices and never mutes a recording input.
+
 Receiver discovery runs while the control panel or **Settings > Receivers** is
 visible, and pauses when both are hidden. Previous results remain available;
 pausing discovery does not interrupt playback. If automatic connection is enabled
