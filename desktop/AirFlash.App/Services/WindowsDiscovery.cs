@@ -1,198 +1,216 @@
-using System.Collections.Concurrent;
-using System.ComponentModel;
-using System.Net;
 using System.Net.NetworkInformation;
-using System.Runtime.InteropServices;
+using System.ComponentModel;
 using AirFlash.Core;
 namespace AirFlash.App.Services;
-// Windows DNS-SD callbacks are rooted statically; native context is an opaque token, never a GC pointer.
+
 public sealed class WindowsDiscovery : IDiscoveryService
 {
     private readonly object _sync = new();
-    private readonly Dictionary<string, (ServiceRecord Record, DateTime Expires)> _records = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, string> _instances = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, long> _pending = new(StringComparer.OrdinalIgnoreCase);
-    private readonly List<Operation> _browsers = [];
-    private System.Threading.Timer? _timer;
+    private readonly Dictionary<string, ServiceRecord> _records = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTimeOffset> _expires = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, OperationSlot> _resolvers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<OperationSlot> _browsers = [];
+    private readonly HashSet<OperationSlot> _retired = [];
     private readonly Func<IReadOnlyList<DiscoveryAdapter>> _adapters;
+    private readonly IDnsSdApi _api;
     private readonly Func<bool> _dnsAvailable;
+    private readonly Action<string> _log;
+    private readonly TimeProvider _time;
+    private readonly ITimer _expiry;
     private string _interfaceId = "";
     private uint? _interfaceIndex;
-    private bool _started;
-    private bool _disposed;
+    private bool _started, _disposed;
     private long _epoch;
     private HashSet<string> _diagnostics = new(StringComparer.Ordinal);
     public event Action<IReadOnlyList<Receiver>>? Changed;
     public event Action<string>? Failed;
-    public WindowsDiscovery(Func<IReadOnlyList<DiscoveryAdapter>>? adapters = null, Func<bool>? dnsAvailable = null)
+    public event Action<bool>? RunningChanged;
+    public WindowsDiscovery(Func<IReadOnlyList<DiscoveryAdapter>>? adapters = null, Action<string>? log = null, Func<bool>? dnsAvailable = null)
+        : this(new WindowsDnsSdApi(), adapters, log, dnsAvailable: dnsAvailable ?? (() => WindowsCapabilities.Current.DnsSdAvailable)) { }
+    internal WindowsDiscovery(IDnsSdApi api, Func<IReadOnlyList<DiscoveryAdapter>>? adapters = null, Action<string>? log = null, TimeProvider? time = null, Func<bool>? dnsAvailable = null)
     {
-        _adapters = adapters ?? NetworkAdapterCatalog.List;
-        _dnsAvailable = dnsAvailable ?? (() => WindowsCapabilities.Current.DnsSdAvailable);
+        _api = api; _dnsAvailable = dnsAvailable ?? (() => true); _adapters = adapters ?? NetworkAdapterCatalog.List; _log = log ?? (_ => { }); _time = time ?? TimeProvider.System;
+        _expiry = _time.CreateTimer(_ => RunSafely(Expire), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
     }
     public void SetInterface(string id)
     {
+        bool restart;
         lock (_sync)
         {
             if (_disposed || _interfaceId == id) return;
-            _interfaceId = id;
-            if (!_started) return;
+            _interfaceId = id; _records.Clear(); _expires.Clear(); restart = _started;
         }
-        RunSafely(Restart);
+        Publish();
+        if (restart) RunSafely(Restart);
     }
     public void Start()
     {
-        if (!_dnsAvailable()) { Failed?.Invoke(L.Get("Windows DNS-SD is unavailable. You can add a receiver manually and collect startup diagnostics.")); return; }
-        lock (_sync) { if (_disposed || _started) return; _started = true; }
-        NetworkChange.NetworkAddressChanged += NetworkChanged;
-        NetworkChange.NetworkAvailabilityChanged += NetworkAvailabilityChanged;
+        if (!_dnsAvailable())
+        {
+            Failed?.Invoke(L.Get("Windows DNS-SD is unavailable. You can add a receiver manually and collect startup diagnostics."));
+            RunningChanged?.Invoke(false); return;
+        }
+        lock (_sync)
+        {
+            if (_disposed || _started) return;
+            _started = true;
+            NetworkChange.NetworkAddressChanged += NetworkChanged;
+            NetworkChange.NetworkAvailabilityChanged += NetworkAvailabilityChanged;
+        }
         RunSafely(Restart);
-        _timer = new(_ => RunSafely(Refresh), null, TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(20));
+    }
+    public void Stop()
+    {
+        OperationSlot[] old;
+        lock (_sync)
+        {
+            if (!_started) return;
+            _started = false; ++_epoch;
+            NetworkChange.NetworkAddressChanged -= NetworkChanged;
+            NetworkChange.NetworkAvailabilityChanged -= NetworkAvailabilityChanged;
+            _expiry.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+            old = DetachOperations();
+        }
+        Cancel(old);
+        RunningChanged?.Invoke(false);
+        // Preserve cache when suspended; don't publish an empty discovery event.
     }
     private void NetworkChanged(object? sender, EventArgs args) => RunSafely(Restart);
     private void NetworkAvailabilityChanged(object? sender, NetworkAvailabilityEventArgs args) => RunSafely(Restart);
-    private void RunSafely(Action operation)
+    private void RunSafely(Action action)
     {
-        try { operation(); }
-        catch (Exception error) { AppPaths.Log($"Discovery operation failed: {error}"); Failed?.Invoke(L.Format("Receiver discovery: {0}", error.Message)); }
+        try { action(); }
+        catch (Exception error) { _log($"Discovery operation failed: {error}"); Failed?.Invoke(L.Format("Receiver discovery: {0}", error.Message)); }
     }
     private void Restart()
     {
-        Operation[] old; long epoch; string selected;
-        lock (_sync) selected = _interfaceId;
+        string selected;
+        lock (_sync) { if (_disposed || !_started) return; selected = _interfaceId; }
         uint? index;
         try { index = DiscoveryInterface.ResolveIndex(selected, _adapters()); }
         catch (NetworkInformationException error) { Failed?.Invoke(error.Message); index = null; }
+        OperationSlot[] old; long epoch;
         lock (_sync)
         {
             if (_disposed || !_started || selected != _interfaceId) return;
-            epoch = ++_epoch;
-            _interfaceIndex = index;
-            old = Operation.All.Values.Where(o => ReferenceEquals(o.Owner, this)).ToArray();
-            _browsers.Clear(); _records.Clear(); _instances.Clear(); _pending.Clear();
+            epoch = ++_epoch; _interfaceIndex = index;
+            old = DetachOperations();
+            // Show cache immediately, then retire entries not confirmed on resume.
+            _expires.Clear();
+            foreach (var name in _records.Keys) _expires[name] = _time.GetUtcNow().AddSeconds(10);
+            ScheduleExpiry();
         }
-        // Cancel outside the cache lock: completion callbacks may need that lock.
-        foreach (var operation in old) operation.Dispose();
-        Publish();
+        Cancel(old);
         if (index is null)
         {
+            RunningChanged?.Invoke(false);
             Failed?.Invoke(L.Get("The selected network interface is unavailable. Discovery is paused."));
             return;
         }
-        lock (_sync)
+        var browsing = false;
+        foreach (var type in new[] { "_airplay._tcp.local", "_raop._tcp.local" })
         {
-            if (_disposed || epoch != _epoch || selected != _interfaceId) return;
-            foreach (var type in new[] { "_airplay._tcp.local", "_raop._tcp.local" })
-            {
-                var operation = new Operation(this, type, type, _epoch, false, index.Value);
-                try
-                {
-                    var status = operation.Start();
-                    if (status is not (0 or 9506)) { operation.Dispose(); Failed?.Invoke(L.Format("Receiver discovery failed: {0}. You can add a receiver manually.", new Win32Exception((int)status).Message)); }
-                    else _browsers.Add(operation);
-                }
-                catch { operation.Dispose(); throw; }
-            }
+            var slot = new OperationSlot();
+            lock (_sync) { if (!Current(epoch)) return; _browsers.Add(slot); }
+            try { slot.Attach(_api.Browse(type, index.Value, (status, records) => RunSafely(() => Browse(epoch, type, status, records)), message => Failed?.Invoke(message))); browsing = true; }
+            catch (Exception error) { Cancel([slot]); Failed?.Invoke(L.Format("Receiver discovery failed: {0}. You can add a receiver manually.", error.Message)); }
         }
+        lock (_sync) { if (!Current(epoch)) return; }
+        RunningChanged?.Invoke(browsing);
     }
-    private void Refresh()
+    private bool Current(long epoch) => !_disposed && _started && epoch == _epoch;
+    private void Browse(long epoch, string type, uint status, IReadOnlyList<DnsSdService> services)
     {
-        string selected; uint? previous;
-        lock (_sync) { selected = _interfaceId; previous = _interfaceIndex; }
-        if (selected.Length > 0)
+        if (status != 0)
         {
-            try { if (DiscoveryInterface.ResolveIndex(selected, _adapters()) != previous) { Restart(); return; } }
-            catch (NetworkInformationException error) { Failed?.Invoke(error.Message); Restart(); return; }
+            lock (_sync) { if (!Current(epoch)) return; }
+            Failed?.Invoke(L.Format("Receiver discovery: {0}", new Win32Exception((int)status).Message)); return;
         }
-        KeyValuePair<string, string>[] instances;
+        var removed = new List<OperationSlot>();
+        var start = new List<(string Name, OperationSlot Slot, uint Index)>();
         lock (_sync)
         {
-            if (_disposed) return;
-            foreach (var key in _records.Where(p => p.Value.Expires <= DateTime.UtcNow).Select(p => p.Key).ToArray()) { _records.Remove(key); _instances.Remove(key); }
-            instances = _instances.ToArray();
+            if (!Current(epoch)) return;
+            foreach (var service in services)
+            {
+                if (service.Ttl == 0)
+                {
+                    _records.Remove(service.Instance); _expires.Remove(service.Instance);
+                    if (_resolvers.Remove(service.Instance, out var resolver)) removed.Add(resolver);
+                }
+                else
+                {
+                    _expires[service.Instance] = _time.GetUtcNow().AddSeconds(Math.Min(service.Ttl, 86400u));
+                    if (!_resolvers.ContainsKey(service.Instance))
+                    {
+                        var slot = new OperationSlot(); _resolvers[service.Instance] = slot;
+                        start.Add((service.Instance, slot, _interfaceIndex!.Value));
+                    }
+                }
+            }
+            ScheduleExpiry();
+        }
+        Cancel(removed);
+        foreach (var item in start)
+        {
+            lock (_sync) { if (!Current(epoch) || _resolvers.GetValueOrDefault(item.Name) != item.Slot) continue; }
+            try { item.Slot.Attach(_api.Resolve(item.Name, type, item.Index, (code, record) => Resolved(epoch, item.Name, item.Slot, code, record), message => Failed?.Invoke(message))); }
+            catch (Exception error)
+            {
+                lock (_sync) { if (_resolvers.GetValueOrDefault(item.Name) == item.Slot) _resolvers.Remove(item.Name); }
+                Cancel([item.Slot]); Failed?.Invoke(L.Format("Resolving receiver: {0}", error.Message));
+            }
         }
         Publish();
-        foreach (var item in instances) Resolve(item.Key, item.Value);
     }
-    private void Browse(Operation operation, uint status, IntPtr records)
+    private void Resolved(long epoch, string name, OperationSlot slot, uint status, ServiceRecord? record)
     {
-        try
+        if (status != 0)
         {
-            if (status != 0)
-            {
-                lock (_sync) { if (_disposed || operation.Epoch != _epoch) return; }
-                Failed?.Invoke(L.Format("Receiver discovery: {0}", new Win32Exception((int)status).Message));
-                return;
-            }
-            for (var item = records; item != IntPtr.Zero; item = Marshal.ReadIntPtr(item))
-            {
-                // DNS_RECORDW x64: next/name pointers, type/data size, flags/TTL/reserved, data union.
-                if (Marshal.ReadInt16(item, 16) != 12) continue;
-                var instance = Marshal.PtrToStringUni(Marshal.ReadIntPtr(item, 32));
-                if (string.IsNullOrEmpty(instance)) continue;
-                lock (_sync)
-                {
-                    if (_disposed || operation.Epoch != _epoch) return;
-                    if (Marshal.ReadInt32(item, 24) == 0) { _records.Remove(instance); _instances.Remove(instance); _pending.Remove(instance); continue; }
-                    _instances[instance] = operation.Type;
-                }
-                Resolve(instance, operation.Type);
-            }
-            Publish();
+            lock (_sync) { if (!Current(epoch) || _resolvers.GetValueOrDefault(name) != slot) return; }
+            Failed?.Invoke(L.Format("Resolving receiver: {0}", new Win32Exception((int)status).Message)); return;
         }
-        catch (Exception error) { Failed?.Invoke(L.Format("Receiver discovery: {0}", error.Message)); }
-        finally { if (records != IntPtr.Zero) DnsRecordListFree(records, 1); }
-    }
-    private void Resolve(string instance, string type)
-    {
+        if (record is null) return;
         lock (_sync)
         {
-            if (_disposed || _pending.ContainsKey(instance)) return;
-            var operation = new Operation(this, instance, type, _epoch, true, _interfaceIndex!.Value);
-            _pending[instance] = operation.Token;
-            try
-            {
-                var status = operation.Start();
-                if (status is not (0 or 9506))
-                {
-                    _pending.Remove(instance); operation.Dispose();
-                    Failed?.Invoke(L.Format("Resolving receiver: {0}", new Win32Exception((int)status).Message));
-                }
-            }
-            catch { _pending.Remove(instance); operation.Dispose(); throw; }
+            if (!Current(epoch) || _resolvers.GetValueOrDefault(name) != slot) return;
+            if (_records.TryGetValue(name, out var previous) && Equal(previous, record)) return;
+            _log("Discovery resolved: " + Describe(record)); _records[name] = record;
         }
+        Publish();
     }
-    private void Resolved(Operation operation, uint status, IntPtr result)
+    private void ScheduleExpiry()
     {
-        try
+        var due = _expires.Count == 0 ? Timeout.InfiniteTimeSpan : _expires.Values.Min() - _time.GetUtcNow();
+        _expiry.Change(due == Timeout.InfiniteTimeSpan ? due : due < TimeSpan.Zero ? TimeSpan.Zero : due, Timeout.InfiniteTimeSpan);
+    }
+    private void Expire()
+    {
+        var old = new List<OperationSlot>(); bool changed = false;
+        lock (_sync)
         {
-            lock (_sync)
+            if (_disposed || !_started) return;
+            foreach (var name in _expires.Where(p => p.Value <= _time.GetUtcNow()).Select(p => p.Key).ToArray())
             {
-                if (_disposed || operation.Epoch != _epoch || !_pending.TryGetValue(operation.Name, out var token) || token != operation.Token) return;
-                _pending.Remove(operation.Name);
-                if (status != 0)
-                {
-                    Failed?.Invoke(L.Format("Resolving receiver: {0}", new Win32Exception((int)status).Message));
-                    return;
-                }
-                if (result == IntPtr.Zero || !_instances.ContainsKey(operation.Name)) return;
-                var info = Marshal.PtrToStructure<ServiceInstance>(result);
-                if (info.Ipv4 == IntPtr.Zero || info.Port == 0 || info.Count > 256) return;
-                var address = new byte[4]; Marshal.Copy(info.Ipv4, address, 0, 4);
-                var txt = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                for (var i = 0; i < info.Count; i++)
-                {
-                    var key = Marshal.PtrToStringUni(Marshal.ReadIntPtr(info.Keys, i * IntPtr.Size));
-                    var value = Marshal.PtrToStringUni(Marshal.ReadIntPtr(info.Values, i * IntPtr.Size));
-                    if (key is not null) txt[key] = value ?? "";
-                }
-                var record = new ServiceRecord(operation.Name, operation.Type, new IPAddress(address).ToString(), info.Port, txt);
-                if (!_records.TryGetValue(operation.Name, out var previous) || Describe(previous.Record) != Describe(record)) AppPaths.Log("Discovery resolved: " + Describe(record));
-                _records[operation.Name] = (record, DateTime.UtcNow.AddSeconds(90));
+                _expires.Remove(name); changed |= _records.Remove(name);
+                if (_resolvers.Remove(name, out var resolver)) old.Add(resolver);
             }
-            Publish();
+            ScheduleExpiry();
         }
-        catch (Exception error) { Failed?.Invoke(L.Format("Resolving receiver: {0}", error.Message)); }
-        finally { if (result != IntPtr.Zero) DnsServiceFreeInstance(result); operation.Complete(); }
+        Cancel(old); if (changed) Publish();
+    }
+    private OperationSlot[] DetachOperations()
+    {
+        var old = _browsers.Concat(_resolvers.Values).Concat(_retired).ToArray();
+        _browsers.Clear(); _resolvers.Clear(); _retired.Clear(); return old;
+    }
+    private void Cancel(IEnumerable<OperationSlot> operations)
+    {
+        foreach (var operation in operations)
+        {
+            try { operation.Dispose(); }
+            catch (Exception error) { lock (_sync) _retired.Add(operation); Failed?.Invoke(error.Message); }
+        }
     }
     private void Publish()
     {
@@ -201,88 +219,40 @@ public sealed class WindowsDiscovery : IDiscoveryService
         {
             if (_disposed) return;
             var diagnostics = new HashSet<string>(StringComparer.Ordinal);
-            receivers = ReceiverAggregator.Build(_records.Values.Select(p => p.Record), message => diagnostics.Add(message));
-            foreach (var message in diagnostics.Except(_diagnostics)) AppPaths.Log(message);
+            receivers = ReceiverAggregator.Build(_records.Values, message => diagnostics.Add(message));
+            foreach (var message in diagnostics.Except(_diagnostics)) _log(message);
             _diagnostics = diagnostics;
         }
         Changed?.Invoke(receivers);
     }
+    private static bool Equal(ServiceRecord left, ServiceRecord right) => left.Instance == right.Instance && left.ServiceType == right.ServiceType && left.Address == right.Address && left.Port == right.Port &&
+        left.Txt.Count == right.Txt.Count && left.Txt.All(p => right.Txt.TryGetValue(p.Key, out var value) && value == p.Value);
     private static string Describe(ServiceRecord record) => System.Text.Json.JsonSerializer.Serialize(new { record.Instance, record.ServiceType, record.Address, record.Port,
         DeviceId = record.Txt.GetValueOrDefault("deviceid", ""), Model = record.Txt.GetValueOrDefault("model", record.Txt.GetValueOrDefault("am", "")), StereoId = record.Txt.GetValueOrDefault("tsid", "") });
     public void Dispose()
     {
-        NetworkChange.NetworkAddressChanged -= NetworkChanged;
-        NetworkChange.NetworkAvailabilityChanged -= NetworkAvailabilityChanged; _timer?.Dispose();
-        Operation[] operations;
-        lock (_sync)
-        {
-            if (_disposed) return; _disposed = true; ++_epoch;
-            operations = Operation.All.Values.Where(o => ReferenceEquals(o.Owner, this)).ToArray();
-            _browsers.Clear();
-        }
-        foreach (var operation in operations) operation.Dispose();
+        Stop();
+        OperationSlot[] old;
+        lock (_sync) { if (_disposed) return; _disposed = true; ++_epoch; old = DetachOperations(); }
+        Cancel(old); _expiry.Dispose();
     }
-    [UnmanagedFunctionPointer(CallingConvention.Winapi)] private delegate void BrowseCallback(uint status, IntPtr context, IntPtr records);
-    [UnmanagedFunctionPointer(CallingConvention.Winapi)] private delegate void ResolveCallback(uint status, IntPtr context, IntPtr instance);
-    private static readonly BrowseCallback BrowseThunk = (status, context, records) =>
+    // An early callback can stop discovery before the native handle is returned.
+    private sealed class OperationSlot : IDisposable
     {
-        try
+        private readonly object _sync = new();
+        private IDisposable? _operation;
+        private bool _stopped;
+        public void Attach(IDisposable operation)
         {
-            if (Operation.All.TryGetValue(context.ToInt64(), out var op)) op.Owner.Browse(op, status, records);
-            else if (records != IntPtr.Zero) DnsRecordListFree(records, 1);
+            bool stop; lock (_sync) { _operation = operation; stop = _stopped; }
+            if (stop) Dispose();
         }
-        catch (Exception error) { AppPaths.Log($"Discovery callback failed: {error}"); }
-    };
-    private static readonly ResolveCallback ResolveThunk = (status, context, result) =>
-    {
-        try
-        {
-            if (Operation.All.TryGetValue(context.ToInt64(), out var op)) op.Owner.Resolved(op, status, result);
-            else if (result != IntPtr.Zero) DnsServiceFreeInstance(result);
-        }
-        catch (Exception error) { AppPaths.Log($"Discovery callback failed: {error}"); }
-    };
-    private sealed class Operation : IDisposable
-    {
-        public static readonly ConcurrentDictionary<long, Operation> All = new();
-        private static long _nextToken;
-        public long Token { get; } = Interlocked.Increment(ref _nextToken);
-        public WindowsDiscovery Owner { get; }
-        public string Name { get; }
-        public string Type { get; }
-        public long Epoch { get; }
-        public uint InterfaceIndex { get; }
-        private readonly bool _resolve;
-        private IntPtr _name;
-        private IntPtr _cancel;
-        private bool _pending;
-        public Operation(WindowsDiscovery owner, string name, string type, long epoch, bool resolve, uint interfaceIndex)
-        {
-            Owner = owner; Name = name; Type = type; Epoch = epoch; _resolve = resolve; InterfaceIndex = interfaceIndex;
-            _name = Marshal.StringToHGlobalUni(name); _cancel = Marshal.AllocHGlobal(IntPtr.Size); Marshal.WriteIntPtr(_cancel, IntPtr.Zero); All[Token] = this;
-        }
-        public uint Start()
-        {
-            var request = new ServiceRequest { Version = 1, InterfaceIndex = InterfaceIndex, QueryName = _name, Callback = _resolve ? Marshal.GetFunctionPointerForDelegate(ResolveThunk) : Marshal.GetFunctionPointerForDelegate(BrowseThunk), Context = new(Token) };
-            var status = _resolve ? DnsServiceResolve(ref request, _cancel) : DnsServiceBrowse(ref request, _cancel);
-            _pending = status == 9506;
-            return status;
-        }
-        public void Complete() { _pending = false; Dispose(); }
         public void Dispose()
         {
-            if (!All.TryRemove(Token, out _)) return;
-            try { if (_pending) { if (_resolve) DnsServiceResolveCancel(_cancel); else DnsServiceBrowseCancel(_cancel); } }
-            catch (Exception error) { AppPaths.Log($"Discovery cancellation failed: {error}"); }
-            finally { Marshal.FreeHGlobal(_name); Marshal.FreeHGlobal(_cancel); _name = _cancel = IntPtr.Zero; }
+            IDisposable? operation;
+            lock (_sync) { _stopped = true; operation = _operation; _operation = null; }
+            try { operation?.Dispose(); }
+            catch { lock (_sync) _operation = operation; throw; }
         }
     }
-    [StructLayout(LayoutKind.Sequential)] private struct ServiceRequest { public uint Version, InterfaceIndex; public IntPtr QueryName, Callback, Context; }
-    [StructLayout(LayoutKind.Sequential)] private struct ServiceInstance { public IntPtr InstanceName, HostName, Ipv4, Ipv6; public ushort Port, Priority, Weight; public int Count; public IntPtr Keys, Values; public uint InterfaceIndex; }
-    [DllImport("dnsapi.dll")] private static extern uint DnsServiceBrowse(ref ServiceRequest request, IntPtr cancel);
-    [DllImport("dnsapi.dll")] private static extern uint DnsServiceResolve(ref ServiceRequest request, IntPtr cancel);
-    [DllImport("dnsapi.dll")] private static extern uint DnsServiceBrowseCancel(IntPtr cancel);
-    [DllImport("dnsapi.dll")] private static extern uint DnsServiceResolveCancel(IntPtr cancel);
-    [DllImport("dnsapi.dll")] private static extern void DnsRecordListFree(IntPtr records, int freeType);
-    [DllImport("dnsapi.dll")] private static extern void DnsServiceFreeInstance(IntPtr instance);
 }

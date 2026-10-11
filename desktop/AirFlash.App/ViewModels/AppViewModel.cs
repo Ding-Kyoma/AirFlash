@@ -18,6 +18,12 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private readonly HashSet<string> _autoAttempted = [];
     private readonly DispatcherTimer _volumeTimer;
     private readonly DispatcherTimer _autoTimer;
+    private readonly DispatcherTimer _startupDiscoveryTimer;
+    private readonly DispatcherTimer _discoverySearchTimer;
+    private bool _started, _panelVisible, _receiversPageVisible, _startupDiscovery, _discoveryRequested, _isDiscovering, _searchSettled;
+    public bool IsDiscovering => _isDiscovering;
+    public string DiscoveryEmptyTitle => IsDiscovering && !_searchSettled ? L.Get("Searching for receivers") : L.Get("No receivers found");
+    public string DiscoveryStatus => IsDiscovering ? L.Get("Searching for receivers") : L.Get("Discovery paused. Showing previous results.");
     private AppSettings _settings;
     private SessionSnapshot _snapshot = new(PlaybackState.Idle);
     private string _notice = "";
@@ -97,10 +103,25 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         Session.Changed += SessionChanged;
         _discovery.Changed += list => _dispatcher.BeginInvoke(() => OnDiscovered(list));
         _discovery.Failed += message => _dispatcher.BeginInvoke(() => ShowError(new IOException(message)));
+        _discovery.RunningChanged += running => _dispatcher.BeginInvoke(() =>
+        {
+            if (_closing) return;
+            _isDiscovering = running && _discoveryRequested; Notify(nameof(IsDiscovering)); Notify(nameof(DiscoveryEmptyTitle)); Notify(nameof(DiscoveryStatus));
+        });
         _volumeTimer = new(TimeSpan.FromMilliseconds(200), DispatcherPriority.Background, async (_, _) => { _volumeTimer!.Stop(); try { await FlushVolumeAsync(); } catch (Exception error) { ShowError(error); } }, dispatcher);
         _volumeTimer.Stop();
         _autoTimer = new(TimeSpan.FromMilliseconds(900), DispatcherPriority.Background, async (_, _) => { _autoTimer!.Stop(); try { await TryAutoConnectAsync(); } catch (Exception error) { ShowError(error); } }, dispatcher);
         _autoTimer.Stop();
+        _startupDiscoveryTimer = new(TimeSpan.FromSeconds(10), DispatcherPriority.Background, (_, _) =>
+        {
+            _startupDiscoveryTimer!.Stop(); _startupDiscovery = false; UpdateDiscoveryDemand();
+        }, dispatcher);
+        _startupDiscoveryTimer.Stop();
+        _discoverySearchTimer = new(TimeSpan.FromSeconds(10), DispatcherPriority.Background, (_, _) =>
+        {
+            _discoverySearchTimer!.Stop(); _searchSettled = true; Notify(nameof(DiscoveryEmptyTitle));
+        }, dispatcher);
+        _discoverySearchTimer.Stop();
         StopCommand = new(() => StopAsync(), ShowError, () => _snapshot.IsActive);
         MuteCommand = new(async () => { await Session.SetMutedAsync(!Session.Muted); Notify(nameof(Muted)); Notify(nameof(MuteLabel)); }, ShowError);
         MergeManualReceivers();
@@ -126,8 +147,26 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         catch (Exception error) { ShowError(error); }
         finally { _settingsGate.Release(); }
         if (_closing) return;
-        try { _discovery.Start(); } catch (Exception error) { ShowError(error); }
+        _started = true;
+        _startupDiscovery = _settings.AutoConnectOnDiscover || _settings.Receivers.Values.Any(o => o.AutoConnect == true && !o.Hidden);
+        if (_startupDiscovery) _startupDiscoveryTimer.Start();
+        UpdateDiscoveryDemand();
         RefreshReceivers(); ScheduleAutoConnect();
+    }
+    public void SetPanelVisible(bool visible) { _panelVisible = visible; UpdateDiscoveryDemand(); }
+    public void SetReceiversPageVisible(bool visible) { _receiversPageVisible = visible; UpdateDiscoveryDemand(); }
+    private void UpdateDiscoveryDemand()
+    {
+        if (!_started || _closing) return;
+        var requested = _panelVisible || _receiversPageVisible || _startupDiscovery;
+        if (requested == _discoveryRequested) return;
+        _discoveryRequested = requested;
+        if (requested)
+        {
+            _searchSettled = false; _discoverySearchTimer.Stop(); _discoverySearchTimer.Start(); try { _discovery.Start(); } catch (Exception error) { ShowError(error); }
+        }
+        else { _discoverySearchTimer.Stop(); try { _discovery.Stop(); } catch (Exception error) { ShowError(error); } }
+        Notify(nameof(DiscoveryEmptyTitle));
     }
     private void EngineChanged() => _dispatcher.BeginInvoke(() =>
     {
@@ -233,11 +272,11 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         if (currentSnapshot.Receiver is { IsManual: false } current)
         {
             var id = ReceiverMigrations.GetValueOrDefault(current.Id, current.Id);
-            if (!discovered.TryGetValue(id, out var next) || !next.Complete)
-            {
-                if (currentSnapshot.IsActive) await Session.StopAsync();
-            }
-            else if (!ReceiverEqual(current, next) || !SettingsMerge.Equal(originalSettings, _settings)) await Session.UpdateReceiverAsync(next, _settings.Clone());
+            // Discovery snapshots can be incomplete while scanning or suspended.
+            // The transport health checks own disconnect detection during playback.
+            if (discovered.TryGetValue(id, out var next) && next.Complete &&
+                (!ReceiverEqual(current, next) || !SettingsMerge.Equal(originalSettings, _settings)))
+                await Session.UpdateReceiverAsync(next, _settings.Clone());
         }
         ScheduleAutoConnect();
     }
@@ -255,9 +294,10 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             && left.Codecs.SequenceEqual(right.Codecs) && left.Aliases.SequenceEqual(right.Aliases) && CatalogEqual(left.Members, right.Members);
     private void RefreshReceivers()
     {
-        var visible = AllReceivers.Where(r => r.Online && !_settings.ReadOptions(r.Id).Hidden).ToArray();
+        var visible = AllReceivers.Where(r => (r.Online || _snapshot.IsActive && _snapshot.Receiver?.Id == r.Id) && !_settings.ReadOptions(r.Id).Hidden).ToList();
+        if (_snapshot.IsActive && _snapshot.Receiver is { } active && !visible.Any(r => r.Id == active.Id) && !_settings.ReadOptions(active.Id).Hidden) visible.Add(active);
         foreach (var row in Receivers.Where(row => visible.All(r => r.Id != row.Receiver.Id)).ToArray()) Receivers.Remove(row);
-        for (var i = 0; i < visible.Length; i++)
+        for (var i = 0; i < visible.Count; i++)
         {
             var row = Receivers.FirstOrDefault(r => r.Receiver.Id == visible[i].Id);
             if (row is null) { row = new(this, visible[i]); Receivers.Insert(i, row); }
@@ -278,7 +318,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         if (errors != ErrorDetails) Notify(nameof(ErrorDetails));
         if (previous.State != snapshot.State || previous.Receiver?.Id != snapshot.Receiver?.Id)
         {
-            foreach (var row in Receivers) row.Refresh();
+            RefreshReceivers();
             StopCommand.Refresh();
         }
         foreach (var row in Receivers) row.Refresh();
@@ -442,7 +482,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public ValueTask DisposeAsync() => new(_disposeTask ??= DisposeCoreAsync());
     private async Task DisposeCoreAsync()
     {
-        _closing = true; _volumeTimer.Stop(); _autoTimer.Stop(); _discovery.Dispose();
+        _closing = true; _volumeTimer.Stop(); _autoTimer.Stop(); _startupDiscoveryTimer.Stop(); _discoverySearchTimer.Stop(); _discovery.Dispose();
         if (_engine is not null) _engine.Changed -= EngineChanged;
         await _startup;
         Endpoints.Dispose();
@@ -487,14 +527,13 @@ public sealed class ReceiverViewModel : ObservableObject
     public string MuteLabel => Muted ? L.Get("Unmute") : L.Get("Mute");
     public bool Active => _app.Snapshot.IsActive && _app.Snapshot.Receiver?.Id == Receiver.Id;
     public bool CanPlay => Active || _app.EngineReady && Receiver.Online && Receiver.Complete;
-    public string PlayGlyph => Active ? "■" : "▶";
     public string PlayHint => Active ? L.Get("Stop playback / disconnect") : L.Get("Play on this device");
     public string StateText => (Active ? _app.StatusTitle : !Receiver.Online ? L.Get("Offline") : !Receiver.Complete ? L.Get("Waiting for the other member") : L.Get("Disconnected")) + (Receiver.IsGroup ? $" · {Receiver.Members.Length}/2" : "");
     public AsyncCommand ToggleCommand { get; }
     public AsyncCommand MuteCommand { get; }
     public void Refresh()
     {
-        var values = new Dictionary<string, object?> { [nameof(Name)] = Name, [nameof(Detail)] = Detail, [nameof(Volume)] = Volume, [nameof(VolumeText)] = VolumeText, [nameof(VolumeStatus)] = VolumeStatus, [nameof(CanSetVolume)] = CanSetVolume, [nameof(CanMute)] = CanMute, [nameof(Muted)] = Muted, [nameof(MuteLabel)] = MuteLabel, [nameof(Active)] = Active, [nameof(CanPlay)] = CanPlay, [nameof(PlayGlyph)] = PlayGlyph, [nameof(PlayHint)] = PlayHint, [nameof(StateText)] = StateText };
+        var values = new Dictionary<string, object?> { [nameof(Name)] = Name, [nameof(Detail)] = Detail, [nameof(Volume)] = Volume, [nameof(VolumeText)] = VolumeText, [nameof(VolumeStatus)] = VolumeStatus, [nameof(CanSetVolume)] = CanSetVolume, [nameof(CanMute)] = CanMute, [nameof(Muted)] = Muted, [nameof(MuteLabel)] = MuteLabel, [nameof(Active)] = Active, [nameof(CanPlay)] = CanPlay, [nameof(PlayHint)] = PlayHint, [nameof(StateText)] = StateText };
         foreach (var (name, value) in values)
             if (!_display.TryGetValue(name, out var old) || !Equals(old, value))
             {

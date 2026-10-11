@@ -45,6 +45,13 @@ public partial class App : Application
             L.Initialize(smokeLanguage);
             base.OnStartup(args);
             Resources["LatencyChoices"] = Choices.Latencies;
+            if (args.Args.Contains("--discovery-perf"))
+            {
+                var outputIndex = Array.IndexOf(args.Args, "--output");
+                if (outputIndex < 0 || outputIndex + 1 >= args.Args.Length) throw new ArgumentException("--discovery-perf requires --output.");
+                AppPaths.DataDirectory = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(args.Args[outputIndex + 1]))!, "isolated-data");
+                Shutdown(await DiscoveryPerf.RunAsync(args.Args)); return;
+            }
             if (args.Args.Contains("--update-check"))
             {
                 using var client = new System.Net.Http.HttpClient { MaxResponseContentBufferSize = 1024 * 1024 };
@@ -72,7 +79,7 @@ public partial class App : Application
             var audio = new AudioService();
             var factory = new ExtractingEngineFactory();
             _engine = new(token => QueryEngineAsync(factory, token), AppPaths.Log);
-            _viewModel = new(store, new WindowsDiscovery(), new Autostart(), audio, factory, Dispatcher, _engine);
+            _viewModel = new(store, new WindowsDiscovery(log: AppPaths.Log), new Autostart(), audio, factory, Dispatcher, _engine);
             _panel = new(_viewModel); MainWindow = _panel;
             _panel.SettingsRequested += ShowSettings; _panel.QuitRequested += Quit;
             _tray = new(_panel, _viewModel, ShowSettings, Quit); _panel.Tray = _tray;
@@ -86,7 +93,7 @@ public partial class App : Application
         catch (Exception error)
         {
             AppPaths.Log(error.ToString());
-            if (args.Args.Any(a => a.EndsWith("-check", StringComparison.Ordinal) || a is "--ui-smoke" or "--tray-smoke" or "--ui-perf")) { WriteOutput(args.Args, new { ok = false, error = error.ToString() }); Shutdown(1); return; }
+            if (args.Args.Any(a => a.EndsWith("-check", StringComparison.Ordinal) || a is "--ui-smoke" or "--tray-smoke" or "--ui-perf" or "--discovery-perf")) { WriteOutput(args.Args, new { ok = false, error = error.ToString() }); Shutdown(1); return; }
             MessageBox.Show(error.Message + "\n\n" + AppPaths.LogDirectory, L.Get("AirFlash startup failed"), MessageBoxButton.OK, MessageBoxImage.Error);
             Quit();
         }

@@ -55,6 +55,12 @@ source you trust.
 5. Choose the capture endpoint and latency profile in Settings when the defaults
    are not suitable.
 
+Receiver discovery runs while the control panel or **Settings > Receivers** is
+visible, and pauses when both are hidden. Previous results remain available;
+pausing discovery does not interrupt playback. If automatic connection is enabled
+globally or for a receiver, AirFlash also discovers devices for ten seconds at
+startup. Open a receiver list to resume discovery afterwards.
+
 AirFlash intentionally uses fresh application storage under `%APPDATA%/AirFlash`
 and `%LOCALAPPDATA%/AirFlash`. It does not read configuration, credentials, or
 engine caches created by the previous product name; users must configure and pair

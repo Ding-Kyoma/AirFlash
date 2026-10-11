@@ -34,6 +34,12 @@ Windows taskbar and notification icons require native bitmap handles. `AppIconSe
 
 125%（120 DPI）下，常规小图标为 20px、大图标为 40px，均有原生尺寸帧。应用面板使用 WPF 矢量绘制；README 标题使用 SVG。文档截图仍为 PNG，其中面板和托盘的 Logo 从同一矢量资源按截图像素尺寸重新绘制。
 
+## Panel controls / 面板控件图标
+
+Settings, receiver speaker, play and stop icons are application-owned `Geometry` resources in `ControlPanel.xaml`, drawn with WPF `Path` elements. Their 24-unit design canvases scale uniformly to 18, 19 and 16 DIPs. Outline icons use rounded strokes; colors follow the current theme. Playback switches geometry using the receiver's existing `Active` state while retaining its command, tooltip and accessible name.
+
+这些控件图标随应用编译打包，不依赖 `Segoe Fluent Icons`、`Segoe MDL2 Assets` 或其他图标字体；Windows 10 用户无需安装字体。修改它们时编辑面板的 Geometry 资源，应用 Logo 仍使用上述 SVG 生成流程。
+
 ## Verification / 验收
 
 ```powershell
@@ -44,6 +50,8 @@ AirFlash.exe --ui-smoke --ui-language zh-CN --output artifacts/icon-smoke-zh/rep
 ```
 
 UI smoke checks native HICON dimensions, window and tray handles, notification-driven tray refresh and simulated Explorer re-registration. It renders the panel and an icon comparison sheet at **100%, 125%, 150%, 175%, 200%** in both themes. Reports include the actual window DPI and monitor work area. Mock engine/audio/discovery/autostart services do not access HomePods or alter system audio.
+
+Panel checks verify every receiver has separate speaker/playback visuals, nonempty geometry, unclipped bounds, nontransparent rendered pixels and theme colors. They also exercise settings activation, keyboard focus and play/stop/play with localized accessible labels. Validate the built EXE and MSI on Windows 10 without Segoe Fluent Icons and on Windows 11; simulated DPI renders do not establish OS compatibility.
 
 Physical acceptance on **3440×1440 at 125%**:
 
