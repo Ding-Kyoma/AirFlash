@@ -253,7 +253,9 @@ internal static class UiRegression
             await app.ToggleAsync(app.AllReceivers[0]); await Until(() => app.Snapshot.State == PlaybackState.Streaming);
             discovery.Items = ReceiverAggregator.Build(services.Take(2)); discovery.Publish();
             await Until(() => app.AllReceivers.Single().Members.Length == 1);
-            Check(app.Snapshot.IsActive && app.AllReceivers.Single().Detail.Contains("1/2", StringComparison.Ordinal) && engine.CreatedCount == 1, "missing discovery member shows one of two without stopping active transport", checks);
+            Check(app.Snapshot.State == PlaybackState.Streaming && app.AllReceivers.Single().Detail.Contains("1/2", StringComparison.Ordinal)
+                && engine.CreatedCount == 1 && engine.DisposedCount == 0,
+                "missing discovery member shows one of two without stopping active transport", checks);
         }
         finally { await vm.ApplicationCompleted; window.Close(); }
 

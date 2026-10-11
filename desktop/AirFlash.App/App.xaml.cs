@@ -66,6 +66,7 @@ public partial class App : Application
                 Shutdown(0); return;
             }
             if (args.Args.Contains("--self-check")) { Shutdown(await SelfCheckAsync(args.Args)); return; }
+            if (args.Args.Contains("--stability-check")) { Shutdown(await StabilityCheck.RunAsync(args.Args)); return; }
             if (args.Args.Contains("--compat-check")) { Shutdown(await CompatibilityCheckAsync(args.Args)); return; }
             if (args.Args.Contains("--discovery-check")) { Shutdown(await DiscoveryCheckAsync(args.Args)); return; }
             if (args.Args.Contains("--audio-check")) { Shutdown(await AudioCheckAsync(args.Args)); return; }

@@ -17,6 +17,8 @@ The original startup failure has not yet been reproduced or assigned a confirmed
 
 ## Bug Fixes
 
+- Keep active AirPlay playback and its Stop control when discovery temporarily loses a receiver or a stereo member. Refresh the session after delayed identity persistence and skip passive receiver updates during pairing.
+
 - Keep the control panel, tray and settings available when the engine fails to initialize; disable playback and pairing until a successful retry, and coordinate retry with shutdown.
 - Log startup stages before WPF resource initialization, plus engine launch errors, exit codes and bounded stderr.
 - Skip Windows 11 DWM attributes on Windows 10 and report discovery, audio endpoint and autostart initialization failures without blocking the shell.
