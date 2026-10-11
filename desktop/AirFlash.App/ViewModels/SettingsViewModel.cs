@@ -30,6 +30,25 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     public bool IsApplying => _applying;
     public bool CanEdit => !_applying;
     public bool IsEndpointLoading => _endpointLoading;
+    private bool _applicationsLoading;
+    public bool IsApplicationsLoading => _applicationsLoading;
+    public bool ApplicationCaptureSupported => App.Applications.Supported;
+    public bool CanMuteEndpoint => Draft.CaptureMode != "application";
+    public ObservableCollection<CaptureApplication> Applications { get; } = [];
+    private CaptureApplication? _selectedApplication;
+    public CaptureApplication? SelectedApplication
+    {
+        get => _selectedApplication;
+        set
+        {
+            if (!Set(ref _selectedApplication, value) || _updating) return;
+            Draft.CaptureApplicationPath = value?.Path;
+            Draft.CaptureApplicationInstance = value is { ProcessId: > 0 } ? value : null;
+            RefreshValidation();
+        }
+    }
+    public AsyncCommand RefreshApplicationsCommand { get; }
+    public RelayCommand OpenVolumeMixerCommand { get; }
     public Task ApplicationCompleted => _application?.Task ?? Task.CompletedTask;
     public string Progress { get => _progress; private set => Set(ref _progress, value); }
     public string Error { get => _error; private set => Set(ref _error, value); }
@@ -41,7 +60,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         {
             if (!Set(ref _selectedPage, value)) return;
             Notify(nameof(PageTitle)); Notify(nameof(PageDescription));
-            if (value == AudioCapturePage) _ = LoadEndpointsAsync(false);
+            if (value == AudioCapturePage) { _ = LoadEndpointsAsync(false); if (Draft.CaptureMode == "application") _ = LoadApplicationsAsync(); }
             if (value == NetworkPage) RefreshAdapters();
         }
     }
@@ -84,6 +103,12 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         OkCommand = new(async () => { if (!HasChanges || await ApplyAsync()) CloseRequested?.Invoke(true); }, ShowError, () => CanEdit && _validationErrors == 0 && _validation is null);
         CancelCommand = new(() => { if (CanEdit) CloseRequested?.Invoke(false); }, () => CanEdit);
         RefreshEndpointsCommand = new(() => LoadEndpointsAsync(true), ShowError, () => CanEdit && !_endpointLoading);
+        RefreshApplicationsCommand = new(LoadApplicationsAsync, ShowError, () => CanEdit && !_applicationsLoading && ApplicationCaptureSupported);
+        OpenVolumeMixerCommand = new(() =>
+        {
+            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("ms-settings:apps-volume") { UseShellExecute = true }); }
+            catch (Exception error) { ShowError(error); }
+        });
         RefreshAdaptersCommand = new(RefreshAdapters);
         OpenLogsCommand = new(() => { try { AppPaths.OpenLogs(); } catch (Exception error) { ShowError(error); } });
         CopyDiagnosticsCommand = new(() => { try { Clipboard.SetText(App.Diagnostics()); } catch (Exception error) { ShowError(error); } });
@@ -108,6 +133,11 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     {
         if (args.PropertyName == nameof(AppSettings.StreamSampleRate)) Equalizer.RefreshHeadroom();
         if (_updating) return;
+        if (args.PropertyName == nameof(AppSettings.CaptureMode))
+        {
+            Notify(nameof(CanMuteEndpoint));
+            if (Draft.CaptureMode == "application") _ = LoadApplicationsAsync();
+        }
         RefreshValidation();
         if (args.PropertyName == nameof(AppSettings.DiscoveryInterfaceId)) RefreshAdapters();
     }
@@ -153,7 +183,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private void RefreshBusy()
     {
         Notify(nameof(IsApplying)); Notify(nameof(CanEdit));
-        ApplyCommand.Refresh(); OkCommand.Refresh(); CancelCommand.Refresh(); AddReceiverCommand.Refresh(); RefreshEndpointsCommand.Refresh();
+        ApplyCommand.Refresh(); OkCommand.Refresh(); CancelCommand.Refresh(); AddReceiverCommand.Refresh(); RefreshEndpointsCommand.Refresh(); RefreshApplicationsCommand.Refresh();
         foreach (var row in Receivers) row.Refresh();
     }
     public async Task<bool> ApplyAsync()
@@ -238,6 +268,34 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         Draft.ManualReceivers.Remove(manual); Draft.Receivers.Remove(id);
         var row = Receivers.FirstOrDefault(r => r.Receiver.Id == id); if (row is not null) Receivers.Remove(row);
         SyncSubscriptions(); RefreshValidation();
+    }
+    public async Task LoadApplicationsAsync()
+    {
+        if (_disposed || _applicationsLoading || !ApplicationCaptureSupported) return;
+        _applicationsLoading = true; Notify(nameof(IsApplicationsLoading)); RefreshApplicationsCommand.Refresh();
+        var path = Draft.CaptureApplicationPath;
+        var instance = Draft.CaptureApplicationInstance;
+        try
+        {
+            var items = (await App.Applications.RefreshAsync()).ToList();
+            if (_disposed) return;
+            // Respect a user selection changed during this asynchronous refresh.
+            path = Draft.CaptureApplicationPath; instance = Draft.CaptureApplicationInstance;
+            var matches = items.Where(p => string.Equals(p.Path, path, StringComparison.OrdinalIgnoreCase)).ToArray();
+            var selected = matches.FirstOrDefault(p => p.ProcessId == instance?.ProcessId && p.StartedAt == instance.StartedAt)
+                ?? (matches.Length == 1 ? matches[0] : null);
+            if (!string.IsNullOrWhiteSpace(path) && selected is null)
+            {
+                selected = new(path, L.Get(matches.Length > 1 ? "Multiple instances · " : "Unavailable · ") + System.IO.Path.GetFileName(path), 0, 0);
+                items.Add(selected);
+            }
+            _updating = true;
+            try { Applications.Clear(); foreach (var item in items) Applications.Add(item); SelectedApplication = selected; }
+            finally { _updating = false; }
+            Notify(nameof(ApplicationCaptureSupported));
+        }
+        catch (Exception error) { if (!_disposed) ShowError(error); }
+        finally { _applicationsLoading = false; Notify(nameof(IsApplicationsLoading)); RefreshApplicationsCommand.Refresh(); }
     }
     public async Task LoadEndpointsAsync(bool refresh)
     {

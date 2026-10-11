@@ -15,5 +15,9 @@ pub mod live;
 #[cfg(windows)]
 pub mod credentials;
 
+pub mod standby;
 pub mod transport;
 pub mod volume;
+
+#[cfg(windows)]
+pub mod applications;

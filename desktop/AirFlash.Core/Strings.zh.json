@@ -263,5 +263,22 @@
   "Audio engine initialization timed out after 10 seconds.": "音频引擎初始化超过 10 秒，已超时。",
   "Windows DNS-SD is unavailable. You can add a receiver manually and collect startup diagnostics.": "Windows DNS-SD 不可用。可以手动添加接收器，并收集启动诊断信息。",
   "Playback": "播放",
-  "Recording": "录音"
+  "Recording": "录音",
+  "Specific application": "指定应用",
+  "Capture application": "采集应用",
+  "Select an application.": "请选择应用。",
+  "Could not list applications.": "无法列出应用。",
+  "Multiple instances · ": "多个实例 · ",
+  "Capture the selected application and its child processes. Browsers include the whole process tree, not individual tabs. Requires Windows build 20348 or later.": "采集所选应用及其子进程的声音。浏览器按整个进程树采集，不区分标签页。需要 Windows build 20348 或更高版本。",
+  "Play an application only on HomePod": "让应用只在 HomePod 播放",
+  "Install a virtual audio cable, then set only the target application output to CABLE Input in the Windows volume mixer. Keep games and notifications on your headphones.": "安装虚拟音频线后，在 Windows 音量混合器中仅将目标应用的输出设为 CABLE Input，让游戏和通知继续使用耳机。",
+  "Open Windows volume mixer": "打开 Windows 音量混合器",
+  "Select the application above, or choose CABLE Output (Recording) as the specific endpoint. Disable Listen to this device or local monitoring. After stopping AirFlash, restore the application output in Windows if needed.": "在上方选择应用，或将指定端点设为 CABLE Output（录音）。关闭“侦听此设备”或本地监听。停止 AirFlash 后，如需本地播放，可在 Windows 中恢复该应用的输出设备。",
+  "Virtual devices provide audio routing. Protected content may remain silent depending on the player and its protection mechanism. Capture and resampling do not guarantee bit-perfect audio.": "虚拟设备用于音频路由。受保护内容仍可能因播放器或保护机制而无法采集。采集与重采样不保证逐位无损。",
+  "Release the AirPlay session during standby and reconnect when audio is detected. Audio during reconnection may be missed.": "待机时释放 AirPlay 会话，检测到声音后自动重新连接。重连期间的音频可能丢失。",
+  "Application capture requires Windows build 20348 or later. Use a virtual audio endpoint on this Windows version.": "应用采集需要 Windows build 20348 或更高版本。当前系统可通过虚拟音频端点实现隔离。",
+  "Waiting for the selected application to start.": "正在等待所选应用启动。",
+  "Multiple application instances are running. Select an instance in Settings → Audio capture.": "应用正在运行多个实例，请在设置 → 音频采集中选择实例。",
+  "AirPlay session released. Waiting for audio.": "已释放 AirPlay 会话，正在等待声音。",
+  "Audio detected; reconnecting…": "检测到声音，正在重新连接…"
 }

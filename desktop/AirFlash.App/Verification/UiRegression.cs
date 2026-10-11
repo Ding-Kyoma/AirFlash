@@ -1,6 +1,7 @@
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Threading;
+using AirFlash.App.Services;
 using AirFlash.App.Ui;
 using AirFlash.App.ViewModels;
 using AirFlash.Core;
@@ -13,7 +14,8 @@ internal static class UiRegression
         var store = new UiSmoke.MemoryStore(); var audio = new UiSmoke.MockAudio();
         var autostart = new UiSmoke.MockAutostart(); var discovery = new UiSmoke.MockDiscovery();
         var engine = new UiSmoke.MockFactory();
-        await using var app = new AppViewModel(store, discovery, autostart, audio, engine, Application.Current.Dispatcher);
+        var applications = new MockApplications();
+        await using var app = new AppViewModel(store, discovery, autostart, audio, engine, Application.Current.Dispatcher, applications: applications);
         app.SetPanelVisible(true); app.Start(); await app.Startup; await Pump();
         var window = new SettingsWindow(app); window.Show(); await Pump();
         var vm = window.ViewModel;
@@ -137,6 +139,31 @@ internal static class UiRegression
             Check(audio.Enumerations == enumerations + 1 && audio.MaxEnumerations == 1 && vm.Endpoints.Any(e => e.Name == "Newest"), "changes during enumeration trigger one serial follow-up", checks);
             audio.EnumerationGate = null; audio.EnumerationEntered = null;
 
+            var firstApplication = new CaptureApplication(@"C:\Music.exe", "Music", 41, 100);
+            var secondApplication = firstApplication with { ProcessId = 42, StartedAt = 200 };
+            applications.Items = [firstApplication, secondApplication];
+            vm.Draft.CaptureMode = "application"; await Until(() => !vm.IsApplicationsLoading); await Pump();
+            vm.SelectedApplication = secondApplication;
+            vm.Draft.MuteWhileStreaming = true;
+            Check(!vm.CanMuteEndpoint && await vm.ApplyAsync(), "application selection saves while endpoint mute is disabled", checks);
+            Check(store.Saved.CaptureApplicationPath == firstApplication.Path && app.Settings.CaptureApplicationInstance == secondApplication, "application identity retains chosen runtime instance", checks);
+            foreach (var dark in new[] { false, true })
+            {
+                ThemeService.SetForVerification(dark); await Pump();
+                var scroll = window.PageScroll;
+                scroll.ScrollToHome(); await Pump();
+                UiSmoke.Render(window, Path.Combine(directory, $"capture-{(dark ? "dark" : "light")}-top.png"), 1);
+                scroll.ScrollToEnd(); await Pump();
+                UiSmoke.Render(window, Path.Combine(directory, $"capture-{(dark ? "dark" : "light")}-routing.png"), 1);
+            }
+            applications.Items = []; await vm.LoadApplicationsAsync();
+            Check(vm.Draft.CaptureApplicationPath == firstApplication.Path && vm.SelectedApplication?.ProcessId == 0, "missing application stays selected without switching to system audio", checks);
+            applications.Items = [firstApplication]; await vm.LoadApplicationsAsync();
+            Check(vm.SelectedApplication == firstApplication, "unique restarted application is shown", checks);
+            vm.Draft.CaptureMode = "endpoint"; vm.Draft.MuteWhileStreaming = false;
+            Check(await vm.ApplyAsync(), "returning from application to endpoint capture succeeds", checks);
+            await Until(() => app.Snapshot.State == PlaybackState.Streaming); await Pump();
+
             var statusNotifications = 0; var rowNotifications = 0;
             app.PropertyChanged += (_, args) => { if (args.PropertyName == nameof(AppViewModel.StatusTitle)) statusNotifications++; };
             foreach (var receiver in app.Receivers) receiver.PropertyChanged += (_, _) => rowNotifications++;
@@ -174,6 +201,12 @@ internal static class UiRegression
         await RunAutoConnectIdentityRegressionAsync(checks);
         await RunDiscoveryDemandRegressionAsync(checks);
         await RunStereoIdentityRegressionAsync(checks, directory);
+    }
+    private sealed class MockApplications : IApplicationCatalog
+    {
+        public bool Supported => true;
+        public IReadOnlyList<CaptureApplication> Items { get; set; } = [];
+        public Task<IReadOnlyList<CaptureApplication>> RefreshAsync(CancellationToken cancellation = default) => Task.FromResult(Items);
     }
     private static async Task RunIdentityRegressionAsync(List<string> checks, string directory)
     {

@@ -70,7 +70,7 @@
               <TextBox Width="80" Text="{Binding Draft.StandbySilenceSeconds, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}"/>
               <TextBlock Text="{loc:Text 'seconds (5–300)'}" VerticalAlignment="Center" Margin="10,0,0,0" Style="{StaticResource Hint}"/>
             </StackPanel>
-            <TextBlock Text="{loc:Text 'Stay connected during standby and resume when audio is detected.'}" Style="{StaticResource Hint}" Margin="0,14,0,0"/>
+            <TextBlock Text="{loc:Text 'Release the AirPlay session during standby and reconnect when audio is detected. Audio during reconnection may be missed.'}" Style="{StaticResource Hint}" Margin="0,14,0,0"/>
           </StackPanel>
         </Border>
       </StackPanel>
@@ -136,6 +136,14 @@
             <TextBlock Text="{loc:Text 'Audio source'}" Style="{StaticResource SectionTitle}"/>
             <RadioButton Content="{loc:Text 'Default system output'}" GroupName="CaptureMode" IsChecked="{Binding Draft.CaptureMode, Converter={StaticResource Equal}, ConverterParameter=loopback}"/>
             <TextBlock Text="{loc:Text 'Capture audio from the default playback device and follow changes to the Windows default output.'}" Style="{StaticResource Hint}" Margin="26,0,0,22"/>
+            <RadioButton Content="{loc:Text 'Specific application'}" GroupName="CaptureMode" IsEnabled="{Binding ApplicationCaptureSupported}" IsChecked="{Binding Draft.CaptureMode, Converter={StaticResource Equal}, ConverterParameter=application}"/>
+            <Grid Margin="26,0,0,12" IsEnabled="{Binding Draft.CaptureMode, Converter={StaticResource Equal}, ConverterParameter=application}">
+              <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <ComboBox x:Name="ApplicationCombo" ItemsSource="{Binding Applications}" DisplayMemberPath="DisplayName" SelectedItem="{Binding SelectedApplication, Mode=TwoWay}" ToolTip="{Binding SelectedApplication.Path}" AutomationProperties.Name="{loc:Text 'Capture application'}"/>
+              <Button Grid.Column="1" Content="{loc:Text 'Refresh'}" Margin="8,0,0,0" Command="{Binding RefreshApplicationsCommand}"/>
+            </Grid>
+            <ProgressBar IsIndeterminate="True" Height="3" Margin="26,0,0,12" Visibility="{Binding IsApplicationsLoading, Converter={StaticResource BoolVisibility}}"/>
+            <TextBlock Text="{loc:Text 'Capture the selected application and its child processes. Browsers include the whole process tree, not individual tabs. Requires Windows build 20348 or later.'}" Style="{StaticResource Hint}" Margin="26,0,0,22"/>
             <RadioButton Content="{loc:Text 'Specific audio endpoint'}" GroupName="CaptureMode" IsChecked="{Binding Draft.CaptureMode, Converter={StaticResource Equal}, ConverterParameter=endpoint}"/>
             <Grid Margin="26,0,0,12" IsEnabled="{Binding Draft.CaptureMode, Converter={StaticResource Equal}, ConverterParameter=endpoint}">
               <Grid.ColumnDefinitions>
@@ -152,8 +160,17 @@
         <Border Style="{StaticResource Card}">
           <StackPanel>
             <TextBlock Text="{loc:Text 'Local speakers'}" Style="{StaticResource SectionTitle}"/>
-            <CheckBox Content="{loc:Text 'Mute local output while streaming (playback devices only)'}" IsChecked="{Binding Draft.MuteWhileStreaming}"/>
+            <CheckBox Content="{loc:Text 'Mute local output while streaming (playback devices only)'}" IsChecked="{Binding Draft.MuteWhileStreaming}" IsEnabled="{Binding CanMuteEndpoint}"/>
             <TextBlock Text="{loc:Text 'Recording devices are never muted. Restore the previous playback-device mute state when playback stops or the connection fails. Some protected content cannot be captured through loopback.'}" Style="{StaticResource Hint}"/>
+          </StackPanel>
+        </Border>
+        <Border Style="{StaticResource Card}">
+          <StackPanel>
+            <TextBlock Text="{loc:Text 'Play an application only on HomePod'}" Style="{StaticResource SectionTitle}"/>
+            <TextBlock Text="{loc:Text 'Install a virtual audio cable, then set only the target application output to CABLE Input in the Windows volume mixer. Keep games and notifications on your headphones.'}" Style="{StaticResource Hint}"/>
+            <Button Content="{loc:Text 'Open Windows volume mixer'}" Command="{Binding OpenVolumeMixerCommand}" HorizontalAlignment="Left" Margin="0,12,0,12"/>
+            <TextBlock Text="{loc:Text 'Select the application above, or choose CABLE Output (Recording) as the specific endpoint. Disable Listen to this device or local monitoring. After stopping AirFlash, restore the application output in Windows if needed.'}" Style="{StaticResource Hint}"/>
+            <TextBlock Text="{loc:Text 'Virtual devices provide audio routing. Protected content may remain silent depending on the player and its protection mechanism. Capture and resampling do not guarantee bit-perfect audio.'}" Style="{StaticResource Hint}" Margin="0,12,0,0"/>
           </StackPanel>
         </Border>
       </StackPanel>

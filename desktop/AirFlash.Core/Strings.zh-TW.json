@@ -256,5 +256,22 @@
   "Could not update the equalizer.": "無法更新等化器。",
   "Could not update the equalizer: {0}": "無法更新等化器：{0}",
   "Playback": "播放",
-  "Recording": "錄音"
+  "Recording": "錄音",
+  "Specific application": "指定應用",
+  "Capture application": "擷取應用程式",
+  "Select an application.": "請選擇應用程式。",
+  "Could not list applications.": "無法列出應用程式。",
+  "Multiple instances · ": "多個執行個體 · ",
+  "Capture the selected application and its child processes. Browsers include the whole process tree, not individual tabs. Requires Windows build 20348 or later.": "擷取所選應用程式及其子處理程序的聲音。瀏覽器會擷取整個處理程序樹，不區分分頁。需要 Windows build 20348 或更新版本。",
+  "Play an application only on HomePod": "讓應用程式只在 HomePod 播放",
+  "Install a virtual audio cable, then set only the target application output to CABLE Input in the Windows volume mixer. Keep games and notifications on your headphones.": "安裝虛擬音訊線後，在 Windows 音量混音程式中只將目標應用程式的輸出設為 CABLE Input，讓遊戲和通知繼續使用耳機。",
+  "Open Windows volume mixer": "開啟 Windows 音量混音程式",
+  "Select the application above, or choose CABLE Output (Recording) as the specific endpoint. Disable Listen to this device or local monitoring. After stopping AirFlash, restore the application output in Windows if needed.": "在上方選擇應用程式，或將指定端點設為 CABLE Output（錄音）。關閉「聆聽此裝置」或本機監聽。停止 AirFlash 後，如需本機播放，可在 Windows 中還原該應用程式的輸出裝置。",
+  "Virtual devices provide audio routing. Protected content may remain silent depending on the player and its protection mechanism. Capture and resampling do not guarantee bit-perfect audio.": "虛擬裝置用於音訊路由。受保護內容仍可能因播放器或保護機制而無法擷取。擷取與重新取樣不保證位元完全一致。",
+  "Release the AirPlay session during standby and reconnect when audio is detected. Audio during reconnection may be missed.": "待機時釋放 AirPlay 工作階段，偵測到聲音後自動重新連線。重新連線期間的音訊可能遺失。",
+  "Application capture requires Windows build 20348 or later. Use a virtual audio endpoint on this Windows version.": "應用程式擷取需要 Windows build 20348 或更新版本。目前系統可透過虛擬音訊端點實現隔離。",
+  "Waiting for the selected application to start.": "正在等待所選應用程式啟動。",
+  "Multiple application instances are running. Select an instance in Settings → Audio capture.": "應用程式正在執行多個執行個體，請在設定 → 音訊擷取中選擇執行個體。",
+  "AirPlay session released. Waiting for audio.": "已釋放 AirPlay 工作階段，正在等待聲音。",
+  "Audio detected; reconnecting…": "偵測到聲音，正在重新連線…"
 }

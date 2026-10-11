@@ -24,6 +24,16 @@ internal static class UiSmoke
         var directory = Path.GetDirectoryName(report)!; Directory.CreateDirectory(directory);
         AppPaths.DataDirectory = Path.Combine(directory, "isolated-data");
         var checks = new List<string>();
+        if (args.Contains("--ui-regression-smoke"))
+        {
+            try
+            {
+                await UiRegression.RunAsync(checks, directory);
+                App.WriteOutput(args, new { ok = true, checks, note = "Settings regression with simulated services only; no tray required." });
+                return 0;
+            }
+            catch (Exception error) { App.WriteOutput(args, new { ok = false, checks, error = error.ToString() }); return 1; }
+        }
         if (args.Contains("--ui-scroll-smoke"))
         {
             try

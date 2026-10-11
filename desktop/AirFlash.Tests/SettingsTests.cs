@@ -6,6 +6,26 @@ namespace AirFlash.Tests;
 public sealed class SettingsTests
 {
     [Fact]
+    public void ApplicationIdentityPersistsWithoutRuntimePidAndMergesInstanceSelection()
+    {
+        var settings = new AppSettings { CaptureMode = "application", CaptureApplicationPath = @"C:\Player.exe", CaptureEndpoint = "old-device" };
+        Assert.Null(settings.Validate()); Assert.Null(settings.EffectiveEndpoint); Assert.False(settings.ShouldMuteEndpoint);
+        var baseline = settings.Clone();
+        settings.CaptureApplicationInstance = new(settings.CaptureApplicationPath, "Player", 42, 100);
+        var clone = settings.Clone(); Assert.Equal(settings.CaptureApplicationInstance, clone.CaptureApplicationInstance);
+        var json = JsonSerializer.Serialize(settings, AppSettings.JsonOptions);
+        Assert.DoesNotContain("process_id", json); Assert.DoesNotContain("started_at", json);
+        var saved = JsonSerializer.Deserialize<AppSettings>(json, AppSettings.JsonOptions)!;
+        Assert.Equal(settings.CaptureApplicationPath, saved.CaptureApplicationPath); Assert.Null(saved.CaptureApplicationInstance);
+        Assert.False(SettingsMerge.Equal(baseline, settings));
+        var current = baseline.Clone(); current.MasterVolume = 40;
+        var merged = SettingsMerge.Merge(baseline, settings, current);
+        Assert.Equal(40, merged.MasterVolume); Assert.Equal(settings.CaptureApplicationInstance, merged.CaptureApplicationInstance);
+        var old = JsonSerializer.Deserialize<AppSettings>("{\"schema_version\":2,\"capture_mode\":\"loopback\"}", AppSettings.JsonOptions)!;
+        Assert.Null(old.Validate()); Assert.False(old.StandbyEnabled); Assert.Null(old.CaptureApplicationPath);
+        settings.CaptureApplicationPath = ""; Assert.NotNull(settings.Validate());
+    }
+    [Fact]
     public void CopyFromRetainsBoundObjectsAndRoundTripsAllSettings()
     {
         var source = new AppSettings

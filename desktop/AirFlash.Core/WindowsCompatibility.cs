@@ -8,4 +8,5 @@ public static class WindowsCompatibility
     public static bool SupportsHost(Version version, Architecture process, Architecture system) =>
         version >= new Version(10, 0, MinimumBuild) && process == Architecture.X64 && system == Architecture.X64;
     public static bool SupportsWindowColors(Version version) => version >= new Version(10, 0, 22000);
+    public static bool SupportsApplicationCapture(Version version) => version >= new Version(10, 0, 20348);
 }

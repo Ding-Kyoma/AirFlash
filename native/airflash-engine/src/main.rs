@@ -1,7 +1,7 @@
 //! Versioned JSONL qualification interface. stdout is exclusively structured IPC.
 use airflash_engine::{
     rtsp::Cancellation,
-    session::{ProbeOptions, probe_with_controls},
+    session::{ProbeOptions, probe_with_all_controls},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -41,6 +41,7 @@ struct Running {
     pending_pin: Option<std::sync::mpsc::Sender<String>>,
     gain_limit: f64,
     volume: airflash_engine::volume::Control,
+    standby: airflash_engine::standby::Control,
     equalizer: Option<(airflash_engine::equalizer::Control, u32)>,
 }
 impl Drop for Running {
@@ -112,8 +113,42 @@ fn main() {
             "hello" => send(
                 &request.id,
                 &request.session_id,
-                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"partial","live_loopback":true,"commands":["hello","start","probe","stop","set_gain","set_equalizer","set_device_volume","pair","pair_pin"],"production_ready":false}),
+                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"partial","live_loopback":true,"capabilities":{"application_capture":airflash_engine::applications::supported(),"standby_release":true},"commands":["hello","list_applications","start","probe","stop","set_gain","set_equalizer","set_standby","set_device_volume","pair","pair_pin"],"production_ready":false}),
             ),
+            "list_applications" => match airflash_engine::applications::list() {
+                Ok(items) => send(
+                    &request.id,
+                    &request.session_id,
+                    json!({"event":"applications","items":items}),
+                ),
+                Err(error) => send(
+                    &request.id,
+                    &request.session_id,
+                    json!({"event":"error","message":error.to_string()}),
+                ),
+            },
+            "set_standby" => {
+                let result = (|| -> anyhow::Result<()> {
+                    let settings = serde_json::from_value(request.params)?;
+                    let running = running
+                        .as_ref()
+                        .filter(|r| r.id == request.session_id && r.equalizer.is_some())
+                        .ok_or_else(|| anyhow::anyhow!("standby requires a live session"))?;
+                    running.standby.set(settings)
+                })();
+                match result {
+                    Ok(()) => send(
+                        &request.id,
+                        &request.session_id,
+                        json!({"event":"standby_changed"}),
+                    ),
+                    Err(error) => send(
+                        &request.id,
+                        &request.session_id,
+                        json!({"event":"error","message":error.to_string()}),
+                    ),
+                }
+            }
             "probe" | "start" => {
                 let options: ProbeOptions = match serde_json::from_value(request.params) {
                     Ok(o) => o,
@@ -149,14 +184,25 @@ fn main() {
                 let worker_gain = gain.clone();
                 let volume = airflash_engine::volume::Control::default();
                 let worker_volume = volume.clone();
+                let standby = airflash_engine::standby::Control::new(options.standby);
+                let worker_standby = standby.clone();
                 let gain_limit = if request.command == "probe" { 0.1 } else { 1.0 };
                 let rate = options.sample_rate;
-                let equalizer = airflash_engine::equalizer::Control::new(options.equalizer, rate).unwrap();
+                let equalizer =
+                    airflash_engine::equalizer::Control::new(options.equalizer, rate).unwrap();
                 let worker_equalizer = equalizer.clone();
                 let live_equalizer = (request.command == "start").then_some((equalizer, rate));
                 let worker = thread::spawn(move || {
                     let emit = |e| send(&request.id, &request.session_id, e);
-                    if let Err(error) = probe_with_controls(options, worker_cancel, worker_gain, worker_volume, worker_equalizer, emit) {
+                    if let Err(error) = probe_with_all_controls(
+                        options,
+                        worker_cancel,
+                        worker_gain,
+                        worker_volume,
+                        worker_equalizer,
+                        worker_standby,
+                        emit,
+                    ) {
                         emit(airflash_engine::transport::error_event(&error));
                     }
                 });
@@ -168,37 +214,78 @@ fn main() {
                     pending_pin: None,
                     gain_limit,
                     volume,
+                    standby,
                     equalizer: live_equalizer,
                 });
             }
             "set_device_volume" => {
-                if let Some(r) = running.as_ref().filter(|r| r.id == request.session_id && r.pending_pin.is_none()) {
+                if let Some(r) = running
+                    .as_ref()
+                    .filter(|r| r.id == request.session_id && r.pending_pin.is_none())
+                {
                     if let (Some(percent), Some(sequence)) = (
-                        request.params.get("volume").and_then(Value::as_u64).filter(|v| *v <= 100),
-                        request.params.get("sequence").and_then(Value::as_u64).filter(|v| *v > 0)) {
-                        r.volume.set(airflash_engine::volume::Command { sequence, percent: percent as u8 });
+                        request
+                            .params
+                            .get("volume")
+                            .and_then(Value::as_u64)
+                            .filter(|v| *v <= 100),
+                        request
+                            .params
+                            .get("sequence")
+                            .and_then(Value::as_u64)
+                            .filter(|v| *v > 0),
+                    ) {
+                        r.volume.set(airflash_engine::volume::Command {
+                            sequence,
+                            percent: percent as u8,
+                        });
                     } else {
-                        send(&request.id, &request.session_id, json!({"event":"device_volume_error","message":"invalid device volume command"}));
+                        send(
+                            &request.id,
+                            &request.session_id,
+                            json!({"event":"device_volume_error","message":"invalid device volume command"}),
+                        );
                     }
                 }
             }
             "set_equalizer" => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
-                struct Update { sequence: u64, equalizer: airflash_engine::equalizer::Settings }
-                let sequence = request.params.get("sequence").cloned().unwrap_or(Value::Null);
+                struct Update {
+                    sequence: u64,
+                    equalizer: airflash_engine::equalizer::Settings,
+                }
+                let sequence = request
+                    .params
+                    .get("sequence")
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 let result = (|| -> anyhow::Result<_> {
                     let update: Update = serde_json::from_value(request.params)?;
                     anyhow::ensure!(update.sequence > 0, "equalizer sequence must be positive");
-                    let r = running.as_ref().filter(|r| r.id == request.session_id).ok_or_else(|| anyhow::anyhow!("equalizer session is no longer active"))?;
-                    let (control, rate) = r.equalizer.as_ref().ok_or_else(|| anyhow::anyhow!("equalizer updates require a live streaming session"))?;
-                    let prepared = airflash_engine::equalizer::Prepared::new(update.equalizer, *rate)?;
+                    let r = running
+                        .as_ref()
+                        .filter(|r| r.id == request.session_id)
+                        .ok_or_else(|| anyhow::anyhow!("equalizer session is no longer active"))?;
+                    let (control, rate) = r.equalizer.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("equalizer updates require a live streaming session")
+                    })?;
+                    let prepared =
+                        airflash_engine::equalizer::Prepared::new(update.equalizer, *rate)?;
                     control.set(update.sequence, prepared);
                     Ok(prepared)
                 })();
                 match result {
-                    Ok(prepared) => send(&request.id, &request.session_id, json!({"event":"equalizer_changed","sequence":sequence,"auto_attenuation_db":prepared.auto_attenuation_db,"effective_preamp_db":prepared.effective_preamp_db})),
-                    Err(error) => send(&request.id, &request.session_id, json!({"event":"equalizer_error","sequence":sequence,"message":error.to_string()})),
+                    Ok(prepared) => send(
+                        &request.id,
+                        &request.session_id,
+                        json!({"event":"equalizer_changed","sequence":sequence,"auto_attenuation_db":prepared.auto_attenuation_db,"effective_preamp_db":prepared.effective_preamp_db}),
+                    ),
+                    Err(error) => send(
+                        &request.id,
+                        &request.session_id,
+                        json!({"event":"equalizer_error","sequence":sequence,"message":error.to_string()}),
+                    ),
                 }
             }
             "set_gain" => {
@@ -318,6 +405,7 @@ fn main() {
                     pending_pin: Some(tx),
                     gain_limit: 0.0,
                     volume: airflash_engine::volume::Control::default(),
+                    standby: airflash_engine::standby::Control::default(),
                     equalizer: None,
                 });
             }

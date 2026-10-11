@@ -45,12 +45,12 @@ or a similar tool, and route the audio you want to stream to that endpoint.
 - Includes selectable latency modes, tray operation, mute restoration,
   automatic reconnection, and connection diagnostics.
 - Provides a ten-band equalizer with presets and live preview in Settings.
-- Captures playback or recording endpoints, including virtual audio devices.
+- Captures a selected application or playback/recording endpoints, including virtual audio devices.
+- Releases AirPlay sessions after configurable silence and reconnects when audio returns.
 - Available as a portable Windows x64 app with English, Simplified Chinese, and Traditional Chinese UI.
 
 ## Feature plan
 
-- [ ] Select an application as the audio source ([#18](https://github.com/Ding-Kyoma/AirFlash/issues/18)).
 - [ ] Dolby Atmos support.
 
 ## Usage
@@ -68,6 +68,30 @@ endpoint corresponding to its B1/B2/B3 bus (for example, Voicemeeter Output)
 and enable that bus for the desired audio in Voicemeeter. Playback devices use
 loopback; recording devices capture their input directly. Automatic local mute
 applies only to playback devices and never mutes a recording input.
+
+**Specific application** captures the selected application and its child processes;
+browsers include the complete process tree, not individual tabs. This native mode
+requires Windows build 20348 or later. Older Windows versions retain endpoint
+capture. The application selection is saved by executable path and follows a
+restart when exactly one matching instance is running. If several independent
+instances match, select an instance again. A missing application never falls back
+to system audio.
+
+To hear the target application only on HomePod while games and notifications stay
+on your headphones, install a virtual cable such as [VB-CABLE](https://vb-audio.com/Cable/)
+and use **Open Windows volume mixer** to route only that application's output to
+**CABLE Input**. Select the application, or use **Specific audio endpoint → CABLE
+Output · Recording**. Disable **Listen to this device** and any local monitoring.
+Application capture never mutes your entire playback device. The manual Windows
+routing remains after AirFlash stops; change it back when local playback is needed.
+Virtual routing cannot guarantee capture of DRM-protected content, and capture,
+resampling, and stream-format conversion do not guarantee bit-perfect output.
+
+Enable **AirFlash streaming → Standby** to release the complete AirPlay session
+after 5–300 seconds of silence (default duration: 10 seconds; disabled by default).
+Capture continues locally, and detected audio automatically starts a new session.
+Reconnection resumes current audio; its opening or short notification sounds may
+be missed. HomePod manages its own power state after the session is released.
 
 Receiver discovery runs while the control panel or **Settings > Receivers** is
 visible, and pauses when both are hidden. Previous results remain available;

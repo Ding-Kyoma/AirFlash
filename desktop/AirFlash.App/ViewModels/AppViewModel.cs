@@ -35,6 +35,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private bool _monitorVisible;
     private readonly Dictionary<string, string> _monitorValues = [];
     public EndpointCatalog Endpoints { get; }
+    public IApplicationCatalog Applications { get; }
     public bool IsClosing => _closing;
     public SessionController Session { get; }
     public ObservableCollection<ReceiverViewModel> Receivers { get; } = [];
@@ -88,12 +89,13 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand MuteCommand { get; }
     public event Action? SettingsChanged;
     public event Action? CatalogChanged;
-    public AppViewModel(ISettingsStore store, IDiscoveryService discovery, IAutostart autostart, IAudioService audio, IEngineFactory factory, Dispatcher dispatcher, EngineInitialization? engine = null)
+    public AppViewModel(ISettingsStore store, IDiscoveryService discovery, IAutostart autostart, IAudioService audio, IEngineFactory factory, Dispatcher dispatcher, EngineInitialization? engine = null, IApplicationCatalog? applications = null)
     {
         _engine = engine;
         RetryEngineCommand = new(() => _engine?.InitializeAsync() ?? Task.CompletedTask, ShowError, () => EngineFailed && !_closing);
         if (_engine is not null) _engine.Changed += EngineChanged;
         _store = store; _discovery = discovery; _autostart = autostart; _audio = audio; _dispatcher = dispatcher;
+        Applications = applications ?? new ApplicationCatalog(factory);
         Endpoints = new(audio, dispatcher);
         Endpoints.DevicesChanged += OnEndpointsChangedAsync;
         Endpoints.Failed += ShowError;
@@ -445,6 +447,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
                     if (!(await Endpoints.RefreshAsync()).Any(e => e.Id == merged.CaptureEndpoint))
                         throw new InvalidOperationException(L.Get("The selected capture endpoint is unavailable. Select another."));
             }
+            if (merged.CaptureMode == "application" && !Applications.Supported) throw new InvalidOperationException(L.Get("Application capture requires Windows build 20348 or later. Use a virtual audio endpoint on this Windows version."));
             var changedAutostart = merged.StartAtLogin != before.StartAtLogin;
             using (UiPerformance.Measure("apply.persist"))
             {

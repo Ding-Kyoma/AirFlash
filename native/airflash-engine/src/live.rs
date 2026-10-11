@@ -52,11 +52,15 @@ struct State {
     capacity: usize,
     target: usize,
     error: Option<String>,
+    ended: bool,
     metrics: Metrics,
     ages: VecDeque<f64>,
 }
 impl State {
     fn push_frame(&mut self, frame: Frame) {
+        if frame.left.abs().max(frame.right.abs()) > 0.004 {
+            self.metrics.last_audio_qpc_ns = frame.qpc;
+        }
         if self.frames.len() >= self.capacity {
             self.frames.pop_front();
             self.metrics.dropped_frames += 1;
@@ -64,6 +68,11 @@ impl State {
         self.frames.push_back(frame);
     }
 }
+enum Target {
+    Endpoint(Option<String>),
+    Application(crate::applications::Application),
+}
+
 pub struct Loopback {
     equalizer_control: crate::equalizer::Control,
     state: Arc<Mutex<State>>,
@@ -71,15 +80,34 @@ pub struct Loopback {
     worker: Option<JoinHandle<()>>,
 }
 impl Loopback {
-    pub fn start(endpoint: Option<String>, rate: u32, equalizer: crate::equalizer::Control) -> Result<Self> {
+    pub fn start(
+        endpoint: Option<String>,
+        rate: u32,
+        equalizer: crate::equalizer::Control,
+    ) -> Result<Self> {
+        Self::start_target(Target::Endpoint(endpoint), rate, equalizer)
+    }
+    pub fn start_application(
+        application: crate::applications::Application,
+        rate: u32,
+        equalizer: crate::equalizer::Control,
+    ) -> Result<Self> {
+        Self::start_target(Target::Application(application), rate, equalizer)
+    }
+    fn start_target(
+        target: Target,
+        rate: u32,
+        equalizer: crate::equalizer::Control,
+    ) -> Result<Self> {
         let capacity = rate as usize * 60 / 1000;
-        let target = rate as usize * 20 / 1000;
+        let queue_target = rate as usize * 20 / 1000;
         let state = Arc::new(Mutex::new(State {
             equalizer: crate::equalizer::Processor::new(equalizer.initial(), rate),
             frames: VecDeque::with_capacity(capacity),
             capacity,
-            target,
+            target: queue_target,
             error: None,
+            ended: false,
             metrics: Metrics::default(),
             ages: VecDeque::with_capacity(4000),
         }));
@@ -90,7 +118,7 @@ impl Loopback {
         let worker = thread::Builder::new()
             .name("wasapi-capture".into())
             .spawn(move || {
-                if let Err(e) = capture(endpoint, rate, child_stop, &child_state, &tx) {
+                if let Err(e) = capture(target, rate, child_stop, &child_state, &tx) {
                     let message = format!("{e:#}");
                     child_state.lock().unwrap().error = Some(message.clone());
                     let _ = tx.try_send(Err(message));
@@ -110,6 +138,12 @@ impl Loopback {
             }
         }
     }
+    pub fn last_audio(&self) -> u64 {
+        self.state.lock().unwrap().metrics.last_audio_qpc_ns
+    }
+    pub fn ended(&self) -> bool {
+        self.state.lock().unwrap().ended
+    }
     pub fn ready(&self) -> Result<bool> {
         let s = self.state.lock().unwrap();
         if let Some(e) = &s.error {
@@ -119,7 +153,9 @@ impl Loopback {
     }
     pub fn packet(&self, gain: f32) -> Result<(Vec<u8>, Option<u64>)> {
         let mut s = self.state.lock().unwrap();
-        if let Some((sequence, prepared)) = self.equalizer_control.latest() { s.equalizer.update(sequence, prepared); }
+        if let Some((sequence, prepared)) = self.equalizer_control.latest() {
+            s.equalizer.update(sequence, prepared);
+        }
         if let Some(e) = &s.error {
             anyhow::bail!("capture stopped: {e}");
         }
@@ -139,7 +175,6 @@ impl Loopback {
                 }
             };
             if frame.left.abs().max(frame.right.abs()) > 0.004 {
-                s.metrics.last_audio_qpc_ns = frame.qpc;
                 marker.get_or_insert(frame.qpc);
             }
             let age = now.saturating_sub(frame.qpc) as f64 / 1e6;
@@ -162,7 +197,8 @@ impl Loopback {
     pub fn discard_stale(&self) {
         let mut s = self.state.lock().unwrap();
         let cutoff = qpc_ns().saturating_sub(20_000_000);
-        while s.frames.front().is_some_and(|frame| frame.qpc < cutoff) || s.frames.len() > s.target {
+        while s.frames.front().is_some_and(|frame| frame.qpc < cutoff) || s.frames.len() > s.target
+        {
             s.frames.pop_front();
             s.metrics.dropped_frames += 1;
         }
@@ -211,12 +247,17 @@ fn endpoint_index(name: &str, endpoints: &[(String, Option<String>)]) -> Result<
     if let Some(index) = endpoints.iter().position(|(id, _)| id == name) {
         return Ok(index);
     }
-    let mut matches = endpoints.iter().enumerate()
+    let mut matches = endpoints
+        .iter()
+        .enumerate()
         .filter(|(_, (_, friendly))| friendly.as_deref() == Some(name));
     let Some((index, _)) = matches.next() else {
         anyhow::bail!("capture endpoint unavailable: {name}");
     };
-    ensure!(matches.next().is_none(), "capture endpoint name is ambiguous; select a device ID: {name}");
+    ensure!(
+        matches.next().is_none(),
+        "capture endpoint name is ambiguous; select a device ID: {name}"
+    );
     Ok(index)
 }
 
@@ -261,7 +302,7 @@ fn find_device(enumerator: &IMMDeviceEnumerator, name: Option<&str>) -> Result<I
 }
 
 fn capture(
-    endpoint: Option<String>,
+    target: Target,
     stream_rate: u32,
     stop: Arc<AtomicBool>,
     state: &Arc<Mutex<State>>,
@@ -270,13 +311,38 @@ fn capture(
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }?;
     let _com = ComGuard;
     let _priority = Mmcss::new();
-    let enumerator: IMMDeviceEnumerator =
-        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }?;
-    let device = find_device(&enumerator, endpoint.as_deref())?;
-    let flow = unsafe { device.cast::<IMMEndpoint>()?.GetDataFlow() }?;
-    let flags = capture_flags(flow)?;
-    let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }?;
-    let pointer = unsafe { client.GetMixFormat() }?;
+    let mut explicit = WAVEFORMATEX {
+        wFormatTag: 1,
+        nChannels: 2,
+        nSamplesPerSec: stream_rate,
+        nAvgBytesPerSec: stream_rate * 4,
+        nBlockAlign: 4,
+        wBitsPerSample: 16,
+        cbSize: 0,
+    };
+    let (client, flags, process, pointer) = match target {
+        Target::Endpoint(endpoint) => {
+            let enumerator: IMMDeviceEnumerator =
+                unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }?;
+            let device = find_device(&enumerator, endpoint.as_deref())?;
+            let flow = unsafe { device.cast::<IMMEndpoint>()?.GetDataFlow() }?;
+            let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }?;
+            let pointer = unsafe { client.GetMixFormat() }?;
+            (client, capture_flags(flow)?, None, pointer)
+        }
+        Target::Application(application) => {
+            let process = crate::applications::Process::verify(&application)?;
+            let client = crate::applications::activate(application.process_id, &stop)?;
+            (
+                client,
+                AUDCLNT_STREAMFLAGS_LOOPBACK
+                    | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+                    | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+                Some(process),
+                &mut explicit as *mut WAVEFORMATEX,
+            )
+        }
+    };
     let spec = unsafe { pointer.read_unaligned() };
     let channels = spec.nChannels as usize;
     let bits = spec.wBitsPerSample;
@@ -290,7 +356,11 @@ fn capture(
     };
     let event = EventGuard(unsafe { CreateEventW(None, false, false, None) }?);
     // Prefer the shared engine period; fall back to documented shared initialization.
-    let initialized = if let Ok(client3) = client.cast::<IAudioClient3>() {
+    let initialized = if let Some(client3) = process
+        .is_none()
+        .then(|| client.cast::<IAudioClient3>().ok())
+        .flatten()
+    {
         let (mut default, mut fundamental, mut minimum, mut maximum) = (0, 0, 0, 0);
         unsafe {
             client3.GetSharedModeEnginePeriod(
@@ -310,7 +380,9 @@ fn capture(
     let initialized = initialized.or_else(|_| unsafe {
         client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 200_000, 0, pointer, None)
     });
-    unsafe { CoTaskMemFree(Some(pointer.cast())) };
+    if process.is_none() {
+        unsafe { CoTaskMemFree(Some(pointer.cast())) };
+    }
     initialized?;
     ensure!(
         channels > 0 && channels <= 8 && (8000..=192000).contains(&rate),
@@ -344,6 +416,10 @@ fn capture(
     let _ = ready.send(Ok(()));
     let mut last_packet = Instant::now();
     while !stop.load(Ordering::Acquire) {
+        if process.as_ref().is_some_and(|p| !p.alive()) {
+            state.lock().unwrap().ended = true;
+            break;
+        }
         if unsafe { WaitForSingleObject(event.0, 50) } != WAIT_OBJECT_0 {
             // Silent render endpoints may emit no loopback packets. Sender pads silence.
             if last_packet.elapsed() > Duration::from_secs(2) {
@@ -420,8 +496,8 @@ fn capture(
                     let s = state.lock().unwrap();
                     (s.frames.len(), s.target)
                 };
-                let correction =
-                    ((target as f64 - have as f64) / stream_rate as f64 * 0.01).clamp(-0.0005, 0.0005);
+                let correction = ((target as f64 - have as f64) / stream_rate as f64 * 0.01)
+                    .clamp(-0.0005, 0.0005);
                 resampler.set_resample_ratio_relative(1.0 + correction, true)?;
                 let output = resampler.process(&input, None)?;
                 let delay = resampler.output_delay() as u64 * 1_000_000_000 / stream_rate as u64;
@@ -430,7 +506,8 @@ fn capture(
                     shared.push_frame(Frame {
                         left,
                         right,
-                        qpc: start.saturating_sub(delay) + i as u64 * 1_000_000_000 / stream_rate as u64,
+                        qpc: start.saturating_sub(delay)
+                            + i as u64 * 1_000_000_000 / stream_rate as u64,
                     });
                 }
             }
@@ -440,13 +517,16 @@ fn capture(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
     fn capture_direction_selects_loopback_only_for_playback() {
         let common = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST;
-        assert_eq!(capture_flags(eRender).unwrap(), common | AUDCLNT_STREAMFLAGS_LOOPBACK);
+        assert_eq!(
+            capture_flags(eRender).unwrap(),
+            common | AUDCLNT_STREAMFLAGS_LOOPBACK
+        );
         assert_eq!(capture_flags(eCapture).unwrap(), common);
         assert!(capture_flags(eAll).is_err());
     }
@@ -459,9 +539,22 @@ mod tests {
             ("another-id".into(), Some("Voicemeeter Output".into())),
         ];
         assert_eq!(endpoint_index("recording-id", &endpoints).unwrap(), 1);
-        assert!(endpoint_index("Voicemeeter Output", &endpoints).unwrap_err().to_string().contains("ambiguous"));
-        assert!(endpoint_index("missing", &endpoints).unwrap_err().to_string().contains("unavailable"));
-        assert_eq!(endpoint_index("Voicemeeter Output", &endpoints[..2]).unwrap(), 1);
+        assert!(
+            endpoint_index("Voicemeeter Output", &endpoints)
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+        assert!(
+            endpoint_index("missing", &endpoints)
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable")
+        );
+        assert_eq!(
+            endpoint_index("Voicemeeter Output", &endpoints[..2]).unwrap(),
+            1
+        );
     }
 
     // Opt-in local WASAPI check: no receiver, playback, or audio file is involved.
@@ -475,9 +568,12 @@ mod tests {
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.unwrap();
         let device = find_device(&enumerator, Some(&endpoint)).unwrap();
         let flow = unsafe { device.cast::<IMMEndpoint>().unwrap().GetDataFlow() }.unwrap();
-        assert!(flow == eCapture, "local check requires a recording endpoint");
-        let equalizer = crate::equalizer::Control::new(
-            crate::equalizer::Settings::default(), 44100).unwrap();
+        assert!(
+            flow == eCapture,
+            "local check requires a recording endpoint"
+        );
+        let equalizer =
+            crate::equalizer::Control::new(crate::equalizer::Settings::default(), 44100).unwrap();
         let source = Loopback::start(Some(endpoint), 44100, equalizer).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut nonzero = false;
@@ -485,22 +581,34 @@ mod tests {
             thread::sleep(Duration::from_millis(8));
             nonzero |= source.packet(0.1).unwrap().0.iter().any(|b| *b != 0);
         }
-        assert!(source.metrics().capture_frames > 0, "no WASAPI frames received");
+        assert!(
+            source.metrics().capture_frames > 0,
+            "no WASAPI frames received"
+        );
         assert!(nonzero, "recording endpoint supplied only silence");
-        println!("captured {} frames at {} Hz; nonzero PCM verified",
-            source.metrics().capture_frames, source.metrics().input_rate);
+        println!(
+            "captured {} frames at {} Hz; nonzero PCM verified",
+            source.metrics().capture_frames,
+            source.metrics().input_rate
+        );
     }
     const CAPACITY: usize = crate::rtp::RATE as usize * 60 / 1000;
     const TARGET: usize = crate::rtp::RATE as usize * 20 / 1000;
-    fn source() -> Loopback {
-        let equalizer_control = crate::equalizer::Control::new(crate::equalizer::Settings::default(), crate::rtp::RATE).unwrap();
+    pub(crate) fn source() -> Loopback {
+        let equalizer_control =
+            crate::equalizer::Control::new(crate::equalizer::Settings::default(), crate::rtp::RATE)
+                .unwrap();
         Loopback {
             state: Arc::new(Mutex::new(State {
-                equalizer: crate::equalizer::Processor::new(equalizer_control.initial(), crate::rtp::RATE),
+                equalizer: crate::equalizer::Processor::new(
+                    equalizer_control.initial(),
+                    crate::rtp::RATE,
+                ),
                 frames: VecDeque::new(),
                 capacity: CAPACITY,
                 target: TARGET,
                 error: None,
+                ended: false,
                 metrics: Metrics::default(),
                 ages: VecDeque::new(),
             })),
@@ -508,6 +616,29 @@ mod tests {
             worker: None,
             equalizer_control,
         }
+    }
+    pub(crate) fn feed(source: &Loopback, amplitude: f32) {
+        let mut state = source.state.lock().unwrap();
+        for _ in 0..FRAMES {
+            state.push_frame(Frame {
+                left: amplitude,
+                right: amplitude,
+                qpc: qpc_ns(),
+            });
+        }
+    }
+    #[test]
+    fn activity_is_detected_without_sender_and_before_gain() {
+        let source = source();
+        feed(&source, 0.003);
+        assert_eq!(source.last_audio(), 0);
+        feed(&source, 0.01);
+        assert!(source.last_audio() > 0);
+        let activity = source.last_audio();
+        assert!(source.packet(0.0).unwrap().0.iter().all(|b| *b == 0));
+        assert_eq!(source.last_audio(), activity);
+        source.discard_stale();
+        assert_eq!(source.last_audio(), activity);
     }
     #[test]
     fn underrun_pads_silence_and_can_resume_audio() {
@@ -527,10 +658,24 @@ mod tests {
     #[test]
     fn equalizer_precedes_master_gain_and_pcm_conversion() {
         let source = source();
-        let settings = crate::equalizer::Settings { enabled: true, preamp_db: -12.0, ..Default::default() };
-        source.equalizer_control.set(1, crate::equalizer::Prepared::new(settings, crate::rtp::RATE).unwrap());
-        for _ in 0..FRAMES * 3 { source.state.lock().unwrap().push_frame(Frame { left: 0.25, right: -0.25, qpc: qpc_ns() }); }
-        source.packet(0.5).unwrap(); source.packet(0.5).unwrap();
+        let settings = crate::equalizer::Settings {
+            enabled: true,
+            preamp_db: -12.0,
+            ..Default::default()
+        };
+        source.equalizer_control.set(
+            1,
+            crate::equalizer::Prepared::new(settings, crate::rtp::RATE).unwrap(),
+        );
+        for _ in 0..FRAMES * 3 {
+            source.state.lock().unwrap().push_frame(Frame {
+                left: 0.25,
+                right: -0.25,
+                qpc: qpc_ns(),
+            });
+        }
+        source.packet(0.5).unwrap();
+        source.packet(0.5).unwrap();
         let (pcm, marker) = source.packet(0.5).unwrap();
         let last = &pcm[pcm.len() - 4..];
         let expected = (0.25 * 10f32.powf(-12.0 / 20.0) * 0.5 * 32767.0).round() as i16;

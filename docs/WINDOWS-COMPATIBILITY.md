@@ -9,6 +9,10 @@ This change is a compatibility candidate. Static audit and Windows 11 regression
 checks do not establish successful execution on Windows 10. The reported user's
 startup failure has not yet been reproduced or assigned a confirmed cause.
 
+Native per-application capture is optional and requires build 20348 or later.
+Earlier systems keep default-output and specific-endpoint capture, including
+virtual-cable routing. The engine reports this capability without opening audio.
+
 ## What changed
 
 - The application logs before WPF resource initialization. Initialization failures

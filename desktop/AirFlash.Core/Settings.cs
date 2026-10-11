@@ -64,6 +64,11 @@ public sealed class AppSettings : ObservableObject
     public string CaptureMode { get => _CaptureMode; set => Set(ref _CaptureMode, value); }
     private string? _CaptureEndpoint = null;
     public string? CaptureEndpoint { get => _CaptureEndpoint; set => Set(ref _CaptureEndpoint, value); }
+    private string? _CaptureApplicationPath;
+    public string? CaptureApplicationPath { get => _CaptureApplicationPath; set => Set(ref _CaptureApplicationPath, value); }
+    private CaptureApplication? _CaptureApplicationInstance;
+    [JsonIgnore] public CaptureApplication? CaptureApplicationInstance { get => _CaptureApplicationInstance; set => Set(ref _CaptureApplicationInstance, value); }
+    public bool ShouldMuteEndpoint => MuteWhileStreaming && CaptureMode != "application";
     public void RefreshCaptureEndpoint() => Notify(nameof(CaptureEndpoint));
     private int _MasterVolume = 100;
     public int MasterVolume { get => _MasterVolume; set => Set(ref _MasterVolume, value); }
@@ -84,7 +89,7 @@ public sealed class AppSettings : ObservableObject
         return (options.LatencyMode ?? LatencyMode) switch { "realtime" => 120, "buffered" => 500, "custom" => Math.Clamp(options.CustomBufferMs ?? CustomBufferMs, 0, 2000), _ => 200 };
     }
     public double Gain(string id) => Math.Clamp(MasterVolume, 0, 100) / 100d;
-    public string? EffectiveEndpoint => CaptureMode == "loopback" ? null : CaptureEndpoint;
+    public string? EffectiveEndpoint => CaptureMode == "endpoint" ? CaptureEndpoint : null;
     public string? Validate()
     {
         if (UiLanguage is not ("system" or "en" or "zh")) return L.Get("Select a valid language.");
@@ -97,8 +102,9 @@ public sealed class AppSettings : ObservableObject
         if (Equalizer.Validate() is { } equalizerError) return equalizerError;
         if (CustomBufferMs is < 0 or > 2000) return L.Get("Custom latency must be between 0 and 2000 ms.");
         if (!double.IsFinite(StandbySilenceSeconds) || StandbySilenceSeconds is < 5 or > 300) return L.Get("Standby threshold must be between 5 and 300 seconds.");
-        if (CaptureMode is not ("loopback" or "endpoint")) return L.Get("Select a valid capture mode.");
+        if (CaptureMode is not ("loopback" or "endpoint" or "application")) return L.Get("Select a valid capture mode.");
         if (CaptureMode == "endpoint" && string.IsNullOrWhiteSpace(CaptureEndpoint)) return L.Get("Select a capture endpoint.");
+        if (CaptureMode == "application" && string.IsNullOrWhiteSpace(CaptureApplicationPath)) return L.Get("Select an application.");
         foreach (var options in Receivers.Values)
         {
             if (options.Volume is < 0 or > 100) return L.Get("Device volume must be between 0 and 100.");
@@ -121,6 +127,7 @@ public sealed class AppSettings : ObservableObject
         LatencyMode = source.LatencyMode; CustomBufferMs = source.CustomBufferMs;
         StandbyEnabled = source.StandbyEnabled; StandbySilenceSeconds = source.StandbySilenceSeconds;
         CaptureMode = source.CaptureMode; CaptureEndpoint = source.CaptureEndpoint;
+        CaptureApplicationPath = source.CaptureApplicationPath; CaptureApplicationInstance = source.CaptureApplicationInstance;
         MasterVolume = source.MasterVolume; LastReceiverId = source.LastReceiverId;
         Extra = source.Extra?.ToDictionary(p => p.Key, p => p.Value.Clone());
         ReceiverAliases = new(source.ReceiverAliases, StringComparer.Ordinal);
@@ -134,7 +141,12 @@ public sealed class AppSettings : ObservableObject
             if (index < 0) ManualReceivers.Insert(i, receiver); else if (index != i) ManualReceivers.Move(index, i);
         }
     }
-    public AppSettings Clone() => JsonSerializer.Deserialize<AppSettings>(JsonSerializer.Serialize(this, JsonOptions), JsonOptions)!;
+    public AppSettings Clone()
+    {
+        var clone = JsonSerializer.Deserialize<AppSettings>(JsonSerializer.Serialize(this, JsonOptions), JsonOptions)!;
+        clone.CaptureApplicationInstance = CaptureApplicationInstance;
+        return clone;
+    }
     public static readonly string[] Modes = ["realtime", "normal", "buffered", "custom"];
     public static readonly string[] SampleRates = ["44100", "48000"];
     public static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, WriteIndented = true, PropertyNameCaseInsensitive = true, IgnoreReadOnlyProperties = true };
@@ -147,9 +159,13 @@ public static class SettingsMerge
         var original = JsonSerializer.SerializeToNode(baseline, AppSettings.JsonOptions)!;
         var edited = JsonSerializer.SerializeToNode(draft, AppSettings.JsonOptions)!;
         var latest = JsonSerializer.SerializeToNode(current, AppSettings.JsonOptions)!;
-        return Patch(original, edited, latest)!.Deserialize<AppSettings>(AppSettings.JsonOptions)!;
+        var result = Patch(original, edited, latest)!.Deserialize<AppSettings>(AppSettings.JsonOptions)!;
+        result.CaptureApplicationInstance = baseline.CaptureApplicationInstance != draft.CaptureApplicationInstance
+            ? draft.CaptureApplicationInstance : current.CaptureApplicationInstance;
+        if (!string.Equals(result.CaptureApplicationInstance?.Path, result.CaptureApplicationPath, StringComparison.OrdinalIgnoreCase)) result.CaptureApplicationInstance = null;
+        return result;
     }
-    public static bool Equal(AppSettings left, AppSettings right) => JsonNode.DeepEquals(JsonSerializer.SerializeToNode(left, AppSettings.JsonOptions), JsonSerializer.SerializeToNode(right, AppSettings.JsonOptions));
+    public static bool Equal(AppSettings left, AppSettings right) => (left.CaptureMode != "application" && right.CaptureMode != "application" || left.CaptureApplicationInstance == right.CaptureApplicationInstance) && JsonNode.DeepEquals(JsonSerializer.SerializeToNode(left, AppSettings.JsonOptions), JsonSerializer.SerializeToNode(right, AppSettings.JsonOptions));
     private static JsonNode? Patch(JsonNode? original, JsonNode? edited, JsonNode? latest)
     {
         if (JsonNode.DeepEquals(original, edited)) return latest?.DeepClone();

@@ -17,6 +17,7 @@ public sealed record SessionTiming(TimeSpan Connect, TimeSpan Read, TimeSpan Pin
 public sealed class SessionController(IEngineFactory factory, IAudioService audio, Action<string>? log = null, SessionTiming? timing = null) : IAsyncDisposable
 {
     private readonly SemaphoreSlim _serial = new(1, 1);
+    private readonly SemaphoreSlim _audioWriter = new(1, 1);
     private readonly object _sync = new();
     private readonly SessionTiming _timing = timing ?? SessionTiming.Default;
     private CancellationTokenSource? _lifetime;
@@ -27,6 +28,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private Receiver? _receiver;
     private long _generation;
     private bool _muted;
+    private bool _transportStreaming;
     private readonly SemaphoreSlim _equalizerWriter = new(1, 1);
     private EqualizerSettings? _equalizerPreview;
     private Guid? _equalizerOwner;
@@ -172,7 +174,12 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     public SessionSnapshot Snapshot { get { lock (_sync) return _snapshot; } }
     public event Action<SessionSnapshot>? Changed;
     public bool Muted => _muted;
-    private string Signature(Receiver receiver, AppSettings settings) => $"{receiver.TransportKey}|{settings.EffectiveEndpoint}|{settings.Latency(receiver.Id)}|{settings.StreamSampleRate}";
+    private string Signature(Receiver receiver, AppSettings settings)
+    {
+        var application = settings.CaptureMode == "application" ? settings.CaptureApplicationPath : null;
+        var instance = settings.CaptureMode == "application" ? settings.CaptureApplicationInstance : null;
+        return $"{receiver.TransportKey}|{settings.CaptureMode}|{settings.EffectiveEndpoint}|{application}|{instance?.ProcessId}|{instance?.StartedAt}|{settings.Latency(receiver.Id)}|{settings.StreamSampleRate}";
+    }
     public async Task StartAsync(Receiver receiver, AppSettings settings)
     {
         if (!receiver.Complete) throw new InvalidOperationException(L.Get("Both stereo pair members must be online."));
@@ -235,9 +242,9 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                 await StartLockedAsync(receiver, settings, null).ConfigureAwait(false);
             else
             {
-                if (!settings.MuteWhileStreaming) await RestoreAudioAsync().ConfigureAwait(false);
-                else if (Snapshot.State is PlaybackState.Streaming or PlaybackState.Standby) await audio.MuteAsync(settings.EffectiveEndpoint).ConfigureAwait(false);
+                await ApplyLocalMuteAsync().ConfigureAwait(false);
                 await SendGainAsync().ConfigureAwait(false);
+                await SendStandbyAsync().ConfigureAwait(false);
                 await SendEqualizerAsync().ConfigureAwait(false);
             }
         }
@@ -254,6 +261,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             else
             {
                 lock (_sync) { _receiver = receiver; _settings = settings.Clone(); }
+                await SendStandbyAsync().ConfigureAwait(false);
                 PublishCurrent(_generation);
             }
         }
@@ -264,6 +272,15 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         await _serial.WaitAsync().ConfigureAwait(false);
         try { _muted = muted; await SendGainAsync().ConfigureAwait(false); }
         finally { _serial.Release(); }
+    }
+    private static object StandbyParameters(AppSettings settings, string receiverId) => new { enabled = settings.StandbyEnabled, silence_seconds = settings.ReadOptions(receiverId).StandbySeconds ?? settings.StandbySilenceSeconds };
+    private async Task SendStandbyAsync()
+    {
+        IEngineConnection? connection; string? session; Receiver? receiver;
+        lock (_sync) { connection = _connection; session = _sessionId; receiver = _receiver; }
+        if (connection is null || session is null || receiver is null || Snapshot.State == PlaybackState.Pairing) return;
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        await connection.SendAsync(session, "set_standby", StandbyParameters(_settings, receiver.Id), timeout.Token).ConfigureAwait(false);
     }
     private double Gain(Receiver receiver) => _muted ? 0 : _settings.Gain(_receiver?.Id ?? receiver.Id);
     private async Task SendGainAsync()
@@ -303,7 +320,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                     await _equalizerWriter.WaitAsync(cancellation).ConfigureAwait(false);
                     try
                     {
-                        await connection.SendAsync(session, "start", new { peers, source = "loopback", duration_ms = 0, latency_ms = settings.Latency(receiver.Id), gain = Gain(receiver), timing = "ptp", capture_endpoint = settings.EffectiveEndpoint, sample_rate = int.Parse(settings.StreamSampleRate), equalizer = EffectiveEqualizer().WireParameters() }, cancellation).ConfigureAwait(false);
+                        await connection.SendAsync(session, "start", new { peers, source = settings.CaptureMode == "application" ? "application" : "loopback", capture_application_path = settings.CaptureMode == "application" ? settings.CaptureApplicationPath : null, capture_process_id = settings.CaptureMode == "application" ? settings.CaptureApplicationInstance?.ProcessId : null, capture_process_started_at = settings.CaptureMode == "application" ? settings.CaptureApplicationInstance?.StartedAt : null, standby = StandbyParameters(settings, receiver.Id), duration_ms = 0, latency_ms = settings.Latency(receiver.Id), gain = Gain(receiver), timing = "ptp", capture_endpoint = settings.EffectiveEndpoint, sample_rate = int.Parse(settings.StreamSampleRate), equalizer = EffectiveEqualizer().WireParameters() }, cancellation).ConfigureAwait(false);
                         lock (_sync) { if (epoch == _generation && ReferenceEquals(_connection, connection)) _equalizerReady = true; }
                     }
                     finally { _equalizerWriter.Release(); }
@@ -325,9 +342,27 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         if (kind == "streaming")
                         {
                             startedAt = Stopwatch.GetTimestamp();
-                            if (_settings.MuteWhileStreaming) await audio.MuteAsync(_settings.EffectiveEndpoint).ConfigureAwait(false);
+                            lock (_sync) { if (epoch != _generation) continue; _transportStreaming = true; }
+                            await ApplyLocalMuteAsync().ConfigureAwait(false);
                             log?.Invoke($"Streaming started: {receiver.Id}; target latency {settings.Latency(receiver.Id)} ms; reconnect attempts {attempts}");
                             Publish(epoch, PlaybackState.Streaming);
+                        }
+                        else if (kind == "standby")
+                        {
+                            startedAt = Stopwatch.GetTimestamp();
+                            await RestoreAudioAsync().ConfigureAwait(false);
+                            var message = item.Text("reason") switch
+                            {
+                                "application_unavailable" => L.Get("Waiting for the selected application to start."),
+                                "application_ambiguous" => L.Get("Multiple application instances are running. Select an instance in Settings → Audio capture."),
+                                _ => L.Get("AirPlay session released. Waiting for audio.")
+                            };
+                            Publish(epoch, PlaybackState.Standby, message);
+                        }
+                        else if (kind == "resuming")
+                        {
+                            startedAt = 0; deadline = DateTime.UtcNow + _timing.Connect;
+                            Publish(epoch, PlaybackState.Connecting, L.Get("Audio detected; reconnecting…"));
                         }
                         else if (kind == "device_volume" && startedAt != 0 && item.Text("host") == volumeHost)
                         {
@@ -358,13 +393,11 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                             lock (_sync) { if (epoch != _generation) continue; _diagnostics = _diagnostics with { Transport = TransportMetrics.Parse(item) }; }
                             var current = Snapshot; Publish(epoch, current.State, current.Message);
                         }
-                        else if (kind == "capture_metrics" && startedAt != 0 && item.TryGetProperty("metrics", out var metrics))
+                        else if (kind == "capture_metrics" && item.TryGetProperty("metrics", out var metrics))
                         {
                             var parsed = new StreamMetrics(metrics.Number("capture_to_send_p95_ms"), metrics.Number("max_queue_age_ms"), metrics.Integer("underrun_packets"), metrics.Integer("dropped_frames"), metrics.Integer("input_rate") is { } rate ? (int)rate : null);
-                            var lastAudio = metrics.Number("last_audio_qpc_ns") ?? 0;
-                            var silence = lastAudio > 0 ? (Stopwatch.GetTimestamp() * (1e9 / Stopwatch.Frequency) - lastAudio) / 1e9 : Stopwatch.GetElapsedTime(startedAt).TotalSeconds;
-                            var threshold = _settings.ReadOptions(Snapshot.Receiver?.Id ?? receiver.Id).StandbySeconds ?? _settings.StandbySilenceSeconds;
-                            Publish(epoch, _settings.StandbyEnabled && silence >= threshold ? PlaybackState.Standby : PlaybackState.Streaming, metrics: parsed);
+                            var current = Snapshot;
+                            Publish(epoch, current.State, current.Message, metrics: parsed);
                         }
                     }
                 }
@@ -461,6 +494,23 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     }
     private async Task RestoreAudioAsync()
     {
+        lock (_sync) _transportStreaming = false;
+        await ApplyLocalMuteAsync().ConfigureAwait(false);
+    }
+    private async Task ApplyLocalMuteAsync()
+    {
+        await _audioWriter.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            bool mute; string? endpoint;
+            lock (_sync) { mute = _transportStreaming && _settings.ShouldMuteEndpoint; endpoint = _settings.EffectiveEndpoint; }
+            if (mute) await audio.MuteAsync(endpoint).ConfigureAwait(false);
+            else await RestoreAudioCoreAsync().ConfigureAwait(false);
+        }
+        finally { _audioWriter.Release(); }
+    }
+    private async Task RestoreAudioCoreAsync()
+    {
         try { await audio.RestoreAsync().ConfigureAwait(false); } catch (Exception error) { log?.Invoke(L.Format("Failed to restore local mute state: {0}", error.Message)); }
     }
     private void Publish(long epoch, PlaybackState state, string message = "", StreamMetrics? metrics = null)
@@ -479,5 +529,6 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         lock (_sync) { _equalizerDisposed = true; _equalizerEdit?.Cancel(); _equalizerEdit = null; _equalizerEditTask = null; }
         await StopAsync().ConfigureAwait(false);
         _serial.Dispose();
+        _audioWriter.Dispose();
     }
 }

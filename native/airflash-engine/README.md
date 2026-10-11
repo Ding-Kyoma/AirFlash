@@ -1,7 +1,7 @@
 # Native AirPlay engine
 
 Windows-only Rust sidecar; JSONL v1 on stdin/stdout. Diagnostics must not contain keys or PINs.
-Python UI commands use `start` (live WASAPI); finite tests use `probe` (<=5000ms, gain<=0.1,
+Desktop commands use `start` (live WASAPI); finite tests use `probe` (<=5000ms, gain<=0.1,
 440Hz WAV peak<=0.05). EOF cancels all owned work. `stop` and gain changes apply only to the
 matching session. `pair` emits `pin_required`; `pair_pin` completes pairing, validates the
 accessory signature and writes version-1, user-bound DPAPI credentials. Old pyatv credentials
@@ -35,3 +35,18 @@ Limitations: first-device scope is a single native HomePod stereo pair, Windows 
 ALAC and persistent pairing have independent/simulated tests; hardware qualification covers
 PCM transient authentication. No cross-model 200ms guarantee. The PTP implementation is
 an AirPlay unicast master, not a general-purpose IEEE 1588 daemon or full BMCA implementation.
+
+Live capture accepts `source: "loopback"` (optional `capture_endpoint`) or
+`source: "application"` with `capture_application_path` and optional runtime-only
+`capture_process_id` / `capture_process_started_at` supplied together. `hello.capabilities` reports
+`application_capture` (build >=20348) and `standby_release`. `list_applications`
+returns executable path, process ID, creation FILETIME and display name, grouping
+same-executable child processes under their root. Paths persist; PID hints do not.
+
+`start.standby` and `set_standby` accept `{ "enabled": false, "silence_seconds": 10 }`
+with a finite duration in 5..300 seconds. These options are unavailable to finite
+probes. After silence, all receiver, feedback and timing resources are dropped
+while WASAPI and periodic IPC metrics remain active. `standby` gives a reason of
+`silence`, `application_unavailable` or `application_ambiguous`; `resuming` precedes
+a fresh transport and `streaming`. Intentional standby never emits `stopped`.
+Gain/EQ/device-volume controls retain their latest state across transport rebuilds.
