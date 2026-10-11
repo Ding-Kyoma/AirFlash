@@ -328,9 +328,14 @@ internal static class UiSmoke
     }
     internal sealed class MockDiscovery : IDiscoveryService
     {
+        public event Action<bool>? RunningChanged;
+        public bool Running { get; private set; }
+        public int Starts { get; private set; }
+        public int Stops { get; private set; }
         public event Action<IReadOnlyList<Receiver>>? Changed;
         public event Action<string>? Failed { add { } remove { } }
-        public void Start() => Publish();
+        public void Start() { if (Running) return; Running = true; Starts++; RunningChanged?.Invoke(true); Publish(); }
+        public void Stop() { if (!Running) return; Running = false; Stops++; RunningChanged?.Invoke(false); }
         public string SelectedInterface { get; private set; } = "";
         public void SetInterface(string id) { SelectedInterface = id; Changed?.Invoke(id.Length == 0 ? Items : []); }
         public IReadOnlyList<Receiver> Items { get; set; } = [
@@ -339,7 +344,7 @@ internal static class UiSmoke
             new("c", "卧室 HomePod mini", "127.0.0.4") { Online = false, Model = "HomePod mini" }
         ];
         public void Publish() => Changed?.Invoke(Items);
-        public void Dispose() { }
+        public void Dispose() => Stop();
     }
     internal sealed class MockFactory : IEngineFactory
     {

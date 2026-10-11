@@ -15,5 +15,8 @@
     <ProjectReference Include="../AirFlash.Core/AirFlash.Core.csproj"/>
     <Compile Include="../AirFlash.App/Ui/VolumeSliderMath.cs" Link="VolumeSliderMath.cs"/>
     <Compile Include="../AirFlash.App/Services/TrayRegistration.cs" Link="TrayRegistration.cs"/>
+    <Compile Include="../AirFlash.App/Services/WindowsDiscovery.cs" Link="WindowsDiscovery.cs"/>
+    <Compile Include="../AirFlash.App/Services/WindowsDnsSdApi.cs" Link="WindowsDnsSdApi.cs"/>
+    <Compile Include="../AirFlash.App/Services/NetworkAdapterCatalog.cs" Link="NetworkAdapterCatalog.cs"/>
   </ItemGroup>
 </Project>

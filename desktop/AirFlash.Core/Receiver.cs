@@ -126,7 +126,9 @@ public interface IDiscoveryService : IDisposable
 {
     event Action<IReadOnlyList<Receiver>>? Changed;
     event Action<string>? Failed;
+    event Action<bool>? RunningChanged;
     void Start();
+    void Stop();
     void SetInterface(string id);
 }
 public interface IAudioService
