@@ -9,6 +9,15 @@ body:
         Thanks for reporting a problem with AirFlash. Please search existing issues before submitting a new report.
         Include enough detail for someone else to reproduce the problem. You can attach logs, screenshots, or recordings by dragging them into a text area below.
 
+  - type: checkboxes
+    id: existing-issues
+    attributes:
+      label: Search existing issues
+      description: Please search both open and closed issues. If you find a similar issue, add a comment to that issue instead of creating a new one.
+      options:
+        - label: I have searched existing issues and found no similar issue reporting this problem.
+          required: true
+
   - type: textarea
     id: bug-description
     attributes:
