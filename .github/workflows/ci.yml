@@ -37,7 +37,7 @@ jobs:
         run: ./scripts/dotnet.ps1 test AirFlash.sln '-p:RestoreLockedMode=true'
       - name: Audit self-contained bundle
         shell: pwsh
-        run: ./scripts/dotnet.ps1 publish AirFlash.App/AirFlash.App.csproj -c Release -r win-x64 --self-contained true '-p:IncludeNativeLibrariesForSelfExtract=true' '-p:RestoreLockedMode=true' -o artifacts/compatibility-publish
+        run: ./scripts/dotnet.ps1 publish AirFlash.App/AirFlash.App.csproj -c Release -r win-x64 --self-contained true '-p:IncludeNativeLibrariesForSelfExtract=true' '-p:RestoreLockedMode=true' -o (Join-Path (Get-Location).Path 'artifacts/compatibility-publish')
       - name: Verify packaged startup and compatibility
         shell: pwsh
         run: |
