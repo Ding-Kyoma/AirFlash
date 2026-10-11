@@ -35,3 +35,6 @@ jobs:
       - name: .NET tests
         shell: pwsh
         run: ./scripts/dotnet.ps1 test AirFlash.sln '-p:RestoreLockedMode=true'
+      - name: Discovery stability regression
+        shell: pwsh
+        run: ./scripts/dotnet.ps1 run --project AirFlash.App/AirFlash.App.csproj --no-restore -- --stability-check --output ../artifacts/discovery-stability.json

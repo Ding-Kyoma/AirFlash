@@ -109,6 +109,9 @@ pwsh scripts/build-native.ps1 -Check
 The ignored Rust soak test uses localhost UDP receivers only. Real HomePod tests
 are intentionally limited to the repository's low-volume, five-second procedure.
 
+See [Discovery stability](docs/DISCOVERY-STABILITY.md) for the isolated playback
+retention regression check and repair validation notes.
+
 ## Contributing
 
 Keep protocol behavior, pairing boundaries, and measurement limits explicit in

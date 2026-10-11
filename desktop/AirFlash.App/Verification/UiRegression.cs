@@ -236,8 +236,10 @@ internal static class UiRegression
             vm.SelectedPage = SettingsViewModel.ReceiversPage; await Pump(); UiSmoke.Render(window, Path.Combine(directory, "settings-identity-stereo.png"), 1);
             await app.ToggleAsync(app.AllReceivers[0]); await Until(() => app.Snapshot.State == PlaybackState.Streaming);
             discovery.Items = ReceiverAggregator.Build(services.Take(2)); discovery.Publish();
-            await Until(() => !app.Snapshot.IsActive && app.AllReceivers.Single().Members.Length == 1);
-            Check(app.AllReceivers.Single().Detail.Contains("1/2", StringComparison.Ordinal) && engine.CreatedCount == 1, "missing stereo member shows one of two and stops incomplete playback", checks);
+            await Until(() => app.AllReceivers.Single().Members.Length == 1);
+            Check(app.AllReceivers.Single().Detail.Contains("1/2", StringComparison.Ordinal) && engine.CreatedCount == 1
+                && app.Snapshot.State == PlaybackState.Streaming && engine.DisposedCount == 0,
+                "missing stereo discovery member retains existing playback", checks);
         }
         finally { await vm.ApplicationCompleted; window.Close(); }
 

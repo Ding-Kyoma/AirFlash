@@ -208,14 +208,17 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         }
         MergeManualReceivers();
         if (!CatalogEqual(before, AllReceivers)) { RefreshReceivers(); CatalogChanged?.Invoke(); }
+        currentSnapshot = Session.Snapshot;
         if (currentSnapshot.Receiver is { IsManual: false } current)
         {
             var id = ReceiverMigrations.GetValueOrDefault(current.Id, current.Id);
             if (!discovered.TryGetValue(id, out var next) || !next.Complete)
             {
-                if (currentSnapshot.IsActive) await Session.StopAsync();
+                // Discovery is not a transport health signal; native errors own reconnects.
+                if (currentSnapshot.IsActive) AppPaths.Log("Discovery incomplete; retaining active transport: " + current.Id);
             }
-            else if (!ReceiverEqual(current, next) || !SettingsMerge.Equal(originalSettings, _settings)) await Session.UpdateReceiverAsync(next, _settings.Clone());
+            else if (currentSnapshot.State != PlaybackState.Pairing && (!ReceiverEqual(current, next) || !SettingsMerge.Equal(originalSettings, _settings)))
+                await Session.UpdateReceiverAsync(next, _settings.Clone());
         }
         ScheduleAutoConnect();
     }
@@ -233,7 +236,11 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             && left.Codecs.SequenceEqual(right.Codecs) && left.Aliases.SequenceEqual(right.Aliases) && CatalogEqual(left.Members, right.Members);
     private void RefreshReceivers()
     {
-        var visible = AllReceivers.Where(r => r.Online && !_settings.ReadOptions(r.Id).Hidden).ToArray();
+        var active = Session.Snapshot;
+        IEnumerable<Receiver> catalog = AllReceivers;
+        if (active.IsActive && active.Receiver is { } current && catalog.All(r => r.Id != current.Id))
+            catalog = catalog.Append(current with { Online = false });
+        var visible = catalog.Where(r => (r.Online || active.IsActive && r.Id == active.Receiver?.Id) && !_settings.ReadOptions(r.Id).Hidden).ToArray();
         foreach (var row in Receivers.Where(row => visible.All(r => r.Id != row.Receiver.Id)).ToArray()) Receivers.Remove(row);
         for (var i = 0; i < visible.Length; i++)
         {
@@ -256,7 +263,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         if (errors != ErrorDetails) Notify(nameof(ErrorDetails));
         if (previous.State != snapshot.State || previous.Receiver?.Id != snapshot.Receiver?.Id)
         {
-            foreach (var row in Receivers) row.Refresh();
+            RefreshReceivers();
             StopCommand.Refresh();
         }
         foreach (var row in Receivers) row.Refresh();
