@@ -29,6 +29,7 @@ public static class ReceiverIdentity
     {
         var normalized = Normalize(id);
         return normalized.Length > 0 && !normalized.StartsWith("stereo:", StringComparison.Ordinal)
+            && !normalized.StartsWith("software:", StringComparison.Ordinal)
             && !normalized.StartsWith("endpoint:", StringComparison.Ordinal) && !TryEndpoint(normalized, out _, out _);
     }
     public static string Resolve(string id, IReadOnlyDictionary<string, string> aliases)

@@ -250,7 +250,7 @@ public sealed class ReceiverIdentityTests
             await store.SaveReceiverIdentityAsync(migration.Settings, migration.NeedsBackup);
             await store.SaveReceiverIdentityAsync(migration.Settings, true);
             Assert.Equal(text, File.ReadAllText(path + ".pre-receiver-identity.bak"));
-            var loaded = store.Load(); Assert.Equal(2, loaded.SchemaVersion); Assert.True(loaded.ReadOptions("aabbccddee01").Hidden);
+            var loaded = store.Load(); Assert.Equal(3, loaded.SchemaVersion); Assert.True(loaded.ReadOptions("aabbccddee01").Hidden);
             Assert.Equal(migration.Settings.ReceiverAliases, loaded.ReceiverAliases); Assert.Empty(Directory.GetFiles(folder, "*.tmp"));
         }
         finally { Directory.Delete(folder, true); }

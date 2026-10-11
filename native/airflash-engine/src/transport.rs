@@ -318,7 +318,9 @@ fn feedback_loop(
             if let Some(response) =
                 connection.read_for(POLL.min(timing.hard - elapsed), Some(stop))?
             {
-                if !connection.stale_response(&response) { break response; }
+                if !connection.stale_response(&response) {
+                    break response;
+                }
             }
         };
         connection.validate_cseq(&response)?;
@@ -410,6 +412,7 @@ pub struct MediaMetrics {
     pub invalid_requests: u64,
 }
 pub struct MediaTransport {
+    buffered: Option<crate::buffered::Sender>,
     pub packetizer: Packetizer,
     pub metrics: MediaMetrics,
     audio: UdpSocket,
@@ -431,6 +434,7 @@ impl MediaTransport {
         audio.set_nonblocking(true)?;
         control.set_nonblocking(true)?;
         Ok(Self {
+            buffered: None,
             packetizer,
             metrics: MediaMetrics::default(),
             audio,
@@ -454,6 +458,22 @@ impl MediaTransport {
     pub fn connect_audio(&self, address: SocketAddr) -> Result<()> {
         Ok(self.audio.connect(address)?)
     }
+    pub fn connect_buffered(&mut self, address: SocketAddr) -> Result<()> {
+        self.buffered = Some(crate::buffered::Sender::connect(address)?);
+        self.packetizer.enable_buffered();
+        Ok(())
+    }
+    pub fn latency(&self) -> Duration {
+        self.latency
+    }
+    pub fn service_buffered(&mut self, now: Instant) -> Result<()> {
+        if let Some(sender) = &mut self.buffered {
+            sender.service(now).map_err(|e| {
+                Fault::new(self.remote.ip(), "buffered", "timeline_expired", true, e)
+            })?;
+        }
+        Ok(())
+    }
     pub fn set_control_port(&mut self, port: u16) {
         self.remote.set_port(port);
     }
@@ -465,9 +485,13 @@ impl MediaTransport {
         v["receiver_latency_ms"] = json!(self.latency.as_secs_f64() * 1000.0);
         v["receiver_latency_estimated"] = json!(self.estimated);
         v["retransmit_pending"] = json!(self.pending.len());
+        v["buffered_pending"] = json!(self.buffered.as_ref().map_or(0, |s| s.queued()));
         v
     }
     pub fn sync(&mut self, clock_ns: u64, id: Option<u64>, latency: u32, first: bool) {
+        if self.buffered.is_some() {
+            return;
+        }
         let packet = rtp::sync_packet(self.packetizer.timestamp, latency, clock_ns, id, first);
         if self.control.send_to(&packet, self.remote).is_err() {
             self.metrics.sync_send_errors += 1;
@@ -482,10 +506,33 @@ impl MediaTransport {
         health: &Health,
     ) -> Result<()> {
         health.check()?;
+        if now >= media_time + self.latency {
+            return Err(Fault::new(
+                self.remote.ip(),
+                "media",
+                "timeline_expired",
+                true,
+                "frame missed its presentation deadline",
+            )
+            .into());
+        }
         let packet = self
             .packetizer
             .packet_at(pcm, first, now, media_time + self.latency)?;
-        self.observe_send(self.audio.send(&packet).map(|_| ()), now, health)
+        if let Some(sender) = &mut self.buffered {
+            sender
+                .enqueue(packet, media_time + self.latency)
+                .map_err(|e| {
+                    Fault::new(self.remote.ip(), "buffered", "timeline_expired", true, e)
+                })?;
+            sender.service(now).map_err(|e| {
+                Fault::new(self.remote.ip(), "buffered", "timeline_expired", true, e)
+            })?;
+            self.metrics.packets_sent += 1;
+            Ok(())
+        } else {
+            self.observe_send(self.audio.send(&packet).map(|_| ()), now, health)
+        }
     }
     // One failed datagram is media loss, not evidence of a dead RTSP session.
     pub fn observe_send(
@@ -533,6 +580,9 @@ impl MediaTransport {
         Ok(())
     }
     pub fn service_retransmits(&mut self) {
+        if self.buffered.is_some() {
+            return;
+        }
         let until = Instant::now() + RETRANSMIT_BUDGET;
         let mut buffer = [0u8; 128];
         for _ in 0..MAX_REQUESTS {
@@ -643,11 +693,102 @@ impl MediaSchedule {
     pub fn sent(&mut self) {
         self.frames += FRAMES as u64;
     }
+    /// Keep the original sample timeline: fill only a bounded, still playable gap.
+    pub fn recovery_silence(&self, now: Instant, earliest_render: Instant) -> Result<u64> {
+        let due = (now.saturating_duration_since(self.deadline()).as_nanos()
+            * u128::from(self.rate)
+            / 1_000_000_000
+            / FRAMES as u128) as u64;
+        if due < 2 {
+            return Ok(0);
+        }
+        if due > 8 || now + Duration::from_millis(2) >= earliest_render {
+            return Err(Fault::new(
+                "",
+                "scheduler",
+                "timeline_expired",
+                true,
+                "expired audio requires a fresh group timeline",
+            )
+            .into());
+        }
+        Ok(due)
+    }
 }
 
 #[cfg(test)]
 mod schedule_tests {
     use super::*;
+    #[test]
+    fn expired_udp_media_is_rejected_before_packetization_or_network_write() {
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let audio = UdpSocket::bind("127.0.0.1:0").unwrap();
+        audio.connect(peer.local_addr().unwrap()).unwrap();
+        let control = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut media = MediaTransport::new(
+            Packetizer::new([1; 32], 7, 1000, 42),
+            audio,
+            control,
+            peer.local_addr().unwrap(),
+        )
+        .unwrap();
+        let now = Instant::now();
+        let error = media
+            .send(
+                &vec![0; rtp::PCM_BYTES],
+                false,
+                now,
+                now - Duration::from_secs(1),
+                &Health::default(),
+            )
+            .unwrap_err();
+        let fault = error.downcast_ref::<Fault>().unwrap();
+        assert!(fault.retryable);
+        assert_eq!(fault.code, "timeline_expired");
+        assert_eq!(media.packetizer.seq, 7);
+        assert_eq!(media.packetizer.timestamp, 1000);
+        assert_eq!(media.metrics.packets_sent, 0);
+        let mut bytes = [0; 2048];
+        assert_eq!(
+            peer.recv(&mut bytes).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+    #[test]
+    fn live_recovery_fills_valid_slots_without_advancing_or_reanchoring() {
+        let start = Instant::now();
+        for rate in [44_100, 48_000] {
+            let mut schedule = MediaSchedule::new(start, rate);
+            let now = start + Duration::from_millis(30);
+            let due = schedule
+                .recovery_silence(now, start + Duration::from_millis(150))
+                .unwrap();
+            assert!((2..=8).contains(&due));
+            assert_eq!(schedule.frames, 0);
+            assert_eq!(schedule.deadline(), start);
+            for _ in 0..due {
+                schedule.sent();
+            }
+            assert_eq!(schedule.frames, due * FRAMES as u64);
+            assert_eq!(schedule.skipped_packets, 0);
+            assert!(
+                schedule
+                    .recovery_silence(
+                        start + Duration::from_millis(250),
+                        start + Duration::from_secs(1)
+                    )
+                    .is_err()
+            );
+            let schedule = MediaSchedule::new(start, rate);
+            let error = schedule
+                .recovery_silence(now, now + Duration::from_millis(1))
+                .unwrap_err();
+            let fault = error.downcast_ref::<Fault>().unwrap();
+            assert!(fault.retryable);
+            assert_eq!(fault.code, "timeline_expired");
+        }
+    }
     #[test]
     fn schedule_advances_by_selected_rate() {
         let start = Instant::now();

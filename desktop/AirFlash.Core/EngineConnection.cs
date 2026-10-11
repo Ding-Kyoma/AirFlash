@@ -78,7 +78,7 @@ public sealed class ProcessEngineConnection : IEngineConnection
         try
         {
             _process.StandardInput.Close();
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(12));
             try { await _process.WaitForExitAsync(timeout.Token).ConfigureAwait(false); }
             catch (OperationCanceledException) { if (!_process.HasExited) _process.Kill(true); await _process.WaitForExitAsync().ConfigureAwait(false); }
             await _stderr.ConfigureAwait(false);

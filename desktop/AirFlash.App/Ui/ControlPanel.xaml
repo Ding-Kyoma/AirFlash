@@ -95,6 +95,7 @@
                     <Grid.RowDefinitions>
                       <RowDefinition Height="Auto"/>
                       <RowDefinition Height="Auto"/>
+                      <RowDefinition Height="Auto"/>
                     </Grid.RowDefinitions>
                     <Border Background="{DynamicResource TintBrush}" Width="32" Height="36" CornerRadius="8" VerticalAlignment="Top">
                       <Viewbox Width="19" Height="19" Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Center">
@@ -125,7 +126,7 @@
                         </Grid>
                       </Viewbox>
                     </Button>
-                    <Grid Grid.Row="1" Grid.ColumnSpan="3" Margin="0,9,0,0">
+                    <Grid Grid.Row="1" Grid.ColumnSpan="3" Margin="0,9,0,0" Visibility="{Binding HasSingleVolume, Converter={StaticResource BoolVisibility}}">
                       <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="108"/>
                         <ColumnDefinition Width="*"/>
@@ -137,6 +138,20 @@
                       <TextBlock Grid.Column="2" Text="{Binding VolumeText}" HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="{DynamicResource MutedBrush}"/>
                       <Button Grid.Column="3" Content="{Binding MuteLabel}" Command="{Binding MuteCommand}" AutomationProperties.Name="{Binding MuteLabel}" Width="64" Padding="8,4" Margin="10,0,0,0" FontSize="11"/>
                     </Grid>
+                    <ItemsControl Grid.Row="2" Grid.ColumnSpan="3" ItemsSource="{Binding MemberVolumes}" Margin="0,8,0,0">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                          <StackPanel Margin="0,4,0,4">
+                            <TextBlock Text="{Binding Name}" Style="{StaticResource Hint}"/>
+                            <Grid>
+                              <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="44"/></Grid.ColumnDefinitions>
+                              <Slider Style="{StaticResource VolumeSlider}" Minimum="0" Maximum="100" IsEnabled="{Binding CanSetVolume}" Value="{Binding Volume, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" IsSnapToTickEnabled="True" TickFrequency="1" AutomationProperties.Name="{loc:Text 'Hardware volume'}"/>
+                              <TextBlock Grid.Column="1" Text="{Binding VolumeText}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                            </Grid>
+                          </StackPanel>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
                   </Grid>
                 </Border>
               </DataTemplate>

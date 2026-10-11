@@ -38,7 +38,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public bool IsClosing => _closing;
     public SessionController Session { get; }
     public ObservableCollection<ReceiverViewModel> Receivers { get; } = [];
-    public IReadOnlyList<Receiver> AllReceivers => _known.Values.OrderBy(r => r.Name, StringComparer.CurrentCultureIgnoreCase).ToArray();
+    public IReadOnlyList<Receiver> AllReceivers => _known.Values.Concat(SoftwareStereo.Resolve(_known.Values, _settings)).OrderBy(r => r.Name, StringComparer.CurrentCultureIgnoreCase).ToArray();
     public AppSettings Settings => _settings;
     public SessionSnapshot Snapshot => _snapshot;
     public string Notice { get => _notice; private set { Set(ref _notice, value); Notify(nameof(ErrorDetails)); } }
@@ -59,6 +59,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public string MonitorSessionUptime => _snapshot.Diagnostics?.Transport?.SessionUptimeMs is { } ms ? TimeSpan.FromMilliseconds(ms).ToString(@"d\.hh\:mm\:ss") : "—";
     public string MonitorWarnings => _snapshot.Diagnostics?.Warnings is { Count: > 0 } warnings ? string.Join("\n", warnings.Select(w => w.Detail)) : "—";
     public string MonitorLastFault => _snapshot.Diagnostics?.LastFault?.Detail ?? "—";
+    public string MonitorNegotiated => string.Join("\n", (_snapshot.Diagnostics?.Negotiated ?? []).Select(n => $"{n.Text("host")} · {n.Text("codec")} · {n.Integer("sample_rate")} Hz · {n.Text("transport")} · {n.Text("timing")} · {n.Text("channel")} · {n.Integer("sync_offset_ms")} ms"))
+        + "\n" + (_snapshot.Diagnostics?.ClockStatus?.ToString() ?? "—") + "\n" + (_snapshot.Diagnostics?.SchedulerStatus?.ToString() ?? "—");
     public ObservableCollection<TransportMemberViewModel> MonitorMembers { get; } = [];
     public string MonitorBeforeFault
     {
@@ -158,7 +160,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private void UpdateDiscoveryDemand()
     {
         if (!_started || _closing) return;
-        var requested = _panelVisible || _receiversPageVisible || _startupDiscovery;
+        var requested = _panelVisible || _receiversPageVisible || _startupDiscovery || _snapshot.IsActive && _snapshot.Receiver?.IsSoftwareGroup == true;
         if (requested == _discoveryRequested) return;
         _discoveryRequested = requested;
         if (requested)
@@ -273,6 +275,17 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         if (currentSnapshot.Receiver is { IsManual: false } current)
         {
             var id = ReceiverMigrations.GetValueOrDefault(current.Id, current.Id);
+            if (current.IsSoftwareGroup)
+            {
+                var resolved = SoftwareStereo.Resolve(_known.Values, _settings).FirstOrDefault(r => r.Id == id);
+                if (resolved?.Members.Any(m => m.IsGroup || m.StereoId.Length > 0) == true)
+                {
+                    await Session.StopAsync();
+                    ShowError(new IOException(L.Get("Stereo groups require two distinct independent receivers.")));
+                    return;
+                }
+                if (resolved is { Online: true, Complete: true }) discovered[id] = resolved;
+            }
             // Discovery snapshots can be incomplete while scanning or suspended.
             // The transport health checks own disconnect detection during playback.
             if (currentSnapshot.State != PlaybackState.Pairing && discovered.TryGetValue(id, out var next) && next.Complete &&
@@ -324,6 +337,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         {
             RefreshReceivers();
             StopCommand.Refresh();
+            UpdateDiscoveryDemand();
         }
         foreach (var row in Receivers) row.Refresh();
         if (_monitorVisible) RefreshMonitor();
@@ -344,6 +358,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             [nameof(MonitorSkipped)] = MonitorSkipped, [nameof(MonitorReconnects)] = MonitorReconnects,
             [nameof(MonitorSessionUptime)] = MonitorSessionUptime, [nameof(MonitorWarnings)] = MonitorWarnings,
             [nameof(MonitorLastFault)] = MonitorLastFault, [nameof(MonitorBeforeFault)] = MonitorBeforeFault
+            , [nameof(MonitorNegotiated)] = MonitorNegotiated
         };
         foreach (var (name, value) in values)
             if (!_monitorValues.TryGetValue(name, out var previous) || previous != value) { _monitorValues[name] = value; Notify(name); }
@@ -360,7 +375,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         if (_closing) return;
         if (_snapshot.IsActive && _snapshot.Receiver?.Id == receiver.Id) { await StopAsync(); return; }
         if (!EngineReady) return;
-        var group = AllReceivers.FirstOrDefault(r => r.IsGroup && r.Members.Any(m => m.Address == receiver.Address));
+        var group = AllReceivers.FirstOrDefault(r => r.IsGroup && !r.IsSoftwareGroup && r.Members.Any(m => m.Address == receiver.Address));
         if (group is not null) receiver = group;
         await FlushVolumeAsync();
         await _settingsGate.WaitAsync();
@@ -389,8 +404,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         var receiver = eligible.OrderByDescending(r => r.Id == _settings.LastReceiverId).FirstOrDefault();
         if (receiver is not null && !_autoAttempted.Contains(receiver.Id)) await ToggleAsync(receiver);
     }
-    public DeviceVolumeState ReceiverVolume(string id) => _snapshot.Receiver?.Id == id &&
-        _snapshot.State is PlaybackState.Streaming or PlaybackState.Standby ? _snapshot.DeviceVolume ?? new() : new();
+    public DeviceVolumeState ReceiverVolume(string id) => _snapshot.State is PlaybackState.Streaming or PlaybackState.Standby
+        ? _snapshot.Receiver?.IsSoftwareGroup == true ? _snapshot.MemberVolumes?.GetValueOrDefault(id) ?? new() : _snapshot.Receiver?.Id == id ? _snapshot.DeviceVolume ?? new() : new() : new();
     public async Task ToggleReceiverMuteAsync(string id)
     {
         var volume = ReceiverVolume(id);
@@ -474,7 +489,19 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             }
             progress?.Invoke(L.Get("Updating audio…"));
             string? audioError = null;
-            try { using (UiPerformance.Measure("apply.session")) await Session.UpdateSettingsAsync(merged); }
+            try
+            {
+                using (UiPerformance.Measure("apply.session"))
+                {
+                    if (Session.Snapshot.Receiver is { IsSoftwareGroup: true } active)
+                    {
+                        var next = AllReceivers.FirstOrDefault(r => r.Id == active.Id);
+                        if (next is { Online: true, Complete: true }) await Session.UpdateReceiverAsync(next, merged);
+                        else await Session.StopAsync();
+                    }
+                    await Session.UpdateSettingsAsync(merged);
+                }
+            }
             catch (Exception error) { audioError = L.Format("Settings saved, but audio could not be updated: {0}", error.Message); ShowError(new IOException(audioError, error)); }
             ScheduleAutoConnect();
             return new(merged, audioError);
@@ -505,6 +532,7 @@ public sealed class ReceiverViewModel : ObservableObject
 {
     private readonly Dictionary<string, object?> _display = [];
     private readonly AppViewModel _app;
+    public ObservableCollection<ReceiverViewModel> MemberVolumes { get; } = [];
     public Receiver Receiver { get; set; }
     public ReceiverViewModel(AppViewModel app, Receiver receiver)
     {
@@ -526,6 +554,7 @@ public sealed class ReceiverViewModel : ObservableObject
         "pending" => L.Get("Synchronizing…"), "unconfirmed" => L.Get("Volume not confirmed"),
         "unsynced" => L.Get("Volume not synchronized"), _ => "" };
     public bool CanSetVolume => DeviceVolume.Available;
+    public bool HasSingleVolume => !Receiver.IsSoftwareGroup;
     public bool CanMute => CanSetVolume && (!Muted || DeviceVolume.LastNonZero is > 0);
     public bool Muted => DeviceVolume.Display == 0;
     public string MuteLabel => Muted ? L.Get("Unmute") : L.Get("Mute");
@@ -537,7 +566,11 @@ public sealed class ReceiverViewModel : ObservableObject
     public AsyncCommand MuteCommand { get; }
     public void Refresh()
     {
-        var values = new Dictionary<string, object?> { [nameof(Name)] = Name, [nameof(Detail)] = Detail, [nameof(Volume)] = Volume, [nameof(VolumeText)] = VolumeText, [nameof(VolumeStatus)] = VolumeStatus, [nameof(CanSetVolume)] = CanSetVolume, [nameof(CanMute)] = CanMute, [nameof(Muted)] = Muted, [nameof(MuteLabel)] = MuteLabel, [nameof(Active)] = Active, [nameof(CanPlay)] = CanPlay, [nameof(PlayHint)] = PlayHint, [nameof(StateText)] = StateText };
+        var members = Receiver.IsSoftwareGroup ? Receiver.Members : [];
+        foreach (var row in MemberVolumes.Where(r => members.All(m => m.Id != r.Receiver.Id)).ToArray()) MemberVolumes.Remove(row);
+        foreach (var member in members)
+        { var row = MemberVolumes.FirstOrDefault(r => r.Receiver.Id == member.Id); if (row is null) MemberVolumes.Add(row = new(_app, member)); else row.Receiver = member; row.Refresh(); }
+        var values = new Dictionary<string, object?> { [nameof(HasSingleVolume)] = HasSingleVolume, [nameof(Name)] = Name, [nameof(Detail)] = Detail, [nameof(Volume)] = Volume, [nameof(VolumeText)] = VolumeText, [nameof(VolumeStatus)] = VolumeStatus, [nameof(CanSetVolume)] = CanSetVolume, [nameof(CanMute)] = CanMute, [nameof(Muted)] = Muted, [nameof(MuteLabel)] = MuteLabel, [nameof(Active)] = Active, [nameof(CanPlay)] = CanPlay, [nameof(PlayHint)] = PlayHint, [nameof(StateText)] = StateText };
         foreach (var (name, value) in values)
             if (!_display.TryGetValue(name, out var old) || !Equals(old, value))
             {

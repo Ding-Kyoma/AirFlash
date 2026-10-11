@@ -30,7 +30,10 @@ pub fn qpc_ns() -> u64 {
     }
     (count as u128 * 1_000_000_000 / frequency as u128) as u64
 }
-pub struct Mmcss(Option<HANDLE>);
+pub struct Mmcss {
+    handle: Option<HANDLE>,
+    priority_set: bool,
+}
 impl Default for Mmcss {
     fn default() -> Self {
         Self::new()
@@ -38,13 +41,31 @@ impl Default for Mmcss {
 }
 impl Mmcss {
     pub fn new() -> Self {
+        Self::with_priority(AVRT_PRIORITY_CRITICAL)
+    }
+    pub fn clock() -> Self {
+        Self::with_priority(AVRT_PRIORITY_HIGH)
+    }
+    fn with_priority(priority: AVRT_PRIORITY) -> Self {
         let mut index = 0;
-        Self(unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut index) }.ok())
+        let handle = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut index) }.ok();
+        let priority_set =
+            handle.is_some_and(|h| unsafe { AvSetMmThreadPriority(h, priority) }.is_ok());
+        Self {
+            handle,
+            priority_set,
+        }
+    }
+    pub fn registered(&self) -> bool {
+        self.handle.is_some()
+    }
+    pub fn priority_set(&self) -> bool {
+        self.priority_set
     }
 }
 impl Drop for Mmcss {
     fn drop(&mut self) {
-        if let Some(h) = self.0.take() {
+        if let Some(h) = self.handle.take() {
             unsafe {
                 let _ = AvRevertMmThreadCharacteristics(h);
             }

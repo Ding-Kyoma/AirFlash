@@ -120,9 +120,67 @@ pub fn load(root: &Path, id: &str) -> Result<Option<Credentials>> {
     );
     Ok(Some(credentials))
 }
+pub fn save_password(root: &Path, id: &str, password: &str) -> Result<()> {
+    std::fs::create_dir_all(root)?;
+    let encrypted = protect(password.as_bytes(), true)?;
+    let target = path(root, id).with_extension("password.dpapi");
+    let temp = root.join(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(b"W2PW\x01")?;
+        file.write_all(&encrypted)?;
+        file.sync_all()?;
+        drop(file);
+        unsafe {
+            MoveFileExW(
+                &HSTRING::from(temp.as_os_str()),
+                &HSTRING::from(target.as_os_str()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+pub fn load_password(root: &Path, id: &str) -> Result<Option<Zeroizing<String>>> {
+    let target = path(root, id).with_extension("password.dpapi");
+    if !target.exists() {
+        return Ok(None);
+    }
+    ensure!(
+        std::fs::metadata(&target)?.len() <= 16384,
+        "password file too large"
+    );
+    let data = std::fs::read(target)?;
+    ensure!(data.starts_with(b"W2PW\x01"), "unsupported password format");
+    let mut clear = protect(&data[5..], false)?;
+    let text = String::from_utf8(std::mem::take(&mut *clear)).context("invalid stored password")?;
+    Ok(Some(Zeroizing::new(text)))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn passwords_are_user_bound_encrypted_and_separate_from_pairing_credentials() {
+        let root =
+            std::env::temp_dir().join(format!("airflash-secret-test-{}", uuid::Uuid::new_v4()));
+        save_password(&root, "AA:BB:CC:DD:EE:01", "synthetic-password").unwrap();
+        let file = path(&root, "aabbccddee01").with_extension("password.dpapi");
+        let bytes = std::fs::read(file).unwrap();
+        assert!(!bytes.windows(18).any(|b| b == b"synthetic-password"));
+        assert_eq!(
+            &**load_password(&root, "aabbccddee01").unwrap().unwrap(),
+            "synthetic-password"
+        );
+        assert!(load(&root, "aabbccddee01").unwrap().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn dpapi_roundtrip_and_tamper() {
         let original = b"synthetic-test-key";

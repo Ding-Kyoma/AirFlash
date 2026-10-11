@@ -174,6 +174,71 @@ internal static class UiRegression
         await RunAutoConnectIdentityRegressionAsync(checks);
         await RunDiscoveryDemandRegressionAsync(checks);
         await RunStereoIdentityRegressionAsync(checks, directory);
+        await RunSoftwareStereoRegressionAsync(checks, directory);
+    }
+    private static async Task RunSoftwareStereoRegressionAsync(List<string> checks, string directory)
+    {
+        var a = new Receiver("a", "A · HomePod", "127.0.0.1");
+        var b = new Receiver("b", "B · Soundbar", "127.0.0.2");
+        var c = new Receiver("c", "C · Mac", "127.0.0.3");
+        var native = new Receiver("stereo:native", "Native pair", "") { StereoId = "native", Members = [new("n1", "Native left", "127.0.0.4"), new("n2", "Native right", "127.0.0.5")] };
+        var discovery = new UiSmoke.MockDiscovery { Items = [a, b, c, native] };
+        var store = new UiSmoke.MemoryStore(); var engine = new UiSmoke.MockFactory();
+        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+        app.SetPanelVisible(true); app.Start(); await app.Startup; await Pump();
+        var window = new SettingsWindow(app); window.Show(); var vm = window.ViewModel;
+        var panel = new ControlPanel(app); panel.ShowPanel();
+        try
+        {
+            vm.SelectedPage = SettingsViewModel.ReceiversPage; await Pump();
+            Check(vm.GroupCandidates.Count == 3 && vm.GroupCandidates.All(r => r.Id != "n1" && r.Id != "n2" && !r.IsGroup), "software editor excludes native pair members and group roots", checks);
+            vm.AddGroupCommand.Execute(null); await Pump();
+            var editor = vm.Groups.Single(); var group = editor.Group; var id = group.Id;
+            group.Name = "Office software stereo"; group.LeftOffsetMs = -80; group.RightOffsetMs = 25; group.SampleRate = "48000";
+            var combos = UiSmoke.Descendants(window).OfType<ComboBox>().Where(box => box.ItemsSource == vm.GroupCandidates).ToArray();
+            Check(combos.Length == 2 && combos.Select(box => box.SelectedValue).ToHashSet().SetEquals(new[] { "a", "b" }), "software member selectors bind stable IDs", checks);
+            Check(await vm.ApplyAsync() && store.Saved.SoftwareGroups.Single().Id == id, "software group creation saves stable ID and common rate", checks);
+            await app.ToggleAsync(app.AllReceivers.Single(r => r.Id == id));
+            await Until(() => app.Snapshot.State == PlaybackState.Streaming && app.Receivers.Single(r => r.Receiver.Id == id).MemberVolumes.All(m => m.CanSetVolume));
+            var card = app.Receivers.Single(r => r.Receiver.Id == id);
+            Check(!card.HasSingleVolume && card.MemberVolumes.Count == 2 && card.MemberVolumes.Select(m => m.Volume).ToArray().SequenceEqual(new[] { 28, 45 }), "software panel exposes two independent hardware volume readouts", checks);
+            Check(!engine.Commands.Any(command => command.Text("command") == "set_device_volume"), "creating a software group does not write hardware volume", checks);
+            await Pump();
+            Check(UiSmoke.Descendants(window).OfType<Button>().Single(button => ReferenceEquals(button.Command, editor.SwapCommand)).IsEnabled, "software swap button is enabled again after applying", checks);
+            await app.SetReceiverVolumeAsync("b", 61);
+            await Until(() => app.ReceiverVolume("b").Display == 61);
+            Check(app.ReceiverVolume("a").Display == 28 && app.ReceiverVolume("b").Status == "confirmed", "software hardware volume writes only selected member and preserves confirmation", checks);
+            window.PageScroll.ScrollToVerticalOffset(300); await Pump();
+            UiSmoke.Render(window, Path.Combine(directory, "settings-software-stereo.png"), 1);
+            panel.ShowPanel(); await Pump();
+            panel.DeviceScroll.ScrollToBottom(); await Pump();
+            Check(UiSmoke.Descendants(panel).OfType<Slider>().Count(slider => slider.DataContext is ReceiverViewModel member && card.MemberVolumes.Contains(member) && slider.IsEnabled) == 2, "software panel renders both enabled member sliders", checks);
+            UiSmoke.Render(panel, Path.Combine(directory, "panel-software-stereo.png"), 1);
+            var starts = engine.CreatedCount;
+            editor.SwapCommand.Execute(null);
+            Check(await vm.ApplyAsync(), "software left-right swap applies", checks);
+            await Until(() => app.Snapshot.State == PlaybackState.Streaming && engine.CreatedCount == starts + 1 && app.Snapshot.Receiver?.Members[0].Id == "b");
+            Check(app.Snapshot.Receiver!.Members[0].Id == "b" && app.Snapshot.Receiver.Members[0].SyncOffsetMs == 25, "software swap rebuilds whole session and retains member offset: " + string.Join(",", app.Snapshot.Receiver.Members.Select(m => $"{m.Id}:{m.Channel}:{m.SyncOffsetMs}")) + $" draft={group.LeftId}/{group.RightId}:{group.LeftOffsetMs}/{group.RightOffsetMs}", checks);
+            panel.Hide(); vm.SelectedPage = 0; await Pump();
+            Check(discovery.Running, "active software group retains discovery with receiver lists hidden", checks);
+            discovery.Items = [b, c, native]; discovery.Publish(); await Pump();
+            Check(app.Snapshot.State == PlaybackState.Streaming && engine.CreatedCount == starts + 1, "temporary software member broadcast loss preserves active transport", checks);
+            discovery.Items = [a, b, c, native]; discovery.Publish(); await Pump();
+            Check(group.LeftId == "b" && group.RightId == "a", "discovery refresh preserves software member selectors", checks);
+            starts = engine.CreatedCount; group.RightId = "c";
+            Check(await vm.ApplyAsync(), "software member replacement applies", checks);
+            await Until(() => app.Snapshot.State == PlaybackState.Streaming && engine.CreatedCount == starts + 1 && app.Snapshot.Receiver?.Members[1].Id == "c");
+            Check(app.Snapshot.Receiver!.Members[1].Id == "c", "software replacement starts both new members together", checks);
+            editor.RemoveCommand.Execute(null);
+            var split = await vm.ApplyAsync(); await Pump();
+            Check(split && app.Snapshot.State == PlaybackState.Idle && store.Saved.SoftwareGroups.Count == 0, "splitting an active software group stops and removes its session", checks);
+            vm.AddGroupCommand.Execute(null); Check(await vm.ApplyAsync(), "software group can be recreated after split", checks);
+            await app.ToggleAsync(app.AllReceivers.Single(r => r.IsSoftwareGroup)); await Until(() => app.Snapshot.State == PlaybackState.Streaming);
+            discovery.Items = [new Receiver("stereo:new", "New native pair", "") { StereoId = "new", Members = [a, b] }, c, native];
+            discovery.Publish(); await Until(() => app.Snapshot.State == PlaybackState.Idle);
+            Check(!app.Snapshot.IsActive, "confirmed native pairing invalidates active software membership", checks);
+        }
+        finally { await vm.ApplicationCompleted; window.Close(); panel.ShutdownPanel(); }
     }
     private static async Task RunIdentityRegressionAsync(List<string> checks, string directory)
     {
