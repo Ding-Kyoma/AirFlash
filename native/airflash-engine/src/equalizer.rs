@@ -147,7 +147,7 @@ impl Control {
         )))))
     }
     // This reports mailbox adoption, not audio pickup or fade completion.
-    // Replay identity is equality of the prepared coefficients and headroom.
+    // Replay identity is equality of the full retained Prepared value.
     pub fn set(&self, sequence: u64, prepared: Prepared) -> SetResult {
         let mut latest = self.0.lock().unwrap();
         let outcome = if sequence > latest.0 {
