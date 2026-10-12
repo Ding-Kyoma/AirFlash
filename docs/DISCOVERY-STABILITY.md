@@ -7,6 +7,26 @@ detection and recovery to the transport controller, retains the active receiver
 row and Stop action, and removes an unavailable row after Stop. Offline or
 incomplete receivers remain ineligible for new automatic playback.
 
+Opening the tray panel resumes discovery. Passive refresh has its own
+session-controller entry point: names and confirmed identity aliases update
+without replacing the active transport, even if the broadcast leader, member
+order, advertised profiles or addresses change. The latest complete target is
+saved for a permitted transport retry or an actual connection-settings change.
+Closing the panel, missing broadcasts and manual Stop do not start a new session.
+Software members confirmed to have joined a native pair still invalidate the
+software group.
+
+Passive refresh and topology invalidation check session ownership after acquiring
+the lifecycle lock. A scan delayed by identity persistence or another operation
+cannot modify a newer playback or Pairing session. Native-pair settings comparisons
+use the same group profile and latency as the engine start request; unused member
+settings cannot trigger a rebuild. Unchanged standby policies are not resent.
+
+Logs distinguish `Session start reason=user_play`, `reason=settings_change`,
+`Session stop reason=user_stop`, `reason=discovery_topology_conflict` and
+`Session reconnect reason=transport_fault`. A retained discovery refresh records
+only the names of changed connection fields. It does not count as a reconnect.
+
 ## Integration and scope
 
 [PR #19](https://github.com/Ding-Kyoma/AirFlash/pull/19), contributed by DANVEZ,
@@ -45,7 +65,7 @@ pwsh scripts/dotnet.ps1 run --project AirFlash.App/AirFlash.App.csproj --no-rest
 
 The stability check uses simulated discovery, audio, autostart, settings and
 engine services with isolated data. It does not access real speakers or require
-an embedded native engine. Success produces `ok: true`, 28 named checks and
+an embedded native engine. Success produces `ok: true`, 50 named checks and
 exit code 0.
 
 The original 24 checks cover single/stereo receivers with all adapters or one
@@ -56,7 +76,13 @@ Four additional assertions hold identity persistence while a newer Streaming or
 Pairing session takes over, then verify that discovery reconciliation preserves
 its target and engine. Existing .NET tests cover transport error/retry behavior;
 the simulated stability matrix does not qualify every native failure or every
-session-state interleaving.
+session-state interleaving. The additional 22 panel checks repeatedly show and
+hide a real WPF panel with simulated services, alternating native-pair leader
+and member order on all adapters and a selected adapter. Playback, the existing
+engine, Stop controls and standby-command counts must remain unchanged. Unit
+tests also cover passive address changes applied on permitted retries, identity
+and member-volume migration, delayed work queued behind a new playback, Pairing,
+explicit settings changes and the existing retry limits.
 
 ## Validation limits
 

@@ -231,6 +231,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private async Task ReconcileDiscoveryAsync(IReadOnlyList<Receiver> list)
     {
         var currentSnapshot = Session.Snapshot;
+        var discoverySession = currentSnapshot;
         var originalSettings = _settings.Clone();
         var reconciliation = ReceiverCatalog.Reconcile(list, _settings, currentSnapshot.Receiver?.Id);
         if (!SettingsMerge.Equal(_settings, reconciliation.Settings))
@@ -282,17 +283,16 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
                 var resolved = SoftwareStereo.Resolve(_known.Values, _settings).FirstOrDefault(r => r.Id == id);
                 if (resolved?.Members.Any(m => m.IsGroup || m.StereoId.Length > 0) == true)
                 {
-                    await Session.StopAsync();
-                    ShowError(new IOException(L.Get("Stereo groups require two distinct independent receivers.")));
+                    if (await Session.StopForDiscoveryConflictAsync(discoverySession))
+                        ShowError(new IOException(L.Get("Stereo groups require two distinct independent receivers.")));
                     return;
                 }
                 if (resolved is { Online: true, Complete: true }) discovered[id] = resolved;
             }
             // Discovery snapshots can be incomplete while scanning or suspended.
             // The transport health checks own disconnect detection during playback.
-            if (currentSnapshot.State != PlaybackState.Pairing && discovered.TryGetValue(id, out var next) && next.Complete &&
-                (!ReceiverEqual(current, next) || !SettingsMerge.Equal(originalSettings, _settings)))
-                await Session.UpdateReceiverAsync(next, _settings.Clone());
+            if (currentSnapshot.State != PlaybackState.Pairing && discovered.TryGetValue(id, out var next) && next.Complete)
+                await Session.RefreshReceiverAsync(next, discoverySession, ReceiverMigrations);
         }
         ScheduleAutoConnect();
     }
@@ -498,9 +498,16 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
                 {
                     if (Session.Snapshot.Receiver is { IsSoftwareGroup: true } active)
                     {
-                        var next = AllReceivers.FirstOrDefault(r => r.Id == active.Id);
-                        if (next is { Online: true, Complete: true }) await Session.UpdateReceiverAsync(next, merged);
-                        else await Session.StopAsync();
+                        var previousGroup = before.SoftwareGroups.FirstOrDefault(g => g.Id == active.Id);
+                        var nextGroup = merged.SoftwareGroups.FirstOrDefault(g => g.Id == active.Id);
+                        // Only an explicit membership edit adopts the current catalog here.
+                        // Hot settings must retain working addresses through discovery loss.
+                        if (previousGroup is not null && nextGroup is not null && (previousGroup.LeftId != nextGroup.LeftId || previousGroup.RightId != nextGroup.RightId))
+                        {
+                            var next = AllReceivers.FirstOrDefault(r => r.Id == active.Id);
+                            if (next is { Online: true, Complete: true }) await Session.UpdateReceiverAsync(next, merged);
+                            else await Session.StopAsync();
+                        }
                     }
                     await Session.UpdateSettingsAsync(merged);
                 }
