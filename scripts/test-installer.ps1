@@ -3,6 +3,7 @@ $ErrorActionPreference = 'Stop'
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'Run installer lifecycle tests only in a disposable GitHub-hosted runner.' }
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 Set-Location $root
+. (Join-Path $PSScriptRoot 'installer-test-common.ps1')
 function Find-Msi([string]$Directory) {
     $packages = @(Get-ChildItem -LiteralPath $Directory -Filter 'AirFlash*.msi' -File)
     if ($packages.Count -ne 1) { throw "Expected exactly one AirFlash MSI in $Directory; found $($packages.Count)." }
@@ -37,10 +38,13 @@ Check-Installed
 Run-Msi @('/x',"`"$msi`"") 'first-uninstall'
 if ((Test-Path $installed) -or @(Entries).Count -ne 0) { throw 'First uninstall left application or registration.' }
 
-# Use the preceding public release when available; first release uses a lower-version package fixture.
+# Choose a strictly lower version than this MSI's executable, including for
+# unofficial validation builds that can lag today's public release.
 $releases = gh api repos/Ding-Kyoma/AirFlash/releases | ConvertFrom-Json
 if ($LASTEXITCODE) { throw 'Cannot inspect preceding releases.' }
-$previous = $releases | Where-Object { -not $_.draft -and -not $_.prerelease } | Select-Object -First 1
+$fileInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path dist/AirFlash.exe))
+$current = [Version]('{0}.{1}.{2}' -f $fileInfo.FileMajorPart,$fileInfo.FileMinorPart,$fileInfo.FileBuildPart)
+$previous = Select-AirFlashInstallerPredecessor -Releases $releases -CurrentVersion $current
 $oldDir = Join-Path $root 'artifacts/installer-test/previous'
 New-Item $oldDir -ItemType Directory -Force | Out-Null
 if ($previous) {
@@ -69,8 +73,6 @@ Run-Msi @('/x',"`"$msi`"") 'final-uninstall'
 if ((Test-Path $installed) -or @(Entries).Count -ne 0) { throw 'Uninstall left application or registration.' }
 # After distributing a preview, the next stable MSI must upgrade it cleanly.
 if ($env:RELEASE_CHANNEL -eq 'stable') {
-    $fileInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path dist/AirFlash.exe))
-    $current = [Version]('{0}.{1}.{2}' -f $fileInfo.FileMajorPart,$fileInfo.FileMinorPart,$fileInfo.FileBuildPart)
     $preview = $releases | Where-Object { $_.prerelease -and $_.tag_name -match '^v(\d+\.\d+\.\d+)-rc\.1$' -and [Version]$Matches[1] -lt $current } | Select-Object -First 1
     if ($preview) {
         $previewDir = Join-Path $root 'artifacts/installer-test/preview'
