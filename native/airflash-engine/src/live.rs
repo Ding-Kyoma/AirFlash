@@ -1,4 +1,4 @@
-//! Native loopback -> one resampler -> time-bounded PCM queue.
+//! Native playback loopback or recording input -> one resampler -> bounded PCM queue.
 use crate::{
     rtp::FRAMES,
     wasapi::{Mmcss, qpc_ns},
@@ -88,7 +88,7 @@ impl Loopback {
         let child_state = state.clone();
         let (tx, rx) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
-            .name("wasapi-loopback".into())
+            .name("wasapi-capture".into())
             .spawn(move || {
                 if let Err(e) = capture(endpoint, rate, child_stop, &child_state, &tx) {
                     let message = format!("{e:#}");
@@ -106,7 +106,7 @@ impl Loopback {
             result => {
                 stop.store(true, Ordering::Release);
                 let _ = worker.join();
-                anyhow::bail!("loopback initialization: {result:?}");
+                anyhow::bail!("audio capture initialization: {result:?}");
             }
         }
     }
@@ -206,37 +206,60 @@ impl Drop for EventGuard {
         }
     }
 }
+// IDs take precedence over friendly names, including names that resemble an ID.
+fn endpoint_index(name: &str, endpoints: &[(String, Option<String>)]) -> Result<usize> {
+    if let Some(index) = endpoints.iter().position(|(id, _)| id == name) {
+        return Ok(index);
+    }
+    let mut matches = endpoints.iter().enumerate()
+        .filter(|(_, (_, friendly))| friendly.as_deref() == Some(name));
+    let Some((index, _)) = matches.next() else {
+        anyhow::bail!("capture endpoint unavailable: {name}");
+    };
+    ensure!(matches.next().is_none(), "capture endpoint name is ambiguous; select a device ID: {name}");
+    Ok(index)
+}
+
+fn capture_flags(flow: EDataFlow) -> Result<u32> {
+    let flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST;
+    if flow == eRender {
+        Ok(flags | AUDCLNT_STREAMFLAGS_LOOPBACK)
+    } else {
+        ensure!(flow == eCapture, "unsupported capture endpoint direction");
+        Ok(flags)
+    }
+}
+
 fn find_device(enumerator: &IMMDeviceEnumerator, name: Option<&str>) -> Result<IMMDevice> {
     let Some(name) = name.filter(|s| !s.is_empty()) else {
         return Ok(unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }?);
     };
-    let devices = unsafe { enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) }?;
+    let devices = unsafe { enumerator.EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE) }?;
+    let mut endpoints = Vec::new();
     for i in 0..unsafe { devices.GetCount() }? {
         let device = unsafe { devices.Item(i) }?;
         let id = unsafe { device.GetId() }?;
-        let identifier = unsafe { id.to_string() }?;
+        let identifier = unsafe { id.to_string() };
         unsafe { CoTaskMemFree(Some(id.0.cast())) };
-        if identifier == name {
-            return Ok(device);
-        }
+        endpoints.push((identifier?, None));
+    }
+    // Avoid reading unrelated friendly-name properties when the request uses an ID.
+    if let Some(index) = endpoints.iter().position(|(id, _)| id == name) {
+        return Ok(unsafe { devices.Item(index as u32) }?);
+    }
+    for (i, (_, friendly)) in endpoints.iter_mut().enumerate() {
+        let device = unsafe { devices.Item(i as u32) }?;
         let store = unsafe { device.OpenPropertyStore(STGM_READ) }?;
         let mut value = unsafe { store.GetValue(&PKEY_Device_FriendlyName) }?;
-        let text = unsafe { PropVariantToStringAlloc(&value) };
-        let friendly = match text {
-            Ok(text) => {
-                let result = unsafe { text.to_string() };
-                unsafe { CoTaskMemFree(Some(text.0.cast())) };
-                result.ok()
-            }
-            Err(_) => None,
-        };
-        unsafe { PropVariantClear(&mut value) }?;
-        if friendly.as_deref() == Some(name) {
-            return Ok(device);
+        if let Ok(text) = unsafe { PropVariantToStringAlloc(&value) } {
+            *friendly = unsafe { text.to_string() }.ok();
+            unsafe { CoTaskMemFree(Some(text.0.cast())) };
         }
+        unsafe { PropVariantClear(&mut value) }?;
     }
-    anyhow::bail!("capture endpoint unavailable: {name}")
+    Ok(unsafe { devices.Item(endpoint_index(name, &endpoints)? as u32) }?)
 }
+
 fn capture(
     endpoint: Option<String>,
     stream_rate: u32,
@@ -250,6 +273,8 @@ fn capture(
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }?;
     let device = find_device(&enumerator, endpoint.as_deref())?;
+    let flow = unsafe { device.cast::<IMMEndpoint>()?.GetDataFlow() }?;
+    let flags = capture_flags(flow)?;
     let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }?;
     let pointer = unsafe { client.GetMixFormat() }?;
     let spec = unsafe { pointer.read_unaligned() };
@@ -263,9 +288,6 @@ fn capture(
     } else {
         spec.wFormatTag
     };
-    let flags = AUDCLNT_STREAMFLAGS_LOOPBACK
-        | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
-        | AUDCLNT_STREAMFLAGS_NOPERSIST;
     let event = EventGuard(unsafe { CreateEventW(None, false, false, None) }?);
     // Prefer the shared engine period; fall back to documented shared initialization.
     let initialized = if let Ok(client3) = client.cast::<IAudioClient3>() {
@@ -420,6 +442,54 @@ fn capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_direction_selects_loopback_only_for_playback() {
+        let common = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST;
+        assert_eq!(capture_flags(eRender).unwrap(), common | AUDCLNT_STREAMFLAGS_LOOPBACK);
+        assert_eq!(capture_flags(eCapture).unwrap(), common);
+        assert!(capture_flags(eAll).is_err());
+    }
+
+    #[test]
+    fn endpoint_selection_prefers_id_and_rejects_ambiguous_names() {
+        let endpoints = vec![
+            ("playback-id".into(), Some("recording-id".into())),
+            ("recording-id".into(), Some("Voicemeeter Output".into())),
+            ("another-id".into(), Some("Voicemeeter Output".into())),
+        ];
+        assert_eq!(endpoint_index("recording-id", &endpoints).unwrap(), 1);
+        assert!(endpoint_index("Voicemeeter Output", &endpoints).unwrap_err().to_string().contains("ambiguous"));
+        assert!(endpoint_index("missing", &endpoints).unwrap_err().to_string().contains("unavailable"));
+        assert_eq!(endpoint_index("Voicemeeter Output", &endpoints[..2]).unwrap(), 1);
+    }
+
+    // Opt-in local WASAPI check: no receiver, playback, or audio file is involved.
+    #[test]
+    #[ignore = "requires AIRFLASH_CAPTURE_ENDPOINT and a recording endpoint with an active signal"]
+    fn recording_endpoint_captures_nonzero_pcm() {
+        let endpoint = std::env::var("AIRFLASH_CAPTURE_ENDPOINT").expect("recording device ID");
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }.unwrap();
+        let _com = ComGuard;
+        let enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.unwrap();
+        let device = find_device(&enumerator, Some(&endpoint)).unwrap();
+        let flow = unsafe { device.cast::<IMMEndpoint>().unwrap().GetDataFlow() }.unwrap();
+        assert!(flow == eCapture, "local check requires a recording endpoint");
+        let equalizer = crate::equalizer::Control::new(
+            crate::equalizer::Settings::default(), 44100).unwrap();
+        let source = Loopback::start(Some(endpoint), 44100, equalizer).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut nonzero = false;
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(8));
+            nonzero |= source.packet(0.1).unwrap().0.iter().any(|b| *b != 0);
+        }
+        assert!(source.metrics().capture_frames > 0, "no WASAPI frames received");
+        assert!(nonzero, "recording endpoint supplied only silence");
+        println!("captured {} frames at {} Hz; nonzero PCM verified",
+            source.metrics().capture_frames, source.metrics().input_rate);
+    }
     const CAPACITY: usize = crate::rtp::RATE as usize * 60 / 1000;
     const TARGET: usize = crate::rtp::RATE as usize * 20 / 1000;
     fn source() -> Loopback {

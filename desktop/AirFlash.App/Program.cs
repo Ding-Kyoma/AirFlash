@@ -11,7 +11,7 @@ internal static class Program
     // Match the modes actually dispatched by App.OnStartup. The broad error-reporting
     // predicate above must not redirect a normal startup merely because a value ends in -check.
     internal static bool NeedsDiagnosticIsolation(string[] args) => args.Any(a => a is
-        "--discovery-perf" or "--update-check" or "--self-check" or "--compat-check" or
+        "--discovery-perf" or "--update-check" or "--self-check" or "--stability-check" or "--compat-check" or
         "--discovery-check" or "--audio-check" or "--ui-smoke" or "--tray-smoke" or "--ui-perf");
     [STAThread]
     public static int Main(string[] args)

@@ -50,8 +50,8 @@ public sealed class AudioService : IAudioService, IAsyncDisposable, IMMNotificat
         UiPerformance.Count("audio.enumerate");
         using var enumerator = new MMDeviceEnumerator();
         var endpoints = new List<AudioEndpoint>();
-        foreach (var device in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
-            using (device) endpoints.Add(new(device.ID, device.FriendlyName));
+        foreach (var device in enumerator.EnumerateAudioEndPoints(DataFlow.All, DeviceState.Active))
+            using (device) endpoints.Add(new(device.ID, device.FriendlyName, device.DataFlow == DataFlow.Capture ? AudioEndpointKind.Recording : AudioEndpointKind.Playback));
         return endpoints;
     });
     public Task<string?> GetDefaultEndpointIdAsync() => RunAsync(() =>
@@ -64,7 +64,8 @@ public sealed class AudioService : IAudioService, IAsyncDisposable, IMMNotificat
     {
         using var enumerator = new MMDeviceEnumerator();
         using var device = endpointId is null ? enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Console) : enumerator.GetDevice(endpointId);
-        if (_originalMute.ContainsKey(device.ID)) return true;
+        // Recording endpoint mute affects the captured signal, not local speakers.
+        if (device.DataFlow != DataFlow.Render || _originalMute.ContainsKey(device.ID)) return true;
         var previous = device.AudioEndpointVolume.Mute;
         device.AudioEndpointVolume.Mute = true;
         _originalMute[device.ID] = previous;
