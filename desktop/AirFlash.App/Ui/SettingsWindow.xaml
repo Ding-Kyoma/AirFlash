@@ -179,6 +179,37 @@
       <StackPanel>
         <TextBlock Text="{Binding App.DiscoveryStatus}" Style="{StaticResource Hint}" Margin="0,0,0,12"/>
         <Button Content="{loc:Text '＋ Add receiver manually'}" HorizontalAlignment="Left" Command="{Binding AddReceiverCommand}" Margin="0,0,0,16"/>
+        <TextBlock Text="{loc:Text 'Software stereo'}" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,8"/>
+        <TextBlock Text="{loc:Text 'ALAC saves bandwidth; PCM is also lossless. The group sample rate overrides member sample rates.'}" Style="{StaticResource Hint}" Margin="0,0,0,8"/>
+        <TextBlock Text="{loc:Text 'Latency presets do not select TCP transport.'}" Style="{StaticResource Hint}" Margin="0,0,0,8"/>
+        <TextBlock Text="{loc:Text 'Two independent receivers. Acoustic synchronization and hardware compatibility are unverified. Positive offset delays that member.'}" Style="{StaticResource Hint}" Margin="0,0,0,12"/>
+        <Button Content="{loc:Text 'Create stereo group'}" Command="{Binding AddGroupCommand}" HorizontalAlignment="Left" Margin="0,0,0,12"/>
+        <ItemsControl ItemsSource="{Binding Groups}">
+          <ItemsControl.ItemTemplate>
+            <DataTemplate>
+              <Border Style="{StaticResource Card}">
+                <StackPanel>
+                  <TextBlock Text="{loc:Text 'Group name'}" Style="{StaticResource Hint}"/>
+                  <TextBox Text="{Binding Group.Name, UpdateSourceTrigger=PropertyChanged}" Margin="0,4,0,12"/>
+                  <TextBlock Text="{loc:Text 'Left receiver'}" Style="{StaticResource Hint}"/>
+                  <ComboBox ItemsSource="{Binding Candidates}" DisplayMemberPath="Name" SelectedValuePath="Id" SelectedValue="{Binding Group.LeftId, Mode=TwoWay}" Margin="0,4,0,12"/>
+                  <TextBlock Text="{loc:Text 'Left offset / ms (−500 to +500)'}" Style="{StaticResource Hint}"/>
+                  <TextBox Text="{Binding Group.LeftOffsetMs, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" Margin="0,4,0,12"/>
+                  <TextBlock Text="{loc:Text 'Right receiver'}" Style="{StaticResource Hint}"/>
+                  <ComboBox ItemsSource="{Binding Candidates}" DisplayMemberPath="Name" SelectedValuePath="Id" SelectedValue="{Binding Group.RightId, Mode=TwoWay}" Margin="0,4,0,12"/>
+                  <TextBlock Text="{loc:Text 'Right offset / ms (−500 to +500)'}" Style="{StaticResource Hint}"/>
+                  <TextBox Text="{Binding Group.RightOffsetMs, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" Margin="0,4,0,12"/>
+                  <TextBlock Text="{loc:Text 'Common sample rate'}" Style="{StaticResource Hint}"/>
+                  <ComboBox ItemsSource="{x:Static vm:Choices.Rates}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Group.SampleRate, Mode=TwoWay}" Margin="0,4,0,12"/>
+                  <WrapPanel>
+                    <Button Content="{loc:Text 'Swap left and right'}" Command="{Binding SwapCommand}" Margin="0,0,8,0"/>
+                    <Button Content="{loc:Text 'Split group'}" Command="{Binding RemoveCommand}"/>
+                  </WrapPanel>
+                </StackPanel>
+              </Border>
+            </DataTemplate>
+          </ItemsControl.ItemTemplate>
+        </ItemsControl>
         <ItemsControl ItemsSource="{Binding Receivers}">
           <ItemsControl.ItemTemplate>
             <DataTemplate>
@@ -197,6 +228,14 @@
                   <CheckBox Content="{loc:Text 'Hide from control panel'}" IsChecked="{Binding Options.Hidden}"/>
                   <Expander Header="{loc:Text 'Advanced settings'}" Margin="0,0,0,12">
                     <StackPanel Margin="0,14,0,0">
+                      <TextBlock Text="{loc:Text 'Audio encoding'}" Style="{StaticResource Hint}"/>
+                      <ComboBox ItemsSource="{x:Static vm:Choices.Codecs}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.Codec, Mode=TwoWay}" Margin="0,4,0,12"/>
+                      <TextBlock Text="{loc:Text 'Stream sample rate'}" Style="{StaticResource Hint}"/>
+                      <ComboBox ItemsSource="{x:Static vm:Choices.ReceiverRates}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.SampleRate, Mode=TwoWay}" Margin="0,4,0,12"/>
+                      <TextBlock Text="{loc:Text 'Stream transport'}" Style="{StaticResource Hint}"/>
+                      <ComboBox ItemsSource="{x:Static vm:Choices.Transports}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.Transport, Mode=TwoWay}" Margin="0,4,0,12"/>
+                      <TextBlock Text="{loc:Text 'Clock policy'}" Style="{StaticResource Hint}"/>
+                      <ComboBox ItemsSource="{x:Static vm:Choices.Timings}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.Timing, Mode=TwoWay}" Margin="0,4,0,12"/>
                       <TextBlock Text="{loc:Text 'Latency mode'}" Style="{StaticResource Hint}"/>
                       <ComboBox ItemsSource="{x:Static vm:Choices.ReceiverLatencies}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.LatencyMode, Mode=TwoWay}" Margin="0,4,0,12"/>
                       <StackPanel IsEnabled="{Binding Options.LatencyMode, Converter={StaticResource Equal}, ConverterParameter=custom}">
@@ -207,6 +246,8 @@
                       <TextBox Text="{Binding Options.StandbySeconds, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" Margin="0,4,0,0"/>
                     </StackPanel>
                   </Expander>
+                  <TextBlock Text="{loc:Text 'Hardware volume'}" Style="{StaticResource Hint}"/>
+                  <Slider Minimum="0" Maximum="100" Value="{Binding Volume, Mode=TwoWay}" IsEnabled="{Binding CanSetVolume}" IsSnapToTickEnabled="True" TickFrequency="1" Margin="0,4,0,12"/>
                   <StackPanel Orientation="Horizontal">
                     <Button Content="{loc:Text 'Pair…'}" Command="{Binding PairCommand}" ToolTip="{loc:Text 'Optional: use if the device requires a PIN. Playback starts after pairing.'}"/>
                     <Button Content="{loc:Text 'Remove'}" Command="{Binding RemoveCommand}" Visibility="{Binding IsManual, Converter={StaticResource BoolVisibility}}" Margin="8,0,0,0"/>
@@ -221,6 +262,12 @@
     </DataTemplate>
     <DataTemplate x:Key="Page5">
       <StackPanel>
+        <Border Style="{StaticResource Card}">
+          <StackPanel>
+            <TextBlock Text="{loc:Text 'Negotiated stream and clock status (experimental)'}" FontWeight="SemiBold"/>
+            <TextBlock Text="{Binding App.MonitorNegotiated}" Style="{StaticResource Hint}" Margin="0,8,0,0"/>
+          </StackPanel>
+        </Border>
         <Border Style="{StaticResource Card}">
           <StackPanel>
             <TextBlock Text="{Binding App.StatusTitle}" FontSize="20" FontWeight="SemiBold"/>

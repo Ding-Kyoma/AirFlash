@@ -38,7 +38,7 @@ struct Running {
     cancel: Cancellation,
     worker: Option<JoinHandle<()>>,
     gain: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    pending_pin: Option<std::sync::mpsc::Sender<String>>,
+    pending_pin: Option<std::sync::mpsc::Sender<zeroize::Zeroizing<String>>>,
     gain_limit: f64,
     volume: airflash_engine::volume::Control,
     standby: airflash_engine::standby::Control,
@@ -51,6 +51,21 @@ impl Drop for Running {
             let _ = worker.join();
         }
     }
+}
+fn capabilities() -> Vec<&'static str> {
+    let mut values = vec![
+        "receiver_profiles",
+        "software_stereo",
+        "continuity",
+        "buffered_audio",
+        "member_volume",
+        "receiver_password",
+        "standby_release",
+    ];
+    if airflash_engine::applications::supported() {
+        values.push("application_capture");
+    }
+    values
 }
 fn main() {
     let mut running: Option<Running> = None;
@@ -94,7 +109,9 @@ fn main() {
             );
             continue;
         }
-        let request: Request = match serde_json::from_slice(&bytes) {
+        let parsed = serde_json::from_slice(&bytes);
+        bytes.fill(0);
+        let mut request: Request = match parsed {
             Ok(r) => r,
             Err(e) => {
                 send("", "", json!({"event":"error","message":e.to_string()}));
@@ -113,7 +130,7 @@ fn main() {
             "hello" => send(
                 &request.id,
                 &request.session_id,
-                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"partial","live_loopback":true,"capabilities":{"application_capture":airflash_engine::applications::supported(),"standby_release":true},"commands":["hello","list_applications","start","probe","stop","set_gain","set_equalizer","set_standby","set_device_volume","pair","pair_pin"],"production_ready":false}),
+                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"experimental","live_loopback":true,"capabilities":capabilities(),"commands":["hello","list_applications","start","probe","stop","set_gain","set_equalizer","set_standby","set_device_volume","pair","pair_pin"],"production_ready":false}),
             ),
             "list_applications" => match airflash_engine::applications::list() {
                 Ok(items) => send(
@@ -235,10 +252,15 @@ fn main() {
                             .and_then(Value::as_u64)
                             .filter(|v| *v > 0),
                     ) {
-                        r.volume.set(airflash_engine::volume::Command {
+                        let command = airflash_engine::volume::Command {
                             sequence,
                             percent: percent as u8,
-                        });
+                        };
+                        if let Some(host) = request.params.get("host").and_then(Value::as_str) {
+                            r.volume.set_member(host, command);
+                        } else {
+                            r.volume.set(command);
+                        }
                     } else {
                         send(
                             &request.id,
@@ -314,11 +336,12 @@ fn main() {
             }
             "pair_pin" => {
                 if let Some(r) = running.as_ref().filter(|r| r.id == request.session_id) {
-                    if let (Some(channel), Some(pin)) = (
-                        &r.pending_pin,
-                        request.params.get("pin").and_then(Value::as_str),
-                    ) {
-                        let _ = channel.send(pin.to_owned());
+                    if let (Some(channel), Some(pin)) =
+                        (&r.pending_pin, request.params.get_mut("pin"))
+                    {
+                        if let Value::String(secret) = pin.take() {
+                            let _ = channel.send(zeroize::Zeroizing::new(secret));
+                        }
                     }
                 }
             }
@@ -342,7 +365,12 @@ fn main() {
                 let cancel = Cancellation::default();
                 let child_cancel = cancel.clone();
                 let session = request.session_id.clone();
-                let (tx, rx) = std::sync::mpsc::channel::<String>();
+                let (tx, rx) = std::sync::mpsc::channel::<zeroize::Zeroizing<String>>();
+                let password_required = request
+                    .params
+                    .get("password_required")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let worker = thread::spawn(move || {
                     let result = (|| -> anyhow::Result<()> {
                         let mut conn = airflash_engine::rtsp::Connection::connect(
@@ -356,11 +384,11 @@ fn main() {
                             .and_then(plist::Value::as_string)
                             .ok_or_else(|| anyhow::anyhow!("missing device identifier"))?
                             .to_owned();
-                        let credentials = airflash_engine::auth::pair_prompt(&mut conn, || {
+                        let get_secret = || {
                             send(
                                 &request.id,
                                 &request.session_id,
-                                json!({"event":"pin_required","host":peer.host}),
+                                json!({"event":if password_required {"password_required"}else{"pin_required"},"host":peer.host}),
                             );
                             let deadline =
                                 std::time::Instant::now() + std::time::Duration::from_secs(120);
@@ -371,17 +399,29 @@ fn main() {
                                     "PIN entry timed out"
                                 );
                                 match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                                    Ok(pin) => return Ok(pin),
+                                    Ok(mut pin) => return Ok(std::mem::take(&mut *pin)),
                                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                                     Err(_) => anyhow::bail!("PIN entry cancelled"),
                                 }
                             }
-                        })?;
-                        airflash_engine::credentials::save(
-                            &airflash_engine::credentials::directory(),
-                            &device_id,
-                            &credentials,
-                        )?;
+                        };
+                        if password_required {
+                            let password = zeroize::Zeroizing::new(get_secret()?);
+                            airflash_engine::auth::transient_password(&mut conn, &password)?;
+                            airflash_engine::credentials::save_password(
+                                &airflash_engine::credentials::directory(),
+                                &device_id,
+                                &password,
+                            )?;
+                        } else {
+                            let credentials =
+                                airflash_engine::auth::pair_prompt(&mut conn, get_secret)?;
+                            airflash_engine::credentials::save(
+                                &airflash_engine::credentials::directory(),
+                                &device_id,
+                                &credentials,
+                            )?;
+                        }
                         send(
                             &request.id,
                             &request.session_id,

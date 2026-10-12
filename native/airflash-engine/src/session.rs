@@ -30,6 +30,8 @@ pub struct Peer {
     pub port: u16,
     #[serde(default)]
     pub codecs: Vec<u8>,
+    #[serde(default)]
+    pub profile: crate::profile::Profile,
 }
 fn default_port() -> u16 {
     7000
@@ -66,6 +68,8 @@ pub struct ProbeOptions {
     pub timing: String,
     #[serde(default)]
     pub group_id: Option<String>,
+    #[serde(default)]
+    pub group_mode: String,
     #[serde(default)]
     pub handshake_only: bool,
     #[serde(default)]
@@ -147,6 +151,41 @@ impl ProbeOptions {
         );
         if self.peers.len() == 2 {
             ensure!(self.peers[0].host != self.peers[1].host, "duplicate peer");
+        }
+        ensure!(
+            ["", "single", "native_stereo", "software_stereo"].contains(&self.group_mode.as_str()),
+            "invalid group mode"
+        );
+        for peer in &self.peers {
+            ensure!(
+                (-500..=500).contains(&peer.profile.sync_offset_ms),
+                "sync offset must be -500..500 ms"
+            );
+            ensure!(
+                peer.profile.latency_ms.is_none_or(|v| v <= 2000),
+                "latency must be 0..2000 ms"
+            );
+        }
+        if self.group_mode == "software_stereo" {
+            ensure!(
+                self.peers.len() == 2
+                    && self
+                        .peers
+                        .iter()
+                        .any(|p| p.profile.channel == crate::profile::Channel::Left)
+                    && self
+                        .peers
+                        .iter()
+                        .any(|p| p.profile.channel == crate::profile::Channel::Right),
+                "software stereo requires one left and one right member"
+            );
+        } else {
+            ensure!(
+                self.peers
+                    .iter()
+                    .all(|p| p.profile.channel == crate::profile::Channel::Stereo),
+                "channel routing requires a software stereo group"
+            );
         }
         ensure!(
             (1..=5000).contains(&self.duration_ms),
@@ -239,6 +278,7 @@ impl Drop for NtpServer {
     }
 }
 struct Member {
+    selection: crate::profile::Selection,
     peer: Peer,
     conn: std::sync::Arc<std::sync::Mutex<Connection>>,
     events: Option<EventWorker>,
@@ -252,10 +292,12 @@ struct Member {
     session_started: bool,
 }
 impl Member {
+    #[allow(clippy::too_many_arguments)]
     fn connect(
         peer: &Peer,
         options: &ProbeOptions,
-        clock_id: Option<u64>,
+        ptp: &mut Option<PtpMaster>,
+        clock: &Clock,
         ntp_port: u16,
         initial_rtp: u32,
         cancel: Cancellation,
@@ -268,6 +310,27 @@ impl Member {
         emit(json!({"event":"phase","host":peer.host,"phase":"info"}));
         let info = conn.request("GET", "/info", &[], &[])?.plist()?;
         let capabilities = info.as_dictionary().context("info is not a dictionary")?;
+        let selection = crate::profile::Formats::parse(&info).negotiate(
+            &peer.profile,
+            &peer.codecs,
+            options.sample_rate,
+            options.timing == "ptp",
+        )?;
+        if selection.ptp && ptp.is_none() {
+            let peers = options.peers.iter().map(|p| p.host).collect();
+            let followers = options
+                .peers
+                .iter()
+                .filter(|p| p.profile.follow_receiver_clock)
+                .map(|p| p.host)
+                .collect();
+            *ptp = Some(PtpMaster::start_with_followers(
+                peers,
+                followers,
+                clock.clone(),
+            )?);
+        }
+        let clock_id = selection.ptp.then(|| ptp.as_ref().unwrap().clock_id);
         emit(
             json!({"event":"peer_info","host":peer.host,"model":capabilities.get("model").and_then(Value::as_string),"source_version":capabilities.get("sourceVersion").and_then(Value::as_string)}),
         );
@@ -283,6 +346,10 @@ impl Member {
         };
         let secret = (if let Some(credentials) = saved {
             auth::verify(&mut conn, &credentials)
+        } else if let Some(password) =
+            crate::credentials::load_password(&crate::credentials::directory(), device_id)?
+        {
+            auth::transient_password(&mut conn, &password)
         } else {
             auth::transient(&mut conn)
         })
@@ -301,16 +368,12 @@ impl Member {
         let rate = options.sample_rate;
         let mut packetizer =
             Packetizer::with_rate(audio_key, rand::random(), initial_rtp, ssrc, rate);
-        let use_alac =
-            !peer.codecs.is_empty() && !peer.codecs.contains(&0) && peer.codecs.contains(&1);
-        ensure!(
-            peer.codecs.is_empty() || peer.codecs.contains(&0) || use_alac,
-            "receiver supports neither PCM nor ALAC"
-        );
+        let use_alac = selection.alac;
         if use_alac {
             packetizer.enable_alac();
         }
         let mut member = Self {
+            selection,
             peer: peer.clone(),
             conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
             events: None,
@@ -330,7 +393,10 @@ impl Member {
             ("macAddress", string(sender_id)),
             ("name", string("AirFlash")),
             ("sessionUUID", string(Uuid::new_v4().to_string())),
-            ("timingProtocol", string(options.timing.to_uppercase())),
+            (
+                "timingProtocol",
+                string(if selection.ptp { "PTP" } else { "NTP" }),
+            ),
             ("isMultiSelectAirPlay", Value::Boolean(true)),
             ("groupContainsGroupLeader", Value::Boolean(false)),
             ("senderSupportsRelay", Value::Boolean(false)),
@@ -367,6 +433,7 @@ impl Member {
             &secret,
             member.health.clone(),
         )?);
+        member.record()?;
         if clock_id.is_some() {
             let mut peers: Vec<Value> = options
                 .peers
@@ -380,8 +447,9 @@ impl Member {
                 &Value::Array(peers),
             )?;
         }
-        let latency = (options.latency_ms as u64 * rate as u64) / 1000;
-        let stream = dictionary(vec![
+        let requested_latency = peer.profile.latency_ms.unwrap_or(options.latency_ms);
+        let latency = (requested_latency as u64 * rate as u64) / 1000;
+        let mut stream_fields = vec![
             (
                 "audioFormat",
                 number(crate::rtp::audio_format(use_alac, rate)),
@@ -390,15 +458,27 @@ impl Member {
             ("controlPort", number(member.media.control_port()? as u64)),
             ("ct", number(if use_alac { 2 } else { 1 })),
             ("isMedia", Value::Boolean(true)),
-            ("latencyMin", number(latency)),
-            ("latencyMax", number(latency)),
             ("shk", Value::Data(audio_key.to_vec())),
             ("spf", number(FRAMES as u64)),
             ("sr", number(rate as u64)),
-            ("type", number(96)),
+            (
+                "type",
+                number(
+                    if selection.transport == crate::profile::Transport::Buffered {
+                        103
+                    } else {
+                        96
+                    },
+                ),
+            ),
             ("supportsDynamicStreamID", Value::Boolean(false)),
             ("streamConnectionID", number(ssrc as u64)),
-        ]);
+        ];
+        if selection.transport != crate::profile::Transport::Buffered {
+            stream_fields.push(("latencyMin", number(latency)));
+            stream_fields.push(("latencyMax", number(latency)));
+        }
+        let stream = dictionary(stream_fields);
         emit(
             json!({"event":"phase","host":peer.host,"phase":"setup_audio","requested_latency_ms":options.latency_ms}),
         );
@@ -418,12 +498,22 @@ impl Member {
             .and_then(Value::as_array)
             .and_then(|a| a.first())
             .context("missing stream response")?;
-        member.remote_control = get_port(stream, "controlPort")?;
+        member.remote_control = if selection.transport == crate::profile::Transport::Buffered {
+            0
+        } else {
+            get_port(stream, "controlPort")?
+        };
         let data_port = get_port(stream, "dataPort")?;
         member.media.set_control_port(member.remote_control);
-        member
-            .media
-            .connect_audio(SocketAddr::new(peer.host, data_port))?;
+        if selection.transport == crate::profile::Transport::Buffered {
+            member
+                .media
+                .connect_buffered(SocketAddr::new(peer.host, data_port))?;
+        } else {
+            member
+                .media
+                .connect_audio(SocketAddr::new(peer.host, data_port))?;
+        }
         let receiver_latency = stream
             .as_dictionary()
             .and_then(|d| d.get("latencyMin"))
@@ -432,11 +522,11 @@ impl Member {
             .filter(|v| *v > 0 && *v <= rate as u64 * 10)
             .map(|samples| Duration::from_nanos(samples * 1_000_000_000 / rate as u64));
         member.media.configure_latency(
-            effective_latency.unwrap_or(Duration::from_millis(u64::from(options.latency_ms))),
+            effective_latency.unwrap_or(Duration::from_millis(u64::from(requested_latency))),
             effective_latency.is_none(),
         );
         emit(
-            json!({"event":"negotiated","host":peer.host,"data_port":data_port,"codec":if use_alac{"alac"}else{"pcm"},"sample_rate":rate,"control_port":member.remote_control,"requested_latency_ms":options.latency_ms,"receiver_latency_min_samples":stream.as_dictionary().and_then(|d|d.get("latencyMin")).and_then(Value::as_unsigned_integer),"measured_latency_ms":null}),
+            json!({"event":"negotiated","host":peer.host,"data_port":data_port,"codec":if use_alac{"alac"}else{"pcm"},"transport":selection.transport,"timing":if selection.ptp{"ptp"}else{"ntp"},"channel":peer.profile.channel,"sync_offset_ms":peer.profile.sync_offset_ms,"qualification":"experimental","sample_rate":rate,"control_port":member.remote_control,"requested_latency_ms":options.latency_ms,"receiver_latency_min_samples":stream.as_dictionary().and_then(|d|d.get("latencyMin")).and_then(Value::as_unsigned_integer),"measured_latency_ms":null}),
         );
         Ok(member)
     }
@@ -455,10 +545,6 @@ impl Member {
             .lock()
             .unwrap()
             .request("RECORD", &self.uri, &headers, &[])?;
-        self.conn
-            .lock()
-            .unwrap()
-            .request("FLUSH", &self.uri, &headers, &[])?;
         self.ready = true;
         Ok(())
     }
@@ -473,7 +559,7 @@ impl Member {
         Ok(())
     }
     fn metrics(&self) -> Json {
-        json!({"host":self.peer.host, "media":self.media.metrics(), "health":self.health.snapshot()})
+        json!({"host":self.peer.host, "codec":if self.selection.alac {"alac"}else{"pcm"},"transport":self.selection.transport,"timing":if self.selection.ptp{"ptp"}else{"ntp"},"channel":self.peer.profile.channel,"sync_offset_ms":self.peer.profile.sync_offset_ms,"qualification":"experimental","media":self.media.metrics(), "health":self.health.snapshot()})
     }
     fn close(&mut self) {
         if self.closed {
@@ -573,13 +659,36 @@ pub fn probe_with_all_controls(
         options.validate_start()?;
         run_live(options, cancel, gain, volume, equalizer, standby, emit)
     } else {
-        options.validate()?;
-        run_stream(
-            &options, &cancel, &gain, volume, equalizer, None, &standby, &emit,
-        )?;
-        emit(json!({"event":"stopped","cancelled":cancel.is_cancelled()}));
-        Ok(())
+        run_session(
+            options,
+            cancel,
+            gain,
+            volume,
+            equalizer,
+            emit,
+            (Clock::new(), None),
+        )
     }
+}
+
+// Finite qualification can inject a local clock in the transport simulation.
+#[allow(clippy::too_many_arguments)]
+fn run_session(
+    options: ProbeOptions,
+    cancel: Cancellation,
+    gain: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    volume: crate::volume::Control,
+    equalizer: crate::equalizer::Control,
+    emit: impl Fn(Json),
+    clocks: (Clock, Option<PtpMaster>),
+) -> Result<()> {
+    options.validate()?;
+    let standby = crate::standby::Control::new(options.standby);
+    run_stream(
+        &options, &cancel, &gain, volume, equalizer, None, &standby, &emit, clocks,
+    )?;
+    emit(json!({"event":"stopped","cancelled":cancel.is_cancelled()}));
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -697,6 +806,7 @@ fn run_live(
             Some(live),
             &standby,
             &emit,
+            (Clock::new(), None),
         )? {
             StreamEnd::Finished => break,
             StreamEnd::SourceEnded => {
@@ -723,6 +833,7 @@ fn run_stream(
     provided: Option<&crate::live::Loopback>,
     standby: &crate::standby::Control,
     emit: &impl Fn(Json),
+    clocks: (Clock, Option<PtpMaster>),
 ) -> Result<StreamEnd> {
     if options.duration_ms == 0 {
         options.validate_start()?;
@@ -742,15 +853,13 @@ fn run_stream(
         .transpose()?;
     #[cfg(windows)]
     let _priority = crate::wasapi::Mmcss::new();
-    let clock = Clock::new();
+    #[cfg(windows)]
+    emit(
+        json!({"event":"scheduler_status","registered":_priority.registered(),"priority_set":_priority.priority_set()}),
+    );
+    let (clock, mut ptp) = clocks;
     let peers: Vec<_> = options.peers.iter().map(|p| p.host).collect();
     let ntp = NtpServer::start(peers.clone(), clock.clone())?;
-    let ptp = if options.timing == "ptp" {
-        Some(PtpMaster::start(peers, clock.clone())?)
-    } else {
-        None
-    };
-    let clock_id = ptp.as_ref().map(|p| p.clock_id);
     let initial_rtp = rand::random::<u32>();
     let mut members = Vec::new();
     for peer in &options.peers {
@@ -759,7 +868,8 @@ fn run_stream(
             Member::connect(
                 peer,
                 options,
-                clock_id,
+                &mut ptp,
+                &clock,
                 ntp.port,
                 initial_rtp,
                 cancel.clone(),
@@ -774,13 +884,27 @@ fn run_stream(
         );
         return Ok(StreamEnd::Finished);
     }
-    for member in &mut members {
-        cancel.check()?;
-        member
-            .record()
-            .with_context(|| format!("RECORD {}", member.peer.host))
-            .map_err(|error| Fault::from_error(member.peer.host, "control", &error))?;
+    if let Some(timer) = &ptp {
+        let until = Instant::now() + Duration::from_secs(8);
+        while members
+            .iter()
+            .any(|m| m.selection.ptp && !timer.ready(m.peer.host))
+        {
+            cancel.check()?;
+            if Instant::now() >= until {
+                return Err(Fault::new(
+                    "",
+                    "clock",
+                    "clock_not_ready",
+                    true,
+                    "PTP exchange did not become ready",
+                )
+                .into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
+    let clock_id = ptp.as_ref().map(|p| p.clock_id);
     let rate = options.sample_rate;
     let owned_live = if provided.is_none() && options.source == "loopback" {
         Some(crate::live::Loopback::start(
@@ -840,23 +964,67 @@ fn send_packets(
 ) -> Result<StreamEnd> {
     let rate = options.sample_rate;
     let start = Instant::now();
+    let base_ns = clock.now_ns();
+    let common_latency = members.iter().map(|m| m.media.latency()).max().unwrap()
+        + Duration::from_millis(
+            members
+                .iter()
+                .map(|m| (-m.peer.profile.sync_offset_ms).max(0) as u64)
+                .max()
+                .unwrap_or(0),
+        );
+    for member in members.iter() {
+        if member.selection.transport == crate::profile::Transport::Buffered {
+            let render = offset_time(
+                base_ns,
+                common_latency,
+                Duration::ZERO,
+                member.peer.profile.sync_offset_ms,
+            )?;
+            let (id, network) = ptp.as_ref().unwrap().timeline(member.peer.host, render)?;
+            member.conn.lock().unwrap().plist_request(
+                "SETRATEANCHORTIME",
+                &member.uri,
+                &dictionary(vec![
+                    ("rate", number(1)),
+                    ("rtpTime", number(member.media.packetizer.timestamp as u64)),
+                    ("networkTimeSecs", number(network / 1_000_000_000)),
+                    (
+                        "networkTimeFrac",
+                        number(
+                            (((network % 1_000_000_000) as u128) << 64)
+                                .checked_div(1_000_000_000)
+                                .unwrap() as u64,
+                        ),
+                    ),
+                    ("networkTimeTimelineID", number(id)),
+                ]),
+            )?;
+        }
+    }
     let duration = Duration::from_millis(options.duration_ms as u64);
-    let latency = options.latency_ms * rate / 1000;
     let mut schedule = MediaSchedule::new(start, rate);
     let mut packets = 0u64;
     for member in members.iter_mut() {
         member.start_feedback(start)?;
     }
-    let volume_worker = crate::volume::Worker::start(
-        members
-            .iter()
-            .map(|m| (m.peer.host.to_string(), m.uri.clone(), m.conn.clone()))
-            .collect(),
-        volume,
-    )?;
+    let volume_peers = members
+        .iter()
+        .map(|m| (m.peer.host.to_string(), m.uri.clone(), m.conn.clone()))
+        .collect::<Vec<_>>();
+    let volume_workers = if options.group_mode == "software_stereo" {
+        volume_peers
+            .into_iter()
+            .map(|p| crate::volume::Worker::start_member(p, volume.clone()))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        vec![crate::volume::Worker::start(volume_peers, volume)?]
+    };
     let mut next_metrics = start + Duration::from_secs(1);
     let mut last_marker = 0u64;
     let mut next_sync = start;
+    let mut silence_packets = 0u64;
+    let mut recovery_left = 0u64;
     emit(
         json!({"event":"streaming","members":members.len(),"clock_id":clock_id,"first_send_unix_ns":clock.now_ns(),"first_send_qpc_ns":crate::wasapi::qpc_ns(),"requested_latency_ms":options.latency_ms,"sample_rate":rate,"measured_latency_ms":null,"qualified":false}),
     );
@@ -874,8 +1042,10 @@ fn send_packets(
                     return Ok(StreamEnd::Silence(now));
                 }
             }
-            for event in volume_worker.events.try_iter() {
-                emit(event);
+            for worker in &volume_workers {
+                for event in worker.events.try_iter() {
+                    emit(event);
+                }
             }
             for member in members.iter() {
                 for notice in member.health.notices() {
@@ -883,35 +1053,84 @@ fn send_packets(
                 }
                 member.health.check()?;
             }
+            if let Some(timer) = &ptp {
+                if members
+                    .iter()
+                    .any(|m| m.selection.ptp && !timer.ready(m.peer.host))
+                {
+                    return Err(Fault::new(
+                        "",
+                        "clock",
+                        "clock_lost",
+                        true,
+                        "PTP exchanges stopped",
+                    )
+                    .into());
+                }
+            }
+            for member in members.iter_mut() {
+                member
+                    .media
+                    .service_buffered(Instant::now())
+                    .map_err(|e| Fault::from_error(member.peer.host, "buffered", &e))?;
+            }
             let deadline = schedule.deadline();
             let now = Instant::now();
             if now < deadline {
                 thread::sleep((deadline - now).min(Duration::from_millis(2)));
                 continue;
             }
-            let skipped = schedule.recover(now, options.duration_ms == 0)?;
-            if skipped > 0 {
-                for member in members.iter_mut() {
-                    member.media.packetizer.skip_packets(skipped);
-                }
+            let late = now.saturating_duration_since(deadline);
+            schedule.max_lateness_us = schedule.max_lateness_us.max(late.as_micros());
+            let due = (late.as_nanos() * u128::from(rate) / 1_000_000_000 / FRAMES as u128) as u64;
+            if options.duration_ms > 0 {
+                schedule.recover(now, false)?;
+            } else if recovery_left == 0 && due >= 2 {
+                let earliest = members
+                    .iter()
+                    .map(|m| {
+                        offset_deadline(deadline, common_latency, m.peer.profile.sync_offset_ms)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .min()
+                    .unwrap();
+                recovery_left = schedule.recovery_silence(now, earliest)?;
+                schedule.recoveries += 1;
                 if let Some(source) = &live {
                     source.discard_stale();
                 }
-                next_sync = now;
                 emit(
-                    json!({"event":"warning","code":"sender_late_recovered","channel":"scheduler","host":null,"recovered":true,"skipped_packets":skipped,"message":"Sender discarded expired audio slots and recovered its timeline"}),
+                    json!({"event":"warning","code":"sender_late_recovered","channel":"scheduler","host":null,"recovered":true,"silence_packets":due,"message":"Sender filled valid timeline slots with encoded silence"}),
                 );
             }
             if now >= next_sync {
                 for m in members.iter_mut() {
-                    m.media
-                        .sync(clock.now_ns(), clock_id, latency, packets == 0);
+                    let local = offset_time(
+                        base_ns + schedule.frames * 1_000_000_000 / u64::from(rate),
+                        common_latency,
+                        m.media.latency(),
+                        m.peer.profile.sync_offset_ms,
+                    )?;
+                    let (id, network) = if m.selection.ptp {
+                        let (id, t) = ptp.as_ref().unwrap().timeline(m.peer.host, local)?;
+                        (Some(id), t)
+                    } else {
+                        (None, local)
+                    };
+                    let latency =
+                        (m.media.latency().as_nanos() * u128::from(rate) / 1_000_000_000) as u32;
+                    m.media.sync(network, id, latency, packets == 0);
                 }
                 next_sync = now + Duration::from_millis(100);
             }
             if let Some(source) = &live {
-                let (packet, marker) =
-                    source.packet(f32::from_bits(gain.load(Ordering::Relaxed)))?;
+                let current_gain = f32::from_bits(gain.load(Ordering::Relaxed));
+                let (packet, marker) = if recovery_left > 0 {
+                    source.silence_packet(current_gain)?
+                } else {
+                    source.packet(current_gain)?
+                };
                 pcm = packet;
                 if let Some(qpc) = marker {
                     if qpc.saturating_sub(last_marker) > 200_000_000 {
@@ -929,6 +1148,20 @@ fn send_packets(
                 }
             }
             if now >= next_metrics {
+                if let Some(timer) = &ptp {
+                    let snapshots: Vec<_> = timer
+                        .snapshots()
+                        .into_iter()
+                        .filter(|s| {
+                            members
+                                .iter()
+                                .any(|m| m.selection.ptp && m.peer.host == s.host)
+                        })
+                        .collect();
+                    emit(
+                        json!({"event":"clock_status","members":snapshots,"mmcss":*timer.mmcss.lock().unwrap()}),
+                    );
+                }
                 if let Some(source) = &live {
                     emit(json!({"event":"capture_metrics","metrics":source.metrics()}));
                 }
@@ -938,10 +1171,14 @@ fn send_packets(
             // Every member gets new media before any member services retransmissions.
             for member in members.iter_mut() {
                 member.media.send(
-                    &pcm,
+                    &member.peer.profile.channel.map(&pcm),
                     packets == 0,
                     Instant::now(),
-                    schedule.deadline(),
+                    offset_deadline(
+                        schedule.deadline(),
+                        common_latency - member.media.latency(),
+                        member.peer.profile.sync_offset_ms,
+                    )?,
                     &member.health,
                 )?;
             }
@@ -950,9 +1187,59 @@ fn send_packets(
             }
             schedule.sent();
             packets += 1;
+            if recovery_left > 0 {
+                recovery_left -= 1;
+                silence_packets += 1;
+            }
         }
         Ok(StreamEnd::Finished)
     })();
+    // Stop/reconfiguration shares one faded final packet and drains its render
+    // deadline on every member before tearing down the common session.
+    if outcome.is_ok() {
+        if let Some(source) = &live {
+            let render = offset_deadline(schedule.deadline(), common_latency, 0)?;
+            let (fade, _) = source.silence_packet(0.0)?;
+            let mut sent = true;
+            for member in members.iter_mut() {
+                sent &= member
+                    .media
+                    .send(
+                        &member.peer.profile.channel.map(&fade),
+                        false,
+                        Instant::now(),
+                        offset_deadline(
+                            schedule.deadline(),
+                            common_latency - member.media.latency(),
+                            member.peer.profile.sync_offset_ms,
+                        )?,
+                        &Health::default(),
+                    )
+                    .is_ok();
+            }
+            if sent {
+                let until = render
+                    + Duration::from_nanos(FRAMES as u64 * 1_000_000_000 / u64::from(rate))
+                    + Duration::from_millis(
+                        members
+                            .iter()
+                            .map(|m| m.peer.profile.sync_offset_ms.max(0) as u64)
+                            .max()
+                            .unwrap_or(0),
+                    );
+                while Instant::now() < until {
+                    if members
+                        .iter_mut()
+                        .any(|m| m.media.service_buffered(Instant::now()).is_err())
+                    {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
+            emit(json!({"event":"timeline_drained","faded":sent}));
+        }
+    }
     if let Some(source) = &live {
         emit(json!({"event":"capture_metrics","metrics":source.metrics()}));
     }
@@ -963,9 +1250,9 @@ fn send_packets(
     }
     emit(transport_metrics(members, &schedule));
     emit(
-        json!({"event":"metrics","packets_per_member":packets,"frames":schedule.frames,"max_send_lateness_us":schedule.max_lateness_us,"retransmits":members.iter().map(|m|m.media.metrics.retransmits_sent).sum::<u64>(),"ptp_packets_received":ptp.as_ref().map(|p|p.received.load(Ordering::Relaxed)),"measured_latency_ms":null,"qualified":false}),
+        json!({"event":"metrics","packets_per_member":packets,"frames":schedule.frames,"silence_packets":silence_packets,"max_send_lateness_us":schedule.max_lateness_us,"retransmits":members.iter().map(|m|m.media.metrics.retransmits_sent).sum::<u64>(),"ptp_packets_received":ptp.as_ref().map(|p|p.received.load(Ordering::Relaxed)),"measured_latency_ms":null,"qualified":false}),
     );
-    drop(volume_worker);
+    drop(volume_workers);
     for m in members.iter_mut() {
         m.close();
     }
@@ -975,6 +1262,25 @@ fn send_packets(
 fn transport_metrics(members: &[Member], schedule: &MediaSchedule) -> Json {
     json!({"event":"transport_metrics","session_uptime_ms":schedule.start.elapsed().as_millis(),"sender_late_recoveries":schedule.recoveries,"skipped_packets":schedule.skipped_packets,"max_send_lateness_us":schedule.max_lateness_us,"members":members.iter().map(Member::metrics).collect::<Vec<_>>()})
 }
+fn offset_time(base: u64, common: Duration, own: Duration, offset_ms: i32) -> Result<u64> {
+    Ok(u64::try_from(
+        base as i128 + common.as_nanos() as i128 - own.as_nanos() as i128
+            + i128::from(offset_ms) * 1_000_000,
+    )?)
+}
+fn offset_deadline(base: Instant, lead: Duration, offset_ms: i32) -> Result<Instant> {
+    let ns = lead.as_nanos() as i128 + i128::from(offset_ms) * 1_000_000;
+    if ns >= 0 {
+        base.checked_add(Duration::from_nanos(u64::try_from(ns)?))
+    } else {
+        base.checked_sub(Duration::from_nanos(u64::try_from(-ns)?))
+    }
+    .context("invalid media deadline")
+}
+
+#[cfg(test)]
+#[path = "session_simulation.rs"]
+mod simulation;
 
 #[cfg(test)]
 mod tests {
@@ -1025,10 +1331,16 @@ mod tests {
         )
         .unwrap();
         let member = Member {
+            selection: crate::profile::Selection {
+                alac: false,
+                transport: crate::profile::Transport::Realtime,
+                ptp: false,
+            },
             peer: Peer {
                 host: "127.0.0.1".parse().unwrap(),
                 port: listener.local_addr().unwrap().port(),
                 codecs: vec![],
+                profile: crate::profile::Profile::default(),
             },
             conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
             events: None,
@@ -1045,7 +1357,23 @@ mod tests {
     }
     #[test]
     fn silence_releases_both_members_and_activity_resumes_current_audio() {
+        silence_release(false);
+    }
+    #[test]
+    fn software_stereo_releases_both_members_and_activity_resumes_current_audio() {
+        silence_release(true);
+    }
+    fn silence_release(software: bool) {
         let options: ProbeOptions = serde_json::from_value(json!({"peers":[{"host":"127.0.0.1"}],"source":"loopback","duration_ms":0,"latency_ms":120,"gain":0.0})).unwrap();
+        let options = ProbeOptions {
+            group_mode: if software {
+                "software_stereo"
+            } else {
+                "native_stereo"
+            }
+            .into(),
+            ..options
+        };
         // Accelerated policy used only with synthetic audio and localhost peers.
         let standby = crate::standby::Control::new(crate::standby::Settings {
             enabled: true,
@@ -1057,6 +1385,10 @@ mod tests {
             let (a, rx_a, server_a) = local_member();
             let (b, rx_b, server_b) = local_member();
             let mut members = vec![a, b];
+            if software {
+                members[0].peer.profile.channel = crate::profile::Channel::Left;
+                members[1].peer.profile.channel = crate::profile::Channel::Right;
+            }
             // Connect each member to its own UDP peer.
             members[0]
                 .media
@@ -1122,6 +1454,7 @@ mod tests {
                 host: "127.0.0.1".parse().unwrap(),
                 port: 7000,
                 codecs: Vec::new(),
+                profile: crate::profile::Profile::default(),
             }],
             wav_path: PathBuf::new(),
             source: "wav".into(),
@@ -1137,6 +1470,7 @@ mod tests {
             sample_rate: 44100,
             timing: "ptp".into(),
             group_id: None,
+            group_mode: String::new(),
             handshake_only: false,
             record_mic_path: None,
         };

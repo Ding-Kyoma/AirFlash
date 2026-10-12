@@ -40,6 +40,8 @@ or a similar tool, and route the audio you want to stream to that endpoint.
 
 - Streams Windows system audio to HomePod over AirPlay 2.
 - Supports synchronized playback on existing two-device HomePod stereo pairs.
+- Adds experimental two-receiver software stereo groups, independent hardware volume,
+  per-receiver PCM/ALAC and UDP/TCP profiles, and 5 ms continuity transitions.
 - Offers automatic device discovery, PIN pairing, and manual device setup.
 - Lets you filter device discovery by selecting a network adapter in Settings.
 - Includes selectable latency modes, tray operation, mute restoration,
@@ -50,6 +52,10 @@ or a similar tool, and route the audio you want to stream to that endpoint.
 - Available as a portable Windows x64 app with English, Simplified Chinese, and Traditional Chinese UI.
 
 ## Feature plan
+
+See [audio continuity and schema v3](docs/audio-stereo-v3.md) for setup, protocol details,
+simulation results and remaining hardware acceptance. Samsung, Mac and mixed-brand
+playback and acoustic synchronization have not been qualified by this implementation.
 
 - [ ] Dolby Atmos support.
 
@@ -94,7 +100,8 @@ Reconnection resumes current audio; its opening or short notification sounds may
 be missed. HomePod manages its own power state after the session is released.
 
 Receiver discovery runs while the control panel or **Settings > Receivers** is
-visible, and pauses when both are hidden. Previous results remain available;
+visible, and remains active for software stereo topology changes during playback.
+Otherwise it pauses when both are hidden. Previous results remain available;
 pausing discovery does not interrupt playback. If automatic connection is enabled
 globally or for a receiver, AirFlash also discovers devices for ten seconds at
 startup. Open a receiver list to resume discovery afterwards.

@@ -8,11 +8,13 @@ namespace AirFlash.Tests;
 public sealed class ApplicationCatalogTests
 {
     [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public async Task EnumeratesThroughIndependentIpcAndHonorsEngineCapability(bool supported)
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public async Task EnumeratesThroughIndependentIpcAndHonorsEngineCapability(bool supported, bool legacy)
     {
-        var connection = new CatalogConnection(supported);
+        var connection = new CatalogConnection(supported, legacy);
         var catalog = new ApplicationCatalog(new CatalogFactory(connection));
         var items = await catalog.RefreshAsync();
         Assert.Equal(supported, catalog.Supported);
@@ -33,7 +35,7 @@ public sealed class ApplicationCatalogTests
     {
         public IEngineConnection Open() => connection;
     }
-    private sealed class CatalogConnection(bool supported) : IEngineConnection
+    private sealed class CatalogConnection(bool supported, bool legacy) : IEngineConnection
     {
         private readonly Channel<JsonElement> _events = Channel.CreateUnbounded<JsonElement>();
         public List<string> Commands { get; } = [];
@@ -42,7 +44,7 @@ public sealed class ApplicationCatalogTests
         {
             Commands.Add(command);
             _events.Writer.TryWrite(command == "hello"
-                ? JsonSerializer.SerializeToElement(new { @event = "hello", version = 1, capabilities = new { application_capture = supported } })
+                ? JsonSerializer.SerializeToElement(new { @event = "hello", version = 1, capabilities = legacy ? (object)new { application_capture = supported } : supported ? new[] { "application_capture", "standby_release" } : new[] { "standby_release" } })
                 : JsonSerializer.SerializeToElement(new { @event = "applications", items = new[] { new { path = @"C:\Music.exe", name = "Music", process_id = 42, started_at = 123 } } }));
             return Task.CompletedTask;
         }

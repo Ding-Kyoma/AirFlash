@@ -21,7 +21,8 @@ public sealed class SettingsStore(string path) : ISettingsStore
             var text = File.ReadAllText(path);
             var json = JsonNode.Parse(text) as JsonObject ?? throw new JsonException(L.Get("Configuration must be a JSON object."));
             var version = json["schema_version"]?.GetValue<int>() ?? 1;
-            if (version > 2) throw new NotSupportedException(L.Get("This configuration is from a newer version. Update the app first."));
+            if (version > 3) throw new NotSupportedException(L.Get("This configuration is from a newer version. Update the app first."));
+            if (version < 3) _migrationSource = text;
             if (version < 2)
             {
                 _migrationSource = text;
@@ -39,7 +40,10 @@ public sealed class SettingsStore(string path) : ISettingsStore
                 if (json["receivers"] is JsonObject items)
                     foreach (var value in items.Select(p => p.Value).OfType<JsonObject>()) ClampBuffer(value);
             }
+            json["schema_version"] = 3;
             var settings = json.Deserialize<AppSettings>(AppSettings.JsonOptions) ?? throw new JsonException(L.Get("Empty configuration."));
+            settings.SoftwareGroups ??= [];
+            settings.SoftwareGroups = new(settings.SoftwareGroups.Where(group => group is not null));
             settings.Receivers ??= [];
             settings.Receivers = settings.Receivers.Where(pair => pair.Value is not null).ToDictionary(pair => pair.Key, pair => pair.Value);
             settings.ManualReceivers ??= [];
@@ -61,17 +65,21 @@ public sealed class SettingsStore(string path) : ISettingsStore
     }
     public void Save(AppSettings settings)
     {
+        if (settings.SchemaVersion > 3) throw new NotSupportedException(L.Get("This configuration is from a newer version. Update the app first."));
+        var saved = settings.Clone();
+        saved.SchemaVersion = 3;
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
         if (_migrationSource is not null)
         {
             var backup = path + ".pre-wpf.bak";
             if (!File.Exists(backup)) File.WriteAllText(backup, _migrationSource);
+            if (!File.Exists(path + ".pre-v3.bak")) File.WriteAllText(path + ".pre-v3.bak", _migrationSource);
             _migrationSource = null;
         }
         var temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
-            File.WriteAllText(temp, JsonSerializer.Serialize(settings, AppSettings.JsonOptions));
+            File.WriteAllText(temp, JsonSerializer.Serialize(saved, AppSettings.JsonOptions));
             if (File.Exists(path)) File.Replace(temp, path, null);
             else File.Move(temp, path);
         }

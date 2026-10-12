@@ -73,6 +73,9 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     public string NetworkStatus { get => _networkStatus; private set => Set(ref _networkStatus, value); }
     public RelayCommand RefreshAdaptersCommand { get; }
     public ObservableCollection<ReceiverEditor> Receivers { get; } = [];
+    public ObservableCollection<SoftwareGroupEditor> Groups { get; } = [];
+    public ObservableCollection<Receiver> GroupCandidates { get; } = [];
+    public RelayCommand AddGroupCommand { get; }
     public AsyncCommand ApplyCommand { get; }
     public AsyncCommand OkCommand { get; }
     public RelayCommand CancelCommand { get; }
@@ -113,9 +116,12 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         OpenLogsCommand = new(() => { try { AppPaths.OpenLogs(); } catch (Exception error) { ShowError(error); } });
         CopyDiagnosticsCommand = new(() => { try { Clipboard.SetText(App.Diagnostics()); } catch (Exception error) { ShowError(error); } });
         AddReceiverCommand = new(() => { if (CanEdit) AddReceiverRequested?.Invoke(); }, () => CanEdit);
+        AddGroupCommand = new(AddGroup, () => CanEdit && GroupCandidates.Count >= 2);
         LicensesCommand = new(() => new Ui.LicensesWindow().Show());
         Draft.PropertyChanged += DraftChanged;
         Draft.ManualReceivers.CollectionChanged += ManualChanged;
+        Draft.SoftwareGroups.CollectionChanged += GroupsChanged;
+        App.Session.Changed += VolumeChanged;
         RefreshCatalog(); RefreshValidation();
         App.CatalogChanged += RefreshCatalog;
         App.Endpoints.Changed += UpdateEndpoints;
@@ -129,6 +135,23 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         foreach (var options in Draft.Receivers.Values) if (_subscribed.Add(options)) options.PropertyChanged += DraftChanged;
     }
     private void ManualChanged(object? sender, NotifyCollectionChangedEventArgs args) { if (!_updating) RefreshValidation(); }
+    private void VolumeChanged(SessionSnapshot snapshot) => Application.Current.Dispatcher.BeginInvoke(() => { if (!_disposed) foreach (var row in Receivers) row.RefreshVolume(); });
+    private void GroupsChanged(object? sender, NotifyCollectionChangedEventArgs args) { if (!_updating) { RefreshGroups(); RefreshValidation(); } }
+    private void AddGroup()
+    {
+        if (!CanEdit) return;
+        var used = Draft.SoftwareGroups.SelectMany(g => new[] { g.LeftId, g.RightId }).ToHashSet();
+        var candidates = GroupCandidates.Where(r => !used.Contains(r.Id)).Take(2).ToArray();
+        if (candidates.Length != 2) { Error = L.Get("Stereo groups require two distinct independent receivers."); return; }
+        Draft.SoftwareGroups.Add(new() { Name = L.Get("Software stereo"), LeftId = candidates[0].Id, RightId = candidates[1].Id, SampleRate = Draft.StreamSampleRate });
+    }
+    private void RefreshGroups()
+    {
+        foreach (var row in Groups.Where(r => !Draft.SoftwareGroups.Contains(r.Group)).ToArray()) { row.Dispose(); Groups.Remove(row); }
+        foreach (var group in Draft.SoftwareGroups)
+            if (Groups.All(r => r.Group != group)) Groups.Add(new(group, GroupCandidates, () => { if (CanEdit) { Draft.SoftwareGroups.Remove(group); Draft.Receivers.Remove(group.Id); } }, () => RefreshValidation(), () => CanEdit));
+        AddGroupCommand.Refresh();
+    }
     private void DraftChanged(object? sender, PropertyChangedEventArgs args)
     {
         if (args.PropertyName == nameof(AppSettings.StreamSampleRate)) Equalizer.RefreshHeadroom();
@@ -184,6 +207,8 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     {
         Notify(nameof(IsApplying)); Notify(nameof(CanEdit));
         ApplyCommand.Refresh(); OkCommand.Refresh(); CancelCommand.Refresh(); AddReceiverCommand.Refresh(); RefreshEndpointsCommand.Refresh(); RefreshApplicationsCommand.Refresh();
+        AddGroupCommand.Refresh();
+        foreach (var group in Groups) { group.SwapCommand.Refresh(); group.RemoveCommand.Refresh(); }
         foreach (var row in Receivers) row.Refresh();
     }
     public async Task<bool> ApplyAsync()
@@ -223,8 +248,14 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         Draft.ReceiverAliases = new(App.Settings.ReceiverAliases, StringComparer.Ordinal);
         _baseline.ReceiverAliases = new(App.Settings.ReceiverAliases, StringComparer.Ordinal);
         var manualIds = Draft.ManualReceivers.Select(r => r.Id).ToHashSet();
-        var catalog = App.AllReceivers.Where(r => !r.IsManual || manualIds.Contains(r.Id)).ToDictionary(r => r.Id);
+        var catalog = App.AllReceivers.Where(r => !r.IsSoftwareGroup && (!r.IsManual || manualIds.Contains(r.Id))).ToDictionary(r => r.Id);
         foreach (var manual in Draft.ManualReceivers) catalog[manual.Id] = new(manual.Id, manual.Name, manual.Host, manual.Port) { IsManual = true };
+        var candidates = SoftwareStereo.Candidates(catalog.Values).OrderBy(r => r.Name).ToList();
+        foreach (var id in Draft.SoftwareGroups.SelectMany(g => new[] { g.LeftId, g.RightId }))
+            if (candidates.All(r => r.Id != id)) candidates.Add(Receiver.Offline(id));
+        foreach (var old in GroupCandidates.Where(r => candidates.All(c => c.Id != r.Id)).ToArray()) GroupCandidates.Remove(old);
+        foreach (var candidate in candidates) if (GroupCandidates.All(r => r.Id != candidate.Id)) GroupCandidates.Add(candidate);
+        RefreshGroups();
         if (Draft.DiscoveryInterfaceId.Length == 0)
             foreach (var id in Draft.Receivers.Keys)
                 if (!ReceiverCatalog.IsCoveredMember(id, App.AllReceivers)) catalog.TryAdd(id, Receiver.Offline(id));
@@ -237,7 +268,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
             var row = Receivers.FirstOrDefault(r => r.Receiver.Id == receiver.Id);
             if (row is null)
             {
-                row = new(receiver, options, current => PairRequested?.Invoke(current), () => RemoveManual(receiver.Id), () => CanEdit, () => App.EngineReady && !App.IsClosing);
+                row = new(receiver, options, current => PairRequested?.Invoke(current), () => RemoveManual(receiver.Id), () => CanEdit, () => App.EngineReady && !App.IsClosing, App);
                 Receivers.Insert(index, row);
             }
             else
@@ -376,17 +407,21 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         NetworkChange.NetworkAddressChanged -= NetworkChanged; NetworkChange.NetworkAvailabilityChanged -= NetworkAvailabilityChanged;
         App.SetMonitorVisible(false);
         Draft.PropertyChanged -= DraftChanged; Draft.ManualReceivers.CollectionChanged -= ManualChanged;
+        Draft.SoftwareGroups.CollectionChanged -= GroupsChanged; App.Session.Changed -= VolumeChanged;
+        foreach (var group in Groups) group.Dispose();
         foreach (var options in _subscribed) options.PropertyChanged -= DraftChanged;
         _subscribed.Clear();
     }
 }
 public sealed class ReceiverEditor : ObservableObject
 {
+    private readonly AppViewModel? _app;
     public Receiver Receiver { get; set; }
     public ReceiverOptions Options { get; private set; }
     public void SetOptions(ReceiverOptions options) { if (ReferenceEquals(Options, options)) return; Options = options; Notify(nameof(Options)); }
-    public ReceiverEditor(Receiver receiver, ReceiverOptions options, Action<Receiver> pair, Action remove, Func<bool> canEdit, Func<bool>? canPair = null)
+    public ReceiverEditor(Receiver receiver, ReceiverOptions options, Action<Receiver> pair, Action remove, Func<bool> canEdit, Func<bool>? canPair = null, AppViewModel? app = null)
     {
+        _app = app;
         Receiver = receiver; Options = options;
         PairCommand = new(() => { if (canEdit() && (canPair?.Invoke() ?? true)) pair(Receiver); }, () => canEdit() && (canPair?.Invoke() ?? true) && Receiver.Online && Receiver.Complete);
         RemoveCommand = new(() => { if (canEdit()) remove(); }, canEdit);
@@ -394,7 +429,23 @@ public sealed class ReceiverEditor : ObservableObject
     public string Name => Receiver.Name;
     public string Detail => $"{(Receiver.Address.Length > 0 ? ReceiverIdentity.Endpoint(Receiver.Address, Receiver.Port) : Receiver.Id)} · {(Receiver.Online ? Receiver.Detail : L.Get("Offline"))}";
     public bool IsManual => Receiver.IsManual;
+    public bool CanSetVolume => _app?.ReceiverVolume(Receiver.Id).Available == true;
+    public int Volume { get => _app?.ReceiverVolume(Receiver.Id).Display ?? 0; set { if (CanSetVolume && value != Volume) _ = WriteVolume(value); } }
+    private async Task WriteVolume(int value) { try { await _app!.SetReceiverVolumeAsync(Receiver.Id, value); } catch (Exception error) { _app!.ShowError(error); } }
+    public void RefreshVolume() { Notify(nameof(Volume)); Notify(nameof(CanSetVolume)); }
     public RelayCommand PairCommand { get; }
     public RelayCommand RemoveCommand { get; }
     public void Refresh() { Notify(nameof(Name)); Notify(nameof(Detail)); Notify(nameof(IsManual)); PairCommand.Refresh(); RemoveCommand.Refresh(); }
+}
+public sealed class SoftwareGroupEditor : IDisposable
+{
+    public SoftwareStereoGroup Group { get; }
+    public ObservableCollection<Receiver> Candidates { get; }
+    public RelayCommand SwapCommand { get; }
+    public RelayCommand RemoveCommand { get; }
+    private readonly Action _changed;
+    public SoftwareGroupEditor(SoftwareStereoGroup group, ObservableCollection<Receiver> candidates, Action remove, Action changed, Func<bool> canEdit)
+    { Group = group; Candidates = candidates; _changed = changed; SwapCommand = new(() => { if (canEdit()) group.Swap(); }, canEdit); RemoveCommand = new(remove, canEdit); Group.PropertyChanged += Changed; }
+    private void Changed(object? sender, PropertyChangedEventArgs args) => _changed();
+    public void Dispose() => Group.PropertyChanged -= Changed;
 }

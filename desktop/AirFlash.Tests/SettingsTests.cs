@@ -139,7 +139,7 @@ public sealed class SettingsTests
             Assert.Null(settings.ReadOptions("one").AutoConnect); Assert.True(settings.ReadOptions("two").AutoConnect);
             Assert.Equal("endpoint", settings.CaptureMode); Assert.Equal("Old device", settings.CaptureEndpoint); Assert.Equal(2000, settings.CustomBufferMs);
             Assert.Equal(old, File.ReadAllText(path)); store.Save(settings);
-            Assert.Equal(old, File.ReadAllText(path + ".pre-wpf.bak")); Assert.Equal(2, new SettingsStore(path).Load().SchemaVersion);
+            Assert.Equal(old, File.ReadAllText(path + ".pre-wpf.bak")); Assert.Equal(3, new SettingsStore(path).Load().SchemaVersion);
             Assert.True(settings.Extra!["show_equalizer"].GetBoolean());
         }
         finally { Directory.Delete(directory, true); }

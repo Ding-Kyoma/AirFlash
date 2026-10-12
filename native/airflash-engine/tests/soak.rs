@@ -16,7 +16,7 @@ fn thirty_minute_local_receivers() {
     let received = Arc::new(AtomicU64::new(0));
     let mut endpoints = Vec::new();
     let mut workers = Vec::new();
-    for _ in 0..2 {
+    for member in 0..2 {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         socket
             .set_read_timeout(Some(Duration::from_millis(100)))
@@ -28,7 +28,7 @@ fn thirty_minute_local_receivers() {
             let mut buf = [0u8; 2048];
             while !done.load(Ordering::Acquire) {
                 if let Ok((n, _)) = socket.recv_from(&mut buf) {
-                    assert_eq!(n, PCM_BYTES + 36);
+                    if member == 0 {assert_eq!(n, PCM_BYTES + 36);}else{assert!(n>36 && n<1500);}
                     assert_eq!(buf[0], 0x80);
                     count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -41,8 +41,15 @@ fn thirty_minute_local_receivers() {
         Packetizer::new([1; 32], 65530, u32::MAX - 500, 1),
         Packetizer::new([2; 32], 65530, u32::MAX - 500, 2),
     ];
+    streams[1].enable_alac();
+    #[cfg(windows)]
+    let _priority=airflash_engine::wasapi::Mmcss::new();
+    let mut load=Vec::new();
+    let busy=std::env::var("AIRFLASH_SOAK_LOAD_THREADS").ok().and_then(|s|s.parse::<usize>().ok()).unwrap_or(0).min(4);
+    for _ in 0..busy {let done=stop.clone();load.push(thread::spawn(move || {let mut n=1u64;while !done.load(Ordering::Relaxed) {for _ in 0..50000 {n=n.wrapping_mul(6364136223846793005).wrapping_add(1);std::hint::black_box(n);}thread::yield_now();}}));}
     let start = Instant::now();
-    let duration = Duration::from_secs(1800);
+    let seconds=std::env::var("AIRFLASH_SOAK_SECONDS").ok().and_then(|s|s.parse::<u64>().ok()).filter(|s|(30..=1800).contains(s)).unwrap_or(1800);
+    let duration = Duration::from_secs(seconds);
     let mut packets = 0u64;
     let mut late = 0u128;
     while start.elapsed() < duration {
@@ -68,6 +75,7 @@ fn thirty_minute_local_receivers() {
     for w in workers {
         w.join().unwrap();
     }
+    for w in load {w.join().unwrap();}
     let received = received.load(Ordering::Relaxed);
     eprintln!(
         "SOAK elapsed_s={} sent={} received={} max_late_us={}",

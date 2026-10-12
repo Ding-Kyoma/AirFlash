@@ -39,8 +39,20 @@ fn capabilities_and_capture_validation_preserve_finite_probe_boundary() {
         .collect();
     assert!(engine.wait().unwrap().success());
     assert_eq!(events.len(), 6);
-    assert_eq!(events[0]["capabilities"]["standby_release"], true);
-    assert!(events[0]["capabilities"]["application_capture"].is_boolean());
+    let capabilities = events[0]["capabilities"].as_array().unwrap();
+    for capability in [
+        "standby_release",
+        "software_stereo",
+        "continuity",
+        "buffered_audio",
+        "member_volume",
+    ] {
+        assert!(capabilities.contains(&json!(capability)));
+    }
+    assert_eq!(
+        capabilities.contains(&json!("application_capture")),
+        airflash_engine::applications::supported()
+    );
     for event in &events[1..5] {
         assert_eq!(event["event"], "error");
     }

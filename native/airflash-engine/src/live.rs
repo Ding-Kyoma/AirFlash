@@ -38,6 +38,13 @@ struct Frame {
 }
 #[derive(Default, Clone, Serialize)]
 pub struct Metrics {
+    pub transition_count: u64,
+    pub silence_pad_frames: u64,
+    pub scheduled_silence_frames: u64,
+    pub discontinuities: u64,
+    pub last_discontinuity: Option<String>,
+    pub mmcss_registered: bool,
+    pub mmcss_priority_set: bool,
     pub dropped_frames: u64,
     pub underrun_packets: u64,
     pub capture_frames: u64,
@@ -47,6 +54,8 @@ pub struct Metrics {
     pub input_rate: u32,
 }
 struct State {
+    splice: crate::continuity::Splice,
+    boundary_pending: bool,
     equalizer: crate::equalizer::Processor,
     frames: VecDeque<Frame>,
     capacity: usize,
@@ -64,6 +73,8 @@ impl State {
         if self.frames.len() >= self.capacity {
             self.frames.pop_front();
             self.metrics.dropped_frames += 1;
+            self.boundary_pending = true;
+            self.metrics.last_discontinuity = Some("queue_overflow".into());
         }
         self.frames.push_back(frame);
     }
@@ -102,6 +113,8 @@ impl Loopback {
         let capacity = rate as usize * 60 / 1000;
         let queue_target = rate as usize * 20 / 1000;
         let state = Arc::new(Mutex::new(State {
+            splice: crate::continuity::Splice::new(rate),
+            boundary_pending: false,
             equalizer: crate::equalizer::Processor::new(equalizer.initial(), rate),
             frames: VecDeque::with_capacity(capacity),
             capacity,
@@ -152,6 +165,12 @@ impl Loopback {
         Ok(s.frames.len() >= s.target)
     }
     pub fn packet(&self, gain: f32) -> Result<(Vec<u8>, Option<u64>)> {
+        self.packet_inner(gain, false)
+    }
+    pub fn silence_packet(&self, gain: f32) -> Result<(Vec<u8>, Option<u64>)> {
+        self.packet_inner(gain, true)
+    }
+    fn packet_inner(&self, gain: f32, force_silence: bool) -> Result<(Vec<u8>, Option<u64>)> {
         let mut s = self.state.lock().unwrap();
         if let Some((sequence, prepared)) = self.equalizer_control.latest() {
             s.equalizer.update(sequence, prepared);
@@ -163,11 +182,24 @@ impl Loopback {
         let mut marker = None;
         let now = qpc_ns();
         let mut underrun = false;
+        if s.boundary_pending {
+            s.splice.boundary();
+            s.boundary_pending = false;
+        }
         for _ in 0..FRAMES {
-            let frame = if let Some(f) = s.frames.pop_front() {
+            let missing = force_silence || s.frames.is_empty();
+            let frame = if let Some(f) = if force_silence {
+                None
+            } else {
+                s.frames.pop_front()
+            } {
                 f
             } else {
-                underrun = true;
+                underrun |= !force_silence;
+                if force_silence {
+                    s.metrics.scheduled_silence_frames += 1;
+                }
+                s.metrics.silence_pad_frames += 1;
                 Frame {
                     left: 0.0,
                     right: 0.0,
@@ -183,14 +215,15 @@ impl Loopback {
                 s.ages.pop_front();
             }
             s.ages.push_back(age);
-            for sample in s.equalizer.frame([frame.left, frame.right]) {
-                let value = (sample * gain).clamp(-1.0, 1.0);
+            let processed = s.equalizer.frame([frame.left, frame.right]);
+            for value in s.splice.frame(processed, gain, missing) {
                 out.extend(((value * 32767.0).round() as i16).to_be_bytes());
             }
         }
         if underrun {
             s.metrics.underrun_packets += 1;
         }
+        s.metrics.transition_count = s.splice.transitions;
         Ok((out, marker))
     }
     /// Restore the capture queue to its normal target after a scheduler stall.
@@ -202,6 +235,8 @@ impl Loopback {
             s.frames.pop_front();
             s.metrics.dropped_frames += 1;
         }
+        s.boundary_pending = true;
+        s.metrics.last_discontinuity = Some("scheduler_recovery".into());
     }
     pub fn metrics(&self) -> Metrics {
         let s = self.state.lock().unwrap();
@@ -311,6 +346,11 @@ fn capture(
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }?;
     let _com = ComGuard;
     let _priority = Mmcss::new();
+    {
+        let mut s = state.lock().unwrap();
+        s.metrics.mmcss_registered = _priority.registered();
+        s.metrics.mmcss_priority_set = _priority.priority_set();
+    }
     let mut explicit = WAVEFORMATEX {
         wFormatTag: 1,
         nChannels: 2,
@@ -450,6 +490,12 @@ fn capture(
                 inputs[1].clear();
                 input_times.clear();
                 resampler.reset();
+                let mut shared = state.lock().unwrap();
+                shared.metrics.dropped_frames += shared.frames.len() as u64;
+                shared.frames.clear();
+                shared.boundary_pending = true;
+                shared.metrics.discontinuities += 1;
+                shared.metrics.last_discontinuity = Some("wasapi_discontinuity".into());
             }
             let bytes = if data.is_null() {
                 &[][..]
@@ -600,6 +646,8 @@ pub(crate) mod tests {
                 .unwrap();
         Loopback {
             state: Arc::new(Mutex::new(State {
+                splice: crate::continuity::Splice::new(crate::rtp::RATE),
+                boundary_pending: false,
                 equalizer: crate::equalizer::Processor::new(
                     equalizer_control.initial(),
                     crate::rtp::RATE,
