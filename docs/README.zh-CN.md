@@ -28,6 +28,10 @@ AirFlash 提供 Windows x64 可执行文件和可独立运行的 MSI 安装包�
 可能显示 SmartScreen 警告。只有在确认下载文件来源可信时，才使用“更多信息”
 和“仍要运行”。
 
+音频采集建议在 **设置 > 音频采集** 中使用 **指定音频端点**。如果没有空闲可用的音频端点，
+可以下载安装 [Virtual Audio Cable（VAC Lite）](https://software.muzychenko.net/freeware/vac471lite.zip)
+等工具创建虚拟端点，并将需要投放的音频路由到该端点。
+
 ## 主要功能
 
 - 通过 AirPlay 2 将 Windows 系统声音发送到 HomePod。
@@ -36,10 +40,12 @@ AirFlash 提供 Windows x64 可执行文件和可独立运行的 MSI 安装包�
 - 支持网卡过滤，可在设置中选择用于发现设备的网卡。
 - 提供延迟模式、托盘运行、静音恢复、自动重连和连接诊断。
 - 在设置中提供 10 段均衡器，支持音效预设和即时试听。
-- 提供便携式 Windows x64 程序、英文和简体中文界面。
+- 支持采集播放或录音端点，包括虚拟音频设备。
+- 提供便携式 Windows x64 程序，支持英文、简体中文和繁体中文界面。
 
 ## 功能计划
 
+- [ ] 支持选择软件作为音频来源（[#18](https://github.com/Ding-Kyoma/AirFlash/issues/18)）。
 - [ ] 支持杜比 Atmos。
 
 ## 使用方法
@@ -65,6 +71,11 @@ AirFlash 使用全新的应用数据目录 `%APPDATA%/AirFlash` 和
 版本预留与发布方法见 [发布流程](RELEASING.md)。
 
 矢量源图、资源生成与高 DPI 验收步骤见 [图标维护](ICONS.md)。
+
+在 **设置 > 音频采集** 中，**指定音频端点**列出活动的播放与录音设备，并标注类型。
+使用 Voicemeeter 时，选择对应 B1/B2/B3 总线的录音端点（例如 Voicemeeter Output），
+再在 Voicemeeter 中为所需音频启用对应总线。播放设备使用回环采集，录音设备直接采集输入；
+自动本地静音仅适用于播放设备，不会静音录音输入。
 
 ## 技术栈
 

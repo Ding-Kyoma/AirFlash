@@ -1,0 +1,105 @@
+name: Bug report
+description: Report a problem with AirFlash and provide the details needed to investigate it.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem with AirFlash. Please search existing issues before submitting a new report.
+        Include enough detail for someone else to reproduce the problem. You can attach logs, screenshots, or recordings by dragging them into a text area below.
+
+  - type: checkboxes
+    id: existing-issues
+    attributes:
+      label: Search existing issues
+      description: Please search both open and closed issues. If you find a similar issue, add a comment to that issue instead of creating a new one.
+      options:
+        - label: I have searched existing issues and found no similar issue reporting this problem.
+          required: true
+
+  - type: textarea
+    id: bug-description
+    attributes:
+      label: Describe the bug
+      description: Describe what went wrong and when it happens. Include the exact error message, if any.
+      placeholder: A clear and concise description of the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction-steps
+    attributes:
+      label: Steps to reproduce
+      description: List the exact steps starting from launching AirFlash. Include any settings or conditions needed to reproduce the problem reliably.
+      placeholder: |
+        1. Launch AirFlash.
+        2. Select ...
+        3. Click ...
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: reproduction-frequency
+    attributes:
+      label: Reproduction frequency
+      description: How consistently do the steps above reproduce the problem?
+      options:
+        - Every time
+        - Intermittently
+        - Only once / not yet reproducible
+    validations:
+      required: true
+
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      description: Press Win + R, enter winver, and copy the Windows edition, version, and full OS build number.
+      placeholder: "Windows 11 Pro, version 24H2, OS Build 26100.x"
+    validations:
+      required: true
+
+  - type: input
+    id: airflash-version
+    attributes:
+      label: AirFlash version
+      description: Copy the version shown in Settings > About, including Preview if shown. If AirFlash cannot start, use AirFlash.exe > Properties > Details > Product version. For a source build, also include the commit SHA.
+      placeholder: "AirFlash X.Y.Z (include Preview or the commit SHA if applicable)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: installation-method
+    attributes:
+      label: Installation method
+      options:
+        - MSI installer
+        - Standalone AirFlash.exe
+        - Built from source
+        - Other / unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        Reproduce the problem, then open Settings > About > Open log folder, or press Win + R and enter %APPDATA%\AirFlash\logs.
+        Drag the relevant .log files into this field, or compress them into a .zip and upload it here. Include the approximate time the problem occurred, with your time zone, so we can find the relevant entries.
+        Review logs before uploading and redact personal information or secrets. Do not upload configuration files or pairing data.
+      placeholder: |
+        Time of the problem (including time zone):
+        Optional: attach logs here or paste a relevant excerpt.
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add any other details that might help, such as whether this worked in an earlier version or any workarounds you found.
+    validations:
+      required: false
