@@ -24,6 +24,16 @@ internal static class UiSmoke
         var directory = Path.GetDirectoryName(report)!; Directory.CreateDirectory(directory);
         AppPaths.DataDirectory = Path.Combine(directory, "isolated-data");
         var checks = new List<string>();
+        if (args.Contains("--ui-scroll-smoke"))
+        {
+            try
+            {
+                await UiScrolling.RunAsync(checks, directory, args.Contains("--ui-scroll-hold"));
+                App.WriteOutput(args, new { ok = true, checks, note = "Settings scrolling with simulated services only." });
+                return 0;
+            }
+            catch (Exception error) { App.WriteOutput(args, new { ok = false, checks, error = error.ToString() }); return 1; }
+        }
         object? iconEnvironment = null;
         var store = new MemoryStore(); var engine = new MockFactory();
         await using var app = new AppViewModel(store, new MockDiscovery(), new MockAutostart(), new MockAudio(), engine, Application.Current.Dispatcher) { EngineVersion = "0.1.0（模拟）" };
@@ -69,10 +79,30 @@ internal static class UiSmoke
             }
             var mode = Descendants(panel).OfType<ComboBox>().Single(); mode.IsDropDownOpen = true; await Pump();
             Check(panel.IsVisible, "dropdown does not dismiss panel", checks); mode.IsDropDownOpen = false; await Pump();
+            CheckPanelIcons(panel, app, checks);
+            Render(panel, Path.Combine(directory, "panel-icons-idle.png"), 1);
+            var settingsButton = Descendants(panel).OfType<Button>().Single(b => System.Windows.Automation.AutomationProperties.GetName(b) == L.Get("Settings"));
+            Check(settingsButton.Focus() && settingsButton.IsKeyboardFocused, "vector settings button remains keyboard focusable", checks);
+            var settingsRequested = false;
+            void OnSettings() => settingsRequested = true;
+            panel.SettingsRequested += OnSettings;
+            Invoke(settingsButton); await Pump();
+            panel.SettingsRequested -= OnSettings;
+            Check(settingsRequested && (string?)settingsButton.ToolTip == L.Get("Settings"), "vector settings button preserves its action and localized label", checks);
             Check(app.Receivers.All(r => r.VolumeText == "—" && !r.CanSetVolume), "disconnected device volume is unknown and disabled", checks);
-            app.Receivers[0].ToggleCommand.Execute(null);
+            var playbackButton = Descendants(panel).OfType<Button>().Single(b => ReferenceEquals(b.Command, app.Receivers[0].ToggleCommand));
+            Check(playbackButton.Focus() && playbackButton.IsKeyboardFocused, "vector playback button remains keyboard focusable", checks);
+            Invoke(playbackButton);
             await Until(() => app.Snapshot.State == PlaybackState.Streaming);
+            CheckPanelIcons(panel, app, checks);
             Check(engine.Commands.Any(c => c.Text("command") == "start"), "panel start reaches engine", checks);
+            Invoke(playbackButton);
+            await Until(() => app.Snapshot.State == PlaybackState.Idle);
+            CheckPanelIcons(panel, app, checks);
+            Invoke(playbackButton);
+            await Until(() => app.Snapshot.State == PlaybackState.Streaming);
+            CheckPanelIcons(panel, app, checks);
+            checks.Add("vector playback button completes play/stop/play with localized accessible labels");
             await Until(() => app.Receivers[0].Volume == 28 && app.Receivers[0].CanSetVolume);
             Check(!engine.Commands.Any(c => c.Text("command") == "set_device_volume"), "initial volume comes from receiver without a write", checks);
             var volumeRow = app.Receivers[0];
@@ -111,17 +141,21 @@ internal static class UiSmoke
             Check(tray.IsRegisteredForVerification, "repeated Explorer notification retains one registered tray icon", checks);
             Check(!settings.ApplyButton.IsEnabled, "apply initially disabled", checks);
             settings.ViewModel.SelectedPage = SettingsViewModel.AudioCapturePage; await Pump();
-            var radio = Descendants(settings).OfType<RadioButton>().Single(r => (string?)r.Content == L.Get("Specific output endpoint"));
+            var radio = Descendants(settings).OfType<RadioButton>().Single(r => (string?)r.Content == L.Get("Specific audio endpoint"));
             var radioPeer = UIElementAutomationPeer.CreatePeerForElement(radio)!;
             ((ISelectionItemProvider)radioPeer.GetPattern(PatternInterface.SelectionItem)!).Select();
             await Pump();
             var endpoints = Descendants(settings).OfType<ComboBox>().Single(c => c.Name == "EndpointCombo");
             Check(endpoints.IsEnabled, "capture mode enables endpoint", checks);
-            endpoints.SelectedIndex = 1; await Pump();
+            var inputEndpoint = ((IEnumerable<AudioEndpoint>)endpoints.ItemsSource).Single(e => e.Kind == AudioEndpointKind.Recording);
+            Check(inputEndpoint.DisplayName.Contains(L.Get("Recording"), StringComparison.Ordinal), "recording endpoint is labeled", checks);
+            endpoints.SelectedValue = inputEndpoint.Id; await Pump();
             var startsBefore = engine.Commands.Count(c => c.Text("command") == "start");
             Invoke(settings.ApplyButton); await Until(() => app.Settings.CaptureMode == "endpoint" && !settings.ViewModel.HasChanges);
             await Until(() => engine.Commands.Count(c => c.Text("command") == "start") > startsBefore);
             Check(engine.Commands.Count(c => c.Text("command") == "start") == startsBefore + 1, "settings restart once", checks);
+            Check(app.Settings.CaptureEndpoint == inputEndpoint.Id && store.Saved.CaptureEndpoint == inputEndpoint.Id, "recording endpoint persists by ID", checks);
+            Check(engine.Commands.Last(c => c.Text("command") == "start").GetProperty("params").GetProperty("capture_endpoint").GetString() == inputEndpoint.Id, "recording endpoint reaches native command", checks);
             settings.ViewModel.Draft.StartAtLogin = true; store.Fail = true;
             Invoke(settings.ApplyButton); await Until(() => settings.ViewModel.Error.Contains("模拟保存失败", StringComparison.Ordinal));
             Check(settings.IsVisible && settings.ViewModel.HasChanges && !app.Settings.StartAtLogin, "failed save preserves draft", checks);
@@ -163,6 +197,7 @@ internal static class UiSmoke
                     }
                 }
                 settings.Hide(); panel.ShowPanel(); await Pump();
+                CheckPanelIcons(panel, app, checks);
                 foreach (var scale in new[] { 1d, 1.25, 1.5, 1.75, 2d }) Render(panel, Path.Combine(directory, $"panel-{(dark ? "dark" : "light")}-{scale * 100}.png"), scale);
                 var quit = Descendants(panel).OfType<Button>().Single(b => System.Windows.Automation.AutomationProperties.GetName(b) == L.Get("Quit"));
                 var quitRequested = false;
@@ -176,15 +211,72 @@ internal static class UiSmoke
             Check(app.MonitorMembers.Count == 1 && app.MonitorRecoveries == "2", "transport metrics reach monitoring view", checks);
             checks.Add("eight pages rendered in light/dark; panel at 100/125/150/175/200 percent");
             await app.StopAsync(); await Until(() => app.Snapshot.State == PlaybackState.Idle);
+            settings.Hide(); panel.ShowPanel(); await Pump();
+            CheckPanelIcons(panel, app, checks);
+            Render(panel, Path.Combine(directory, "panel-icons-stopped.png"), 1);
             Check(engine.DisposedCount == engine.CreatedCount, "stop releases mock engine", checks);
             await UiRegression.RunAsync(checks, directory);
             await UiEqualizer.RunAsync(checks, directory);
+            await VerifyStartupFailureAsync(checks, directory);
+            await UiScrolling.RunAsync(checks, directory);
             await VerifyTrayLifecycleAsync(tray, app, trayGuid, () => menuOpened, () => quitRequestedFromTray, checks);
             App.WriteOutput(args, new { ok = true, checks, icon_environment = iconEnvironment, note = "All engine/audio/discovery/autostart services are simulated. DPI renders do not replace physical multimonitor QA." });
             return 0;
         }
         catch (Exception error) { App.WriteOutput(args, new { ok = false, checks, error = error.ToString() }); return 1; }
         finally { settings?.Close(); panel.ShutdownPanel(); }
+    }
+    private static async Task VerifyStartupFailureAsync(List<string> checks, string directory)
+    {
+        var attempts = 0;
+        await using var engine = new EngineInitialization(_ => ++attempts == 1
+            ? Task.FromException<string>(new UnauthorizedAccessException("simulated cache access denied"))
+            : Task.FromResult("0.1.0"));
+        var factory = new MockFactory();
+        await using var app = new AppViewModel(new MemoryStore(), new MockDiscovery(), new MockAutostart(), new MockAudio(), factory, Application.Current.Dispatcher, engine);
+        var panel = new ControlPanel(app);
+        try
+        {
+            panel.ShowPanel(); app.Start(); await app.Startup; await Pump();
+            var receiver = app.Receivers.First(r => r.Receiver.Online && r.Receiver.Complete);
+            Check(panel.IsVisible && !receiver.CanPlay, "shell is visible before engine initialization", checks);
+            await app.ToggleAsync(receiver.Receiver);
+            Check(factory.CreatedCount == 0, "initializing engine rejects playback without spawning a process", checks);
+            await engine.InitializeAsync(); await Pump();
+            using var settings = new SettingsViewModel(app);
+            var row = settings.Receivers.First(r => r.Receiver.Online && r.Receiver.Complete);
+            Check(app.EngineFailed && !receiver.ToggleCommand.CanExecute(null) && !row.PairCommand.CanExecute(null), "failed engine disables playback and pairing", checks);
+            Check(app.RetryEngineCommand.CanExecute(null) && settings.CancelCommand.CanExecute(null), "failed engine preserves retry and settings", checks);
+            using var missingDns = new WindowsDiscovery(dnsAvailable: () => false);
+            string? failure = null; missingDns.Failed += value => failure = value; missingDns.Start();
+            Check(failure is not null, "missing DNS-SD produces a recoverable diagnostic", checks);
+            app.ShowError(new IOException("simulated discovery failure")); await Pump();
+            Render(panel, Path.Combine(directory, "startup-failure.png"), 1);
+            var messages = Descendants(panel).OfType<TextBlock>().Where(t => t.Text == app.Notice || t.Text == app.EngineMessage).ToArray();
+            Check(messages.Length == 2 && messages[0].TranslatePoint(new(0, messages[0].ActualHeight), panel).Y <= messages[1].TranslatePoint(new(0, 0), panel).Y,
+                "engine and discovery error banners remain readable without overlap", checks);
+            var calls = 0; var dwmErrors = new List<string>();
+            foreach (var build in new[] { 17763, 19044, 19045 })
+                WindowThemeService.ApplyAttributes(new(new(10, 0, build), Architecture.X64, Architecture.X64, true), ThemeService.CurrentPalette,
+                    (_, _) => { calls++; return 0; }, dwmErrors.Add);
+            Check(calls == 0, "Windows 10 skips Windows 11 DWM attributes", checks);
+            WindowThemeService.ApplyAttributes(new(new(10, 0, 22000), Architecture.X64, Architecture.X64, true), ThemeService.CurrentPalette,
+                (_, _) => { calls++; return unchecked((int)0x80070057); }, dwmErrors.Add);
+            Check(calls == 3 && dwmErrors.Count == 3 && panel.IsVisible, "failed optional DWM attributes are logged without closing the shell", checks);
+            await engine.InitializeAsync(); await Pump();
+            Check(app.EngineReady && receiver.ToggleCommand.CanExecute(null) && row.PairCommand.CanExecute(null), "successful retry restores playback and pairing", checks);
+        }
+        finally { panel.ShutdownPanel(); }
+        var store = new MemoryStore(); var preferences = store.Load(); preferences.StartAtLogin = true; store.Save(preferences);
+        var startup = new MockAutostart();
+        await using var audioFailure = new AppViewModel(store, new MockDiscovery(), startup, new MockAudio { FailDefault = true }, new MockFactory(), Application.Current.Dispatcher);
+        audioFailure.SetPanelVisible(true); audioFailure.Start(); await audioFailure.Startup; await Pump();
+        Check(startup.Enabled && audioFailure.Receivers.Count > 0 && audioFailure.Notice.Contains("mock audio failed", StringComparison.Ordinal),
+            "audio initialization failure preserves autostart and discovery initialization", checks);
+        await using var startupFailure = new AppViewModel(store, new MockDiscovery(), new MockAutostart { FailEnable = true }, new MockAudio(), new MockFactory(), Application.Current.Dispatcher);
+        startupFailure.SetPanelVisible(true); startupFailure.Start(); await startupFailure.Startup; await Pump();
+        Check(startupFailure.Receivers.Count > 0 && startupFailure.Notice.Contains("mock startup failed", StringComparison.Ordinal),
+            "autostart initialization failure preserves discovery and the shell model", checks);
     }
     private static async Task VerifyTrayLifecycleAsync(TrayService tray, AppViewModel app, Guid guid, Func<bool> settingsRequested, Func<bool> quitRequested, List<string> checks, bool windowIdentityForVerification = false)
     {
@@ -234,6 +326,50 @@ internal static class UiSmoke
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern uint RegisterWindowMessage(string message);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr handle, out NativeWindowPlacement.Rectangle rectangle);
     private static void Check(bool value, string message, List<string> checks) { if (!value) throw new InvalidOperationException(message); checks.Add(message); }
+    private static void CheckPanelIcons(ControlPanel panel, AppViewModel app, List<string> checks)
+    {
+        var icons = Descendants(panel).OfType<System.Windows.Shapes.Path>()
+            .Where(p => p.Name is "SettingsIcon" or "ReceiverIcon" or "PlaybackIcon").ToArray();
+        Check(icons.Count(p => p.Name == "SettingsIcon") == 1
+            && icons.Count(p => p.Name == "ReceiverIcon") == app.Receivers.Count
+            && icons.Count(p => p.Name == "PlaybackIcon") == app.Receivers.Count,
+            "each receiver simultaneously displays its own speaker and playback vectors", checks);
+        foreach (var icon in icons)
+        {
+            var row = icon.DataContext as ReceiverViewModel;
+            var key = icon.Name switch
+            {
+                "SettingsIcon" => "SettingsIconGeometry",
+                "ReceiverIcon" => "ReceiverIconGeometry",
+                _ => row?.Active == true ? "StopIconGeometry" : "PlayIconGeometry"
+            };
+            Check(ReferenceEquals(icon.Data, panel.FindResource(key)) && !icon.Data.IsEmpty(),
+                $"{icon.Name} uses its expected built-in {key}", checks);
+            var pen = icon.Stroke is null ? null : new Pen(icon.Stroke, icon.StrokeThickness)
+            {
+                StartLineCap = icon.StrokeStartLineCap, EndLineCap = icon.StrokeEndLineCap, LineJoin = icon.StrokeLineJoin
+            };
+            var bounds = icon.RenderedGeometry.GetRenderBounds(pen);
+            Check(icon.IsVisible && icon.ActualWidth > 0 && icon.ActualHeight > 0 && !bounds.IsEmpty
+                && new Rect(0, 0, icon.ActualWidth, icon.ActualHeight).Contains(bounds),
+                $"{icon.Name} is visible and fits inside its design canvas", checks);
+            var bitmap = new RenderTargetBitmap(24, 24, 96, 96, PixelFormats.Pbgra32);
+            bitmap.Render(icon);
+            var pixels = new byte[24 * 24 * 4]; bitmap.CopyPixels(pixels, 24 * 4, 0);
+            Check(Enumerable.Range(0, 24 * 24).Any(i => pixels[i * 4 + 3] != 0),
+                $"{icon.Name} renders nontransparent pixels without glyph lookup", checks);
+            var brush = (icon.Stroke ?? icon.Fill) as SolidColorBrush;
+            var expected = ResourceColor(icon.Name == "SettingsIcon" ? "TextBrush" : "AccentBrush");
+            Check(brush?.Color == expected, $"{icon.Name} follows the current theme color", checks);
+            if (icon.Name == "PlaybackIcon")
+            {
+                var button = Descendants(panel).OfType<Button>().Single(b => ReferenceEquals(b.Command, row!.ToggleCommand));
+                Check(System.Windows.Automation.AutomationProperties.GetName(button) == row!.PlayHint
+                    && (string?)button.ToolTip == row.PlayHint,
+                    "playback vector retains the accessible name and tooltip for its current state", checks);
+            }
+        }
+    }
     private static void CheckThemeColors(bool dark, List<string> checks)
     {
         var expected = dark ? Color.FromRgb(0x78, 0xA9, 0xFF) : Color.FromRgb(0x25, 0x63, 0xEB);
@@ -310,10 +446,11 @@ internal static class UiSmoke
         public int ActiveEnumerations, MaxEnumerations;
         public TaskCompletionSource? EnumerationGate { get; set; }
         public TaskCompletionSource? EnumerationEntered { get; set; }
-        public IReadOnlyList<AudioEndpoint> Items = [new("endpoint-a", "扬声器 · Realtek Audio"), new("endpoint-b", "虚拟声卡 · VB-CABLE")];
+        public IReadOnlyList<AudioEndpoint> Items = [new("endpoint-a", "扬声器 · Realtek Audio"), new("endpoint-b", "虚拟声卡 · VB-CABLE"), new("endpoint-c", "Voicemeeter Output", AudioEndpointKind.Recording)];
         public void NotifyEndpoints() => EndpointsChanged?.Invoke();
         public string? DefaultEndpoint { get; set; } = "endpoint-a";
-        public Task<string?> GetDefaultEndpointIdAsync() => Task.FromResult(DefaultEndpoint);
+        public bool FailDefault { get; set; }
+        public Task<string?> GetDefaultEndpointIdAsync() => FailDefault ? Task.FromException<string?>(new IOException("mock audio failed")) : Task.FromResult(DefaultEndpoint);
         public async Task<IReadOnlyList<AudioEndpoint>> GetEndpointsAsync()
         {
             UiPerformance.Count("audio.enumerate"); Enumerations++;
@@ -328,9 +465,14 @@ internal static class UiSmoke
     }
     internal sealed class MockDiscovery : IDiscoveryService
     {
+        public event Action<bool>? RunningChanged;
+        public bool Running { get; private set; }
+        public int Starts { get; private set; }
+        public int Stops { get; private set; }
         public event Action<IReadOnlyList<Receiver>>? Changed;
         public event Action<string>? Failed { add { } remove { } }
-        public void Start() => Publish();
+        public void Start() { if (Running) return; Running = true; Starts++; RunningChanged?.Invoke(true); Publish(); }
+        public void Stop() { if (!Running) return; Running = false; Stops++; RunningChanged?.Invoke(false); }
         public string SelectedInterface { get; private set; } = "";
         public void SetInterface(string id) { SelectedInterface = id; Changed?.Invoke(id.Length == 0 ? Items : []); }
         public IReadOnlyList<Receiver> Items { get; set; } = [
@@ -339,7 +481,7 @@ internal static class UiSmoke
             new("c", "卧室 HomePod mini", "127.0.0.4") { Online = false, Model = "HomePod mini" }
         ];
         public void Publish() => Changed?.Invoke(Items);
-        public void Dispose() { }
+        public void Dispose() => Stop();
     }
     internal sealed class MockFactory : IEngineFactory
     {

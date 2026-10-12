@@ -99,7 +99,7 @@
         <Border Style="{StaticResource Card}">
           <StackPanel>
             <TextBlock Text="{loc:Text 'Frequency bands'}" Style="{StaticResource SectionTitle}"/>
-            <ScrollViewer x:Name="EqualizerBandScroll" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+            <ScrollViewer x:Name="EqualizerBandScroll" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled" Padding="0,0,0,24" PreviewMouseWheel="OnEqualizerMouseWheel">
               <ItemsControl ItemsSource="{Binding Equalizer.Bands}" IsEnabled="{Binding Equalizer.Enabled}">
                 <ItemsControl.ItemsPanel><ItemsPanelTemplate><StackPanel Orientation="Horizontal"/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
                 <ItemsControl.ItemTemplate>
@@ -136,30 +136,31 @@
             <TextBlock Text="{loc:Text 'Audio source'}" Style="{StaticResource SectionTitle}"/>
             <RadioButton Content="{loc:Text 'Default system output'}" GroupName="CaptureMode" IsChecked="{Binding Draft.CaptureMode, Converter={StaticResource Equal}, ConverterParameter=loopback}"/>
             <TextBlock Text="{loc:Text 'Capture audio from the default playback device and follow changes to the Windows default output.'}" Style="{StaticResource Hint}" Margin="26,0,0,22"/>
-            <RadioButton Content="{loc:Text 'Specific output endpoint'}" GroupName="CaptureMode" IsChecked="{Binding Draft.CaptureMode, Converter={StaticResource Equal}, ConverterParameter=endpoint}"/>
+            <RadioButton Content="{loc:Text 'Specific audio endpoint'}" GroupName="CaptureMode" IsChecked="{Binding Draft.CaptureMode, Converter={StaticResource Equal}, ConverterParameter=endpoint}"/>
             <Grid Margin="26,0,0,12" IsEnabled="{Binding Draft.CaptureMode, Converter={StaticResource Equal}, ConverterParameter=endpoint}">
               <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
-              <ComboBox x:Name="EndpointCombo" ItemsSource="{Binding Endpoints}" DisplayMemberPath="Name" SelectedValuePath="Id" SelectedValue="{Binding Draft.CaptureEndpoint, Mode=TwoWay}" AutomationProperties.Name="{loc:Text 'Capture endpoint'}"/>
+              <ComboBox x:Name="EndpointCombo" ItemsSource="{Binding Endpoints}" DisplayMemberPath="DisplayName" SelectedValuePath="Id" SelectedValue="{Binding Draft.CaptureEndpoint, Mode=TwoWay}" AutomationProperties.Name="{loc:Text 'Capture endpoint'}"/>
               <Button Grid.Column="1" Content="{loc:Text 'Refresh'}" Margin="8,0,0,0" Command="{Binding RefreshEndpointsCommand}"/>
             </Grid>
             <ProgressBar IsIndeterminate="True" Height="3" Margin="26,0,0,12" Visibility="{Binding IsEndpointLoading, Converter={StaticResource BoolVisibility}}"/>
-            <TextBlock Text="{loc:Text 'Virtual audio devices can also be selected. Route the desired apps to that endpoint in Windows first. This app does not change the default system output.'}" Style="{StaticResource Hint}" Margin="26,0,0,0"/>
+            <TextBlock Text="{loc:Text 'Choose a playback or recording device endpoint.'}" Style="{StaticResource Hint}" Margin="26,0,0,0"/>
           </StackPanel>
         </Border>
         <Border Style="{StaticResource Card}">
           <StackPanel>
             <TextBlock Text="{loc:Text 'Local speakers'}" Style="{StaticResource SectionTitle}"/>
-            <CheckBox Content="{loc:Text 'Mute local output on the capture endpoint while streaming'}" IsChecked="{Binding Draft.MuteWhileStreaming}"/>
-            <TextBlock Text="{loc:Text 'Restore the previous mute state when playback stops or the connection fails. Some protected content cannot be captured through loopback.'}" Style="{StaticResource Hint}"/>
+            <CheckBox Content="{loc:Text 'Mute local output while streaming (playback devices only)'}" IsChecked="{Binding Draft.MuteWhileStreaming}"/>
+            <TextBlock Text="{loc:Text 'Recording devices are never muted. Restore the previous playback-device mute state when playback stops or the connection fails. Some protected content cannot be captured through loopback.'}" Style="{StaticResource Hint}"/>
           </StackPanel>
         </Border>
       </StackPanel>
     </DataTemplate>
     <DataTemplate x:Key="Page4">
       <StackPanel>
+        <TextBlock Text="{Binding App.DiscoveryStatus}" Style="{StaticResource Hint}" Margin="0,0,0,12"/>
         <Button Content="{loc:Text '＋ Add receiver manually'}" HorizontalAlignment="Left" Command="{Binding AddReceiverCommand}" Margin="0,0,0,16"/>
         <ItemsControl ItemsSource="{Binding Receivers}">
           <ItemsControl.ItemTemplate>
@@ -330,7 +331,7 @@
         <WrapPanel>
           <Button Content="{loc:Text 'Third-party licenses'}" Command="{Binding LicensesCommand}" Margin="0,0,10,10"/>
           <Button Content="{loc:Text 'Open log folder'}" Command="{Binding OpenLogsCommand}" Margin="0,0,10,10"/>
-          <Button x:Name="CoffeeButton" Content="请作者喝一杯咖啡~" Click="OnCoffeeClick" Visibility="{Binding Source={x:Static core:L.IsChinese}, Converter={StaticResource BoolVisibility}}" Margin="0,0,10,10"/>
+          <Button x:Name="CoffeeButton" Content="{loc:Text 'Buy the author a cup of milk tea~'}" Click="OnCoffeeClick" Visibility="{Binding Source={x:Static core:L.IsChinese}, Converter={StaticResource BoolVisibility}}" Margin="0,0,10,10"/>
         </WrapPanel>
       </StackPanel>
     </DataTemplate>
@@ -386,7 +387,7 @@
         <TextBlock Text="{Binding PageTitle}" FontSize="24" FontWeight="SemiBold"/>
         <TextBlock Text="{Binding PageDescription}" Style="{StaticResource Hint}" Margin="0,5,0,0"/>
       </StackPanel>
-      <ScrollViewer x:Name="PageScroll" Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="0,0,6,10">
+      <ScrollViewer x:Name="PageScroll" Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="0,0,24,10">
         <Grid x:Name="PageContainer"/>
       </ScrollViewer>
     </Grid>

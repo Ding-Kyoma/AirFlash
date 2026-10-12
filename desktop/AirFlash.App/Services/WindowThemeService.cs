@@ -28,23 +28,29 @@ internal static class WindowThemeService
 
     public static void Apply(Window window, ThemePalette palette)
     {
+        if (!WindowsCapabilities.Current.WindowColors) return;
         var handle = new WindowInteropHelper(window).Handle;
         if (handle == IntPtr.Zero) return;
 
         try
         {
-            var dark = palette.IsDark ? 1 : 0;
-            var caption = ToColorRef(palette.Caption);
-            var text = ToColorRef(palette.CaptionText);
-            SetAttribute(handle, DwmwaUseImmersiveDarkMode, ref dark);
-            SetAttribute(handle, DwmwaCaptionColor, ref caption);
-            SetAttribute(handle, DwmwaTextColor, ref text);
+            ApplyAttributes(WindowsCapabilities.Current, palette, (attribute, value) =>
+                DwmSetWindowAttribute(handle, attribute, ref value, sizeof(int)), AppPaths.Log);
         }
-        catch (DllNotFoundException) { }
-        catch (EntryPointNotFoundException) { }
+        catch (DllNotFoundException error) { AppPaths.Log($"Optional DWM unavailable: {error.Message}"); }
+        catch (EntryPointNotFoundException error) { AppPaths.Log($"Optional DWM unavailable: {error.Message}"); }
     }
 
-    private static void SetAttribute(IntPtr handle, int attribute, ref int value) => _ = DwmSetWindowAttribute(handle, attribute, ref value, sizeof(int));
+    internal static void ApplyAttributes(WindowsCapabilities capabilities, ThemePalette palette, Func<int, int, int> set, Action<string> log)
+    {
+        if (!capabilities.WindowColors) return;
+        foreach (var (attribute, value) in new[] { (DwmwaUseImmersiveDarkMode, palette.IsDark ? 1 : 0),
+            (DwmwaCaptionColor, ToColorRef(palette.Caption)), (DwmwaTextColor, ToColorRef(palette.CaptionText)) })
+        {
+            var result = set(attribute, value);
+            if (result < 0) log($"Optional DWM attribute={attribute} failed hresult=0x{result:X8}");
+        }
+    }
 
     private static int ToColorRef(Color color) => color.R | color.G << 8 | color.B << 16;
 

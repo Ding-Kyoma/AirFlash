@@ -21,10 +21,20 @@ Windows audio streaming to HomePods running newer versions of HomePod software.
 Download the latest release from [GitHub Releases](https://github.com/Ding-Kyoma/AirFlash/releases/latest), run
 `AirFlash-X.Y.Z.msi`, and launch AirFlash from the installed shortcut. Apps and Features provides repair and uninstall.
 
+The minimum target is **Windows x64, Windows 10 1809 / build 17763** (LTSC 2019),
+including LTSC 2021, 22H2 and Windows 11. Windows 10 qualification is pending
+affected-user testing. See [Windows compatibility and startup diagnostics](docs/WINDOWS-COMPATIBILITY.md)
+for the candidate status and the PowerShell 5.1 diagnostic collector.
+
 AirFlash is distributed as a Windows x64 executable and standalone MSI. Windows may show
 a SmartScreen warning because release binaries are not code-signed. Use
 **More info** and **Run anyway** only when the downloaded files are from a
 source you trust.
+
+For audio capture, we recommend **Settings > Audio capture > Specific audio endpoint**.
+If you do not have an unused audio endpoint available, install a virtual endpoint
+with [Virtual Audio Cable (VAC Lite)](https://software.muzychenko.net/freeware/vac471lite.zip)
+or a similar tool, and route the audio you want to stream to that endpoint.
 
 ## Key features
 
@@ -35,10 +45,12 @@ source you trust.
 - Includes selectable latency modes, tray operation, mute restoration,
   automatic reconnection, and connection diagnostics.
 - Provides a ten-band equalizer with presets and live preview in Settings.
-- Available as a portable Windows x64 app with English and Simplified Chinese UI.
+- Captures playback or recording endpoints, including virtual audio devices.
+- Available as a portable Windows x64 app with English, Simplified Chinese, and Traditional Chinese UI.
 
 ## Feature plan
 
+- [ ] Select an application as the audio source ([#18](https://github.com/Ding-Kyoma/AirFlash/issues/18)).
 - [ ] Dolby Atmos support.
 
 ## Usage
@@ -49,6 +61,19 @@ source you trust.
 4. Complete PIN pairing in **Settings > Receivers** if the receiver requests it.
 5. Choose the capture endpoint and latency profile in Settings when the defaults
    are not suitable.
+
+In **Settings > Audio capture**, **Specific audio endpoint** lists active playback
+and recording devices with their type. For Voicemeeter, select the recording
+endpoint corresponding to its B1/B2/B3 bus (for example, Voicemeeter Output)
+and enable that bus for the desired audio in Voicemeeter. Playback devices use
+loopback; recording devices capture their input directly. Automatic local mute
+applies only to playback devices and never mutes a recording input.
+
+Receiver discovery runs while the control panel or **Settings > Receivers** is
+visible, and pauses when both are hidden. Previous results remain available;
+pausing discovery does not interrupt playback. If automatic connection is enabled
+globally or for a receiver, AirFlash also discovers devices for ten seconds at
+startup. Open a receiver list to resume discovery afterwards.
 
 AirFlash intentionally uses fresh application storage under `%APPDATA%/AirFlash`
 and `%LOCALAPPDATA%/AirFlash`. It does not read configuration, credentials, or
@@ -108,6 +133,9 @@ pwsh scripts/build-native.ps1 -Check
 
 The ignored Rust soak test uses localhost UDP receivers only. Real HomePod tests
 are intentionally limited to the repository's low-volume, five-second procedure.
+
+See [Discovery stability](docs/DISCOVERY-STABILITY.md) for the isolated playback
+retention regression check and repair validation notes.
 
 ## Contributing
 

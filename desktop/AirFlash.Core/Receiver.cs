@@ -106,7 +106,11 @@ public static class ReceiverAggregator
     private static bool Matches(string left, string right, StringComparison comparison = StringComparison.Ordinal) => left.Length == 0 || right.Length == 0 || left.Equals(right, comparison);
     private static string Describe(ServiceRecord service) => System.Text.Json.JsonSerializer.Serialize(new { service.Instance, service.ServiceType, service.Address, service.Port, DeviceId = Identity(service), Model = Model(service), StereoId = Field([service], "tsid") });
 }
-public sealed record AudioEndpoint(string Id, string Name);
+public enum AudioEndpointKind { Playback, Recording }
+public sealed record AudioEndpoint(string Id, string Name, AudioEndpointKind Kind = AudioEndpointKind.Playback)
+{
+    public string DisplayName => $"{Name} · {L.Get(Kind == AudioEndpointKind.Recording ? "Recording" : "Playback")}";
+}
 public sealed record DiscoveryAdapter(string Id, string Name, string Description, string Ipv4Addresses, bool IsUp, uint InterfaceIndex)
 {
     public bool Available => IsUp && InterfaceIndex != 0 && Ipv4Addresses.Length > 0;
@@ -126,7 +130,9 @@ public interface IDiscoveryService : IDisposable
 {
     event Action<IReadOnlyList<Receiver>>? Changed;
     event Action<string>? Failed;
+    event Action<bool>? RunningChanged;
     void Start();
+    void Stop();
     void SetInterface(string id);
 }
 public interface IAudioService
