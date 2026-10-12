@@ -24,6 +24,21 @@ internal static class UiSmoke
         var directory = Path.GetDirectoryName(report)!; Directory.CreateDirectory(directory);
         AppPaths.DataDirectory = Path.Combine(directory, "isolated-data");
         var checks = new List<string>();
+        Check(!Program.NeedsDiagnosticIsolation([]) && !Program.NeedsDiagnosticIsolation(["--startup"]),
+            "ordinary startup arguments preserve the application's normal data directory", checks);
+        Check(!Program.NeedsDiagnosticIsolation(["--other-check"])
+            && !Program.NeedsDiagnosticIsolation(["--output", "synthetic-output-check"]),
+            "unknown check switches and check-suffixed option values do not redirect normal startup", checks);
+        Check(new[] { "--discovery-perf", "--update-check", "--self-check", "--stability-check", "--compat-check", "--discovery-check", "--audio-check",
+            "--ui-smoke", "--tray-smoke", "--ui-perf" }.All(mode => Program.NeedsDiagnosticIsolation([mode])),
+            "every dispatched diagnostic mode selects isolated startup data without invoking its real service", checks);
+        Check(string.Equals(Program.DiagnosticStartupDataDirectory, AppPaths.DataDirectory, StringComparison.OrdinalIgnoreCase),
+            "startup diagnostic data uses the smoke output directory before the harness starts", checks);
+        var startupLogs = Directory.GetFiles(Path.Combine(AppPaths.DataDirectory, "logs"), "wpf-*.log");
+        var startupText = string.Join("\n", startupLogs.Select(File.ReadAllText));
+        Check(startupText.Contains("Startup stage=platform", StringComparison.Ordinal)
+            && startupText.Contains("Startup stage=wpf-resources ready", StringComparison.Ordinal),
+            "both startup stages are recorded in isolated smoke logs", checks);
         if (args.Contains("--ui-scroll-smoke"))
         {
             try
@@ -141,17 +156,21 @@ internal static class UiSmoke
             Check(tray.IsRegisteredForVerification, "repeated Explorer notification retains one registered tray icon", checks);
             Check(!settings.ApplyButton.IsEnabled, "apply initially disabled", checks);
             settings.ViewModel.SelectedPage = SettingsViewModel.AudioCapturePage; await Pump();
-            var radio = Descendants(settings).OfType<RadioButton>().Single(r => (string?)r.Content == L.Get("Specific output endpoint"));
+            var radio = Descendants(settings).OfType<RadioButton>().Single(r => (string?)r.Content == L.Get("Specific audio endpoint"));
             var radioPeer = UIElementAutomationPeer.CreatePeerForElement(radio)!;
             ((ISelectionItemProvider)radioPeer.GetPattern(PatternInterface.SelectionItem)!).Select();
             await Pump();
             var endpoints = Descendants(settings).OfType<ComboBox>().Single(c => c.Name == "EndpointCombo");
             Check(endpoints.IsEnabled, "capture mode enables endpoint", checks);
-            endpoints.SelectedIndex = 1; await Pump();
+            var inputEndpoint = ((IEnumerable<AudioEndpoint>)endpoints.ItemsSource).Single(e => e.Kind == AudioEndpointKind.Recording);
+            Check(inputEndpoint.DisplayName.Contains(L.Get("Recording"), StringComparison.Ordinal), "recording endpoint is labeled", checks);
+            endpoints.SelectedValue = inputEndpoint.Id; await Pump();
             var startsBefore = engine.Commands.Count(c => c.Text("command") == "start");
             Invoke(settings.ApplyButton); await Until(() => app.Settings.CaptureMode == "endpoint" && !settings.ViewModel.HasChanges);
             await Until(() => engine.Commands.Count(c => c.Text("command") == "start") > startsBefore);
             Check(engine.Commands.Count(c => c.Text("command") == "start") == startsBefore + 1, "settings restart once", checks);
+            Check(app.Settings.CaptureEndpoint == inputEndpoint.Id && store.Saved.CaptureEndpoint == inputEndpoint.Id, "recording endpoint persists by ID", checks);
+            Check(engine.Commands.Last(c => c.Text("command") == "start").GetProperty("params").GetProperty("capture_endpoint").GetString() == inputEndpoint.Id, "recording endpoint reaches native command", checks);
             settings.ViewModel.Draft.StartAtLogin = true; store.Fail = true;
             Invoke(settings.ApplyButton); await Until(() => settings.ViewModel.Error.Contains("模拟保存失败", StringComparison.Ordinal));
             Check(settings.IsVisible && settings.ViewModel.HasChanges && !app.Settings.StartAtLogin, "failed save preserves draft", checks);
@@ -442,7 +461,7 @@ internal static class UiSmoke
         public int ActiveEnumerations, MaxEnumerations;
         public TaskCompletionSource? EnumerationGate { get; set; }
         public TaskCompletionSource? EnumerationEntered { get; set; }
-        public IReadOnlyList<AudioEndpoint> Items = [new("endpoint-a", "扬声器 · Realtek Audio"), new("endpoint-b", "虚拟声卡 · VB-CABLE")];
+        public IReadOnlyList<AudioEndpoint> Items = [new("endpoint-a", "扬声器 · Realtek Audio"), new("endpoint-b", "虚拟声卡 · VB-CABLE"), new("endpoint-c", "Voicemeeter Output", AudioEndpointKind.Recording)];
         public void NotifyEndpoints() => EndpointsChanged?.Invoke();
         public string? DefaultEndpoint { get; set; } = "endpoint-a";
         public bool FailDefault { get; set; }

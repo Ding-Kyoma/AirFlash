@@ -269,12 +269,13 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         }
         MergeManualReceivers();
         if (!CatalogEqual(before, AllReceivers)) { RefreshReceivers(); CatalogChanged?.Invoke(); }
+        currentSnapshot = Session.Snapshot;
         if (currentSnapshot.Receiver is { IsManual: false } current)
         {
             var id = ReceiverMigrations.GetValueOrDefault(current.Id, current.Id);
             // Discovery snapshots can be incomplete while scanning or suspended.
             // The transport health checks own disconnect detection during playback.
-            if (discovered.TryGetValue(id, out var next) && next.Complete &&
+            if (currentSnapshot.State != PlaybackState.Pairing && discovered.TryGetValue(id, out var next) && next.Complete &&
                 (!ReceiverEqual(current, next) || !SettingsMerge.Equal(originalSettings, _settings)))
                 await Session.UpdateReceiverAsync(next, _settings.Clone());
         }
@@ -294,8 +295,11 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             && left.Codecs.SequenceEqual(right.Codecs) && left.Aliases.SequenceEqual(right.Aliases) && CatalogEqual(left.Members, right.Members);
     private void RefreshReceivers()
     {
-        var visible = AllReceivers.Where(r => (r.Online || _snapshot.IsActive && _snapshot.Receiver?.Id == r.Id) && !_settings.ReadOptions(r.Id).Hidden).ToList();
-        if (_snapshot.IsActive && _snapshot.Receiver is { } active && !visible.Any(r => r.Id == active.Id) && !_settings.ReadOptions(active.Id).Hidden) visible.Add(active);
+        var active = Session.Snapshot;
+        IEnumerable<Receiver> catalog = AllReceivers;
+        if (active.IsActive && active.Receiver is { } current && catalog.All(r => r.Id != current.Id))
+            catalog = catalog.Append(current with { Online = false });
+        var visible = catalog.Where(r => (r.Online || active.IsActive && r.Id == active.Receiver?.Id) && !_settings.ReadOptions(r.Id).Hidden).ToList();
         foreach (var row in Receivers.Where(row => visible.All(r => r.Id != row.Receiver.Id)).ToArray()) Receivers.Remove(row);
         for (var i = 0; i < visible.Count; i++)
         {

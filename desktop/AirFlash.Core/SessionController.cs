@@ -326,6 +326,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         {
                             startedAt = Stopwatch.GetTimestamp();
                             if (_settings.MuteWhileStreaming) await audio.MuteAsync(_settings.EffectiveEndpoint).ConfigureAwait(false);
+                            log?.Invoke($"Streaming started: {receiver.Id}; target latency {settings.Latency(receiver.Id)} ms; reconnect attempts {attempts}");
                             Publish(epoch, PlaybackState.Streaming);
                         }
                         else if (kind == "device_volume" && startedAt != 0 && item.Text("host") == volumeHost)
