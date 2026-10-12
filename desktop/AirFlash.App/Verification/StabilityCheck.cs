@@ -15,8 +15,11 @@ internal static class StabilityCheck
         try
         {
             foreach (var selectedAdapter in new[] { false, true })
+            {
                 foreach (var stereo in new[] { false, true })
                     await VerifyAsync(selectedAdapter, stereo, checks);
+                await VerifyPanelRefreshAsync(selectedAdapter, checks);
+            }
             await VerifyDelayedDiscoveryAsync(false, checks);
             await VerifyDelayedDiscoveryAsync(true, checks);
             App.WriteOutput(args, new { ok = true, checks, note = "Simulated discovery, audio, startup and engine; no real speaker access." });
@@ -128,6 +131,38 @@ internal static class StabilityCheck
                 label + ": does not replace the newer engine", checks);
         }
         finally { store.SaveGate.TrySetResult(); }
+    }
+
+    private static async Task VerifyPanelRefreshAsync(bool selectedAdapter, List<string> checks)
+    {
+        var label = selectedAdapter ? "selected adapter" : "all adapters";
+        var left = new Receiver("left", "Left", "127.0.0.1") { IsLeader = true };
+        var right = new Receiver("right", "Right", "127.0.0.2");
+        var pair = left with { Id = "stereo:panel", Name = "Pair", StereoId = "panel", Members = [left, right] };
+        var store = new UiSmoke.MemoryStore(); var settings = store.Load();
+        settings.DiscoveryInterfaceId = selectedAdapter ? "01db7c77-1016-49cb-8f5c-f5c194425d15" : "";
+        store.Save(settings);
+        var discovery = new UiSmoke.MockDiscovery { Items = [pair] }; var engine = new UiSmoke.MockFactory();
+        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+        var panel = new AirFlash.App.Ui.ControlPanel(app);
+        try
+        {
+            panel.ShowPanel(); app.Start(); await app.Startup; await Until(() => app.AllReceivers.Count == 1);
+            await app.ToggleAsync(app.AllReceivers.Single()); await Until(() => app.Snapshot.State == PlaybackState.Streaming);
+            var standbyWrites = engine.Commands.Count(c => c.Text("command") == "set_standby");
+            for (var i = 0; i < 10; i++)
+            {
+                panel.Hide(); await Pump();
+                discovery.Items = [pair with { Name = "Pair " + i, Members = i % 2 == 0 ? [right with { IsLeader = true }, left with { IsLeader = false }] : [left, right] }];
+                panel.ShowPanel(); await Until(() => app.Snapshot.Receiver?.Name == "Pair " + i); await Pump();
+                Check(app.Snapshot.State == PlaybackState.Streaming && engine.CreatedCount == 1 && engine.DisposedCount == 0
+                    && app.Snapshot.Diagnostics?.ReconnectCount == 0 && app.StopCommand.CanExecute(null),
+                    $"{label}: panel refresh {i + 1} retains playback, engine and Stop through leader changes", checks);
+            }
+            Check(engine.Commands.Count(c => c.Text("command") == "set_standby") == standbyWrites,
+                label + ": passive panel refresh does not send duplicate standby commands", checks);
+        }
+        finally { panel.ShutdownPanel(); }
     }
 
     private static void Check(bool value, string name, List<string> checks)

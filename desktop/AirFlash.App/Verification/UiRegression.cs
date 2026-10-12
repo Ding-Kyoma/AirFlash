@@ -251,6 +251,16 @@ internal static class UiRegression
             Check(discovery.Running, "active software group retains discovery with receiver lists hidden", checks);
             discovery.Items = [b, c, native]; discovery.Publish(); await Pump();
             Check(app.Snapshot.State == PlaybackState.Streaming && engine.CreatedCount == starts + 1, "temporary software member broadcast loss preserves active transport", checks);
+            vm.Draft.MasterVolume = 23; vm.Draft.StandbyEnabled = true;
+            Check(await vm.ApplyAsync(), "hot software settings apply during missing member discovery", checks);
+            Check(app.Snapshot.State == PlaybackState.Streaming && engine.CreatedCount == starts + 1,
+                "hot software settings retain the engine while a member broadcast is missing", checks);
+            discovery.Items = [a with { Address = "127.0.0.5" }, b, c, native]; discovery.Publish(); await Pump();
+            vm.Draft.MasterVolume = 24;
+            Check(await vm.ApplyAsync(), "hot software settings apply after passive address change", checks);
+            Check(app.Snapshot.State == PlaybackState.Streaming && engine.CreatedCount == starts + 1
+                && app.Snapshot.Receiver!.Members.Single(m => m.Id == "a").Address == "127.0.0.1",
+                "hot software settings preserve working addresses until a real rebuild", checks);
             discovery.Items = [a, b, c, native]; discovery.Publish(); await Pump();
             Check(group.LeftId == "b" && group.RightId == "a", "discovery refresh preserves software member selectors", checks);
             starts = engine.CreatedCount; group.RightId = "c";
