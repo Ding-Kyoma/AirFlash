@@ -34,6 +34,12 @@ The code contains no dependency on a third-party complete AirPlay sender.
 
 Optional peer profiles select PCM/ALAC, realtime UDP or type-103 buffered TCP, and PTP/NTP.
 Known format tables prefer ALAC in auto mode; forced profiles never silently fall back.
+`hello` advertises `receiver_capabilities`. The read-only `get_receiver_capabilities`
+command accepts one or two `peers` with `receiver_id`, host, port, codec hints, and
+clock evidence. It reads `/info` and returns the supported request combinations and
+their predicted selections using playback's negotiation rules, without pairing or
+starting capture. `negotiated` events include `receiver_id`, port, and `clock_role`
+(`sender`, `follow`, or `ntp`) so the desktop can display each member's actual result.
 TCP frames retain partial writes in a bounded queue and use SETRATEANCHORTIME. The fixed
 sample timeline fills bounded valid gaps with encoded silence or rebuilds after expiry.
 WASAPI discontinuities clear stale queues/resampler state; shared continuity transitions
@@ -46,7 +52,7 @@ New transport/clock/password combinations and mixed-brand groups are experimenta
 have simulated qualification only. No new hardware/acoustic qualification was performed.
 There is no cross-model latency or microsecond acoustic synchronization guarantee. PTP
 supports bounded AirPlay unicast master/follower modes, without full BMCA. See
-[schema v3, IPC examples and acceptance boundaries](../../docs/audio-stereo-v3.md).
+[schema v4, IPC examples and acceptance boundaries](../../docs/audio-stereo-v3.md).
 
 Live capture accepts `source: "loopback"` (optional `capture_endpoint`) or
 `source: "application"` with `capture_application_path` and optional runtime-only

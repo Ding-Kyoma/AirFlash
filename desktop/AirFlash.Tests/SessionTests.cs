@@ -94,9 +94,14 @@ public sealed class SessionTests
         await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
         var settings = Settings(); settings.StandbyEnabled = true; settings.Options("old").StandbySeconds = 5; settings.Options("old").LatencyMode = "realtime";
         await controller.StartAsync(Pod("old"), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        connection.EmitData(new { @event = "negotiated", receiver_id = "old", host = "127.0.0.1", port = 7000, codec = "alac", timing = "ptp", clock_role = "follow" });
+        connection.EmitData(new { @event = "capture_metrics", metrics = new { input_rate = 48000 } });
+        await Until(() => controller.Snapshot.Diagnostics?.Negotiated?.Count == 1);
         ReceiverCatalog.ApplyMigrations(settings, new Dictionary<string, string> { ["old"] = "new" });
         await controller.UpdateReceiverAsync(Pod("new"), settings);
         Assert.Equal(1, factory.OpenCount); Assert.Equal("new", controller.Snapshot.Receiver!.Id); Assert.Equal(120, controller.Snapshot.TargetLatency);
+        var negotiated = Assert.Single(controller.Snapshot.Diagnostics!.Negotiated!);
+        Assert.Equal("new", negotiated.Text("receiver_id")); Assert.Equal("follow", negotiated.Text("clock_role"));
         Assert.Equal(5, connection.Commands.Last(c => c.Command == "set_standby").Parameters.Number("silence_seconds"));
         connection.EmitData(new { @event = "standby", reason = "silence" });
         await Until(() => controller.Snapshot.State == PlaybackState.Standby);
@@ -143,12 +148,23 @@ public sealed class SessionTests
     public async Task ChangingStreamRateRestartsSessionWithNewRate()
     {
         var first = new FakeConnection(); var second = new FakeConnection(); var factory = new FakeFactory(first, second); await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
-        var settings = Settings(); settings.StreamSampleRate = "48000";
+        var settings = Settings(); settings.Options("a").SampleRate = "48000";
         await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
         Assert.Equal(48000, first.Commands.Single(c => c.Command == "start").Parameters.Number("sample_rate"));
         Assert.Equal(48000, controller.Snapshot.StreamRate);
-        settings.StreamSampleRate = "44100"; await controller.UpdateSettingsAsync(settings); await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        settings.Options("a").SampleRate = "44100"; await controller.UpdateSettingsAsync(settings); await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(1));
         Assert.Equal(2, factory.OpenCount); Assert.Equal(44100, second.Commands.Single(c => c.Command == "start").Parameters.Number("sample_rate"));
+    }
+    [Fact]
+    public async Task AutomaticRateUsesReceiverNegotiationBeforeStartingCapture()
+    {
+        var connection = new FakeConnection { ReceiverCapabilityResponse = new { @event = "receiver_capabilities", members = new[] { new { receiver_id = "a", host = "127.0.0.1", port = 7000, known = true, profiles = new[] { new { codec = "auto", transport = "auto", timing = "auto", sample_rate = 48000, selected_codec = "alac", selected_transport = "realtime", selected_timing = "ptp" } } } } } };
+        await using var controller = new SessionController(new FakeFactory(connection), new FakeAudio(), timing: Fast);
+        await controller.StartAsync(Pod(), Settings()); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var commands = connection.Commands.ToArray();
+        Assert.True(Array.FindIndex(commands, c => c.Command == "get_receiver_capabilities") < Array.FindIndex(commands, c => c.Command == "start"));
+        Assert.Equal(48000, commands.Single(c => c.Command == "start").Parameters.Number("sample_rate")); Assert.Equal(48000, controller.Snapshot.StreamRate);
+        Assert.Equal("a", commands.Single(c => c.Command == "start").Parameters.GetProperty("peers")[0].Text("receiver_id"));
     }
     [Fact]
     public async Task SwitchingWaitsForPreviousCleanupAndRejectsStaleEvents()
@@ -593,12 +609,14 @@ public sealed class SessionTests
         public string Session { get; private set; } = "";
         public bool Disposed { get; private set; }
         public bool RespondHello { get; init; } = true;
+        public object? ReceiverCapabilityResponse { get; init; }
         public Task SendAsync(string session, string command, object? parameters, CancellationToken cancellation)
         {
             Commands.Enqueue(new(session, command, JsonSerializer.SerializeToElement(parameters ?? new { })));
             switch (command)
             {
                 case "hello": Session = session; if (RespondHello) EmitHello(); break;
+                case "get_receiver_capabilities": EmitData(ReceiverCapabilityResponse!); break;
                 case "start": Session = session; Started.TrySetResult(); if (autoReady) Emit("streaming"); break;
                 case "pair": Session = session; Emit("pin_required"); break;
                 case "pair_pin": Emit("paired"); break;
@@ -606,7 +624,7 @@ public sealed class SessionTests
             }
             return Task.CompletedTask;
         }
-        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "application_capture" } });
+        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "application_capture" }.Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).ToArray() });
         public void EmitData(object payload, string? session = null)
         {
             var data = JsonSerializer.SerializeToNode(payload)!.AsObject(); data["version"] = 1; data["session_id"] = session ?? Session;

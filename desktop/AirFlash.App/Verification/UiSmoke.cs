@@ -24,11 +24,12 @@ internal static class UiSmoke
         var directory = Path.GetDirectoryName(report)!; Directory.CreateDirectory(directory);
         AppPaths.DataDirectory = Path.Combine(directory, "isolated-data");
         var checks = new List<string>();
-        if (args.Contains("--ui-regression") || args.Contains("--ui-regression-smoke"))
+        if (args.Contains("--ui-regression") || args.Contains("--ui-regression-smoke") || args.Contains("--receiver-settings-regression"))
         {
             try
             {
-                await UiRegression.RunAsync(checks, directory);
+                if (args.Contains("--receiver-settings-regression")) await ReceiverSettingsRegression.RunAsync(checks, directory);
+                else await UiRegression.RunAsync(checks, directory);
                 App.WriteOutput(args, new { ok = true, checks, note = "WPF regression with simulated services. Shell tray and physical DPI are outside this run." });
                 return 0;
             }
@@ -198,6 +199,13 @@ internal static class UiSmoke
                 {
                     settings.ViewModel.SelectedPage = page; await Pump();
                     Render(settings, Path.Combine(directory, $"settings-{(dark ? "dark" : "light")}-{page}.png"), 1);
+                    if (page == 0)
+                    {
+                        var scroll = Descendants(settings).OfType<ScrollViewer>().First(v => v.ScrollableHeight > 0);
+                        scroll.ScrollToEnd(); await Pump();
+                        Render(settings, Path.Combine(directory, $"settings-reset-{(dark ? "dark" : "light")}.png"), 1);
+                        scroll.ScrollToHome();
+                    }
                     if (page == SettingsViewModel.MonitorPage)
                     {
                         var scroll = Descendants(settings).OfType<ScrollViewer>().First(v => v.ScrollableHeight > 0);
@@ -424,11 +432,14 @@ internal static class UiSmoke
         public bool Fail;
         public int DelayMs;
         public int Saves;
+        public int Resets;
+        public bool FailReset;
         public TaskCompletionSource? SaveGate { get; set; }
         public TaskCompletionSource? SaveEntered { get; set; }
         public AppSettings Saved => _settings.Clone();
         private AppSettings _settings = new() { AutoConnectOnDiscover = false, MuteWhileStreaming = false, ShowWiderVolume = false };
         public AppSettings Load() => _settings.Clone();
+        public Task ResetAsync() { Resets++; if (FailReset) throw new IOException("mock reset failed"); _settings = new(); return Task.CompletedTask; }
         public void Save(AppSettings settings) { UiPerformance.Count("settings.save"); Thread.Sleep(DelayMs); if (Fail) throw new IOException("模拟保存失败"); _settings = settings.Clone(); }
         public async Task SaveAsync(AppSettings settings)
         {
@@ -470,8 +481,9 @@ internal static class UiSmoke
             finally { ActiveEnumerations--; }
         }
         public bool FailMute { get; set; }
+        public int Restores;
         public Task MuteAsync(string? endpointId) => FailMute ? Task.FromException(new IOException("mock mute failed")) : Task.CompletedTask;
-        public Task RestoreAsync() => Task.CompletedTask;
+        public Task RestoreAsync() { Restores++; return Task.CompletedTask; }
     }
     internal sealed class MockDiscovery : IDiscoveryService
     {
@@ -497,6 +509,8 @@ internal static class UiSmoke
     {
         public int StopDelayMs;
         public bool FailOpen;
+        public bool AutoReady = true;
+        public Action<object>? EmitEvent;
         public ConcurrentQueue<JsonElement> Commands { get; } = new();
         public int CreatedCount, DisposedCount;
         public IEngineConnection Open()
@@ -519,8 +533,11 @@ internal static class UiSmoke
             if (command == "start")
             {
                 _host = JsonSerializer.SerializeToElement(parameters).GetProperty("peers")[0].Text("host");
-                Emit(session, new { @event = "streaming" });
                 var data = JsonSerializer.SerializeToElement(parameters);
+                foreach (var peer in data.GetProperty("peers").EnumerateArray())
+                    Emit(session, new { @event = "negotiated", receiver_id = peer.Text("receiver_id"), host = peer.Text("host"), port = peer.Integer("port"), codec = "alac", transport = "realtime", timing = "ptp", clock_role = peer.GetProperty("profile").Boolean("follow_receiver_clock") == true ? "follow" : "sender", sample_rate = data.Integer("sample_rate") });
+                factory.EmitEvent = payload => Emit(session, payload);
+                if (factory.AutoReady) Emit(session, new { @event = "streaming" });
                 var hosts = data.Text("group_mode") == "software_stereo" ? data.GetProperty("peers").EnumerateArray().Select(p => p.Text("host")).ToArray() : [_host];
                 foreach (var host in hosts)
                 {

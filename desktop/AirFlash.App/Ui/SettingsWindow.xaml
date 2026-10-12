@@ -37,6 +37,13 @@
             </Grid>
           </StackPanel>
         </Border>
+        <Border Style="{StaticResource Card}">
+          <StackPanel>
+            <TextBlock Text="{loc:Text 'Reset settings'}" Style="{StaticResource SectionTitle}"/>
+            <TextBlock Text="{loc:Text 'Delete all settings and receiver pairing, then restart AirFlash. Logs and engine caches are retained.'}" Style="{StaticResource Hint}"/>
+            <Button Content="{loc:Text 'Reset and restart'}" Command="{Binding ResetCommand}" HorizontalAlignment="Left" Margin="0,12,0,0" AutomationProperties.Name="{loc:Text 'Reset and restart'}"/>
+          </StackPanel>
+        </Border>
       </StackPanel>
     </DataTemplate>
     <DataTemplate x:Key="Page1">
@@ -52,13 +59,6 @@
               <TextBox Width="100" Text="{Binding Draft.CustomBufferMs, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" AutomationProperties.Name="{loc:Text 'Custom latency'}"/>
               <TextBlock Text="{loc:Text 'ms (0–2000)'}" VerticalAlignment="Center" Margin="10,0,0,0" Style="{StaticResource Hint}"/>
             </StackPanel>
-          </StackPanel>
-        </Border>
-        <Border Style="{StaticResource Card}">
-          <StackPanel>
-            <TextBlock Text="{loc:Text 'Stream format'}" Style="{StaticResource SectionTitle}"/>
-            <RadioButton Content="{loc:Text '44.1 kHz · 16-bit (default)'}" GroupName="StreamSampleRate" IsChecked="{Binding Draft.StreamSampleRate, Converter={StaticResource Equal}, ConverterParameter=44100}"/>
-            <RadioButton Content="{loc:Text '48 kHz · 16-bit'}" GroupName="StreamSampleRate" IsChecked="{Binding Draft.StreamSampleRate, Converter={StaticResource Equal}, ConverterParameter=48000}"/>
           </StackPanel>
         </Border>
         <Border Style="{StaticResource Card}">
@@ -178,6 +178,7 @@
     <DataTemplate x:Key="Page4">
       <StackPanel>
         <TextBlock Text="{Binding App.DiscoveryStatus}" Style="{StaticResource Hint}" Margin="0,0,0,12"/>
+        <Button Content="{loc:Text 'Refresh stream capabilities'}" Command="{Binding RefreshReceiverProfilesCommand}" HorizontalAlignment="Left" Margin="0,0,0,12"/>
         <Button Content="{loc:Text '＋ Add receiver manually'}" HorizontalAlignment="Left" Command="{Binding AddReceiverCommand}" Margin="0,0,0,16"/>
         <TextBlock Text="{loc:Text 'Software stereo'}" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,8"/>
         <TextBlock Text="{loc:Text 'ALAC saves bandwidth; PCM is also lossless. The group sample rate overrides member sample rates.'}" Style="{StaticResource Hint}" Margin="0,0,0,8"/>
@@ -200,7 +201,8 @@
                   <TextBlock Text="{loc:Text 'Right offset / ms (−500 to +500)'}" Style="{StaticResource Hint}"/>
                   <TextBox Text="{Binding Group.RightOffsetMs, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" Margin="0,4,0,12"/>
                   <TextBlock Text="{loc:Text 'Common sample rate'}" Style="{StaticResource Hint}"/>
-                  <ComboBox ItemsSource="{x:Static vm:Choices.Rates}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Group.SampleRate, Mode=TwoWay}" Margin="0,4,0,12"/>
+                  <ComboBox ItemsSource="{Binding RateChoices}" DisplayMemberPath="Label" SelectedItem="{Binding RateChoice, Mode=TwoWay}" Margin="0,4,0,12"/>
+                  <TextBlock Text="{Binding RateStatus}" Style="{StaticResource Hint}" Margin="0,0,0,12"/>
                   <WrapPanel>
                     <Button Content="{loc:Text 'Swap left and right'}" Command="{Binding SwapCommand}" Margin="0,0,8,0"/>
                     <Button Content="{loc:Text 'Split group'}" Command="{Binding RemoveCommand}"/>
@@ -226,16 +228,18 @@
                     <ComboBox Grid.Column="1" ItemsSource="{x:Static vm:Choices.AutoConnect}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.AutoConnect, Mode=TwoWay}"/>
                   </Grid>
                   <CheckBox Content="{loc:Text 'Hide from control panel'}" IsChecked="{Binding Options.Hidden}"/>
-                  <Expander Header="{loc:Text 'Advanced settings'}" Margin="0,0,0,12">
+                  <Expander Header="{loc:Text 'Advanced settings'}" Foreground="{DynamicResource TextBrush}" Margin="0,0,0,12">
                     <StackPanel Margin="0,14,0,0">
+                      <TextBlock Text="{Binding ProfileStatus}" Style="{StaticResource Hint}" Margin="0,0,0,12"/>
                       <TextBlock Text="{loc:Text 'Audio encoding'}" Style="{StaticResource Hint}"/>
-                      <ComboBox ItemsSource="{x:Static vm:Choices.Codecs}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.Codec, Mode=TwoWay}" Margin="0,4,0,12"/>
+                      <ComboBox ItemsSource="{Binding CodecChoices}" DisplayMemberPath="Label" SelectedItem="{Binding CodecChoice, Mode=TwoWay}" Margin="0,4,0,12"/>
                       <TextBlock Text="{loc:Text 'Stream sample rate'}" Style="{StaticResource Hint}"/>
-                      <ComboBox ItemsSource="{x:Static vm:Choices.ReceiverRates}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.SampleRate, Mode=TwoWay}" Margin="0,4,0,12"/>
+                      <ComboBox ItemsSource="{Binding RateChoices}" DisplayMemberPath="Label" SelectedItem="{Binding RateChoice, Mode=TwoWay}" IsEnabled="{Binding CanSetSampleRate}" Margin="0,4,0,12"/>
+                      <TextBlock Text="{Binding GroupRateHint}" Style="{StaticResource Hint}" Margin="0,0,0,8"/>
                       <TextBlock Text="{loc:Text 'Stream transport'}" Style="{StaticResource Hint}"/>
-                      <ComboBox ItemsSource="{x:Static vm:Choices.Transports}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.Transport, Mode=TwoWay}" Margin="0,4,0,12"/>
+                      <ComboBox ItemsSource="{Binding TransportChoices}" DisplayMemberPath="Label" SelectedItem="{Binding TransportChoice, Mode=TwoWay}" Margin="0,4,0,12"/>
                       <TextBlock Text="{loc:Text 'Clock policy'}" Style="{StaticResource Hint}"/>
-                      <ComboBox ItemsSource="{x:Static vm:Choices.Timings}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.Timing, Mode=TwoWay}" Margin="0,4,0,12"/>
+                      <ComboBox ItemsSource="{Binding TimingChoices}" DisplayMemberPath="Label" SelectedItem="{Binding TimingChoice, Mode=TwoWay}" Margin="0,4,0,12"/>
                       <TextBlock Text="{loc:Text 'Latency mode'}" Style="{StaticResource Hint}"/>
                       <ComboBox ItemsSource="{x:Static vm:Choices.ReceiverLatencies}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.LatencyMode, Mode=TwoWay}" Margin="0,4,0,12"/>
                       <StackPanel IsEnabled="{Binding Options.LatencyMode, Converter={StaticResource Equal}, ConverterParameter=custom}">

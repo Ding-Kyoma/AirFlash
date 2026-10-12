@@ -53,7 +53,7 @@ public sealed class SoftwareStereoGroup : ObservableObject
 public sealed record ManualReceiver(string Id, string Name, string Host, int Port);
 public sealed class AppSettings : ObservableObject
 {
-    public int SchemaVersion { get; set; } = 3;
+    public int SchemaVersion { get; set; } = 4;
     private bool _StartAtLogin = false;
     public bool StartAtLogin { get => _StartAtLogin; set => Set(ref _StartAtLogin, value); }
     private bool _MuteWhileStreaming = true;
@@ -74,8 +74,6 @@ public sealed class AppSettings : ObservableObject
     public string Theme { get => _Theme; set => Set(ref _Theme, value); }
     private string _DiscoveryInterfaceId = "";
     public string DiscoveryInterfaceId { get => _DiscoveryInterfaceId; set => Set(ref _DiscoveryInterfaceId, value ?? ""); }
-    private string _StreamSampleRate = "44100";
-    public string StreamSampleRate { get => _StreamSampleRate; set => Set(ref _StreamSampleRate, value); }
     private EqualizerSettings _equalizer = new();
     public EqualizerSettings Equalizer { get => _equalizer; set => Set(ref _equalizer, value ?? new()); }
     private string _LatencyMode = "normal";
@@ -116,7 +114,12 @@ public sealed class AppSettings : ObservableObject
         return (options.LatencyMode ?? LatencyMode) switch { "realtime" => 120, "buffered" => 500, "custom" => Math.Clamp(options.CustomBufferMs ?? CustomBufferMs, 0, 2000), _ => 200 };
     }
     public double Gain(string id) => Math.Clamp(MasterVolume, 0, 100) / 100d;
-    public string SampleRate(Receiver receiver) => receiver.IsSoftwareGroup ? SoftwareGroups.Single(g => g.Id == receiver.Id).SampleRate : ReadOptions(receiver.Id).SampleRate ?? StreamSampleRate;
+    public string? SampleRate(Receiver receiver) => receiver.IsSoftwareGroup ? SoftwareGroups.Single(g => g.Id == receiver.Id).SampleRate : ReadOptions(receiver.Id).SampleRate;
+    public bool UsesDeviceLatency(Receiver receiver) => (receiver.IsSoftwareGroup ? receiver.Peers : [receiver]).Any(r =>
+    {
+        var options = ReadOptions(r.Id);
+        return options.LatencyMode is not null || LatencyMode == "custom" && options.CustomBufferMs is not null;
+    });
     public string? EffectiveEndpoint => CaptureMode == "endpoint" ? CaptureEndpoint : null;
     public string? Validate()
     {
@@ -126,7 +129,6 @@ public sealed class AppSettings : ObservableObject
         if (MasterVolume is < 0 or > 100) return L.Get("Master volume must be between 0 and 100.");
         if (MaxReconnectAttempts is < 1 or > 20) return L.Get("Retry attempts must be between 1 and 20.");
         if (!Modes.Contains(LatencyMode)) return L.Get("Select a valid latency mode.");
-        if (!SampleRates.Contains(StreamSampleRate)) return L.Get("Select a valid stream sample rate.");
         if (Equalizer.Validate() is { } equalizerError) return equalizerError;
         if (CustomBufferMs is < 0 or > 2000) return L.Get("Custom latency must be between 0 and 2000 ms.");
         if (!double.IsFinite(StandbySilenceSeconds) || StandbySilenceSeconds is < 5 or > 300) return L.Get("Standby threshold must be between 5 and 300 seconds.");
@@ -161,7 +163,6 @@ public sealed class AppSettings : ObservableObject
         AutoConnectOnDiscover = source.AutoConnectOnDiscover; ForceReconnect = source.ForceReconnect;
         MaxReconnectAttempts = source.MaxReconnectAttempts; UiLanguage = source.UiLanguage; Theme = source.Theme;
         DiscoveryInterfaceId = source.DiscoveryInterfaceId;
-        StreamSampleRate = source.StreamSampleRate;
         Equalizer.CopyFrom(source.Equalizer);
         LatencyMode = source.LatencyMode; CustomBufferMs = source.CustomBufferMs;
         StandbyEnabled = source.StandbyEnabled; StandbySilenceSeconds = source.StandbySilenceSeconds;

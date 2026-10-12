@@ -5,7 +5,7 @@ namespace AirFlash.Tests;
 public sealed class SoftwareStereoTests
 {
     [Fact]
-    public void LoadingNullGroupsAndSavingLegacyObjectsUsesSchemaThree()
+    public void LoadingNullGroupsAndSavingLegacyObjectsUsesSchemaFour()
     {
         var root = Path.Combine(Path.GetTempPath(), "airflash-v3-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(root);
         try
@@ -15,7 +15,7 @@ public sealed class SoftwareStereoTests
             var store = new SettingsStore(path); Assert.Empty(store.Load().SoftwareGroups);
             store.Save(new AppSettings { SchemaVersion = 2 });
             using var json = System.Text.Json.JsonDocument.Parse(File.ReadAllText(path));
-            Assert.Equal(3, json.RootElement.GetProperty("schema_version").GetInt32());
+            Assert.Equal(4, json.RootElement.GetProperty("schema_version").GetInt32());
         }
         finally { Directory.Delete(root, true); }
     }
@@ -36,7 +36,7 @@ public sealed class SoftwareStereoTests
         {
             var path = Path.Combine(root, "config.json"); const string old = """{"schema_version":2,"master_volume":37,"receivers":{"a":{"latency_mode":"custom","custom_buffer_ms":375,"volume":28,"auto_connect":false}}}""";
             await File.WriteAllTextAsync(path, old); var store = new SettingsStore(path); var settings = store.Load();
-            Assert.Equal(3, settings.SchemaVersion); Assert.Equal(375, settings.Latency("a")); Assert.Equal(37, settings.MasterVolume); Assert.Equal(28, settings.Options("a").Volume); Assert.False(settings.Options("a").AutoConnect);
+            Assert.Equal(4, settings.SchemaVersion); Assert.Equal(375, settings.Latency("a")); Assert.Equal(37, settings.MasterVolume); Assert.Equal(28, settings.Options("a").Volume); Assert.False(settings.Options("a").AutoConnect);
             settings.Options("a").Codec = "alac"; settings.Options("a").SampleRate = "48000";
             settings.SoftwareGroups.Add(new() { LeftId = "a", RightId = "b", LeftOffsetMs = -80, RightOffsetMs = 25 });
             await ((ISettingsStore)store).SaveAsync(settings); Assert.Equal(old, await File.ReadAllTextAsync(path + ".pre-v3.bak"));

@@ -25,6 +25,8 @@ use uuid::Uuid;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Peer {
+    #[serde(default)]
+    pub receiver_id: String,
     pub host: IpAddr,
     #[serde(default = "default_port")]
     pub port: u16,
@@ -526,7 +528,7 @@ impl Member {
             effective_latency.is_none(),
         );
         emit(
-            json!({"event":"negotiated","host":peer.host,"data_port":data_port,"codec":if use_alac{"alac"}else{"pcm"},"transport":selection.transport,"timing":if selection.ptp{"ptp"}else{"ntp"},"channel":peer.profile.channel,"sync_offset_ms":peer.profile.sync_offset_ms,"qualification":"experimental","sample_rate":rate,"control_port":member.remote_control,"requested_latency_ms":options.latency_ms,"receiver_latency_min_samples":stream.as_dictionary().and_then(|d|d.get("latencyMin")).and_then(Value::as_unsigned_integer),"measured_latency_ms":null}),
+            json!({"event":"negotiated","receiver_id":peer.receiver_id,"host":peer.host,"port":peer.port,"clock_role":if selection.ptp && peer.profile.follow_receiver_clock {"follow"}else if selection.ptp {"sender"}else {"ntp"},"data_port":data_port,"codec":if use_alac{"alac"}else{"pcm"},"transport":selection.transport,"timing":if selection.ptp{"ptp"}else{"ntp"},"channel":peer.profile.channel,"sync_offset_ms":peer.profile.sync_offset_ms,"qualification":"experimental","sample_rate":rate,"control_port":member.remote_control,"requested_latency_ms":options.latency_ms,"receiver_latency_min_samples":stream.as_dictionary().and_then(|d|d.get("latencyMin")).and_then(Value::as_unsigned_integer),"measured_latency_ms":null}),
         );
         Ok(member)
     }
@@ -1337,6 +1339,7 @@ mod tests {
                 ptp: false,
             },
             peer: Peer {
+                receiver_id: String::new(),
                 host: "127.0.0.1".parse().unwrap(),
                 port: listener.local_addr().unwrap().port(),
                 codecs: vec![],
@@ -1451,6 +1454,7 @@ mod tests {
     fn unsafe_probe_rejected() {
         let mut o = ProbeOptions {
             peers: vec![Peer {
+                receiver_id: String::new(),
                 host: "127.0.0.1".parse().unwrap(),
                 port: 7000,
                 codecs: Vec::new(),

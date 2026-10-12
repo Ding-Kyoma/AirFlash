@@ -202,6 +202,7 @@ internal static class UiRegression
         await RunDiscoveryDemandRegressionAsync(checks);
         await RunStereoIdentityRegressionAsync(checks, directory);
         await RunSoftwareStereoRegressionAsync(checks, directory);
+        await ReceiverSettingsRegression.RunAsync(checks, directory);
     }
     private static async Task RunSoftwareStereoRegressionAsync(List<string> checks, string directory)
     {
@@ -352,7 +353,8 @@ internal static class UiRegression
             discovery.Items = ReceiverAggregator.Build(services.Take(2)); discovery.Publish();
             await Until(() => app.AllReceivers.Single().Members.Length == 1);
             Check(app.Snapshot.State == PlaybackState.Streaming && app.AllReceivers.Single().Detail.Contains("1/2", StringComparison.Ordinal)
-                && engine.CreatedCount == 1 && engine.DisposedCount == 0,
+                && engine.Commands.Count(c => c.Text("command") == "start") == 1
+                && engine.CreatedCount - engine.DisposedCount == 1,
                 "missing discovery member shows one of two without stopping active transport", checks);
         }
         finally { await vm.ApplicationCompleted; window.Close(); }
@@ -378,10 +380,12 @@ internal static class UiRegression
             settings.ViewModel.SelectedPage = 0; await Pump();
             Check(!discovery.Running && discovery.Stops == 1 && app.Receivers.Count == 2, "last receiver list hiding stops discovery and preserves cache", checks);
             panel.ShowPanel(); await Pump();
+            var previousConnections = engine.CreatedCount;
             await app.ToggleAsync(app.AllReceivers.First(r => r.Online)); await Until(() => app.Snapshot.State == PlaybackState.Streaming);
             panel.Hide(); await Pump();
             discovery.Items = []; discovery.Publish(); await Pump();
-            Check(app.Snapshot.IsActive && !discovery.Running && engine.CreatedCount == 1, "suspension and absent discovery results do not interrupt playback", checks);
+            Check(app.Snapshot.IsActive && !discovery.Running && engine.CreatedCount == previousConnections + 1
+                && engine.CreatedCount - engine.DisposedCount == 1, "suspension and absent discovery results do not interrupt playback", checks);
             for (var i = 0; i < 10; i++) { panel.ShowPanel(); await Pump(); panel.Hide(); await Pump(); }
             Check(discovery.Starts == discovery.Stops, "repeated panel visibility releases every discovery session", checks);
         }

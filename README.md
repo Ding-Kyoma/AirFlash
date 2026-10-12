@@ -53,7 +53,7 @@ or a similar tool, and route the audio you want to stream to that endpoint.
 
 ## Feature plan
 
-See [audio continuity and schema v3](docs/audio-stereo-v3.md) for setup, protocol details,
+See [audio continuity and schema v4](docs/audio-stereo-v3.md) for setup, protocol details,
 simulation results and remaining hardware acceptance. Samsung, Mac and mixed-brand
 playback and acoustic synchronization have not been qualified by this implementation.
 
@@ -67,6 +67,29 @@ playback and acoustic synchronization have not been qualified by this implementa
 4. Complete PIN pairing in **Settings > Receivers** if the receiver requests it.
 5. Choose the capture endpoint and latency profile in Settings when the defaults
    are not suitable.
+
+Stream formats are configured in **Settings > Receivers** for each receiver:
+codec, sample rate, UDP/TCP transport, and clock strategy. Choices are filtered by
+the receiver's `/info` capabilities without starting playback or pairing. Automatic
+prefers a supported 44.1 kHz profile, then 48 kHz. Its label shows the expected
+selection before playback and the negotiated selection while playing; unapplied
+edits continue to show predictions. Offline or undetected receivers offer Automatic
+and retain existing explicit settings as pending verification. Native stereo pairs
+use their members' common capabilities. Software stereo groups control both members'
+common sample rate and default to 44.1 kHz.
+
+The control panel's **Global latency mode** changes the shared default. While the
+current connecting, playing, or standby receiver uses an independent latency mode,
+including either software stereo member, the control is disabled and points to
+**Settings > Receivers**. Stopping playback restores it; the global default remains
+editable in Settings.
+
+**Settings > General > Reset and restart** asks once before clearing all settings
+and receiver pairing. AirFlash stops playback and discovery, restores local mute,
+disables startup at login, deletes `config.json` and `native-credentials`, and restarts
+with defaults. Unsaved edits are discarded; logs and engine caches are retained.
+Schema v4 removes the global sample rate: v1–v3 inherited rates become Automatic,
+while explicit receiver and software group rates are preserved.
 
 In **Settings > Audio capture**, **Specific audio endpoint** lists active playback
 and recording devices with their type. For Voicemeeter, select the recording

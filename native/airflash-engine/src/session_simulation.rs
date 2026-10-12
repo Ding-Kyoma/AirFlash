@@ -55,6 +55,7 @@ fn mock_with_cancel(
         udp.local_addr().unwrap().port()
     };
     let peer = Peer {
+        receiver_id: String::new(),
         host: ip.parse().unwrap(),
         port: control.local_addr().unwrap().port(),
         codecs: vec![0, 1],

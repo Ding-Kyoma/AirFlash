@@ -8,6 +8,7 @@ public interface ISettingsStore
     void Save(AppSettings settings);
     Task SaveAsync(AppSettings settings) => Task.Run(() => Save(settings));
     Task SaveReceiverIdentityAsync(AppSettings settings, bool backup) => SaveAsync(settings);
+    Task ResetAsync() => throw new NotSupportedException("This settings store does not support reset.");
 }
 public sealed class SettingsStore(string path) : ISettingsStore
 {
@@ -21,8 +22,8 @@ public sealed class SettingsStore(string path) : ISettingsStore
             var text = File.ReadAllText(path);
             var json = JsonNode.Parse(text) as JsonObject ?? throw new JsonException(L.Get("Configuration must be a JSON object."));
             var version = json["schema_version"]?.GetValue<int>() ?? 1;
-            if (version > 3) throw new NotSupportedException(L.Get("This configuration is from a newer version. Update the app first."));
-            if (version < 3) _migrationSource = text;
+            if (version > 4) throw new NotSupportedException(L.Get("This configuration is from a newer version. Update the app first."));
+            if (version < 4) _migrationSource = text;
             if (version < 2)
             {
                 _migrationSource = text;
@@ -40,7 +41,9 @@ public sealed class SettingsStore(string path) : ISettingsStore
                 if (json["receivers"] is JsonObject items)
                     foreach (var value in items.Select(p => p.Value).OfType<JsonObject>()) ClampBuffer(value);
             }
-            json["schema_version"] = 3;
+            // An inherited rate becomes automatic; explicit receiver/group rates remain intact.
+            foreach (var key in json.Select(p => p.Key).Where(k => k.Equals("stream_sample_rate", StringComparison.OrdinalIgnoreCase)).ToArray()) json.Remove(key);
+            json["schema_version"] = 4;
             var settings = json.Deserialize<AppSettings>(AppSettings.JsonOptions) ?? throw new JsonException(L.Get("Empty configuration."));
             settings.SoftwareGroups ??= [];
             settings.SoftwareGroups = new(settings.SoftwareGroups.Where(group => group is not null));
@@ -65,15 +68,18 @@ public sealed class SettingsStore(string path) : ISettingsStore
     }
     public void Save(AppSettings settings)
     {
-        if (settings.SchemaVersion > 3) throw new NotSupportedException(L.Get("This configuration is from a newer version. Update the app first."));
+        if (settings.SchemaVersion > 4) throw new NotSupportedException(L.Get("This configuration is from a newer version. Update the app first."));
         var saved = settings.Clone();
-        saved.SchemaVersion = 3;
+        saved.SchemaVersion = 4;
+        if (saved.Extra is { } extra)
+            foreach (var key in extra.Keys.Where(k => k.Equals("stream_sample_rate", StringComparison.OrdinalIgnoreCase)).ToArray()) extra.Remove(key);
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
         if (_migrationSource is not null)
         {
             var backup = path + ".pre-wpf.bak";
             if (!File.Exists(backup)) File.WriteAllText(backup, _migrationSource);
             if (!File.Exists(path + ".pre-v3.bak")) File.WriteAllText(path + ".pre-v3.bak", _migrationSource);
+            if (!File.Exists(path + ".pre-v4.bak")) File.WriteAllText(path + ".pre-v4.bak", _migrationSource);
             _migrationSource = null;
         }
         var temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
@@ -89,5 +95,30 @@ public sealed class SettingsStore(string path) : ISettingsStore
     {
         if (backup && File.Exists(path) && !File.Exists(path + ".pre-receiver-identity.bak")) File.Copy(path, path + ".pre-receiver-identity.bak");
         Save(settings);
+    });
+    public Task ResetAsync() => Task.Run(() =>
+    {
+        var config = Path.GetFullPath(path);
+        var root = Path.GetDirectoryName(config)!;
+        var credentials = Path.GetFullPath(Path.Combine(root, "native-credentials"));
+        if (!credentials.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) throw new IOException("Invalid credentials path.");
+        if (Directory.Exists(credentials))
+        {
+            var directories = new Stack<string>(); directories.Push(credentials);
+            while (directories.TryPop(out var directory))
+            {
+                if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0) throw new IOException(L.Get("Cannot reset pairing data through a linked directory."));
+                foreach (var entry in Directory.EnumerateFileSystemEntries(directory))
+                {
+                    var attributes = File.GetAttributes(entry);
+                    if ((attributes & FileAttributes.ReparsePoint) != 0) throw new IOException(L.Get("Cannot reset pairing data through a linked directory."));
+                    if ((attributes & FileAttributes.Directory) != 0) directories.Push(entry);
+                }
+            }
+            Directory.Delete(credentials, true);
+        }
+        File.Delete(config);
+        _migrationSource = null;
+        LoadWarning = null;
     });
 }

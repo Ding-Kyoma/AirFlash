@@ -5,6 +5,7 @@ pub mod continuity;
 pub mod crypto;
 pub mod equalizer;
 pub mod profile;
+pub mod receiver_capabilities;
 pub mod rtp;
 pub mod rtsp;
 pub mod session;

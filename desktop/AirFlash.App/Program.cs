@@ -16,6 +16,7 @@ internal static class Program
         var stage = "platform";
         try
         {
+            RestartService.WaitForPreviousProcess(args);
             // The collector gets isolated logs, including failures before WPF initialization.
             if (args.Contains("--compat-check"))
             {

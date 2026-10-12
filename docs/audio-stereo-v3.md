@@ -1,4 +1,4 @@
-# 音频连续性与软件立体声（schema v3）
+# 音频连续性与软件立体声（schema v4）
 
 本次实现增加按接收端协商的 PCM/ALAC、实时 UDP/缓冲 TCP、PTP/NTP，
 以及两台独立接收端的软件左右声道组。新增接收端路径与软件组均为实验性支持；
@@ -53,13 +53,15 @@ NTP 跳过 `SETPEERS`，不再无条件启动 `FLUSH`。TCP 使用 type 103 的�
 
 ## 配置与 JSONL v1
 
-首次保存旧配置时写 `.pre-v3.bak`，保留已有延迟、音量与其他设置。
+首次保存旧配置时写 `.pre-v4.bak`，保留已有延迟、音量与其他设置。
 schema v3 新增 `software_groups`，接收端选项增加 `codec`、`sample_rate`、`transport`、`timing`。
+当前 schema v4 删除全局 `stream_sample_rate`；设备 `sample_rate` 为空表示自动，优先选择共同支持的 44.1 kHz，其次 48 kHz。
+从 v1–v3 迁移时，原先继承全局采样率的设备改为自动，设备和软件组已有显式值保留。
 稳定设备别名迁移同步更新左右 ID。软件组配置示例：
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "software_groups": [{
     "id": "software:0123456789abcdef0123456789abcdef",
     "name": "Office",
@@ -78,6 +80,12 @@ schema v3 新增 `software_groups`，接收端选项增加 `codec`、`sample_rat
 
 原生 IPC 仍为 v1，先 `hello` 检查 `receiver_profiles`、`software_stereo`、`continuity`、
 `buffered_audio`、`member_volume`、`receiver_password` 能力。
+新增 `receiver_capabilities` 能力及 `get_receiver_capabilities` 查询命令：参数为带稳定
+`receiver_id` 的 `peers`，只读取 `/info`，不会配对或启动音频会话；返回 `members` 中各成员的
+能力矩阵，每项包含请求的编码、传输、时钟、采样率，以及 `selected_codec`、
+`selected_transport`、`selected_timing` 预计结果。筛选与播放共用 Rust 协商规则。
+`negotiated` 事件增加 `receiver_id`、`port` 和 `clock_role`（`follow`、`sender` 或 `ntp`），
+用于显示播放时实际方式。组成员结果不同时分别显示。
 旧调用省略新字段时保留旧编码与传输语义；新桌面端发送显式策略。
 `start` 参数示例（外层请求仍需 `version`、`id`、`session_id`、`command`）：
 

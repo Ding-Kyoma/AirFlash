@@ -55,6 +55,7 @@ impl Drop for Running {
 fn capabilities() -> Vec<&'static str> {
     let mut values = vec![
         "receiver_profiles",
+        "receiver_capabilities",
         "software_stereo",
         "continuity",
         "buffered_audio",
@@ -130,8 +131,40 @@ fn main() {
             "hello" => send(
                 &request.id,
                 &request.session_id,
-                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"experimental","live_loopback":true,"capabilities":capabilities(),"commands":["hello","list_applications","start","probe","stop","set_gain","set_equalizer","set_standby","set_device_volume","pair","pair_pin"],"production_ready":false}),
+                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"experimental","live_loopback":true,"capabilities":capabilities(),"commands":["hello","get_receiver_capabilities","list_applications","start","probe","stop","set_gain","set_equalizer","set_standby","set_device_volume","pair","pair_pin"],"production_ready":false}),
             ),
+            "get_receiver_capabilities" => {
+                let result = (|| -> anyhow::Result<_> {
+                    let peers: Vec<airflash_engine::session::Peer> = serde_json::from_value(
+                        request.params.get("peers").cloned().unwrap_or(Value::Null),
+                    )?;
+                    anyhow::ensure!(
+                        !peers.is_empty() && peers.len() <= 2,
+                        "capability query requires one or two receivers"
+                    );
+                    peers
+                        .iter()
+                        .map(|peer| {
+                            airflash_engine::receiver_capabilities::query(
+                                peer,
+                                Cancellation::default(),
+                            )
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()
+                })();
+                match result {
+                    Ok(members) => send(
+                        &request.id,
+                        &request.session_id,
+                        json!({"event":"receiver_capabilities","members":members}),
+                    ),
+                    Err(error) => send(
+                        &request.id,
+                        &request.session_id,
+                        json!({"event":"error","message":error.to_string()}),
+                    ),
+                }
+            }
             "list_applications" => match airflash_engine::applications::list() {
                 Ok(items) => send(
                     &request.id,

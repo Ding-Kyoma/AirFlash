@@ -177,7 +177,15 @@ impl Formats {
                 .features
                 .or(profile.features)
                 .map_or(inherited_ptp, |f| f & (1 << 41) != 0),
-            Timing::Ptp => true,
+            Timing::Ptp => {
+                ensure!(
+                    self.features
+                        .or(profile.features)
+                        .is_none_or(|f| f & (1 << 41) != 0),
+                    "PTP timing is not advertised"
+                );
+                true
+            }
             Timing::Ntp => false,
         };
         ensure!(

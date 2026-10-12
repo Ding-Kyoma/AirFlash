@@ -23,7 +23,7 @@ public sealed class AudioEndpointTests
         var settings = new AppSettings { CaptureMode = "endpoint", CaptureEndpoint = "recording-id" };
         var restored = JsonSerializer.Deserialize<AppSettings>(
             JsonSerializer.Serialize(settings, AppSettings.JsonOptions), AppSettings.JsonOptions)!;
-        Assert.Equal(3, restored.SchemaVersion);
+        Assert.Equal(4, restored.SchemaVersion);
         Assert.Null(restored.Validate());
         Assert.Equal("recording-id", restored.EffectiveEndpoint);
         Assert.True(restored.MuteWhileStreaming);

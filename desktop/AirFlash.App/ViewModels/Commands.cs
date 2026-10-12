@@ -36,5 +36,4 @@ public static class Choices
     public static Choice[] Transports => [new("auto", L.Get("Automatic")), new("realtime", L.Get("Real-time UDP")), new("buffered", L.Get("Buffered TCP"))];
     public static Choice[] Timings => [new("auto", L.Get("Automatic")), new("ptp", "PTP"), new("ntp", "NTP"), new("follow", L.Get("Follow receiver PTP clock"))];
     public static Choice[] Rates => [new("44100", "44.1 kHz"), new("48000", "48 kHz")];
-    public static Choice[] ReceiverRates => [new(null, L.Get("Use global setting")), .. Rates];
 }
