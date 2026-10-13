@@ -31,7 +31,9 @@ $null = Assert-AirFlashDotnetSdk -Context $dotnetContext
 
 New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 $outputWithSlash = $outputRoot.TrimEnd('\') + '\'
+# Rebind the current EXE even when its version matches a previous publish.
 $arguments = @(
+    '-t:Rebuild',
     '-c', 'Release',
     "-p:ProductVersion=$productVersion",
     "-p:AppExe=$appExe",
