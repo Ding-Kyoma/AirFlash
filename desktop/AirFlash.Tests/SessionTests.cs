@@ -229,6 +229,89 @@ public sealed class SessionTests
         await controller.PairAsync(Pod(), Settings(), (_, _) => Task.FromResult<string?>(null)); await Until(() => process.Disposed);
         Assert.Equal(PlaybackState.Idle, controller.Snapshot.State); Assert.DoesNotContain(process.Commands, c => c.Command == "start");
     }
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task PairPinDeadlineAndLifetimeStopHaveDistinctTerminalStatesWithoutPlayback(bool expirePin)
+    {
+        var limit = TimeSpan.FromSeconds(10);
+        var releaseDispose = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var process = new FakeConnection { BlockDispose = releaseDispose };
+        var factory = new FakeFactory(process); var audio = new FakeAudio();
+        var timing = SessionTiming.Default with { Pin = expirePin ? TimeSpan.FromMilliseconds(100) : Timeout.InfiniteTimeSpan };
+        await using var controller = new SessionController(factory, audio, timing: timing);
+        var pinEntered = new TaskCompletionSource<CancellationToken>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pinCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pinAnswer = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failure = new TaskCompletionSource<SessionSnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var states = new ConcurrentQueue<PlaybackState>();
+        controller.Changed += snapshot =>
+        {
+            states.Enqueue(snapshot.State);
+            if (snapshot.State == PlaybackState.Error) failure.TrySetResult(snapshot);
+        };
+        Task? stop = null;
+        CancellationTokenRegistration pinRegistration = default;
+        try
+        {
+            await controller.PairAsync(Pod(), Settings(), async (_, token) =>
+            {
+                // WaitAsync's cancellation callback may unwind this delegate before
+                // an earlier registration runs. Keep the observation registered
+                // until the outer finally has joined the pairing attempt.
+                pinRegistration = token.Register(() => pinCancelled.TrySetResult());
+                pinEntered.TrySetResult(token);
+                return await pinAnswer.Task.WaitAsync(token);
+            });
+            await process.PairSent.Task.WaitAsync(limit);
+            var pinToken = await pinEntered.Task.WaitAsync(limit);
+            if (!expirePin) stop = controller.StopAsync();
+            await pinCancelled.Task.WaitAsync(limit);
+            await process.StopSent.Task.WaitAsync(limit);
+            await process.Disposing.Task.WaitAsync(limit);
+            Assert.True(pinToken.IsCancellationRequested);
+            Assert.False(process.DisposedSignal.Task.IsCompleted);
+            Assert.False(failure.Task.IsCompleted);
+            Assert.DoesNotContain(process.Commands, command => command.Command is "pair_pin" or "start");
+
+            releaseDispose.TrySetResult();
+            await process.DisposedSignal.Task.WaitAsync(limit);
+            if (expirePin)
+            {
+                var failed = await failure.Task.WaitAsync(limit);
+                Assert.Equal(PlaybackState.Error, failed.State);
+                Assert.False(string.IsNullOrWhiteSpace(failed.Message));
+                Assert.Equal(PlaybackState.Error, controller.Snapshot.State);
+                // Join the completed pairing attempt before checking that no later
+                // continuation can send a PIN or advance into playback.
+                await controller.StopAsync().WaitAsync(limit);
+            }
+            else
+            {
+                await stop!.WaitAsync(limit);
+                Assert.Equal(PlaybackState.Idle, controller.Snapshot.State);
+                Assert.False(failure.Task.IsCompleted);
+            }
+            Assert.True(process.Disposed);
+            Assert.Equal(1, factory.OpenCount);
+            Assert.Single(process.Commands, command => command.Command == "pair");
+            Assert.Contains(process.Commands, command => command.Command == "stop");
+            Assert.DoesNotContain(process.Commands, command => command.Command is "pair_pin" or "start");
+            Assert.DoesNotContain(PlaybackState.Streaming, states);
+            Assert.False(audio.Muted);
+        }
+        finally
+        {
+            pinAnswer.TrySetResult(null);
+            releaseDispose.TrySetResult();
+            try
+            {
+                await controller.StopAsync().WaitAsync(limit);
+                if (stop is not null) await stop.WaitAsync(limit);
+            }
+            finally { pinRegistration.Dispose(); }
+        }
+    }
     [Fact]
     public async Task PairBothMembersThenStartOneStereoSession()
     {
@@ -371,7 +454,10 @@ public sealed class SessionTests
         private readonly Channel<JsonElement> _events = Channel.CreateUnbounded<JsonElement>();
         public ConcurrentQueue<EngineCommand> Commands { get; } = new();
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource PairSent { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource StopSent { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Disposing { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource DisposedSignal { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource? BlockDispose { get; init; }
         public string Session { get; private set; } = "";
         public bool Disposed { get; private set; }
@@ -381,9 +467,9 @@ public sealed class SessionTests
             switch (command)
             {
                 case "start": Session = session; Started.TrySetResult(); if (autoReady) Emit("streaming"); break;
-                case "pair": Session = session; Emit("pin_required"); break;
+                case "pair": Session = session; PairSent.TrySetResult(); Emit("pin_required"); break;
                 case "pair_pin": Emit("paired"); break;
-                case "stop": _events.Writer.TryComplete(); break;
+                case "stop": StopSent.TrySetResult(); _events.Writer.TryComplete(); break;
             }
             return Task.CompletedTask;
         }
@@ -394,7 +480,7 @@ public sealed class SessionTests
         }
         public void Emit(string kind, string? session = null, string? message = null, object? metrics = null) => _events.Writer.TryWrite(JsonSerializer.SerializeToElement(new { version = 1, session_id = session ?? Session, @event = kind, message, metrics }));
         public async ValueTask<JsonElement?> ReadAsync(CancellationToken cancellation) { try { return await _events.Reader.ReadAsync(cancellation); } catch (ChannelClosedException) { return null; } }
-        public async ValueTask DisposeAsync() { Disposing.TrySetResult(); if (BlockDispose is not null) await BlockDispose.Task; Disposed = true; _events.Writer.TryComplete(); }
+        public async ValueTask DisposeAsync() { Disposing.TrySetResult(); if (BlockDispose is not null) await BlockDispose.Task; Disposed = true; _events.Writer.TryComplete(); DisposedSignal.TrySetResult(); }
     }
     private sealed class FakeAudio : IAudioService
     {
