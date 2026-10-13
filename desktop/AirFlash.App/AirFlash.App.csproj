@@ -20,6 +20,8 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../AirFlash.Core/AirFlash.Core.csproj"/>
+    <!-- Keep the single-file analyzer aligned with the lock file when the SDK rolls forward. -->
+    <PackageReference Include="Microsoft.NET.ILLink.Tasks" Version="10.0.12" PrivateAssets="all"/>
     <PackageReference Include="NAudio" Version="2.2.1"/>
   </ItemGroup>
   <ItemGroup>
