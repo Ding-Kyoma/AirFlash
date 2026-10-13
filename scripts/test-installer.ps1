@@ -12,6 +12,13 @@ function Find-Msi([string]$Directory) {
 $msi = Find-Msi 'dist'
 $exeHash = (Get-FileHash dist/AirFlash.exe).Hash
 $msiHash = (Get-FileHash $msi).Hash
+# Resolve the predecessor before touching user data or installing any package.
+$releases = gh api repos/Ding-Kyoma/AirFlash/releases | ConvertFrom-Json
+if ($LASTEXITCODE) { throw 'Cannot inspect preceding releases.' }
+$fileInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path dist/AirFlash.exe))
+$current = [Version]('{0}.{1}.{2}' -f $fileInfo.FileMajorPart,$fileInfo.FileMinorPart,$fileInfo.FileBuildPart)
+$previous = Select-AirFlashInstallerPredecessor -Releases $releases -CurrentVersion $current
+$fixtureVersion = if (-not $previous) { Get-AirFlashInstallerFixtureVersion -CurrentVersion $current }
 $installed = Join-Path $env:ProgramFiles 'AirFlash/AirFlash.exe'
 $data = Join-Path $env:APPDATA 'AirFlash'
 New-Item $data -ItemType Directory -Force | Out-Null
@@ -40,11 +47,6 @@ if ((Test-Path $installed) -or @(Entries).Count -ne 0) { throw 'First uninstall 
 
 # Choose a strictly lower version than this MSI's executable, including for
 # unofficial validation builds that can lag today's public release.
-$releases = gh api repos/Ding-Kyoma/AirFlash/releases | ConvertFrom-Json
-if ($LASTEXITCODE) { throw 'Cannot inspect preceding releases.' }
-$fileInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path dist/AirFlash.exe))
-$current = [Version]('{0}.{1}.{2}' -f $fileInfo.FileMajorPart,$fileInfo.FileMinorPart,$fileInfo.FileBuildPart)
-$previous = Select-AirFlashInstallerPredecessor -Releases $releases -CurrentVersion $current
 $oldDir = Join-Path $root 'artifacts/installer-test/previous'
 New-Item $oldDir -ItemType Directory -Force | Out-Null
 if ($previous) {
@@ -57,7 +59,7 @@ if ($previous) {
     foreach ($file in @('AirFlash.Package.wixproj','Installer.props','Package.wxs','License.rtf')) {
         Copy-Item (Join-Path $root "installer/$file") (Join-Path $fixtureProject $file)
     }
-    & ./scripts/dotnet.ps1 build (Join-Path $fixtureProject 'AirFlash.Package.wixproj') -c Release '-p:ProductVersion=0.2.3' "-p:AppExe=$root/dist/AirFlash.exe" "-p:AppIcon=$root/desktop/AirFlash.App/Assets/app.ico" "-p:UiLicenseFile=$root/installer/License.rtf" "-p:OutputPath=$oldDir/" '-p:DebugType=none'
+    & ./scripts/dotnet.ps1 build (Join-Path $fixtureProject 'AirFlash.Package.wixproj') -c Release "-p:ProductVersion=$fixtureVersion" "-p:AppExe=$root/dist/AirFlash.exe" "-p:AppIcon=$root/desktop/AirFlash.App/Assets/app.ico" "-p:UiLicenseFile=$root/installer/License.rtf" "-p:OutputPath=$oldDir/" '-p:DebugType=none'
     if ($LASTEXITCODE) { throw 'Cannot build upgrade fixture.' }
 }
 if ((Get-FileHash $msi).Hash -ne $msiHash -or (Get-FileHash dist/AirFlash.exe).Hash -ne $exeHash) { throw 'Fixture build changed release assets.' }
