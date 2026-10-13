@@ -205,7 +205,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             }
             catch (PairCancelledException) { }
             catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
-            catch (Exception error) { log?.Invoke(error.ToString()); Publish(epoch, PlaybackState.Error, error.Message); }
+            catch (Exception error) { if (RecordFailure(epoch, error) is { } notice) Publish(epoch, PlaybackState.Error, notice.Detail); }
             finally { await RestoreAudioAsync().ConfigureAwait(false); }
         }, CancellationToken.None);
     }
@@ -377,14 +377,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                 if (cancellation.IsCancellationRequested) return;
                 if (startedAt != 0 && Stopwatch.GetElapsedTime(startedAt) >= TimeSpan.FromSeconds(10)) attempts = 0;
                 ++attempts;
-                var notice = error is EngineFailure engineFailure ? engineFailure.Notice : new EngineNotice("host_error", "", "desktop", error.Message);
-                lock (_sync)
-                {
-                    if (epoch != _generation) return;
-                    // A failed reconnect must not erase the last streaming failure snapshot.
-                    _diagnostics = _diagnostics with { LastFault = notice, CaptureBeforeFault = _snapshot.Metrics ?? _diagnostics.CaptureBeforeFault, TransportBeforeFault = _diagnostics.Transport ?? _diagnostics.TransportBeforeFault };
-                }
-                log?.Invoke($"Session failure: {JsonSerializer.Serialize(_diagnostics)}\n{error}");
+                if (RecordFailure(epoch, error) is not { } notice) return;
                 Publish(epoch, PlaybackState.Error, notice.Detail);
                 if (!_settings.ForceReconnect || attempts > _settings.MaxReconnectAttempts || notice.Retryable == false || notice.Retryable is null && IsAuthenticationFailure(error.Message)) return;
             }
@@ -420,7 +413,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                             }
                             break;
                         case "paired": goto Paired;
-                        case "error": throw new IOException(item.Text("message", L.Get("Pairing failed.")));
+                        case "error": throw new EngineFailure(EngineNotice.Parse(item));
                     }
                 }
             Paired:;
@@ -428,7 +421,19 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             finally { ClearConnection(connection); await RequestStopAsync(connection, session).ConfigureAwait(false); }
         }
     }
-    private sealed class EngineFailure(EngineNotice notice) : IOException(notice.Detail) { public EngineNotice Notice { get; } = notice; }
+    private EngineNotice? RecordFailure(long epoch, Exception error)
+    {
+        var notice = error is EngineFailure engineFailure ? engineFailure.Notice : new EngineNotice("host_error", "", "desktop", error.Message);
+        PlaybackDiagnostics diagnostics;
+        lock (_sync)
+        {
+            if (epoch != _generation) return null;
+            // A failed reconnect must not erase the last streaming failure snapshot.
+            diagnostics = _diagnostics = _diagnostics with { LastFault = notice, CaptureBeforeFault = _snapshot.Metrics ?? _diagnostics.CaptureBeforeFault, TransportBeforeFault = _diagnostics.Transport ?? _diagnostics.TransportBeforeFault };
+        }
+        log?.Invoke($"Session failure: {JsonSerializer.Serialize(diagnostics)}\n{error}");
+        return notice;
+    }
     private sealed class PairCancelledException : OperationCanceledException;
     private static bool IsAuthenticationFailure(string message) => new[] { "pairing", "srp", "verification", "credentials", "signature", "identity", "authentication" }.Any(word => message.Contains(word, StringComparison.OrdinalIgnoreCase));
     private void SetConnection(IEngineConnection connection, string session) { lock (_sync) { _connection = connection; _sessionId = session; _equalizerReady = false; } }
@@ -447,7 +452,8 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         {
             while (true)
             {
-                var item = await connection.ReadAsync(timeout.Token).ConfigureAwait(false) ?? throw new IOException(L.Get("The audio engine exited."));
+                var item = await EngineEvents.ReadAsync(connection, timeout.Token).ConfigureAwait(false) ?? throw new IOException(L.Get("The audio engine exited."));
+                if (EngineEvents.IsProcessRejection(item)) return item;
                 if (item.Number("version") == 1 && item.Text("session_id") == session) return item;
             }
         }
