@@ -49,7 +49,7 @@ or a similar tool, and route the audio you want to stream to that endpoint.
 - Provides a ten-band equalizer with presets and live preview in Settings.
 - Captures a selected application or playback/recording endpoints, including virtual audio devices.
 - Releases AirPlay sessions after configurable silence and reconnects when audio returns.
-- Available as a portable Windows x64 app with English, Simplified Chinese, and Traditional Chinese UI.
+- Available as a portable Windows x64 app with English, Simplified Chinese, Traditional Chinese, and German UI.
 
 ## Feature plan
 

@@ -123,7 +123,7 @@ public sealed class AppSettings : ObservableObject
     public string? EffectiveEndpoint => CaptureMode == "endpoint" ? CaptureEndpoint : null;
     public string? Validate()
     {
-        if (UiLanguage is not ("system" or "en" or "zh")) return L.Get("Select a valid language.");
+        if (UiLanguage is not ("system" or "en" or "zh" or "de")) return L.Get("Select a valid language.");
         if (Theme is not ("system" or "dark" or "light")) return L.Get("Select a valid theme.");
         if (DiscoveryInterfaceId is null || (DiscoveryInterfaceId.Length > 0 && !Guid.TryParse(DiscoveryInterfaceId, out _))) return L.Get("Select a valid network interface.");
         if (MasterVolume is < 0 or > 100) return L.Get("Master volume must be between 0 and 100.");
