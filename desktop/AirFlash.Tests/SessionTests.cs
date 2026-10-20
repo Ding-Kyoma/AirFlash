@@ -34,19 +34,79 @@ public sealed class SessionTests
     [Fact]
     public async Task EqualizerRollbackUsesLastApplyAndOldOwnerCannotClearNewPreview()
     {
-        var process = new FakeConnection(); await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast);
+        var process = new FakeConnection();
+        // This fixture owns cancellation explicitly; a quiet fake's one-second
+        // inactivity deadline is a different scenario, covered separately below.
+        await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(),
+            timing: Fast with { Read = SessionTiming.Default.Read });
         var settings = Settings(); await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
         var oldOwner = Guid.NewGuid(); var newOwner = Guid.NewGuid();
         await controller.PreviewEqualizerAsync(oldOwner, Sound(4)); settings.Equalizer = Sound(4);
         await controller.UpdateSettingsAsync(settings); await controller.ClearEqualizerPreviewAsync(oldOwner);
+        Assert.Equal(PlaybackState.Streaming, controller.Snapshot.State);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        process.BeforeSend = async (command, cancellation) =>
+        {
+            if (command.Command != "set_equalizer" || EqGain(command) != 7) return;
+            entered.TrySetResult(); await release.Task.WaitAsync(cancellation);
+        };
         var pending = controller.PreviewEqualizerAsync(oldOwner, Sound(7));
-        await controller.ClearEqualizerPreviewAsync(oldOwner); await pending;
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await controller.ClearEqualizerPreviewAsync(oldOwner).WaitAsync(TimeSpan.FromSeconds(5));
+            await pending;
+        }
+        finally { release.TrySetResult(); process.BeforeSend = null; }
+        Assert.DoesNotContain(process.Commands, command => command.Command == "set_equalizer" && EqGain(command) == 7);
+        Assert.Equal(PlaybackState.Streaming, controller.Snapshot.State);
         Assert.Equal(4, EqGain(process.Commands.Last(c => c.Command == "set_equalizer")));
         await controller.PreviewEqualizerAsync(newOwner, Sound(9));
+        var count = process.Commands.Count;
         await controller.ClearEqualizerPreviewAsync(oldOwner);
+        Assert.Equal(PlaybackState.Streaming, controller.Snapshot.State);
+        Assert.Equal(count, process.Commands.Count);
         Assert.Equal(9, EqGain(process.Commands.Last(c => c.Command == "set_equalizer")));
         await controller.ClearEqualizerPreviewAsync(newOwner);
+        Assert.Equal(PlaybackState.Streaming, controller.Snapshot.State);
         Assert.Equal(4, EqGain(process.Commands.Last(c => c.Command == "set_equalizer")));
+    }
+    [Fact]
+    public async Task EqualizerPreviewAfterReadTimeoutIsRetainedForTheNextAttempt()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection();
+        await using var controller = new SessionController(new FakeFactory(first, second), new FakeAudio(),
+            timing: Fast with { Read = TimeSpan.FromMilliseconds(50) });
+        var expired = new TaskCompletionSource<SessionSnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var restarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        void Changed(SessionSnapshot snapshot)
+        {
+            if (snapshot.State == PlaybackState.Error) expired.TrySetResult(snapshot);
+            if (snapshot.State == PlaybackState.Streaming && snapshot.Receiver?.Id == "b") restarted.TrySetResult();
+        }
+        controller.Changed += Changed;
+        try
+        {
+            var settings = Settings(); settings.Equalizer = Sound(4);
+            await controller.StartAsync(Pod(), settings);
+            var failure = await expired.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(L.Get("The audio engine response timed out."), failure.Diagnostics?.LastFault?.Message);
+            Assert.Equal("host_error", failure.Diagnostics?.LastFault?.Code);
+            Assert.Equal("desktop", failure.Diagnostics?.LastFault?.Channel);
+            Assert.True(first.Disposed);
+            var count = first.Commands.Count;
+            var oldOwner = Guid.NewGuid(); var newOwner = Guid.NewGuid();
+            await controller.PreviewEqualizerAsync(oldOwner, Sound(7));
+            await controller.PreviewEqualizerAsync(newOwner, Sound(9));
+            await controller.ClearEqualizerPreviewAsync(oldOwner);
+            Assert.Equal(count, first.Commands.Count);
+            Assert.Equal(4, EqGain(first.Commands.Last(command => command.Command == "set_equalizer")));
+            await controller.StartAsync(Pod("b"), settings);
+            await restarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(9, EqGain(second.Commands.Single(command => command.Command == "start")));
+        }
+        finally { controller.Changed -= Changed; }
     }
     [Fact]
     public async Task ContinuousEqualizerDraggingSendsWhileInputIsStillChanging()
@@ -784,14 +844,18 @@ public sealed class SessionTests
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Disposing { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource? BlockDispose { get; init; }
+        public Func<EngineCommand, CancellationToken, Task>? BeforeSend { get; set; }
         public string Session { get; private set; } = "";
         public bool Disposed { get; private set; }
         public bool RespondHello { get; init; } = true;
         public object? ReceiverCapabilityResponse { get; init; }
         public TaskCompletionSource? GainEntered, GainGate;
-        public Task SendAsync(string session, string command, object? parameters, CancellationToken cancellation)
+        public async Task SendAsync(string session, string command, object? parameters, CancellationToken cancellation)
         {
-            Commands.Enqueue(new(session, command, JsonSerializer.SerializeToElement(parameters ?? new { })));
+            var outgoing = new EngineCommand(session, command, JsonSerializer.SerializeToElement(parameters ?? new { }));
+            if (BeforeSend is { } beforeSend) await beforeSend(outgoing, cancellation);
+            cancellation.ThrowIfCancellationRequested();
+            Commands.Enqueue(outgoing);
             switch (command)
             {
                 case "hello": Session = session; if (RespondHello) EmitHello(); break;
@@ -800,9 +864,8 @@ public sealed class SessionTests
                 case "pair": Session = session; Emit("pin_required"); break;
                 case "pair_pin": Emit("paired"); break;
                 case "stop": _events.Writer.TryComplete(); break;
-                case "set_gain": GainEntered?.TrySetResult(); if (GainGate is not null) return GainGate.Task.WaitAsync(cancellation); break;
+                case "set_gain": GainEntered?.TrySetResult(); if (GainGate is not null) await GainGate.Task.WaitAsync(cancellation); break;
             }
-            return Task.CompletedTask;
         }
         public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "application_capture" }.Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).ToArray() });
         public void EmitData(object payload, string? session = null)

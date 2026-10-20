@@ -24,6 +24,21 @@ internal static class UiSmoke
         var directory = Path.GetDirectoryName(report)!; Directory.CreateDirectory(directory);
         AppPaths.DataDirectory = Path.Combine(directory, "isolated-data");
         var checks = new List<string>();
+        Check(!Program.NeedsDiagnosticIsolation([]) && !Program.NeedsDiagnosticIsolation(["--startup"]),
+            "ordinary startup arguments preserve the application's normal data directory", checks);
+        Check(!Program.NeedsDiagnosticIsolation(["--other-check"])
+            && !Program.NeedsDiagnosticIsolation(["--output", "synthetic-output-check"]),
+            "unknown check switches and check-suffixed option values do not redirect normal startup", checks);
+        Check(new[] { "--discovery-perf", "--update-check", "--self-check", "--stability-check", "--compat-check", "--discovery-check", "--audio-check",
+            "--ui-smoke", "--tray-smoke", "--ui-perf" }.All(mode => Program.NeedsDiagnosticIsolation([mode])),
+            "every dispatched diagnostic mode selects isolated startup data without invoking its real service", checks);
+        Check(string.Equals(Program.DiagnosticStartupDataDirectory, AppPaths.DataDirectory, StringComparison.OrdinalIgnoreCase),
+            "startup diagnostic data uses the smoke output directory before the harness starts", checks);
+        var startupLogs = Directory.GetFiles(Path.Combine(AppPaths.DataDirectory, "logs"), "wpf-*.log");
+        var startupText = string.Join("\n", startupLogs.Select(File.ReadAllText));
+        Check(startupText.Contains("Startup stage=platform", StringComparison.Ordinal)
+            && startupText.Contains("Startup stage=wpf-resources ready", StringComparison.Ordinal),
+            "both startup stages are recorded in isolated smoke logs", checks);
         if (args.Contains("--ui-regression") || args.Contains("--ui-regression-smoke") || args.Contains("--receiver-settings-regression"))
         {
             try
