@@ -73,7 +73,7 @@ jobs:
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          ./scripts/build.ps1 -ReservedVersion $env:RELEASE_VERSION -ReleaseChannel $env:RELEASE_CHANNEL
+          ./scripts/build-release.ps1 -ReservedVersion $env:RELEASE_VERSION -ReleaseChannel $env:RELEASE_CHANNEL
           ./scripts/verify-release.ps1 -Version $env:RELEASE_VERSION
       - name: Installer lifecycle in disposable runner
         shell: pwsh

@@ -41,7 +41,7 @@ internal static class Program
                         args.Contains("--compat-check") ? "compat-logs" : "isolated-data");
                 DiagnosticStartupDataDirectory = AppPaths.DataDirectory;
             }
-            AppPaths.Log($"Startup stage={stage} version={AppPaths.Version} os={Environment.OSVersion.Version} architecture={RuntimeInformation.ProcessArchitecture}");
+            AppPaths.Log($"Startup stage={stage} version={AppPaths.DisplayVersion} os={Environment.OSVersion.Version} architecture={RuntimeInformation.ProcessArchitecture}");
             if (!WindowsCapabilities.Current.Supported) throw new PlatformNotSupportedException(WindowsCompatibility.Requirement);
             stage = "wpf-resources";
             var app = new App();

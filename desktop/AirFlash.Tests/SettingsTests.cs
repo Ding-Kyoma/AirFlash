@@ -76,6 +76,14 @@ public sealed class SettingsTests
         settings.UiLanguage = "invalid";
         Assert.NotNull(settings.Validate());
     }
+
+    [Fact]
+    public void GermanLanguageIsAcceptedAndPersists()
+    {
+        var settings = new AppSettings { UiLanguage = "de" };
+        Assert.Null(settings.Validate());
+        Assert.Equal("de", settings.Clone().UiLanguage);
+    }
     [Fact]
     public void FirstRunDefaultsMatchStartupPage()
     {

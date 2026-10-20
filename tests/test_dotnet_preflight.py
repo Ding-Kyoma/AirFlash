@@ -134,6 +134,7 @@ function Reserve-ReleaseVersion {
 """
 
 NATIVE_STUB = r"""
+param([string]$CompatibilityArtifacts)
 $global:airflashTestEvents.Add([pscustomobject]@{ operation = 'native' })
 if ($global:airflashTestCase.add_checkout_host) {
     $path = $global:airflashTestCase.hosts.checkout.path
@@ -144,11 +145,24 @@ $global:LASTEXITCODE = [int]$global:airflashTestCase.native_exit
 """
 
 INSTALLER_STUB = r"""
-param($PublishPath, $OutputPath, $DotnetPath)
+param($PublishPath, $OutputPath, $DotnetPath, $ProductVersion, $ArtifactVersion)
 $global:airflashTestEvents.Add([pscustomobject]@{
     operation = 'installer'; path = $DotnetPath
 })
 throw 'Fixture stopped after installer admission.'
+"""
+
+DEV_VERSION_STUB = r"""
+function Get-DevelopmentVersion {
+    param($Root)
+    [pscustomobject]@{
+        Numeric = '0.4.0'
+        Informational = '0.4.0-dev.3f2a9c1e'
+        BaseTag = 'v0.4.0'
+        Commit = '3f2a9c1e'
+        Dirty = $false
+    }
+}
 """
 
 
@@ -170,6 +184,7 @@ class Fixture:
             RESERVATION_STUB, encoding="utf-8"
         )
         (self.root / "scripts" / "build-native.ps1").write_text(NATIVE_STUB, encoding="utf-8")
+        (self.root / "scripts" / "dev-version.ps1").write_text(DEV_VERSION_STUB, encoding="utf-8")
         self.hosts = {}
 
     def host(self, name, *, version="10.0.301", resolve_exit=0, command_exit=0, **details):
@@ -277,7 +292,7 @@ def side_effects(result):
 def test_failed_selected_sdk_precedes_all_release_and_build_operations(fixture, details):
     selected = fixture.host("checkout", **details)
     fixture.host("path")
-    result = fixture.run("build.ps1", native_errors=True)
+    result = fixture.run("build-release.ps1", native_errors=True)
     assert result["error"]
     assert side_effects(result) == []
     assert [call["path"] for call in host_calls(result)] == [str(selected)]
@@ -345,7 +360,7 @@ def test_unresolved_selected_host_has_actionable_policy_diagnostics(fixture, det
 
 
 def test_missing_host_is_distinct_from_failed_sdk_resolution(fixture):
-    result = fixture.run("build.ps1")
+    result = fixture.run("build-release.ps1")
     assert "No .NET host" in result["error"]
     assert "https://dotnet.microsoft.com/download/dotnet/10.0" in result["error"]
     assert result["events"] == []
@@ -509,6 +524,22 @@ def test_installer_success_checks_and_builds_the_same_override(fixture):
     assert len(list(output.glob("AirFlash-*.msi"))) == 1
 
 
+def test_installer_rejects_a_numeric_version_that_differs_from_the_exe(fixture):
+    fixture.host("override", installer_output=True)
+    publish, output = fixture.installer()
+    result = fixture.run(
+        "build-installer.ps1",
+        parameters={
+            "PublishPath": str(publish),
+            "OutputPath": str(output),
+            "ProductVersion": "9.9.9",
+        },
+    )
+    assert "EXE version mismatch" in result["error"]
+    assert not output.exists()
+    assert result["events"] == []
+
+
 def test_build_keeps_the_preflight_host_when_checkout_host_appears_later(fixture):
     later_host = fixture.host("checkout", version="", resolve_exit=42)
     later_host.unlink()
@@ -518,7 +549,7 @@ def test_build_keeps_the_preflight_host_when_checkout_host_appears_later(fixture
     audit = fixture.root / "artifacts/compatibility/bundle-audit.json"
     audit.parent.mkdir(parents=True)
     audit.write_text(json.dumps({"ok": True}), encoding="utf-8")
-    result = fixture.run("build.ps1", add_checkout_host=True)
+    result = fixture.run("build-release.ps1", add_checkout_host=True)
     assert result["error"] == "Fixture stopped after installer admission."
     assert [call["path"] for call in host_calls(result)] == [str(selected), str(selected)]
     calls = host_calls(result)
@@ -541,7 +572,7 @@ def test_build_keeps_the_preflight_host_when_checkout_host_appears_later(fixture
 
 def test_later_publish_failure_retains_its_build_error(fixture):
     fixture.host("checkout", command_exit=51)
-    result = fixture.run("build.ps1")
+    result = fixture.run("build-release.ps1")
     assert result["error"] == "WPF publish failed; do not use residual dist files"
     assert host_calls(result)[0]["arguments"] == ["--version"]
     assert host_calls(result)[1]["arguments"][0] == "publish"
@@ -549,7 +580,7 @@ def test_later_publish_failure_retains_its_build_error(fixture):
 
 def test_later_native_failure_prevents_publish_and_retains_its_build_error(fixture):
     fixture.host("checkout")
-    result = fixture.run("build.ps1", native_exit=61)
+    result = fixture.run("build-release.ps1", native_exit=61)
     assert result["error"] == "Native build failed"
     assert [event["operation"] for event in result["events"]] == [
         "host",
@@ -558,6 +589,40 @@ def test_later_native_failure_prevents_publish_and_retains_its_build_error(fixtu
         "cleanup",
         "native",
     ]
+
+
+def test_dev_build_never_reserves_a_release_version(fixture):
+    selected = fixture.host("checkout", publish_output=True)
+    fixture.stop_after_installer()
+    for relative in ("build/dev", "dist/dev"):
+        directory = fixture.root / relative
+        directory.mkdir(parents=True)
+        (directory / "preserve.txt").write_text("keep fixture output", encoding="utf-8")
+    audit = fixture.root / "artifacts/dev/compatibility/bundle-audit.json"
+    audit.parent.mkdir(parents=True)
+    audit.write_text(json.dumps({"ok": True}), encoding="utf-8")
+    result = fixture.run("build-dev.ps1")
+    assert result["error"] == "Fixture stopped after installer admission."
+    assert [call["path"] for call in host_calls(result)] == [str(selected), str(selected)]
+    calls = host_calls(result)
+    assert calls[0]["arguments"] == ["--version"]
+    assert calls[1]["arguments"][0] == "publish"
+    assert "-p:InformationalVersion=0.4.0-dev.3f2a9c1e" in calls[1]["arguments"]
+    assert "-p:Version=0.4.0" in calls[1]["arguments"]
+    assert "-p:CompatibilityArtifacts=" + str(audit.parent) in calls[1]["arguments"]
+    assert calls[1]["arguments"][calls[1]["arguments"].index("-o") + 1] == str(
+        fixture.root / "build/dev/wpf-publish"
+    )
+    assert [event["operation"] for event in result["events"]] == [
+        "host",
+        "cleanup",
+        "cleanup",
+        "native",
+        "host",
+        "command",
+        "installer",
+    ]
+    assert not (fixture.root / "artifacts/release-version.txt").exists()
 
 
 def test_release_workflow_prepares_and_checks_sdk_before_reserving_version():

@@ -62,7 +62,7 @@ public partial class App : Application
             {
                 using var client = new System.Net.Http.HttpClient { MaxResponseContentBufferSize = 1024 * 1024 };
                 var release = await new UpdateService(client).CheckAsync();
-                WriteOutput(args.Args, new { ok = true, version = AppPaths.Version, latest = release?.Version.ToString(3), download = release?.DownloadPage.AbsoluteUri });
+                WriteOutput(args.Args, new { ok = true, version = AppPaths.Version, display_version = AppPaths.DisplayVersion, latest = release?.Version.ToString(3), download = release?.DownloadPage.AbsoluteUri });
                 Shutdown(0); return;
             }
             if (args.Args.Contains("--self-check")) { Shutdown(await SelfCheckAsync(args.Args)); return; }
@@ -179,7 +179,7 @@ public partial class App : Application
             var executable = AppPaths.ExtractEngine();
             stage = "engine-hello";
             var hello = await QueryHelloAsync(new ProcessEngineFactory(executable, AppPaths.Log));
-            WriteOutput(args, new { ok = capabilities.Supported && capabilities.DnsSdAvailable, version = AppPaths.Version, capabilities,
+            WriteOutput(args, new { ok = capabilities.Supported && capabilities.DnsSdAvailable, version = AppPaths.Version, display_version = AppPaths.DisplayVersion, capabilities,
                 requirement = WindowsCompatibility.Requirement, native = hello,
                 qualification = "Win10 execution pending; this check does not exercise discovery, pairing or playback." });
             return capabilities.Supported && capabilities.DnsSdAvailable ? 0 : 1;
@@ -187,14 +187,14 @@ public partial class App : Application
         catch (Exception error)
         {
             AppPaths.Log($"Compatibility stage={stage} failed {error}");
-            WriteOutput(args, new { ok = false, version = AppPaths.Version, capabilities, stage, error = error.ToString(), hresult = $"0x{error.HResult:X8}" });
+            WriteOutput(args, new { ok = false, version = AppPaths.Version, display_version = AppPaths.DisplayVersion, capabilities, stage, error = error.ToString(), hresult = $"0x{error.HResult:X8}" });
             return 1;
         }
     }
     private static async Task<int> SelfCheckAsync(string[] args)
     {
         var hello = await QueryHelloAsync(new ProcessEngineFactory(AppPaths.ExtractEngine()));
-        WriteOutput(args, new { ok = true, host = "wpf", version = AppPaths.Version, native = hello });
+        WriteOutput(args, new { ok = true, host = "wpf", version = AppPaths.Version, display_version = AppPaths.DisplayVersion, native = hello });
         return 0;
     }
     private static async Task<int> AudioCheckAsync(string[] args)

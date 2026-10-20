@@ -1,6 +1,9 @@
-param([switch]$Check)
+param([switch]$Check, [string]$CompatibilityArtifacts)
 $ErrorActionPreference = "Stop"
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+if (-not $CompatibilityArtifacts) { $CompatibilityArtifacts = Join-Path $repoRoot 'artifacts/compatibility' }
+$CompatibilityArtifacts = [IO.Path]::GetFullPath($CompatibilityArtifacts)
+New-Item -ItemType Directory -Path $CompatibilityArtifacts -Force | Out-Null
 $cargoCommand = Get-Command cargo -ErrorAction SilentlyContinue
 $cargoPath = if ($cargoCommand) { $cargoCommand.Source } else { Join-Path $env:USERPROFILE '.cargo/bin/cargo.exe' }
 if (-not (Test-Path -LiteralPath $cargoPath)) { throw 'Rust toolchain missing. Install Rust MSVC via rustup.' }
@@ -36,7 +39,7 @@ try {
     if ($dependencies -match '(?i)VCRUNTIME140|MSVCP140|ucrtbase') {
         throw 'Native engine still has a dynamic MSVC CRT dependency.'
     }
-    & uv run --no-sync python -m scripts.compatibility_audit --file $engine --source-root $repoRoot --output (Join-Path $repoRoot 'artifacts/compatibility/engine-audit.json')
+    & uv run --no-sync python -m scripts.compatibility_audit --file $engine --source-root $repoRoot --output (Join-Path $CompatibilityArtifacts 'engine-audit.json')
     if ($LASTEXITCODE -ne 0) { throw 'Native Windows compatibility audit failed.' }
     Write-Output $engine
 } finally { Pop-Location; $env:CARGO_ENCODED_RUSTFLAGS = $oldRustFlags }

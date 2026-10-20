@@ -43,7 +43,7 @@ AirFlash 提供 Windows x64 可执行文件和可独立运行的 MSI 安装包�
 - 在设置中提供 10 段均衡器，支持音效预设和即时试听。
 - 支持采集指定应用及其子进程，或播放与录音端点，包括虚拟音频设备。
 - 支持静音超时后释放 AirPlay 会话，并在检测到声音后自动恢复。
-- 提供便携式 Windows x64 程序，支持英文、简体中文和繁体中文界面。
+- 提供便携式 Windows x64 程序，支持英文、简体中文、繁体中文和德文界面。
 
 ## 功能计划
 
@@ -142,13 +142,17 @@ uv sync --locked
 pwsh scripts/build-native.ps1 -Check
 pwsh scripts/dotnet.ps1 restore AirFlash.sln --locked-mode
 pwsh scripts/dotnet.ps1 run --project AirFlash.App/AirFlash.App.csproj
-pwsh scripts/build.ps1
+pwsh scripts/build-dev.ps1
 ```
 
 构建生成：
 
-- `dist/AirFlash.exe`
-- `dist/AirFlash-X.Y.Z.msi`
+- `dist/dev/AirFlash.exe`
+- `dist/dev/AirFlash-X.Y.Z-dev.<commit>.msi`
+
+开发包以本地最近一个正式 `vX.Y.Z` 标签为基准，并附加当前提交号；它不会保留版本号或推送标签。安装开发 MSI 前，请先卸载已安装的同版本正式包。
+
+只有正式发版时才使用 `pwsh scripts/build-release.ps1`；它会要求干净的发布分支、保留下一个正式版本，并把产物写入 `dist/`。
 
 Rust 引擎会嵌入 WPF 可执行文件，运行时释放到
 `%LOCALAPPDATA%/AirFlash/engine/<hash>` 内容寻址缓存。
