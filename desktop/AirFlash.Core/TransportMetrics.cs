@@ -27,4 +27,5 @@ public sealed record EngineNotice(string Code, string Host, string Channel, stri
     public string Detail => string.Join(" · ", new[] { Message, Host, Channel, Code }.Where(s => !string.IsNullOrWhiteSpace(s)));
 }
 public sealed record PlaybackDiagnostics(long ReconnectCount = 0, EngineNotice? LastFault = null, StreamMetrics? CaptureBeforeFault = null,
-    TransportMetrics? TransportBeforeFault = null, TransportMetrics? Transport = null, IReadOnlyList<EngineNotice>? Warnings = null);
+    TransportMetrics? TransportBeforeFault = null, TransportMetrics? Transport = null, IReadOnlyList<EngineNotice>? Warnings = null,
+    IReadOnlyList<JsonElement>? Negotiated = null, JsonElement? ClockStatus = null, JsonElement? SchedulerStatus = null);

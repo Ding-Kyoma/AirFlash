@@ -94,10 +94,16 @@ public sealed class SessionTests
         await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
         var settings = Settings(); settings.StandbyEnabled = true; settings.Options("old").StandbySeconds = 5; settings.Options("old").LatencyMode = "realtime";
         await controller.StartAsync(Pod("old"), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        connection.EmitData(new { @event = "negotiated", receiver_id = "old", host = "127.0.0.1", port = 7000, codec = "alac", timing = "ptp", clock_role = "follow" });
+        connection.EmitData(new { @event = "capture_metrics", metrics = new { input_rate = 48000 } });
+        await Until(() => controller.Snapshot.Diagnostics?.Negotiated?.Count == 1);
         ReceiverCatalog.ApplyMigrations(settings, new Dictionary<string, string> { ["old"] = "new" });
         await controller.UpdateReceiverAsync(Pod("new"), settings);
         Assert.Equal(1, factory.OpenCount); Assert.Equal("new", controller.Snapshot.Receiver!.Id); Assert.Equal(120, controller.Snapshot.TargetLatency);
-        connection.Emit("capture_metrics", metrics: new { last_audio_qpc_ns = 1 });
+        var negotiated = Assert.Single(controller.Snapshot.Diagnostics!.Negotiated!);
+        Assert.Equal("new", negotiated.Text("receiver_id")); Assert.Equal("follow", negotiated.Text("clock_role"));
+        Assert.Equal(5, connection.Commands.Last(c => c.Command == "set_standby").Parameters.Number("silence_seconds"));
+        connection.EmitData(new { @event = "standby", reason = "silence" });
         await Until(() => controller.Snapshot.State == PlaybackState.Standby);
         Assert.Equal(1, factory.OpenCount); Assert.False(connection.Disposed);
     }
@@ -123,6 +129,184 @@ public sealed class SessionTests
         Assert.Equal(1, factory.OpenCount); Assert.Equal("new-a", controller.Snapshot.Receiver!.Members[0].Id);
     }
     [Fact]
+    public async Task PassiveStereoRefreshRetainsTransportAcrossLeaderAndIdentityChanges()
+    {
+        var connection = new FakeConnection(); var factory = new FakeFactory(connection); var logs = new ConcurrentQueue<string>();
+        await using var controller = new SessionController(factory, new FakeAudio(), logs.Enqueue, Fast);
+        var left = Pod("left") with { IsLeader = true }; var right = Pod("right") with { Address = "127.0.0.2" };
+        var pair = Pod("stereo:pair") with { StereoId = "pair", Members = [left, right] };
+        await controller.StartAsync(pair, Settings()); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var commands = connection.Commands.Count;
+        var migrations = new Dictionary<string, string> { ["left"] = "new-left", ["right"] = "new-right" };
+        for (var i = 0; i < 20; i++)
+        {
+            var next = pair with { Name = "Renamed pair", Members = [right with { Id = "new-right", IsLeader = i % 2 == 0 }, left with { Id = "new-left", IsLeader = i % 2 != 0, Features = 42 }] };
+            await controller.RefreshReceiverAsync(next, controller.Snapshot, migrations);
+        }
+        Assert.Equal(1, factory.OpenCount); Assert.False(connection.Disposed); Assert.Equal(commands, connection.Commands.Count);
+        Assert.Equal(PlaybackState.Streaming, controller.Snapshot.State); Assert.Equal(0, controller.Snapshot.Diagnostics!.ReconnectCount);
+        Assert.Equal("Renamed pair", controller.Snapshot.Receiver!.Name);
+        Assert.Equal("new-left", controller.Snapshot.Receiver.Members[0].Id); Assert.True(controller.Snapshot.Receiver.Members[0].IsLeader);
+        Assert.Null(controller.Snapshot.Receiver.Members[0].Features);
+        Assert.Contains(logs, message => message.Contains("Discovery refresh retained transport"));
+    }
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PassiveAddressRefreshIsUsedOnlyOnPermittedRetry(bool returnToOriginal)
+    {
+        var first = new FakeConnection(); var second = new FakeConnection(); var factory = new FakeFactory(first, second);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        var settings = Settings(); settings.ForceReconnect = true;
+        await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var changed = Pod() with { Address = "127.0.0.2" };
+        await controller.RefreshReceiverAsync(changed, controller.Snapshot, new Dictionary<string, string>());
+        if (returnToOriginal) await controller.RefreshReceiverAsync(Pod(), controller.Snapshot, new Dictionary<string, string>());
+        // A subsequent incomplete snapshot must not erase the last complete target.
+        await controller.RefreshReceiverAsync(changed with { Online = false }, controller.Snapshot, new Dictionary<string, string>());
+        Assert.Equal(1, factory.OpenCount); Assert.False(first.Disposed); Assert.Equal("127.0.0.1", controller.Snapshot.Receiver!.Address);
+        first.EmitData(new { @event = "error", code = "peer_closed", retryable = true, message = "lost transport" });
+        await Until(() => factory.OpenCount == 2 && controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.Equal(returnToOriginal ? "127.0.0.1" : "127.0.0.2", second.Commands.Single(c => c.Command == "start").Parameters.GetProperty("peers")[0].Text("host"));
+        Assert.Equal(1, controller.Snapshot.Diagnostics!.ReconnectCount);
+    }
+    [Fact]
+    public async Task PassiveRefreshDoesNotEnableOrdinaryRetryOrRestartAfterStop()
+    {
+        var first = new FakeConnection(); var factory = new FakeFactory(first);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        await controller.StartAsync(Pod(), Settings()); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var expected = controller.Snapshot; var next = Pod() with { Address = "127.0.0.2" };
+        await controller.RefreshReceiverAsync(next, expected, new Dictionary<string, string>());
+        first.EmitData(new { @event = "error", code = "peer_closed", retryable = true, message = "lost transport" });
+        await Until(() => first.Disposed && controller.Snapshot.State == PlaybackState.Error);
+        Assert.Equal(1, factory.OpenCount); Assert.Equal(0, controller.Snapshot.Diagnostics!.ReconnectCount);
+        await controller.StopAsync(); await controller.RefreshReceiverAsync(next, expected, new Dictionary<string, string>());
+        Assert.Equal(PlaybackState.Idle, controller.Snapshot.State); Assert.Null(controller.Snapshot.Receiver);
+    }
+    [Fact]
+    public async Task DelayedDiscoveryCannotModifyNewPlaybackOfTheSameReceiver()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection(); var factory = new FakeFactory(first, second);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        await controller.StartAsync(Pod(), Settings()); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var obsolete = controller.Snapshot;
+        await controller.StartAsync(Pod(), Settings()); await Until(() => second.Started.Task.IsCompleted && controller.Snapshot.State == PlaybackState.Streaming);
+        await controller.RefreshReceiverAsync(Pod() with { Name = "Stale", Address = "127.0.0.2" }, obsolete, new Dictionary<string, string>());
+        Assert.False(await controller.StopForDiscoveryConflictAsync(obsolete));
+        Assert.Equal("a", controller.Snapshot.Receiver!.Name); Assert.Equal(2, factory.OpenCount); Assert.False(second.Disposed);
+    }
+    [Fact]
+    public async Task PassiveRefreshCannotModifyPairing()
+    {
+        var pair = new FakeConnection(); var factory = new FakeFactory(pair); var pin = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        await controller.PairAsync(Pod(), Settings(), (_, token) => pin.Task.WaitAsync(token));
+        await Until(() => pair.Commands.Any(c => c.Command == "pair"));
+        await controller.RefreshReceiverAsync(Pod() with { Name = "Stale" }, controller.Snapshot, new Dictionary<string, string>());
+        Assert.False(await controller.StopForDiscoveryConflictAsync(controller.Snapshot));
+        Assert.Equal(PlaybackState.Pairing, controller.Snapshot.State); Assert.Equal("a", controller.Snapshot.Receiver!.Name);
+        await controller.StopAsync();
+    }
+    [Fact]
+    public async Task QueuedDiscoveryChecksOwnershipAfterAcquiringLifecycleLock()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection(); var factory = new FakeFactory(first, second);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        await controller.StartAsync(Pod(), Settings()); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var obsolete = controller.Snapshot;
+        first.GainGate = new(TaskCreationOptions.RunContinuationsAsynchronously); first.GainEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            var gain = controller.SetMutedAsync(true); await first.GainEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            var start = controller.StartAsync(Pod(), Settings());
+            var refresh = controller.RefreshReceiverAsync(Pod() with { Name = "Stale", Address = "127.0.0.2" }, obsolete, new Dictionary<string, string>());
+            first.GainGate.TrySetResult(); await Task.WhenAll(gain, start, refresh);
+            await Until(() => second.Started.Task.IsCompleted && controller.Snapshot.State == PlaybackState.Streaming);
+            Assert.Equal("a", controller.Snapshot.Receiver!.Name); Assert.Equal("127.0.0.1", controller.Snapshot.Receiver.Address);
+            Assert.Equal(2, factory.OpenCount); Assert.False(second.Disposed);
+        }
+        finally { first.GainGate.TrySetResult(); }
+    }
+    [Fact]
+    public async Task PassiveSoftwareIdentityRefreshRetainsLiveMemberVolumeRouting()
+    {
+        var connection = new FakeConnection(); var factory = new FakeFactory(connection); var (receiver, settings) = SoftwareGroup();
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        await controller.StartAsync(receiver, settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        connection.EmitData(new { @event = "device_volume", host = "127.0.0.1", volume = 28, sequence = 0, status = "confirmed", available = true });
+        await Until(() => controller.Snapshot.MemberVolumes?.ContainsKey("a") == true);
+        var next = receiver with { Members = [receiver.Members[1], receiver.Members[0] with { Id = "new-a" }] };
+        await controller.RefreshReceiverAsync(next, controller.Snapshot, new Dictionary<string, string> { ["a"] = "new-a" });
+        Assert.Equal(28, controller.Snapshot.MemberVolumes!["new-a"].Actual); Assert.False(controller.Snapshot.MemberVolumes.ContainsKey("a"));
+        var edit = controller.SetDeviceVolumeAsync("new-a", 55); await Until(() => connection.Commands.Any(c => c.Command == "set_device_volume"));
+        Assert.Equal("127.0.0.1", connection.Commands.Single(c => c.Command == "set_device_volume").Parameters.Text("host"));
+        Assert.Equal(1, factory.OpenCount); await controller.StopAsync(); await edit;
+    }
+    [Fact]
+    public async Task PassiveIdentityMigrationPreservesEffectiveSettingsAndLiveUpdatesStayHot()
+    {
+        var connection = new FakeConnection(); var factory = new FakeFactory(connection);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        var settings = Settings(); settings.StandbyEnabled = true; settings.Options("old").StandbySeconds = 5; settings.Options("old").LatencyMode = "realtime";
+        await controller.StartAsync(Pod("old"), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var count = connection.Commands.Count(c => c.Command == "set_standby");
+        var migrations = new Dictionary<string, string> { ["old"] = "new" };
+        connection.EmitData(new { @event = "negotiated", receiver_id = "old", host = "127.0.0.1", port = 7000, codec = "alac", timing = "ptp", clock_role = "follow" });
+        connection.EmitData(new { @event = "capture_metrics", metrics = new { input_rate = 48000 } });
+        await Until(() => controller.Snapshot.Diagnostics?.Negotiated?.Count == 1);
+        await controller.RefreshReceiverAsync(Pod("new"), controller.Snapshot, migrations);
+        Assert.Equal("new", Assert.Single(controller.Snapshot.Diagnostics!.Negotiated!).Text("receiver_id"));
+        ReceiverCatalog.ApplyMigrations(settings, migrations); settings.MasterVolume = 25;
+        await controller.UpdateSettingsAsync(settings); await controller.UpdateSettingsAsync(settings);
+        Assert.Equal(1, factory.OpenCount); Assert.Equal(120, controller.Snapshot.TargetLatency);
+        Assert.Equal(count, connection.Commands.Count(c => c.Command == "set_standby"));
+        Assert.Equal(.25, connection.Commands.Last(c => c.Command == "set_gain").Parameters.Number("gain"));
+        settings.Options("new").StandbySeconds = 20; await controller.UpdateSettingsAsync(settings);
+        Assert.Equal(count + 1, connection.Commands.Count(c => c.Command == "set_standby")); Assert.Equal(1, factory.OpenCount);
+    }
+    [Fact]
+    public async Task IgnoredNativeMemberProfilesCannotRebuildTheGroup()
+    {
+        var connection = new FakeConnection(); var factory = new FakeFactory(connection);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        var pair = Pod("stereo:pair") with { Members = [Pod("left"), Pod("right") with { Address = "127.0.0.2" }] };
+        var settings = Settings(); settings.Options(pair.Id).LatencyMode = "realtime";
+        await controller.StartAsync(pair, settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        settings.Options("left").LatencyMode = "buffered"; settings.Options("right").Codec = "pcm"; settings.Options("left").Timing = "ntp";
+        await controller.UpdateSettingsAsync(settings);
+        Assert.Equal(1, factory.OpenCount); Assert.False(connection.Disposed);
+        Assert.All(connection.Commands.Single(c => c.Command == "start").Parameters.GetProperty("peers").EnumerateArray(), peer => Assert.Equal(120, peer.GetProperty("profile").Number("latency_ms")));
+    }
+    [Theory]
+    [InlineData("capture")]
+    [InlineData("latency")]
+    [InlineData("sample_rate")]
+    [InlineData("codec")]
+    [InlineData("transport")]
+    [InlineData("timing")]
+    public async Task ActualSettingsChangeRebuildsOnceWithLatestDiscoveredAddress(string field)
+    {
+        var first = new FakeConnection(); var second = new FakeConnection(); var factory = new FakeFactory(first, second); var logs = new ConcurrentQueue<string>();
+        await using var controller = new SessionController(factory, new FakeAudio(), logs.Enqueue, Fast);
+        var settings = Settings(); await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        await controller.RefreshReceiverAsync(Pod() with { Address = "127.0.0.2" }, controller.Snapshot, new Dictionary<string, string>());
+        switch (field)
+        {
+            case "capture": settings.CaptureMode = "endpoint"; settings.CaptureEndpoint = "endpoint"; break;
+            case "latency": settings.LatencyMode = "buffered"; break;
+            case "sample_rate": settings.Options("a").SampleRate = "48000"; break;
+            case "codec": settings.Options("a").Codec = "pcm"; break;
+            case "transport": settings.Options("a").Transport = "realtime"; break;
+            case "timing": settings.Options("a").Timing = "ntp"; break;
+        }
+        await controller.UpdateSettingsAsync(settings); await Until(() => second.Started.Task.IsCompleted && controller.Snapshot.State == PlaybackState.Streaming);
+        await controller.UpdateSettingsAsync(settings);
+        Assert.Equal(2, factory.OpenCount); Assert.True(first.Disposed); Assert.False(second.Disposed);
+        Assert.Equal("127.0.0.2", second.Commands.Single(c => c.Command == "start").Parameters.GetProperty("peers")[0].Text("host"));
+        Assert.Contains(logs, message => message.Contains("reason=settings_change") && message.Contains("changed_fields="));
+    }
+    [Fact]
     public async Task StartIsNonblockingAndStopCancelsPendingConnection()
     {
         var process = new FakeConnection(false); var factory = new FakeFactory(process); await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
@@ -142,12 +326,23 @@ public sealed class SessionTests
     public async Task ChangingStreamRateRestartsSessionWithNewRate()
     {
         var first = new FakeConnection(); var second = new FakeConnection(); var factory = new FakeFactory(first, second); await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
-        var settings = Settings(); settings.StreamSampleRate = "48000";
+        var settings = Settings(); settings.Options("a").SampleRate = "48000";
         await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
         Assert.Equal(48000, first.Commands.Single(c => c.Command == "start").Parameters.Number("sample_rate"));
         Assert.Equal(48000, controller.Snapshot.StreamRate);
-        settings.StreamSampleRate = "44100"; await controller.UpdateSettingsAsync(settings); await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        settings.Options("a").SampleRate = "44100"; await controller.UpdateSettingsAsync(settings); await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(1));
         Assert.Equal(2, factory.OpenCount); Assert.Equal(44100, second.Commands.Single(c => c.Command == "start").Parameters.Number("sample_rate"));
+    }
+    [Fact]
+    public async Task AutomaticRateUsesReceiverNegotiationBeforeStartingCapture()
+    {
+        var connection = new FakeConnection { ReceiverCapabilityResponse = new { @event = "receiver_capabilities", members = new[] { new { receiver_id = "a", host = "127.0.0.1", port = 7000, known = true, profiles = new[] { new { codec = "auto", transport = "auto", timing = "auto", sample_rate = 48000, selected_codec = "alac", selected_transport = "realtime", selected_timing = "ptp" } } } } } };
+        await using var controller = new SessionController(new FakeFactory(connection), new FakeAudio(), timing: Fast);
+        await controller.StartAsync(Pod(), Settings()); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var commands = connection.Commands.ToArray();
+        Assert.True(Array.FindIndex(commands, c => c.Command == "get_receiver_capabilities") < Array.FindIndex(commands, c => c.Command == "start"));
+        Assert.Equal(48000, commands.Single(c => c.Command == "start").Parameters.Number("sample_rate")); Assert.Equal(48000, controller.Snapshot.StreamRate);
+        Assert.Equal("a", commands.Single(c => c.Command == "start").Parameters.GetProperty("peers")[0].Text("receiver_id"));
     }
     [Fact]
     public async Task SwitchingWaitsForPreviousCleanupAndRejectsStaleEvents()
@@ -196,6 +391,18 @@ public sealed class SessionTests
         settings.MasterVolume = 20; await controller.UpdateSettingsAsync(settings); Assert.Equal(2, factory.OpenCount); Assert.Contains(second.Commands, c => c.Command == "set_gain" && c.Parameters.Number("gain") == .2);
     }
     [Fact]
+    public async Task InactiveApplicationSelectionDoesNotRestartEndpointCapture()
+    {
+        var process = new FakeConnection(); var factory = new FakeFactory(process);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        var settings = Settings(); settings.CaptureMode = "endpoint"; settings.CaptureEndpoint = "device-id";
+        await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        settings.CaptureApplicationPath = @"C:\Music.exe";
+        settings.CaptureApplicationInstance = new(settings.CaptureApplicationPath, "Music", 41, 100);
+        await controller.UpdateSettingsAsync(settings);
+        Assert.Equal(1, factory.OpenCount); Assert.False(process.Disposed);
+    }
+    [Fact]
     public async Task StopAndFailedSessionRestoreMute()
     {
         var process = new FakeConnection(); var audio = new FakeAudio(); await using var controller = new SessionController(new FakeFactory(process), audio, timing: Fast);
@@ -208,13 +415,115 @@ public sealed class SessionTests
         var settings = Settings(); await controller.StartAsync(Pod(), settings); await Until(() => audio.Muted); settings.MuteWhileStreaming = false; await controller.UpdateSettingsAsync(settings); Assert.False(audio.Muted);
     }
     [Fact]
-    public async Task SilentMetricsEnterStandbyWithoutRestart()
+    public async Task SettingsAppliedDuringStandbyCleanupCannotMuteLocalOutputAgain()
+    {
+        var process = new FakeConnection(); var audio = new FakeAudio();
+        await using var controller = new SessionController(new FakeFactory(process), audio, timing: Fast);
+        var settings = Settings(); settings.StandbyEnabled = true;
+        await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var calls = audio.MuteCalls;
+        audio.RestoreEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        audio.RestoreGate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            process.EmitData(new { @event = "standby", reason = "silence" });
+            await audio.RestoreEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            // Cleanup has changed the audio state but has not yet published Standby.
+            Assert.Equal(PlaybackState.Streaming, controller.Snapshot.State);
+            settings.MasterVolume = 25;
+            var edit = controller.UpdateSettingsAsync(settings);
+            Assert.Equal(calls, audio.MuteCalls);
+            audio.RestoreGate.TrySetResult(); await edit;
+            await Until(() => controller.Snapshot.State == PlaybackState.Standby);
+            Assert.False(audio.Muted); Assert.Equal(calls, audio.MuteCalls);
+        }
+        finally { audio.RestoreGate.TrySetResult(); }
+    }
+    [Fact]
+    public async Task StandbyEditsApplyToResumedSessionAndFailureRestoresLocalMute()
+    {
+        var process = new FakeConnection(); var factory = new FakeFactory(process); var audio = new FakeAudio();
+        await using var controller = new SessionController(factory, audio, timing: Fast);
+        var settings = Settings(); settings.StandbyEnabled = true;
+        await controller.StartAsync(Pod(), settings); await Until(() => audio.Muted);
+        process.EmitData(new { @event = "standby", reason = "silence" });
+        await Until(() => controller.Snapshot.State == PlaybackState.Standby);
+        Assert.False(audio.Muted);
+        settings.MasterVolume = 0; settings.Equalizer = Sound(4); settings.StandbySilenceSeconds = 20;
+        await controller.UpdateSettingsAsync(settings);
+        Assert.Equal(1, factory.OpenCount); Assert.False(audio.Muted);
+        Assert.Equal(0, process.Commands.Last(c => c.Command == "set_gain").Parameters.Number("gain"));
+        Assert.Equal(4, EqGain(process.Commands.Last(c => c.Command == "set_equalizer")));
+        Assert.Equal(20, process.Commands.Last(c => c.Command == "set_standby").Parameters.Number("silence_seconds"));
+        process.Emit("resuming"); process.Emit("streaming");
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.True(audio.Muted); Assert.Equal(1, factory.OpenCount);
+        process.Emit("error", message: "resume connection failed");
+        await Until(() => process.Disposed && controller.Snapshot.State == PlaybackState.Error);
+        Assert.False(audio.Muted);
+    }
+    [Fact]
+    public async Task EngineStandbyReleasesMuteAndMetricsCannotOverrideState()
     {
         var process = new FakeConnection(); var factory = new FakeFactory(process); await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
         var settings = Settings(); settings.StandbyEnabled = true; settings.StandbySilenceSeconds = 5;
         await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        process.EmitData(new { @event = "standby", reason = "silence" });
         process.Emit("capture_metrics", metrics: new { last_audio_qpc_ns = 1, capture_to_send_p95_ms = (double?)null, underrun_packets = 2 });
         await Until(() => controller.Snapshot.State == PlaybackState.Standby); Assert.Equal(1, factory.OpenCount); Assert.Null(controller.Snapshot.Metrics!.CaptureToSendP95);
+    }
+    [Fact]
+    public async Task ApplicationCaptureNeverMutesEndpointAndLiveStandbyEditsDoNotRestart()
+    {
+        var process = new FakeConnection(); var factory = new FakeFactory(process); var audio = new FakeAudio();
+        await using var controller = new SessionController(factory, audio, timing: Fast);
+        var settings = Settings(); settings.CaptureMode = "application"; settings.CaptureApplicationPath = @"C:\Player.exe";
+        settings.CaptureApplicationInstance = new(settings.CaptureApplicationPath, "Player", 42, 123);
+        settings.StandbyEnabled = true; settings.Options("a").StandbySeconds = 7;
+        await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.False(audio.Muted);
+        var start = process.Commands.Single(c => c.Command == "start").Parameters;
+        Assert.Equal("application", start.Text("source")); Assert.Equal(42, start.Integer("capture_process_id"));
+        Assert.Equal(123, start.Integer("capture_process_started_at")); Assert.Equal(JsonValueKind.Null, start.GetProperty("capture_endpoint").ValueKind);
+        Assert.Equal(7, start.GetProperty("standby").Number("silence_seconds"));
+        process.EmitData(new { @event = "standby", reason = "silence" }); await Until(() => controller.Snapshot.State == PlaybackState.Standby);
+        settings.Options("a").StandbySeconds = 20; await controller.UpdateSettingsAsync(settings);
+        Assert.Equal(20, process.Commands.Last(c => c.Command == "set_standby").Parameters.Number("silence_seconds"));
+        Assert.Equal(1, factory.OpenCount); Assert.False(audio.Muted);
+        process.Emit("resuming"); await Until(() => controller.Snapshot.State == PlaybackState.Connecting);
+        process.Emit("streaming"); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.False(audio.Muted); Assert.Equal(1, factory.OpenCount);
+        await controller.StopAsync(); process.Emit("streaming"); Assert.Equal(PlaybackState.Idle, controller.Snapshot.State);
+    }
+    [Fact]
+    public async Task ApplicationCanWaitBeforeFirstConnectionWithoutFallbackAndStopCancelsWaiting()
+    {
+        var process = new FakeConnection(false); var factory = new FakeFactory(process); var audio = new FakeAudio();
+        await using var controller = new SessionController(factory, audio, timing: Fast);
+        var settings = Settings(); settings.CaptureMode = "application"; settings.CaptureApplicationPath = @"C:\Missing.exe";
+        await controller.StartAsync(Pod(), settings); await process.Started.Task;
+        process.EmitData(new { @event = "standby", reason = "application_unavailable" });
+        await Until(() => controller.Snapshot.State == PlaybackState.Standby);
+        process.Emit("capture_metrics", metrics: new { last_audio_qpc_ns = long.MaxValue });
+        await Until(() => controller.Snapshot.Metrics is not null);
+        Assert.Equal(PlaybackState.Standby, controller.Snapshot.State); Assert.False(audio.Muted);
+        await controller.StopAsync(); Assert.True(process.Disposed); Assert.Equal(1, factory.OpenCount);
+    }
+    [Fact]
+    public async Task StandbyEditsDuringHelloWaitForStartAndKeepLatestPolicy()
+    {
+        var process = new FakeConnection { RespondHello = false }; var settings = Settings();
+        await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast);
+        await controller.StartAsync(Pod(), settings);
+        await Until(() => process.Commands.Any(c => c.Command == "hello"));
+        settings.StandbyEnabled = true; settings.StandbySilenceSeconds = 20;
+        await controller.UpdateSettingsAsync(settings);
+        Assert.DoesNotContain(process.Commands, c => c.Command == "set_standby");
+        process.EmitHello(); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var commands = process.Commands.ToArray();
+        Assert.True(Array.FindIndex(commands, c => c.Command == "start") < Array.FindIndex(commands, c => c.Command == "set_standby"));
+        var policy = commands.Last(c => c.Command == "set_standby").Parameters;
+        Assert.True(policy.Boolean("enabled")); Assert.Equal(20, policy.Number("silence_seconds"));
     }
     [Fact]
     public async Task IncompleteStereoGroupNeverStartsEngine()
@@ -359,6 +668,108 @@ public sealed class SessionTests
         await Until(() => controller.Snapshot.DeviceVolume?.Actual == 32);
         Assert.DoesNotContain(second.Commands, c => c.Command == "set_device_volume");
     }
+    private static (Receiver Receiver, AppSettings Settings) SoftwareGroup()
+    {
+        var settings = Settings(); settings.SoftwareGroups.Add(new() { Id = "software:test", LeftId = "a", RightId = "b", LeftOffsetMs = -80, RightOffsetMs = 25 });
+        settings.Options("a").Codec = "alac"; settings.Options("a").Transport = "buffered"; settings.Options("b").Codec = "pcm"; settings.Options("b").Timing = "ntp";
+        return (SoftwareStereo.Resolve([Pod("a"), Pod("b") with { Address = "127.0.0.2" }], settings).Single(), settings);
+    }
+    [Fact]
+    public async Task ApplicationStandbyKeepsSoftwareGroupProfilesAndMemberVolumeRouting()
+    {
+        var process = new FakeConnection(); var factory = new FakeFactory(process); var audio = new FakeAudio();
+        var (receiver, settings) = SoftwareGroup();
+        settings.CaptureMode = "application"; settings.CaptureApplicationPath = @"C:\Player.exe";
+        settings.SoftwareGroups[0].SampleRate = "48000"; settings.StandbyEnabled = true;
+        await using var controller = new SessionController(factory, audio, timing: Fast);
+        await controller.StartAsync(receiver, settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var start = process.Commands.Single(c => c.Command == "start").Parameters;
+        Assert.Equal("application", start.Text("source")); Assert.Equal("software_stereo", start.Text("group_mode"));
+        Assert.Equal(48000, start.Number("sample_rate")); Assert.Equal(2, start.GetProperty("peers").GetArrayLength());
+        Assert.Equal("buffered", start.GetProperty("peers")[0].GetProperty("profile").Text("transport"));
+        Assert.Equal("right", start.GetProperty("peers")[1].GetProperty("profile").Text("channel"));
+        process.EmitData(new { @event = "device_volume", host = "127.0.0.2", volume = 30, sequence = 0, status = "confirmed", available = true });
+        await Until(() => controller.Snapshot.MemberVolumes?.ContainsKey("b") == true);
+        process.EmitData(new { @event = "standby", reason = "silence" }); await Until(() => controller.Snapshot.State == PlaybackState.Standby);
+        var edit = controller.SetDeviceVolumeAsync("b", 45);
+        await Until(() => process.Commands.Any(c => c.Command == "set_device_volume"));
+        var volume = process.Commands.Single(c => c.Command == "set_device_volume").Parameters;
+        Assert.Equal("127.0.0.2", volume.Text("host"));
+        settings.MasterVolume = 0; settings.StandbySilenceSeconds = 20;
+        await controller.UpdateSettingsAsync(settings);
+        process.Emit("resuming"); process.Emit("streaming"); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        process.EmitData(new { @event = "device_volume", host = "127.0.0.2", volume = 45, sequence = volume.Integer("sequence"), status = "confirmed", available = true });
+        await Until(() => controller.Snapshot.MemberVolumes?["b"].Actual == 45);
+        Assert.Equal(1, factory.OpenCount); Assert.Equal(0, audio.MuteCalls);
+        await controller.StopAsync(); await edit;
+    }
+    [Fact]
+    public async Task SoftwareGroupSerializesMemberProfilesAndReconnectsTogetherWithoutGlobalForceReconnect()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection(); var factory = new FakeFactory(first, second); var (receiver, settings) = SoftwareGroup();
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast); await controller.StartAsync(receiver, settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var start = first.Commands.Single(c => c.Command == "start").Parameters; Assert.Equal("software_stereo", start.Text("group_mode")); Assert.Equal(2, start.GetProperty("peers").GetArrayLength());
+        Assert.Equal("left", start.GetProperty("peers")[0].GetProperty("profile").Text("channel")); Assert.Equal("buffered", start.GetProperty("peers")[0].GetProperty("profile").Text("transport"));
+        Assert.Equal("right", start.GetProperty("peers")[1].GetProperty("profile").Text("channel")); Assert.Equal("pcm", start.GetProperty("peers")[1].GetProperty("profile").Text("codec"));
+        first.EmitData(new { @event = "error", host = "127.0.0.2", channel = "events", code = "peer_closed", retryable = true, message = "member disconnected" }); await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.True(first.Disposed); Assert.Equal(2, second.Commands.Single(c => c.Command == "start").Parameters.GetProperty("peers").GetArrayLength()); Assert.DoesNotContain(first.Commands, c => c.Command == "set_device_volume");
+    }
+    [Fact]
+    public async Task SoftwareGroupMemberVolumeTargetsOnlyItsHostAndGroupRemovalStopsPlayback()
+    {
+        var connection = new FakeConnection(); var (receiver, settings) = SoftwareGroup(); await using var controller = new SessionController(new FakeFactory(connection), new FakeAudio(), timing: Fast);
+        await controller.StartAsync(receiver, settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        connection.EmitData(new { @event = "device_volume", host = "127.0.0.1", volume = 28, sequence = 0, status = "confirmed", available = true });
+        connection.EmitData(new { @event = "device_volume", host = "127.0.0.2", volume = 42, sequence = 0, status = "confirmed", available = true });
+        await Until(() => controller.Snapshot.MemberVolumes?.Count == 2); Assert.False(controller.Snapshot.DeviceVolume!.Available);
+        var update = controller.SetDeviceVolumeAsync("b", 55); await Until(() => connection.Commands.Any(c => c.Command == "set_device_volume"));
+        var command = connection.Commands.Single(c => c.Command == "set_device_volume"); Assert.Equal("127.0.0.2", command.Parameters.Text("host")); Assert.Equal(55, command.Parameters.Number("volume"));
+        connection.EmitData(new { @event = "device_volume", host = "127.0.0.2", volume = 55, sequence = command.Parameters.Integer("sequence"), status = "confirmed", available = true });
+        await update;
+        Assert.Equal("confirmed", controller.Snapshot.MemberVolumes!["b"].Status);
+        Assert.Equal(28, controller.Snapshot.MemberVolumes!["a"].Actual);
+        settings.SoftwareGroups.Clear(); await controller.UpdateSettingsAsync(settings); Assert.Equal(PlaybackState.Idle, controller.Snapshot.State); Assert.True(connection.Disposed);
+    }
+    [Fact]
+    public async Task SoftwareGroupSwapRebuildsBothMembersAndKeepsCommonRate()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection(); var factory = new FakeFactory(first, second); var (receiver, settings) = SoftwareGroup();
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast); await controller.StartAsync(receiver, settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        settings.SoftwareGroups[0].Swap(); settings.SoftwareGroups[0].SampleRate = "48000"; var next = SoftwareStereo.Resolve(receiver.Members, settings).Single();
+        await controller.UpdateReceiverAsync(next, settings); await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.True(first.Disposed); Assert.Equal(2, factory.OpenCount); var start = second.Commands.Single(c => c.Command == "start").Parameters; Assert.Equal(48000, start.Number("sample_rate")); Assert.Equal("127.0.0.2", start.GetProperty("peers")[0].Text("host"));
+        Assert.Equal("left", start.GetProperty("peers")[0].GetProperty("profile").Text("channel"));
+    }
+    [Fact]
+    public async Task SettingsOnlySoftwareSwapUpdatesRoutingAndUnknownReplacementStops()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection(); var (receiver, settings) = SoftwareGroup();
+        await using var controller = new SessionController(new FakeFactory(first, second), new FakeAudio(), timing: Fast);
+        await controller.StartAsync(receiver, settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        settings.SoftwareGroups[0].Swap(); await controller.UpdateSettingsAsync(settings);
+        await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal("127.0.0.2", second.Commands.Single(c => c.Command == "start").Parameters.GetProperty("peers")[0].Text("host"));
+        settings.SoftwareGroups[0].RightId = "undiscovered"; await controller.UpdateSettingsAsync(settings);
+        Assert.Equal(PlaybackState.Error, controller.Snapshot.State); Assert.True(second.Disposed);
+    }
+    [Fact]
+    public async Task SoftwareIdentityMigrationKeepsHostRoutingAndVolumeWithoutRestart()
+    {
+        var process = new FakeConnection(); var factory = new FakeFactory(process); var (receiver, settings) = SoftwareGroup();
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        await controller.StartAsync(receiver, settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        process.EmitData(new { @event = "device_volume", host = "127.0.0.1", volume = 28, sequence = 0, status = "confirmed", available = true });
+        await Until(() => controller.Snapshot.MemberVolumes?.ContainsKey("a") == true);
+        ReceiverCatalog.ApplyMigrations(settings, new Dictionary<string, string> { ["a"] = "new-a" });
+        var next = receiver with { Members = [receiver.Members[0] with { Id = "new-a" }, receiver.Members[1]] };
+        await controller.UpdateReceiverAsync(next, settings);
+        Assert.Equal(1, factory.OpenCount); Assert.Equal(28, controller.Snapshot.MemberVolumes!["new-a"].Actual); Assert.False(controller.Snapshot.MemberVolumes.ContainsKey("a"));
+        process.EmitData(new { @event = "device_volume", host = "127.0.0.1", volume = 32, sequence = 0, status = "confirmed", available = true });
+        await Until(() => controller.Snapshot.MemberVolumes?["new-a"].Actual == 32);
+        var edit = controller.SetDeviceVolumeAsync("new-a", 55); await Until(() => process.Commands.Any(c => c.Command == "set_device_volume"));
+        Assert.Equal("127.0.0.1", process.Commands.Single(c => c.Command == "set_device_volume").Parameters.Text("host"));
+        await controller.StopAsync(); await edit;
+    }
     private sealed class FakeFactory(params FakeConnection[] processes) : IEngineFactory
     {
         private readonly ConcurrentQueue<FakeConnection> _processes = new(processes);
@@ -375,18 +786,25 @@ public sealed class SessionTests
         public TaskCompletionSource? BlockDispose { get; init; }
         public string Session { get; private set; } = "";
         public bool Disposed { get; private set; }
+        public bool RespondHello { get; init; } = true;
+        public object? ReceiverCapabilityResponse { get; init; }
+        public TaskCompletionSource? GainEntered, GainGate;
         public Task SendAsync(string session, string command, object? parameters, CancellationToken cancellation)
         {
             Commands.Enqueue(new(session, command, JsonSerializer.SerializeToElement(parameters ?? new { })));
             switch (command)
             {
+                case "hello": Session = session; if (RespondHello) EmitHello(); break;
+                case "get_receiver_capabilities": EmitData(ReceiverCapabilityResponse!); break;
                 case "start": Session = session; Started.TrySetResult(); if (autoReady) Emit("streaming"); break;
                 case "pair": Session = session; Emit("pin_required"); break;
                 case "pair_pin": Emit("paired"); break;
                 case "stop": _events.Writer.TryComplete(); break;
+                case "set_gain": GainEntered?.TrySetResult(); if (GainGate is not null) return GainGate.Task.WaitAsync(cancellation); break;
             }
             return Task.CompletedTask;
         }
+        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "application_capture" }.Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).ToArray() });
         public void EmitData(object payload, string? session = null)
         {
             var data = JsonSerializer.SerializeToNode(payload)!.AsObject(); data["version"] = 1; data["session_id"] = session ?? Session;
@@ -399,10 +817,12 @@ public sealed class SessionTests
     private sealed class FakeAudio : IAudioService
     {
         public bool Muted;
+        public int MuteCalls;
+        public TaskCompletionSource? RestoreEntered, RestoreGate;
         public event Action? EndpointsChanged { add { } remove { } }
         public Task<string?> GetDefaultEndpointIdAsync() => Task.FromResult<string?>("default");
         public Task<IReadOnlyList<AudioEndpoint>> GetEndpointsAsync() => Task.FromResult<IReadOnlyList<AudioEndpoint>>([]);
-        public Task MuteAsync(string? endpointId) { Muted = true; return Task.CompletedTask; }
-        public Task RestoreAsync() { Muted = false; return Task.CompletedTask; }
+        public Task MuteAsync(string? endpointId) { ++MuteCalls; Muted = true; return Task.CompletedTask; }
+        public async Task RestoreAsync() { Muted = false; RestoreEntered?.TrySetResult(); if (RestoreGate is not null) await RestoreGate.Task; }
     }
 }

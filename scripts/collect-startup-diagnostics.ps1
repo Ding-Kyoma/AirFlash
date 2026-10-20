@@ -59,12 +59,23 @@ $process.StartInfo.FileName = $exe
 $process.StartInfo.Arguments = '--compat-check --output "' + $rawOutput + '"'
 $process.StartInfo.UseShellExecute = $false
 $process.StartInfo.CreateNoWindow = $true
-$process.StartInfo.EnvironmentVariables['DOTNET_HOST_TRACE'] = '1'
-$process.StartInfo.EnvironmentVariables['DOTNET_HOST_TRACEFILE'] = $rawTrace
-$process.StartInfo.EnvironmentVariables['DOTNET_HOST_TRACE_VERBOSITY'] = '4'
-$process.StartInfo.EnvironmentVariables['COREHOST_TRACE'] = '1'
-$process.StartInfo.EnvironmentVariables['COREHOST_TRACEFILE'] = $rawTrace
-$process.StartInfo.EnvironmentVariables['COREHOST_TRACE_VERBOSITY'] = '4'
+# Some launchers inherit both Path and PATH. Framework's lazy StringDictionary
+# initialization throws on these Windows-equivalent names, leaving it partial.
+try { $childEnvironment = $process.StartInfo.get_EnvironmentVariables() }
+catch {
+    if ($_.Exception.InnerException -isnot [ArgumentException]) { throw }
+    $childEnvironment = $process.StartInfo.get_EnvironmentVariables()
+    $childEnvironment.Clear()
+    foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+        $childEnvironment[$entry.Key] = $entry.Value
+    }
+}
+$childEnvironment['DOTNET_HOST_TRACE'] = '1'
+$childEnvironment['DOTNET_HOST_TRACEFILE'] = $rawTrace
+$childEnvironment['DOTNET_HOST_TRACE_VERBOSITY'] = '4'
+$childEnvironment['COREHOST_TRACE'] = '1'
+$childEnvironment['COREHOST_TRACEFILE'] = $rawTrace
+$childEnvironment['COREHOST_TRACE_VERBOSITY'] = '4'
 try {
     if (-not $process.Start()) { throw 'Process.Start returned false.' }
     if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {

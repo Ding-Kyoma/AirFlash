@@ -37,6 +37,13 @@
             </Grid>
           </StackPanel>
         </Border>
+        <Border Style="{StaticResource Card}">
+          <StackPanel>
+            <TextBlock Text="{loc:Text 'Reset settings'}" Style="{StaticResource SectionTitle}"/>
+            <TextBlock Text="{loc:Text 'Delete all settings and receiver pairing, then restart AirFlash. Logs and engine caches are retained.'}" Style="{StaticResource Hint}"/>
+            <Button Content="{loc:Text 'Reset and restart'}" Command="{Binding ResetCommand}" HorizontalAlignment="Left" Margin="0,12,0,0" AutomationProperties.Name="{loc:Text 'Reset and restart'}"/>
+          </StackPanel>
+        </Border>
       </StackPanel>
     </DataTemplate>
     <DataTemplate x:Key="Page1">
@@ -56,13 +63,6 @@
         </Border>
         <Border Style="{StaticResource Card}">
           <StackPanel>
-            <TextBlock Text="{loc:Text 'Stream format'}" Style="{StaticResource SectionTitle}"/>
-            <RadioButton Content="{loc:Text '44.1 kHz · 16-bit (default)'}" GroupName="StreamSampleRate" IsChecked="{Binding Draft.StreamSampleRate, Converter={StaticResource Equal}, ConverterParameter=44100}"/>
-            <RadioButton Content="{loc:Text '48 kHz · 16-bit'}" GroupName="StreamSampleRate" IsChecked="{Binding Draft.StreamSampleRate, Converter={StaticResource Equal}, ConverterParameter=48000}"/>
-          </StackPanel>
-        </Border>
-        <Border Style="{StaticResource Card}">
-          <StackPanel>
             <TextBlock Text="{loc:Text 'Standby'}" Style="{StaticResource SectionTitle}"/>
             <CheckBox Content="{loc:Text 'Enter standby when no audio is playing'}" IsChecked="{Binding Draft.StandbyEnabled}"/>
             <StackPanel Orientation="Horizontal" IsEnabled="{Binding Draft.StandbyEnabled}">
@@ -70,7 +70,7 @@
               <TextBox Width="80" Text="{Binding Draft.StandbySilenceSeconds, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}"/>
               <TextBlock Text="{loc:Text 'seconds (5–300)'}" VerticalAlignment="Center" Margin="10,0,0,0" Style="{StaticResource Hint}"/>
             </StackPanel>
-            <TextBlock Text="{loc:Text 'Stay connected during standby and resume when audio is detected.'}" Style="{StaticResource Hint}" Margin="0,14,0,0"/>
+            <TextBlock Text="{loc:Text 'Release the AirPlay session during standby and reconnect when audio is detected. Audio during reconnection may be missed.'}" Style="{StaticResource Hint}" Margin="0,14,0,0"/>
           </StackPanel>
         </Border>
       </StackPanel>
@@ -136,6 +136,14 @@
             <TextBlock Text="{loc:Text 'Audio source'}" Style="{StaticResource SectionTitle}"/>
             <RadioButton Content="{loc:Text 'Default system output'}" GroupName="CaptureMode" IsChecked="{Binding Draft.CaptureMode, Converter={StaticResource Equal}, ConverterParameter=loopback}"/>
             <TextBlock Text="{loc:Text 'Capture audio from the default playback device and follow changes to the Windows default output.'}" Style="{StaticResource Hint}" Margin="26,0,0,22"/>
+            <RadioButton Content="{loc:Text 'Specific application'}" GroupName="CaptureMode" IsEnabled="{Binding ApplicationCaptureSupported}" IsChecked="{Binding Draft.CaptureMode, Converter={StaticResource Equal}, ConverterParameter=application}"/>
+            <Grid Margin="26,0,0,12" IsEnabled="{Binding Draft.CaptureMode, Converter={StaticResource Equal}, ConverterParameter=application}">
+              <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <ComboBox x:Name="ApplicationCombo" ItemsSource="{Binding Applications}" DisplayMemberPath="DisplayName" SelectedItem="{Binding SelectedApplication, Mode=TwoWay}" ToolTip="{Binding SelectedApplication.Path}" AutomationProperties.Name="{loc:Text 'Capture application'}"/>
+              <Button Grid.Column="1" Content="{loc:Text 'Refresh'}" Margin="8,0,0,0" Command="{Binding RefreshApplicationsCommand}"/>
+            </Grid>
+            <ProgressBar IsIndeterminate="True" Height="3" Margin="26,0,0,12" Visibility="{Binding IsApplicationsLoading, Converter={StaticResource BoolVisibility}}"/>
+            <TextBlock Text="{loc:Text 'Capture the selected application and its child processes. Browsers include the whole process tree, not individual tabs. Requires Windows build 20348 or later.'}" Style="{StaticResource Hint}" Margin="26,0,0,22"/>
             <RadioButton Content="{loc:Text 'Specific audio endpoint'}" GroupName="CaptureMode" IsChecked="{Binding Draft.CaptureMode, Converter={StaticResource Equal}, ConverterParameter=endpoint}"/>
             <Grid Margin="26,0,0,12" IsEnabled="{Binding Draft.CaptureMode, Converter={StaticResource Equal}, ConverterParameter=endpoint}">
               <Grid.ColumnDefinitions>
@@ -152,8 +160,17 @@
         <Border Style="{StaticResource Card}">
           <StackPanel>
             <TextBlock Text="{loc:Text 'Local speakers'}" Style="{StaticResource SectionTitle}"/>
-            <CheckBox Content="{loc:Text 'Mute local output while streaming (playback devices only)'}" IsChecked="{Binding Draft.MuteWhileStreaming}"/>
+            <CheckBox Content="{loc:Text 'Mute local output while streaming (playback devices only)'}" IsChecked="{Binding Draft.MuteWhileStreaming}" IsEnabled="{Binding CanMuteEndpoint}"/>
             <TextBlock Text="{loc:Text 'Recording devices are never muted. Restore the previous playback-device mute state when playback stops or the connection fails. Some protected content cannot be captured through loopback.'}" Style="{StaticResource Hint}"/>
+          </StackPanel>
+        </Border>
+        <Border Style="{StaticResource Card}">
+          <StackPanel>
+            <TextBlock Text="{loc:Text 'Play an application only on HomePod'}" Style="{StaticResource SectionTitle}"/>
+            <TextBlock Text="{loc:Text 'Install a virtual audio cable, then set only the target application output to CABLE Input in the Windows volume mixer. Keep games and notifications on your headphones.'}" Style="{StaticResource Hint}"/>
+            <Button Content="{loc:Text 'Open Windows volume mixer'}" Command="{Binding OpenVolumeMixerCommand}" HorizontalAlignment="Left" Margin="0,12,0,12"/>
+            <TextBlock Text="{loc:Text 'Select the application above, or choose CABLE Output (Recording) as the specific endpoint. Disable Listen to this device or local monitoring. After stopping AirFlash, restore the application output in Windows if needed.'}" Style="{StaticResource Hint}"/>
+            <TextBlock Text="{loc:Text 'Virtual devices provide audio routing. Protected content may remain silent depending on the player and its protection mechanism. Capture and resampling do not guarantee bit-perfect audio.'}" Style="{StaticResource Hint}" Margin="0,12,0,0"/>
           </StackPanel>
         </Border>
       </StackPanel>
@@ -161,7 +178,40 @@
     <DataTemplate x:Key="Page4">
       <StackPanel>
         <TextBlock Text="{Binding App.DiscoveryStatus}" Style="{StaticResource Hint}" Margin="0,0,0,12"/>
+        <Button Content="{loc:Text 'Refresh stream capabilities'}" Command="{Binding RefreshReceiverProfilesCommand}" HorizontalAlignment="Left" Margin="0,0,0,12"/>
         <Button Content="{loc:Text '＋ Add receiver manually'}" HorizontalAlignment="Left" Command="{Binding AddReceiverCommand}" Margin="0,0,0,16"/>
+        <TextBlock Text="{loc:Text 'Software stereo'}" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,8"/>
+        <TextBlock Text="{loc:Text 'ALAC saves bandwidth; PCM is also lossless. The group sample rate overrides member sample rates.'}" Style="{StaticResource Hint}" Margin="0,0,0,8"/>
+        <TextBlock Text="{loc:Text 'Latency presets do not select TCP transport.'}" Style="{StaticResource Hint}" Margin="0,0,0,8"/>
+        <TextBlock Text="{loc:Text 'Two independent receivers. Acoustic synchronization and hardware compatibility are unverified. Positive offset delays that member.'}" Style="{StaticResource Hint}" Margin="0,0,0,12"/>
+        <Button Content="{loc:Text 'Create stereo group'}" Command="{Binding AddGroupCommand}" HorizontalAlignment="Left" Margin="0,0,0,12"/>
+        <ItemsControl ItemsSource="{Binding Groups}">
+          <ItemsControl.ItemTemplate>
+            <DataTemplate>
+              <Border Style="{StaticResource Card}">
+                <StackPanel>
+                  <TextBlock Text="{loc:Text 'Group name'}" Style="{StaticResource Hint}"/>
+                  <TextBox Text="{Binding Group.Name, UpdateSourceTrigger=PropertyChanged}" Margin="0,4,0,12"/>
+                  <TextBlock Text="{loc:Text 'Left receiver'}" Style="{StaticResource Hint}"/>
+                  <ComboBox ItemsSource="{Binding Candidates}" DisplayMemberPath="Name" SelectedValuePath="Id" SelectedValue="{Binding Group.LeftId, Mode=TwoWay}" Margin="0,4,0,12"/>
+                  <TextBlock Text="{loc:Text 'Left offset / ms (−500 to +500)'}" Style="{StaticResource Hint}"/>
+                  <TextBox Text="{Binding Group.LeftOffsetMs, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" Margin="0,4,0,12"/>
+                  <TextBlock Text="{loc:Text 'Right receiver'}" Style="{StaticResource Hint}"/>
+                  <ComboBox ItemsSource="{Binding Candidates}" DisplayMemberPath="Name" SelectedValuePath="Id" SelectedValue="{Binding Group.RightId, Mode=TwoWay}" Margin="0,4,0,12"/>
+                  <TextBlock Text="{loc:Text 'Right offset / ms (−500 to +500)'}" Style="{StaticResource Hint}"/>
+                  <TextBox Text="{Binding Group.RightOffsetMs, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" Margin="0,4,0,12"/>
+                  <TextBlock Text="{loc:Text 'Common sample rate'}" Style="{StaticResource Hint}"/>
+                  <ComboBox ItemsSource="{Binding RateChoices}" DisplayMemberPath="Label" SelectedItem="{Binding RateChoice, Mode=TwoWay}" Margin="0,4,0,12"/>
+                  <TextBlock Text="{Binding RateStatus}" Style="{StaticResource Hint}" Margin="0,0,0,12"/>
+                  <WrapPanel>
+                    <Button Content="{loc:Text 'Swap left and right'}" Command="{Binding SwapCommand}" Margin="0,0,8,0"/>
+                    <Button Content="{loc:Text 'Split group'}" Command="{Binding RemoveCommand}"/>
+                  </WrapPanel>
+                </StackPanel>
+              </Border>
+            </DataTemplate>
+          </ItemsControl.ItemTemplate>
+        </ItemsControl>
         <ItemsControl ItemsSource="{Binding Receivers}">
           <ItemsControl.ItemTemplate>
             <DataTemplate>
@@ -178,8 +228,18 @@
                     <ComboBox Grid.Column="1" ItemsSource="{x:Static vm:Choices.AutoConnect}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.AutoConnect, Mode=TwoWay}"/>
                   </Grid>
                   <CheckBox Content="{loc:Text 'Hide from control panel'}" IsChecked="{Binding Options.Hidden}"/>
-                  <Expander Header="{loc:Text 'Advanced settings'}" Margin="0,0,0,12">
+                  <Expander Header="{loc:Text 'Advanced settings'}" Foreground="{DynamicResource TextBrush}" Margin="0,0,0,12">
                     <StackPanel Margin="0,14,0,0">
+                      <TextBlock Text="{Binding ProfileStatus}" Style="{StaticResource Hint}" Margin="0,0,0,12"/>
+                      <TextBlock Text="{loc:Text 'Audio encoding'}" Style="{StaticResource Hint}"/>
+                      <ComboBox ItemsSource="{Binding CodecChoices}" DisplayMemberPath="Label" SelectedItem="{Binding CodecChoice, Mode=TwoWay}" Margin="0,4,0,12"/>
+                      <TextBlock Text="{loc:Text 'Stream sample rate'}" Style="{StaticResource Hint}"/>
+                      <ComboBox ItemsSource="{Binding RateChoices}" DisplayMemberPath="Label" SelectedItem="{Binding RateChoice, Mode=TwoWay}" IsEnabled="{Binding CanSetSampleRate}" Margin="0,4,0,12"/>
+                      <TextBlock Text="{Binding GroupRateHint}" Style="{StaticResource Hint}" Margin="0,0,0,8"/>
+                      <TextBlock Text="{loc:Text 'Stream transport'}" Style="{StaticResource Hint}"/>
+                      <ComboBox ItemsSource="{Binding TransportChoices}" DisplayMemberPath="Label" SelectedItem="{Binding TransportChoice, Mode=TwoWay}" Margin="0,4,0,12"/>
+                      <TextBlock Text="{loc:Text 'Clock policy'}" Style="{StaticResource Hint}"/>
+                      <ComboBox ItemsSource="{Binding TimingChoices}" DisplayMemberPath="Label" SelectedItem="{Binding TimingChoice, Mode=TwoWay}" Margin="0,4,0,12"/>
                       <TextBlock Text="{loc:Text 'Latency mode'}" Style="{StaticResource Hint}"/>
                       <ComboBox ItemsSource="{x:Static vm:Choices.ReceiverLatencies}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.LatencyMode, Mode=TwoWay}" Margin="0,4,0,12"/>
                       <StackPanel IsEnabled="{Binding Options.LatencyMode, Converter={StaticResource Equal}, ConverterParameter=custom}">
@@ -190,6 +250,8 @@
                       <TextBox Text="{Binding Options.StandbySeconds, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" Margin="0,4,0,0"/>
                     </StackPanel>
                   </Expander>
+                  <TextBlock Text="{loc:Text 'Hardware volume'}" Style="{StaticResource Hint}"/>
+                  <Slider Minimum="0" Maximum="100" Value="{Binding Volume, Mode=TwoWay}" IsEnabled="{Binding CanSetVolume}" IsSnapToTickEnabled="True" TickFrequency="1" Margin="0,4,0,12"/>
                   <StackPanel Orientation="Horizontal">
                     <Button Content="{loc:Text 'Pair…'}" Command="{Binding PairCommand}" ToolTip="{loc:Text 'Optional: use if the device requires a PIN. Playback starts after pairing.'}"/>
                     <Button Content="{loc:Text 'Remove'}" Command="{Binding RemoveCommand}" Visibility="{Binding IsManual, Converter={StaticResource BoolVisibility}}" Margin="8,0,0,0"/>
@@ -204,6 +266,12 @@
     </DataTemplate>
     <DataTemplate x:Key="Page5">
       <StackPanel>
+        <Border Style="{StaticResource Card}">
+          <StackPanel>
+            <TextBlock Text="{loc:Text 'Negotiated stream and clock status (experimental)'}" FontWeight="SemiBold"/>
+            <TextBlock Text="{Binding App.MonitorNegotiated}" Style="{StaticResource Hint}" Margin="0,8,0,0"/>
+          </StackPanel>
+        </Border>
         <Border Style="{StaticResource Card}">
           <StackPanel>
             <TextBlock Text="{Binding App.StatusTitle}" FontSize="20" FontWeight="SemiBold"/>

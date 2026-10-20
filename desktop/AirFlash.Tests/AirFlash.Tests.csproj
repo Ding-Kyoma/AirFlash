@@ -19,5 +19,6 @@
     <Compile Include="../AirFlash.App/Services/WindowsDnsSdApi.cs" Link="WindowsDnsSdApi.cs"/>
     <Compile Include="../AirFlash.App/Services/WindowsCapabilities.cs" Link="WindowsCapabilities.cs"/>
     <Compile Include="../AirFlash.App/Services/NetworkAdapterCatalog.cs" Link="NetworkAdapterCatalog.cs"/>
+    <Compile Include="../AirFlash.App/Services/ApplicationCatalog.cs" Link="ApplicationCatalog.cs"/>
   </ItemGroup>
 </Project>

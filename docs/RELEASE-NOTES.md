@@ -7,6 +7,9 @@ Changes since AirFlash 0.3.0.
 
 ## Features
 
+- Select a running application and its child processes as the audio source on Windows build 20348 or later, follow a unique matching instance after restart, and guide virtual-cable routing for HomePod-only playback.
+- Release the complete AirPlay session after configurable silence while continuing local capture, then reconnect when audio returns. Reconnection can miss opening audio or short sounds.
+
 - Capture audio from recording/input endpoints as well as playback devices in Settings → Audio capture → Specific audio endpoint. Device labels identify their type; Voicemeeter users can select the recording endpoint for their B1/B2/B3 bus. Recording inputs are never muted by the local-speaker mute option. Resolves [#9](https://github.com/Ding-Kyoma/AirFlash/issues/9).
 - Add Traditional Chinese localization, selected from the Windows UI language preferences.
 - Pause AirPlay discovery when both the control panel and Settings → Receivers are hidden, retaining previous results and active playback. Automatic connection gets a ten-second discovery window at startup; opening a receiver list resumes discovery.
@@ -26,7 +29,7 @@ Changes since AirFlash 0.3.0.
 
 - Windows 10 startup, discovery, pairing, and playback still require affected-user verification. The original reported startup failure has not been reproduced or assigned a confirmed cause.
 - The discovery fix does not establish the cause of every HomePod disconnection. Intermittent crackling/audio gaps ([#7](https://github.com/Ding-Kyoma/AirFlash/issues/7)), socket timeouts ([#16](https://github.com/Ding-Kyoma/AirFlash/issues/16)), and the remaining delayed-session lifecycle cases in #14 remain open.
-- Per-application audio capture ([#18](https://github.com/Ding-Kyoma/AirFlash/issues/18)) is on the feature plan.
+- Native application capture requires Windows build 20348 or later; older systems can isolate applications using virtual audio endpoints. Browser capture includes its process tree, not individual tabs. Virtual routing does not guarantee DRM-protected capture or bit-perfect output.
 
 ## Downloads
 

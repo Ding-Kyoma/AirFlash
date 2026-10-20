@@ -96,12 +96,18 @@ public static class ReceiverCatalog
                     Hidden = options.Any(o => o.Hidden), AutoConnect = options.Any(o => o.AutoConnect == false) ? false : options.Select(o => o.AutoConnect).FirstOrDefault(v => v.HasValue),
                     Volume = options.Select(o => o.Volume).FirstOrDefault(v => v.HasValue), LatencyMode = options.Select(o => o.LatencyMode).FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)),
                     CustomBufferMs = options.Select(o => o.CustomBufferMs).FirstOrDefault(v => v.HasValue), StandbySeconds = options.Select(o => o.StandbySeconds).FirstOrDefault(v => v.HasValue)
+                    , Codec = options[0].Codec, SampleRate = options.Select(o => o.SampleRate).FirstOrDefault(v => v is not null), Transport = options[0].Transport, Timing = options[0].Timing
                 };
                 settings.Options(group.Key).CopyFrom(merged);
                 foreach (var key in keys.Where(k => k != group.Key)) settings.Receivers.Remove(key);
             }
         }
         if (settings.LastReceiverId is { } last && !manual.Contains(last) && migrations.TryGetValue(last, out var target)) settings.LastReceiverId = target;
+        foreach (var group in settings.SoftwareGroups)
+        {
+            group.LeftId = migrations.GetValueOrDefault(group.LeftId, group.LeftId);
+            group.RightId = migrations.GetValueOrDefault(group.RightId, group.RightId);
+        }
     }
 
     public static bool IsCoveredMember(string id, IEnumerable<Receiver> receivers)

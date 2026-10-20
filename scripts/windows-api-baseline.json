@@ -18,6 +18,7 @@
     "api-ms-win-core-synch-l1-2-0.dll!WakeByAddressAll": {"minimum_build": 9200, "source": "https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-wakebyaddressall"},
     "api-ms-win-core-synch-l1-2-0.dll!WakeByAddressSingle": {"minimum_build": 9200, "source": "https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-wakebyaddresssingle"},
     "bcryptprimitives.dll!ProcessPrng": {"minimum_build": 9200, "source": "https://learn.microsoft.com/windows/win32/seccng/processprng"},
-    "kernel32.dll!GetMachineTypeAttributes": {"minimum_build": 22000, "source": "https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-getmachinetypeattributes"}
+    "kernel32.dll!GetMachineTypeAttributes": {"minimum_build": 22000, "source": "https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-getmachinetypeattributes"},
+    "mmdevapi.dll!ActivateAudioInterfaceAsync": {"minimum_build": 9200, "source": "https://learn.microsoft.com/windows/win32/api/mmdeviceapi/nf-mmdeviceapi-activateaudiointerfaceasync"}
   }
 }

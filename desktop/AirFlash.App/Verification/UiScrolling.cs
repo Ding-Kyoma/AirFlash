@@ -40,7 +40,7 @@ internal static class UiScrolling
             var draftBefore = Fingerprint(window.ViewModel.Draft);
             var savedBefore = Fingerprint(store.Saved);
             var savesBefore = store.Saves;
-            var startsBefore = engine.CreatedCount;
+            var startsBefore = engine.Commands.Count(c => c.Text("command") == "start");
 
             foreach (var dark in new[] { false, true })
             {
@@ -159,7 +159,7 @@ internal static class UiScrolling
 
             Observe(Fingerprint(window.ViewModel.Draft) == draftBefore, "scrolling preserves the edited equalizer curve and settings draft", checks, failures);
             Observe(Fingerprint(store.Saved) == savedBefore && store.Saves == savesBefore, "scrolling never saves settings", checks, failures);
-            Observe(engine.CreatedCount == startsBefore && app.Snapshot.State == PlaybackState.Idle, "scrolling never starts receiver playback", checks, failures);
+            Observe(engine.Commands.Count(c => c.Text("command") == "start") == startsBefore && app.Snapshot.State == PlaybackState.Idle, "scrolling never starts receiver playback", checks, failures);
 
             var report = new
             {

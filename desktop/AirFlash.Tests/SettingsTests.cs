@@ -6,13 +6,32 @@ namespace AirFlash.Tests;
 public sealed class SettingsTests
 {
     [Fact]
+    public void ApplicationIdentityPersistsWithoutRuntimePidAndMergesInstanceSelection()
+    {
+        var settings = new AppSettings { CaptureMode = "application", CaptureApplicationPath = @"C:\Player.exe", CaptureEndpoint = "old-device" };
+        Assert.Null(settings.Validate()); Assert.Null(settings.EffectiveEndpoint); Assert.False(settings.ShouldMuteEndpoint);
+        var baseline = settings.Clone();
+        settings.CaptureApplicationInstance = new(settings.CaptureApplicationPath, "Player", 42, 100);
+        var clone = settings.Clone(); Assert.Equal(settings.CaptureApplicationInstance, clone.CaptureApplicationInstance);
+        var json = JsonSerializer.Serialize(settings, AppSettings.JsonOptions);
+        Assert.DoesNotContain("process_id", json); Assert.DoesNotContain("started_at", json);
+        var saved = JsonSerializer.Deserialize<AppSettings>(json, AppSettings.JsonOptions)!;
+        Assert.Equal(settings.CaptureApplicationPath, saved.CaptureApplicationPath); Assert.Null(saved.CaptureApplicationInstance);
+        Assert.False(SettingsMerge.Equal(baseline, settings));
+        var current = baseline.Clone(); current.MasterVolume = 40;
+        var merged = SettingsMerge.Merge(baseline, settings, current);
+        Assert.Equal(40, merged.MasterVolume); Assert.Equal(settings.CaptureApplicationInstance, merged.CaptureApplicationInstance);
+        var old = JsonSerializer.Deserialize<AppSettings>("{\"schema_version\":2,\"capture_mode\":\"loopback\"}", AppSettings.JsonOptions)!;
+        Assert.Null(old.Validate()); Assert.False(old.StandbyEnabled); Assert.Null(old.CaptureApplicationPath);
+        settings.CaptureApplicationPath = ""; Assert.NotNull(settings.Validate());
+    }
+    [Fact]
     public void CopyFromRetainsBoundObjectsAndRoundTripsAllSettings()
     {
         var source = new AppSettings
         {
             StartAtLogin = true, MuteWhileStreaming = false, AutoConnectOnDiscover = false,
             ForceReconnect = false, MaxReconnectAttempts = 12, UiLanguage = "zh", Theme = "dark",
-            StreamSampleRate = "48000",
             LatencyMode = "custom", CustomBufferMs = 650, StandbyEnabled = true,
             StandbySilenceSeconds = 22, CaptureMode = "endpoint", CaptureEndpoint = "b",
             MasterVolume = 41, LastReceiverId = "a", DiscoveryInterfaceId = "01db7c77-1016-49cb-8f5c-f5c194425d15",
@@ -119,7 +138,7 @@ public sealed class SettingsTests
             Assert.Null(settings.ReadOptions("one").AutoConnect); Assert.True(settings.ReadOptions("two").AutoConnect);
             Assert.Equal("endpoint", settings.CaptureMode); Assert.Equal("Old device", settings.CaptureEndpoint); Assert.Equal(2000, settings.CustomBufferMs);
             Assert.Equal(old, File.ReadAllText(path)); store.Save(settings);
-            Assert.Equal(old, File.ReadAllText(path + ".pre-wpf.bak")); Assert.Equal(2, new SettingsStore(path).Load().SchemaVersion);
+            Assert.Equal(old, File.ReadAllText(path + ".pre-wpf.bak")); Assert.Equal(4, new SettingsStore(path).Load().SchemaVersion);
             Assert.True(settings.Extra!["show_equalizer"].GetBoolean());
         }
         finally { Directory.Delete(directory, true); }
@@ -166,16 +185,16 @@ public sealed class SettingsTests
     [InlineData("48000", true)]
     [InlineData("96000", false)]
     [InlineData("auto", false)]
-    public void StreamSampleRateAcceptsOnlySupportedRates(string rate, bool valid)
+    public void ReceiverSampleRateAcceptsOnlySupportedRates(string rate, bool valid)
     {
-        var settings = new AppSettings { StreamSampleRate = rate };
+        var settings = new AppSettings(); settings.Options("a").SampleRate = rate;
         Assert.Equal(valid, settings.Validate() is null);
     }
     [Fact]
-    public void MissingStreamSampleRateDefaultsTo44100()
+    public void MissingReceiverSampleRateIsAutomatic()
     {
         var settings = JsonSerializer.Deserialize<AppSettings>("""{"schema_version":2}""", AppSettings.JsonOptions)!;
-        Assert.Equal("44100", settings.StreamSampleRate);
+        Assert.Null(settings.SampleRate(new("a", "A", "127.0.0.1")));
         Assert.Null(settings.Validate());
     }
     [Fact]
@@ -213,4 +232,51 @@ public sealed class SettingsTests
         finally { Directory.Delete(directory, true); }
     }
     private static string NewDirectory() { var path = Path.Combine(Path.GetTempPath(), "airplay-tests", Guid.NewGuid().ToString("N")); Directory.CreateDirectory(path); return path; }
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void RemovedGlobalRateMigratesToAutomaticWithoutChangingExplicitProfiles(int version)
+    {
+        var directory = NewDirectory(); var path = Path.Combine(directory, "config.json");
+        try
+        {
+            var original = "{\"schema_version\":" + version + ",\"stream_sample_rate\":\"48000\",\"future_option\":true,\"receivers\":{\"a\":{\"sample_rate\":null},\"b\":{\"sample_rate\":\"48000\"}},\"software_groups\":[{\"id\":\"software:g\",\"name\":\"G\",\"left_id\":\"a\",\"right_id\":\"b\",\"sample_rate\":\"48000\"}]}";
+            File.WriteAllText(path, original);
+            var store = new SettingsStore(path); var settings = store.Load();
+            Assert.Equal(4, settings.SchemaVersion); Assert.Null(settings.ReadOptions("a").SampleRate); Assert.Equal("48000", settings.ReadOptions("b").SampleRate);
+            Assert.Equal("48000", settings.SoftwareGroups.Single().SampleRate); Assert.True(settings.Extra!["future_option"].GetBoolean());
+            store.Save(settings); Assert.DoesNotContain("stream_sample_rate", File.ReadAllText(path)); Assert.Equal(original, File.ReadAllText(path + ".pre-v4.bak"));
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+    [Fact]
+    public async Task ResetRemovesConfigurationAndPairingButRetainsLogsAndClearsMigrationSource()
+    {
+        var directory = NewDirectory(); var path = Path.Combine(directory, "config.json");
+        try
+        {
+            File.WriteAllText(path, "{\"schema_version\":3,\"master_volume\":21}");
+            var credentials = Directory.CreateDirectory(Path.Combine(directory, "native-credentials")).FullName;
+            var logs = Directory.CreateDirectory(Path.Combine(directory, "logs")).FullName;
+            File.WriteAllText(Path.Combine(credentials, "a.dpapi"), "test"); File.WriteAllText(Path.Combine(logs, "session.log"), "keep");
+            var store = new SettingsStore(path); store.Load(); await store.ResetAsync();
+            Assert.False(File.Exists(path)); Assert.False(Directory.Exists(credentials)); Assert.Equal("keep", File.ReadAllText(Path.Combine(logs, "session.log")));
+            Assert.Equal(100, store.Load().MasterVolume); store.Save(new()); Assert.False(File.Exists(path + ".pre-v4.bak"));
+            await store.ResetAsync(); await store.ResetAsync(); Assert.False(File.Exists(path));
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+    [Fact]
+    public void IndependentLatencyIncludesSoftwareMembersAndEffectiveCustomOverrides()
+    {
+        var settings = new AppSettings(); var a = new Receiver("a", "A", "127.0.0.1"); var b = new Receiver("b", "B", "127.0.0.2");
+        var software = new Receiver("software:g", "G", "127.0.0.1") { IsSoftwareGroup = true, Members = [a, b] };
+        Assert.False(settings.UsesDeviceLatency(a)); settings.Options("b").LatencyMode = "buffered";
+        Assert.True(settings.UsesDeviceLatency(software)); Assert.False(settings.UsesDeviceLatency(a));
+        var native = software with { Id = "stereo:g", IsSoftwareGroup = false };
+        Assert.False(settings.UsesDeviceLatency(native)); settings.Options(native.Id).LatencyMode = "normal"; Assert.True(settings.UsesDeviceLatency(native));
+        settings.Options("a").CustomBufferMs = 700; Assert.False(settings.UsesDeviceLatency(a)); settings.LatencyMode = "custom";
+        Assert.True(settings.UsesDeviceLatency(a)); Assert.Equal(700, settings.Latency("a"));
+    }
 }

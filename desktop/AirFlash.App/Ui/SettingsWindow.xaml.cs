@@ -4,6 +4,7 @@ using System.Windows.Data;
 using System.Windows.Input;
 using AirFlash.App.Services;
 using AirFlash.App.ViewModels;
+using AirFlash.Core;
 namespace AirFlash.App.Ui;
 
 public partial class SettingsWindow : Window
@@ -14,6 +15,7 @@ public partial class SettingsWindow : Window
     public SettingsWindow(AppViewModel app)
     {
         InitializeComponent(); ViewModel = new(app); DataContext = ViewModel;
+        ViewModel.ConfirmReset = () => MessageBox.Show(this, L.Get("All settings and receiver pairing will be deleted, and AirFlash will restart. Continue?"), L.Get("Reset and restart"), MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) == MessageBoxResult.Yes;
         WindowThemeService.Track(this);
         AppIconService.Track(this);
         ViewModel.CloseRequested += _ => Close();

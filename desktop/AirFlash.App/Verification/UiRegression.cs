@@ -1,6 +1,7 @@
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Threading;
+using AirFlash.App.Services;
 using AirFlash.App.Ui;
 using AirFlash.App.ViewModels;
 using AirFlash.Core;
@@ -13,7 +14,8 @@ internal static class UiRegression
         var store = new UiSmoke.MemoryStore(); var audio = new UiSmoke.MockAudio();
         var autostart = new UiSmoke.MockAutostart(); var discovery = new UiSmoke.MockDiscovery();
         var engine = new UiSmoke.MockFactory();
-        await using var app = new AppViewModel(store, discovery, autostart, audio, engine, Application.Current.Dispatcher);
+        var applications = new MockApplications();
+        await using var app = new AppViewModel(store, discovery, autostart, audio, engine, Application.Current.Dispatcher, applications: applications);
         app.SetPanelVisible(true); app.Start(); await app.Startup; await Pump();
         var window = new SettingsWindow(app); window.Show(); await Pump();
         var vm = window.ViewModel;
@@ -137,6 +139,31 @@ internal static class UiRegression
             Check(audio.Enumerations == enumerations + 1 && audio.MaxEnumerations == 1 && vm.Endpoints.Any(e => e.Name == "Newest"), "changes during enumeration trigger one serial follow-up", checks);
             audio.EnumerationGate = null; audio.EnumerationEntered = null;
 
+            var firstApplication = new CaptureApplication(@"C:\Music.exe", "Music", 41, 100);
+            var secondApplication = firstApplication with { ProcessId = 42, StartedAt = 200 };
+            applications.Items = [firstApplication, secondApplication];
+            vm.Draft.CaptureMode = "application"; await Until(() => !vm.IsApplicationsLoading); await Pump();
+            vm.SelectedApplication = secondApplication;
+            vm.Draft.MuteWhileStreaming = true;
+            Check(!vm.CanMuteEndpoint && await vm.ApplyAsync(), "application selection saves while endpoint mute is disabled", checks);
+            Check(store.Saved.CaptureApplicationPath == firstApplication.Path && app.Settings.CaptureApplicationInstance == secondApplication, "application identity retains chosen runtime instance", checks);
+            foreach (var dark in new[] { false, true })
+            {
+                ThemeService.SetForVerification(dark); await Pump();
+                var scroll = window.PageScroll;
+                scroll.ScrollToHome(); await Pump();
+                UiSmoke.Render(window, Path.Combine(directory, $"capture-{(dark ? "dark" : "light")}-top.png"), 1);
+                scroll.ScrollToEnd(); await Pump();
+                UiSmoke.Render(window, Path.Combine(directory, $"capture-{(dark ? "dark" : "light")}-routing.png"), 1);
+            }
+            applications.Items = []; await vm.LoadApplicationsAsync();
+            Check(vm.Draft.CaptureApplicationPath == firstApplication.Path && vm.SelectedApplication?.ProcessId == 0, "missing application stays selected without switching to system audio", checks);
+            applications.Items = [firstApplication]; await vm.LoadApplicationsAsync();
+            Check(vm.SelectedApplication == firstApplication, "unique restarted application is shown", checks);
+            vm.Draft.CaptureMode = "endpoint"; vm.Draft.MuteWhileStreaming = false;
+            Check(await vm.ApplyAsync(), "returning from application to endpoint capture succeeds", checks);
+            await Until(() => app.Snapshot.State == PlaybackState.Streaming); await Pump();
+
             var statusNotifications = 0; var rowNotifications = 0;
             app.PropertyChanged += (_, args) => { if (args.PropertyName == nameof(AppViewModel.StatusTitle)) statusNotifications++; };
             foreach (var receiver in app.Receivers) receiver.PropertyChanged += (_, _) => rowNotifications++;
@@ -174,6 +201,88 @@ internal static class UiRegression
         await RunAutoConnectIdentityRegressionAsync(checks);
         await RunDiscoveryDemandRegressionAsync(checks);
         await RunStereoIdentityRegressionAsync(checks, directory);
+        await RunSoftwareStereoRegressionAsync(checks, directory);
+        await ReceiverSettingsRegression.RunAsync(checks, directory);
+    }
+    private static async Task RunSoftwareStereoRegressionAsync(List<string> checks, string directory)
+    {
+        var a = new Receiver("a", "A · HomePod", "127.0.0.1");
+        var b = new Receiver("b", "B · Soundbar", "127.0.0.2");
+        var c = new Receiver("c", "C · Mac", "127.0.0.3");
+        var native = new Receiver("stereo:native", "Native pair", "") { StereoId = "native", Members = [new("n1", "Native left", "127.0.0.4"), new("n2", "Native right", "127.0.0.5")] };
+        var discovery = new UiSmoke.MockDiscovery { Items = [a, b, c, native] };
+        var store = new UiSmoke.MemoryStore(); var engine = new UiSmoke.MockFactory();
+        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+        app.SetPanelVisible(true); app.Start(); await app.Startup; await Pump();
+        var window = new SettingsWindow(app); window.Show(); var vm = window.ViewModel;
+        var panel = new ControlPanel(app); panel.ShowPanel();
+        try
+        {
+            vm.SelectedPage = SettingsViewModel.ReceiversPage; await Pump();
+            Check(vm.GroupCandidates.Count == 3 && vm.GroupCandidates.All(r => r.Id != "n1" && r.Id != "n2" && !r.IsGroup), "software editor excludes native pair members and group roots", checks);
+            vm.AddGroupCommand.Execute(null); await Pump();
+            var editor = vm.Groups.Single(); var group = editor.Group; var id = group.Id;
+            group.Name = "Office software stereo"; group.LeftOffsetMs = -80; group.RightOffsetMs = 25; group.SampleRate = "48000";
+            var combos = UiSmoke.Descendants(window).OfType<ComboBox>().Where(box => box.ItemsSource == vm.GroupCandidates).ToArray();
+            Check(combos.Length == 2 && combos.Select(box => box.SelectedValue).ToHashSet().SetEquals(new[] { "a", "b" }), "software member selectors bind stable IDs", checks);
+            Check(await vm.ApplyAsync() && store.Saved.SoftwareGroups.Single().Id == id, "software group creation saves stable ID and common rate", checks);
+            await app.ToggleAsync(app.AllReceivers.Single(r => r.Id == id));
+            await Until(() => app.Snapshot.State == PlaybackState.Streaming && app.Receivers.Single(r => r.Receiver.Id == id).MemberVolumes.All(m => m.CanSetVolume));
+            var card = app.Receivers.Single(r => r.Receiver.Id == id);
+            Check(!card.HasSingleVolume && card.MemberVolumes.Count == 2 && card.MemberVolumes.Select(m => m.Volume).ToArray().SequenceEqual(new[] { 28, 45 }), "software panel exposes two independent hardware volume readouts", checks);
+            Check(!engine.Commands.Any(command => command.Text("command") == "set_device_volume"), "creating a software group does not write hardware volume", checks);
+            await Pump();
+            Check(UiSmoke.Descendants(window).OfType<Button>().Single(button => ReferenceEquals(button.Command, editor.SwapCommand)).IsEnabled, "software swap button is enabled again after applying", checks);
+            await app.SetReceiverVolumeAsync("b", 61);
+            await Until(() => app.ReceiverVolume("b").Display == 61);
+            Check(app.ReceiverVolume("a").Display == 28 && app.ReceiverVolume("b").Status == "confirmed", "software hardware volume writes only selected member and preserves confirmation", checks);
+            window.PageScroll.ScrollToVerticalOffset(300); await Pump();
+            UiSmoke.Render(window, Path.Combine(directory, "settings-software-stereo.png"), 1);
+            panel.ShowPanel(); await Pump();
+            panel.DeviceScroll.ScrollToBottom(); await Pump();
+            Check(UiSmoke.Descendants(panel).OfType<Slider>().Count(slider => slider.DataContext is ReceiverViewModel member && card.MemberVolumes.Contains(member) && slider.IsEnabled) == 2, "software panel renders both enabled member sliders", checks);
+            UiSmoke.Render(panel, Path.Combine(directory, "panel-software-stereo.png"), 1);
+            var starts = engine.CreatedCount;
+            editor.SwapCommand.Execute(null);
+            Check(await vm.ApplyAsync(), "software left-right swap applies", checks);
+            await Until(() => app.Snapshot.State == PlaybackState.Streaming && engine.CreatedCount == starts + 1 && app.Snapshot.Receiver?.Members[0].Id == "b");
+            Check(app.Snapshot.Receiver!.Members[0].Id == "b" && app.Snapshot.Receiver.Members[0].SyncOffsetMs == 25, "software swap rebuilds whole session and retains member offset: " + string.Join(",", app.Snapshot.Receiver.Members.Select(m => $"{m.Id}:{m.Channel}:{m.SyncOffsetMs}")) + $" draft={group.LeftId}/{group.RightId}:{group.LeftOffsetMs}/{group.RightOffsetMs}", checks);
+            panel.Hide(); vm.SelectedPage = 0; await Pump();
+            Check(discovery.Running, "active software group retains discovery with receiver lists hidden", checks);
+            discovery.Items = [b, c, native]; discovery.Publish(); await Pump();
+            Check(app.Snapshot.State == PlaybackState.Streaming && engine.CreatedCount == starts + 1, "temporary software member broadcast loss preserves active transport", checks);
+            vm.Draft.MasterVolume = 23; vm.Draft.StandbyEnabled = true;
+            Check(await vm.ApplyAsync(), "hot software settings apply during missing member discovery", checks);
+            Check(app.Snapshot.State == PlaybackState.Streaming && engine.CreatedCount == starts + 1,
+                "hot software settings retain the engine while a member broadcast is missing", checks);
+            discovery.Items = [a with { Address = "127.0.0.5" }, b, c, native]; discovery.Publish(); await Pump();
+            vm.Draft.MasterVolume = 24;
+            Check(await vm.ApplyAsync(), "hot software settings apply after passive address change", checks);
+            Check(app.Snapshot.State == PlaybackState.Streaming && engine.CreatedCount == starts + 1
+                && app.Snapshot.Receiver!.Members.Single(m => m.Id == "a").Address == "127.0.0.1",
+                "hot software settings preserve working addresses until a real rebuild", checks);
+            discovery.Items = [a, b, c, native]; discovery.Publish(); await Pump();
+            Check(group.LeftId == "b" && group.RightId == "a", "discovery refresh preserves software member selectors", checks);
+            starts = engine.CreatedCount; group.RightId = "c";
+            Check(await vm.ApplyAsync(), "software member replacement applies", checks);
+            await Until(() => app.Snapshot.State == PlaybackState.Streaming && engine.CreatedCount == starts + 1 && app.Snapshot.Receiver?.Members[1].Id == "c");
+            Check(app.Snapshot.Receiver!.Members[1].Id == "c", "software replacement starts both new members together", checks);
+            editor.RemoveCommand.Execute(null);
+            var split = await vm.ApplyAsync(); await Pump();
+            Check(split && app.Snapshot.State == PlaybackState.Idle && store.Saved.SoftwareGroups.Count == 0, "splitting an active software group stops and removes its session", checks);
+            vm.AddGroupCommand.Execute(null); Check(await vm.ApplyAsync(), "software group can be recreated after split", checks);
+            await app.ToggleAsync(app.AllReceivers.Single(r => r.IsSoftwareGroup)); await Until(() => app.Snapshot.State == PlaybackState.Streaming);
+            discovery.Items = [new Receiver("stereo:new", "New native pair", "") { StereoId = "new", Members = [a, b] }, c, native];
+            discovery.Publish(); await Until(() => app.Snapshot.State == PlaybackState.Idle);
+            Check(!app.Snapshot.IsActive, "confirmed native pairing invalidates active software membership", checks);
+        }
+        finally { await vm.ApplicationCompleted; window.Close(); panel.ShutdownPanel(); }
+    }
+    private sealed class MockApplications : IApplicationCatalog
+    {
+        public bool Supported => true;
+        public IReadOnlyList<CaptureApplication> Items { get; set; } = [];
+        public Task<IReadOnlyList<CaptureApplication>> RefreshAsync(CancellationToken cancellation = default) => Task.FromResult(Items);
     }
     private static async Task RunIdentityRegressionAsync(List<string> checks, string directory)
     {
@@ -254,7 +363,8 @@ internal static class UiRegression
             discovery.Items = ReceiverAggregator.Build(services.Take(2)); discovery.Publish();
             await Until(() => app.AllReceivers.Single().Members.Length == 1);
             Check(app.Snapshot.State == PlaybackState.Streaming && app.AllReceivers.Single().Detail.Contains("1/2", StringComparison.Ordinal)
-                && engine.CreatedCount == 1 && engine.DisposedCount == 0,
+                && engine.Commands.Count(c => c.Text("command") == "start") == 1
+                && engine.CreatedCount - engine.DisposedCount == 1,
                 "missing discovery member shows one of two without stopping active transport", checks);
         }
         finally { await vm.ApplicationCompleted; window.Close(); }
@@ -280,10 +390,12 @@ internal static class UiRegression
             settings.ViewModel.SelectedPage = 0; await Pump();
             Check(!discovery.Running && discovery.Stops == 1 && app.Receivers.Count == 2, "last receiver list hiding stops discovery and preserves cache", checks);
             panel.ShowPanel(); await Pump();
+            var previousConnections = engine.CreatedCount;
             await app.ToggleAsync(app.AllReceivers.First(r => r.Online)); await Until(() => app.Snapshot.State == PlaybackState.Streaming);
             panel.Hide(); await Pump();
             discovery.Items = []; discovery.Publish(); await Pump();
-            Check(app.Snapshot.IsActive && !discovery.Running && engine.CreatedCount == 1, "suspension and absent discovery results do not interrupt playback", checks);
+            Check(app.Snapshot.IsActive && !discovery.Running && engine.CreatedCount == previousConnections + 1
+                && engine.CreatedCount - engine.DisposedCount == 1, "suspension and absent discovery results do not interrupt playback", checks);
             for (var i = 0; i < 10; i++) { panel.ShowPanel(); await Pump(); panel.Hide(); await Pump(); }
             Check(discovery.Starts == discovery.Stops, "repeated panel visibility releases every discovery session", checks);
         }

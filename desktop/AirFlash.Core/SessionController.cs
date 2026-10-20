@@ -6,9 +6,10 @@ namespace AirFlash.Core;
 
 public enum PlaybackState { Idle, Connecting, Streaming, Standby, Pairing, Error }
 public sealed record StreamMetrics(double? CaptureToSendP95 = null, double? MaxQueueAge = null, long? Underruns = null, long? DroppedFrames = null, int? InputRate = null);
-public sealed record SessionSnapshot(PlaybackState State, Receiver? Receiver = null, string Message = "", StreamMetrics? Metrics = null, int TargetLatency = 0, PlaybackDiagnostics? Diagnostics = null, int StreamRate = 0, DeviceVolumeState? DeviceVolume = null)
+public sealed record SessionSnapshot(PlaybackState State, Receiver? Receiver = null, string Message = "", StreamMetrics? Metrics = null, int TargetLatency = 0, PlaybackDiagnostics? Diagnostics = null, int StreamRate = 0, DeviceVolumeState? DeviceVolume = null, IReadOnlyDictionary<string, DeviceVolumeState>? MemberVolumes = null)
 {
     public bool IsActive => State is PlaybackState.Connecting or PlaybackState.Streaming or PlaybackState.Standby or PlaybackState.Pairing;
+    internal long Generation { get; init; }
 }
 public sealed record SessionTiming(TimeSpan Connect, TimeSpan Read, TimeSpan Pin, TimeSpan Retry)
 {
@@ -17,6 +18,7 @@ public sealed record SessionTiming(TimeSpan Connect, TimeSpan Read, TimeSpan Pin
 public sealed class SessionController(IEngineFactory factory, IAudioService audio, Action<string>? log = null, SessionTiming? timing = null) : IAsyncDisposable
 {
     private readonly SemaphoreSlim _serial = new(1, 1);
+    private readonly SemaphoreSlim _audioWriter = new(1, 1);
     private readonly object _sync = new();
     private readonly SessionTiming _timing = timing ?? SessionTiming.Default;
     private CancellationTokenSource? _lifetime;
@@ -25,8 +27,10 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private string? _sessionId;
     private AppSettings _settings = new();
     private Receiver? _receiver;
+    private Receiver? _discoveredReceiver;
     private long _generation;
     private bool _muted;
+    private bool _transportStreaming;
     private readonly SemaphoreSlim _equalizerWriter = new(1, 1);
     private EqualizerSettings? _equalizerPreview;
     private Guid? _equalizerOwner;
@@ -34,6 +38,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private CancellationTokenSource? _equalizerEdit;
     private Task? _equalizerEditTask;
     private bool _equalizerReady, _equalizerDisposed;
+    private (bool Enabled, double Seconds)? _sentStandby;
     public event Action<string?>? EqualizerFeedback;
     public Task PreviewEqualizerAsync(Guid owner, EqualizerSettings equalizer)
     {
@@ -110,10 +115,13 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         finally { _equalizerWriter.Release(); }
     }
     private DeviceVolumeState _deviceVolume = new();
+    private readonly Dictionary<string, DeviceVolumeState> _memberVolumes = [];
+    private readonly Dictionary<string, string> _memberHosts = [];
     private long _volumeSequence;
     private CancellationTokenSource? _volumeEdit;
     public async Task SetDeviceVolumeAsync(string receiverId, int value)
     {
+        if (Snapshot.Receiver?.IsSoftwareGroup == true) { await SetMemberVolumeAsync(receiverId, value).ConfigureAwait(false); return; }
         CancellationToken token;
         long sequence, epoch;
         lock (_sync)
@@ -167,28 +175,92 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         lock (_sync) { if (epoch == _generation) Publish(epoch, _snapshot.State, _snapshot.Message); }
     }
     private PlaybackDiagnostics _diagnostics = new();
+    private async Task SetMemberVolumeAsync(string memberId, int value)
+    {
+        long epoch, sequence; string host, session; IEngineConnection connection; CancellationToken token;
+        lock (_sync)
+        {
+            if (_receiver?.IsSoftwareGroup != true || _snapshot.State is not (PlaybackState.Streaming or PlaybackState.Standby) || !_memberVolumes.TryGetValue(memberId, out var state) || !state.Available || !_memberHosts.TryGetValue(memberId, out host!) || _connection is null || _sessionId is null) return;
+            epoch = _generation; sequence = ++_volumeSequence; connection = _connection; session = _sessionId; token = _lifetime!.Token;
+            _memberVolumes[memberId] = state.Begin(Math.Clamp(value, 0, 100), sequence);
+        }
+        PublishCurrent(epoch);
+        try
+        {
+            await Task.Delay(200, token).ConfigureAwait(false);
+            lock (_sync) { if (epoch != _generation || _memberVolumes.GetValueOrDefault(memberId)?.Sequence != sequence) return; }
+            await connection.SendAsync(session, "set_device_volume", new { host, volume = Math.Clamp(value, 0, 100), sequence }, token).ConfigureAwait(false);
+            await Task.Delay(TimeSpan.FromSeconds(3), token).ConfigureAwait(false);
+            lock (_sync) { if (epoch != _generation || _memberVolumes.GetValueOrDefault(memberId)?.Sequence != sequence || _memberVolumes[memberId].Target is null) return; _memberVolumes[memberId] = _memberVolumes[memberId].Timeout(); }
+            PublishCurrent(epoch);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception error) when (error is IOException or ObjectDisposedException or InvalidOperationException)
+        {
+            log?.Invoke($"Member volume command failed: {error.Message}");
+            lock (_sync) { if (epoch != _generation || !_memberVolumes.TryGetValue(memberId, out var state) || state.Sequence != sequence) return; _memberVolumes[memberId] = state.Timeout() with { Available = false }; }
+            PublishCurrent(epoch);
+        }
+    }
     private readonly Dictionary<string, EngineNotice> _warnings = [];
     private SessionSnapshot _snapshot = new(PlaybackState.Idle);
     public SessionSnapshot Snapshot { get { lock (_sync) return _snapshot; } }
     public event Action<SessionSnapshot>? Changed;
     public bool Muted => _muted;
-    private string Signature(Receiver receiver, AppSettings settings) => $"{receiver.TransportKey}|{settings.EffectiveEndpoint}|{settings.Latency(receiver.Id)}|{settings.StreamSampleRate}";
+    private static ReceiverOptions ProfileOptions(Receiver receiver, Receiver member, AppSettings settings) => settings.ReadOptions(receiver.IsGroup && !receiver.IsSoftwareGroup ? receiver.Id : member.Id);
+    private static object PeerProfile(Receiver receiver, Receiver member, AppSettings settings)
+    {
+        var options = ProfileOptions(receiver, member, settings);
+        return new { codec = options.Codec, transport = options.Transport, timing = options.Timing == "follow" ? "ptp" : options.Timing,
+            follow_receiver_clock = options.Timing == "follow" || options.Timing == "auto" && member.FollowReceiverClock, features = member.Features,
+            channel = receiver.IsSoftwareGroup ? member.Channel : "stereo", sync_offset_ms = receiver.IsSoftwareGroup ? member.SyncOffsetMs : 0,
+            latency_ms = settings.Latency(receiver.IsSoftwareGroup ? member.Id : receiver.Id) };
+    }
+    private static Dictionary<string, string?> ConnectionFields(Receiver receiver, AppSettings settings)
+    {
+        var application = settings.CaptureMode == "application";
+        return new()
+        {
+            ["receiver"] = JsonSerializer.Serialize(new { mode = receiver.IsSoftwareGroup ? "software_stereo" : receiver.IsGroup ? "native_stereo" : "single",
+                group = receiver.IsGroup && !receiver.IsSoftwareGroup ? receiver.StereoId : null,
+                peers = receiver.Peers.OrderBy(m => m.Address, StringComparer.Ordinal).ThenBy(m => m.Port).Select(m => new { m.Address, m.Port, leader = receiver.IsGroup && m.IsLeader }) }),
+            ["capture"] = JsonSerializer.Serialize(new { settings.CaptureMode, endpoint = settings.EffectiveEndpoint,
+                path = application ? settings.CaptureApplicationPath : null, process = application ? settings.CaptureApplicationInstance?.ProcessId : null,
+                started = application ? settings.CaptureApplicationInstance?.StartedAt : null }),
+            ["latency"] = settings.Latency(receiver.Id).ToString(),
+            ["sample_rate"] = settings.SampleRate(receiver),
+            ["profiles"] = JsonSerializer.Serialize(receiver.Peers.OrderBy(m => m.Address, StringComparer.Ordinal).ThenBy(m => m.Port).Select(m => PeerProfile(receiver, m, settings)))
+        };
+    }
+    private static string[] ConnectionChanges(Receiver previous, AppSettings old, Receiver receiver, AppSettings settings)
+    {
+        var before = ConnectionFields(previous, old); var after = ConnectionFields(receiver, settings);
+        return before.Keys.Where(key => before[key] != after[key]).ToArray();
+    }
+    private Receiver RestartReceiver(Receiver receiver, AppSettings settings)
+    {
+        var next = _discoveredReceiver is { Online: true, Complete: true } discovered && discovered.Id == receiver.Id ? discovered : receiver;
+        return next.IsSoftwareGroup ? SoftwareStereo.Resolve(next.Members.Concat(settings.ManualReceivers.Select(m => new Receiver(m.Id, m.Name, m.Host, m.Port) { IsManual = true })), settings).First(g => g.Id == next.Id) : next;
+    }
     public async Task StartAsync(Receiver receiver, AppSettings settings)
     {
         if (!receiver.Complete) throw new InvalidOperationException(L.Get("Both stereo pair members must be online."));
+        if (settings.Validate() is { } validation) throw new ArgumentException(validation, nameof(settings));
+        if (receiver.IsSoftwareGroup && (!receiver.Online || receiver.Members.Select(m => Receiver.PhysicalKey(m.DeviceId, m.Address)).Distinct().Count() != 2)) throw new InvalidOperationException(L.Get("Stereo groups require two distinct independent receivers."));
         await _serial.WaitAsync().ConfigureAwait(false);
-        try { await StartLockedAsync(receiver, settings, null).ConfigureAwait(false); }
+        try { await StartLockedAsync(receiver, settings, null, "user_play").ConfigureAwait(false); }
         finally { _serial.Release(); }
     }
     public async Task PairAsync(Receiver receiver, AppSettings settings, Func<Receiver, CancellationToken, Task<string?>> requestPin)
     {
         if (!receiver.Complete) throw new InvalidOperationException(L.Get("Wait until both stereo pair members are online before pairing."));
         await _serial.WaitAsync().ConfigureAwait(false);
-        try { await StartLockedAsync(receiver, settings, requestPin).ConfigureAwait(false); }
+        try { await StartLockedAsync(receiver, settings, requestPin, "user_pair").ConfigureAwait(false); }
         finally { _serial.Release(); }
     }
-    private async Task StartLockedAsync(Receiver receiver, AppSettings settings, Func<Receiver, CancellationToken, Task<string?>>? requestPin)
+    private async Task StartLockedAsync(Receiver receiver, AppSettings settings, Func<Receiver, CancellationToken, Task<string?>>? requestPin, string reason, string[]? changedFields = null)
     {
+        log?.Invoke($"Session start reason={reason}; changed_fields={string.Join(",", changedFields ?? [])}");
         await StopLockedAsync().ConfigureAwait(false);
         _settings = settings.Clone(); _receiver = receiver;
         var epoch = ++_generation;
@@ -212,12 +284,12 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     public async Task StopAsync()
     {
         await _serial.WaitAsync().ConfigureAwait(false);
-        try { await StopLockedAsync().ConfigureAwait(false); _receiver = null; Publish(_generation, PlaybackState.Idle); }
+        try { log?.Invoke("Session stop reason=user_stop"); await StopLockedAsync().ConfigureAwait(false); _receiver = null; Publish(_generation, PlaybackState.Idle); }
         finally { _serial.Release(); }
     }
     private async Task StopLockedAsync()
     {
-        lock (_sync) { ++_generation; _volumeEdit?.Cancel(); _volumeEdit?.Dispose(); _volumeEdit = null; _deviceVolume = new(); }
+        lock (_sync) { ++_generation; _discoveredReceiver = null; _volumeEdit?.Cancel(); _volumeEdit?.Dispose(); _volumeEdit = null; _deviceVolume = new(); _memberVolumes.Clear(); _memberHosts.Clear(); }
         if (_lifetime is not null) await _lifetime.CancelAsync().ConfigureAwait(false);
         if (_work is not null) await _work.ConfigureAwait(false);
         _lifetime?.Dispose(); _lifetime = null; _work = null;
@@ -229,15 +301,29 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         try
         {
             var old = _settings;
+            if (_receiver is { IsSoftwareGroup: true } group && settings.SoftwareGroups.All(g => g.Id != group.Id))
+            { await StopLockedAsync().ConfigureAwait(false); _receiver = null; _settings = settings.Clone(); Publish(_generation, PlaybackState.Idle); return; }
+            var previous = _receiver;
+            if (_receiver is { IsSoftwareGroup: true } software)
+            {
+                var catalog = software.Members.Concat(settings.ManualReceivers.Select(m => new Receiver(m.Id, m.Name, m.Host, m.Port) { IsManual = true }));
+                var resolved = SoftwareStereo.Resolve(catalog, settings).First(g => g.Id == software.Id);
+                if (!resolved.Complete || !resolved.Online)
+                {
+                    await StopLockedAsync().ConfigureAwait(false); _receiver = null; _settings = settings.Clone();
+                    Publish(_generation, PlaybackState.Error, L.Get("Stereo groups require two distinct independent receivers.")); return;
+                }
+                _receiver = resolved;
+            }
             _settings = settings.Clone();
             lock (_sync) ++_equalizerSequence;
-            if (_receiver is { } receiver && Snapshot.IsActive && Snapshot.State != PlaybackState.Pairing && Signature(receiver, old) != Signature(receiver, settings))
-                await StartLockedAsync(receiver, settings, null).ConfigureAwait(false);
+            if (_receiver is { } receiver && Snapshot.IsActive && Snapshot.State != PlaybackState.Pairing && ConnectionChanges(previous ?? receiver, old, receiver, settings) is { Length: > 0 } changes)
+                await StartLockedAsync(RestartReceiver(receiver, settings), settings, null, "settings_change", changes).ConfigureAwait(false);
             else
             {
-                if (!settings.MuteWhileStreaming) await RestoreAudioAsync().ConfigureAwait(false);
-                else if (Snapshot.State is PlaybackState.Streaming or PlaybackState.Standby) await audio.MuteAsync(settings.EffectiveEndpoint).ConfigureAwait(false);
+                await ApplyLocalMuteAsync().ConfigureAwait(false);
                 await SendGainAsync().ConfigureAwait(false);
+                await SendStandbyAsync().ConfigureAwait(false);
                 await SendEqualizerAsync().ConfigureAwait(false);
             }
         }
@@ -249,13 +335,87 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         try
         {
             if (_receiver is not { } previous) return;
-            if (Snapshot.IsActive && Snapshot.State != PlaybackState.Pairing && Signature(previous, _settings) != Signature(receiver, settings))
-                await StartLockedAsync(receiver, settings, null).ConfigureAwait(false);
+            if (Snapshot.IsActive && Snapshot.State != PlaybackState.Pairing && ConnectionChanges(previous, _settings, receiver, settings) is { Length: > 0 } changes)
+                await StartLockedAsync(receiver, settings, null, "settings_change", changes).ConfigureAwait(false);
             else
             {
-                lock (_sync) { _receiver = receiver; _settings = settings.Clone(); }
+                lock (_sync)
+                {
+                    RemapReceiverIdentities(previous, receiver);
+                    _receiver = receiver; _settings = settings.Clone();
+                }
+                await SendStandbyAsync().ConfigureAwait(false);
                 PublishCurrent(_generation);
             }
+        }
+        finally { _serial.Release(); }
+    }
+    private bool OwnsDiscoverySnapshot(SessionSnapshot expected) => expected.Generation == _generation && expected.Receiver?.Id == _receiver?.Id
+        && _receiver is not null && _snapshot.State is not (PlaybackState.Idle or PlaybackState.Pairing);
+    private void RemapReceiverIdentities(Receiver previous, Receiver receiver)
+    {
+        var identities = previous.Peers.Select(old => (Old: old, Current: receiver.Peers.FirstOrDefault(p => p.Address == old.Address && p.Port == old.Port)))
+            .Where(p => p.Current is not null && p.Current.Id != p.Old.Id).ToDictionary(p => p.Old.Id, p => p.Current!.Id);
+        if (identities.Count > 0 && _diagnostics.Negotiated is { } negotiated)
+            _diagnostics = _diagnostics with { Negotiated = negotiated.Select(item =>
+            {
+                if (!identities.TryGetValue(item.Text("receiver_id"), out var id)) return item;
+                var fields = item.EnumerateObject().ToDictionary(p => p.Name, p => p.Value.Clone());
+                fields["receiver_id"] = JsonSerializer.SerializeToElement(id);
+                return JsonSerializer.SerializeToElement(fields);
+            }).ToArray() };
+
+        if (!previous.IsSoftwareGroup || !receiver.IsSoftwareGroup) return;
+        foreach (var member in receiver.Members)
+        {
+            var old = previous.Members.FirstOrDefault(m => m.Address == member.Address && m.Port == member.Port);
+            if (old is null || old.Id == member.Id) continue;
+            if (_memberHosts.Remove(old.Id, out var host)) _memberHosts[member.Id] = host;
+            if (_memberVolumes.Remove(old.Id, out var state)) _memberVolumes[member.Id] = state.Target is null ? state : state.Timeout();
+        }
+    }
+    // Browsing describes a future connection. It cannot reconfigure a working transport.
+    public async Task RefreshReceiverAsync(Receiver receiver, SessionSnapshot expected, IReadOnlyDictionary<string, string> migrations)
+    {
+        await _serial.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            lock (_sync)
+            {
+                if (!OwnsDiscoverySnapshot(expected) || _receiver is not { } previous || receiver.IsSoftwareGroup != previous.IsSoftwareGroup
+                    || receiver.IsGroup != previous.IsGroup || receiver.Id != migrations.GetValueOrDefault(previous.Id, previous.Id)) return;
+                var settings = _settings.Clone();
+                ReceiverCatalog.ApplyMigrations(settings, migrations, previous.Id);
+                if (receiver.Online && receiver.Complete && (!receiver.IsSoftwareGroup || receiver.Members.Select(m => Receiver.PhysicalKey(m.DeviceId, m.Address)).Distinct().Count() == 2
+                    && receiver.Members.Select(m => m.Address).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 2)) _discoveredReceiver = receiver;
+                Receiver Identity(Receiver active, Receiver discovered) => active with { Id = discovered.Id, Name = discovered.Name, DeviceId = discovered.DeviceId,
+                    Model = discovered.Model, GroupName = discovered.GroupName, Aliases = discovered.Aliases };
+                var retained = Identity(previous, receiver);
+                if (previous.IsGroup)
+                    retained = retained with { Members = previous.Members.Select(member =>
+                    {
+                        var id = migrations.GetValueOrDefault(member.Id, member.Id);
+                        var found = receiver.Members.FirstOrDefault(m => m.Id == id || m.Address == member.Address && m.Port == member.Port);
+                        return found is null ? member : Identity(member, found);
+                    }).ToArray() };
+                RemapReceiverIdentities(previous, retained);
+                var changes = ConnectionChanges(previous, _settings, receiver, settings);
+                if (changes.Length > 0) log?.Invoke($"Discovery refresh retained transport; changed_fields={string.Join(",", changes)}");
+                _receiver = retained; _settings = settings;
+                PublishCurrent(_generation);
+            }
+        }
+        finally { _serial.Release(); }
+    }
+    public async Task<bool> StopForDiscoveryConflictAsync(SessionSnapshot expected)
+    {
+        await _serial.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            lock (_sync) { if (!OwnsDiscoverySnapshot(expected) || _receiver?.IsSoftwareGroup != true) return false; }
+            log?.Invoke("Session stop reason=discovery_topology_conflict");
+            await StopLockedAsync().ConfigureAwait(false); _receiver = null; Publish(_generation, PlaybackState.Idle);
+            return true;
         }
         finally { _serial.Release(); }
     }
@@ -264,6 +424,27 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         await _serial.WaitAsync().ConfigureAwait(false);
         try { _muted = muted; await SendGainAsync().ConfigureAwait(false); }
         finally { _serial.Release(); }
+    }
+    private static object StandbyParameters(AppSettings settings, string receiverId) => new { enabled = settings.StandbyEnabled, silence_seconds = settings.ReadOptions(receiverId).StandbySeconds ?? settings.StandbySilenceSeconds };
+    private async Task SendStandbyAsync()
+    {
+        await _equalizerWriter.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            IEngineConnection? connection; string? session; (bool Enabled, double Seconds) policy;
+            lock (_sync)
+            {
+                if (!_equalizerReady || _receiver is null) return;
+                connection = _connection; session = _sessionId;
+                policy = (_settings.StandbyEnabled, _settings.ReadOptions(_receiver.Id).StandbySeconds ?? _settings.StandbySilenceSeconds);
+                if (_sentStandby == policy) return;
+            }
+            if (connection is null || session is null || Snapshot.State == PlaybackState.Pairing) return;
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            await connection.SendAsync(session, "set_standby", new { enabled = policy.Enabled, silence_seconds = policy.Seconds }, timeout.Token).ConfigureAwait(false);
+            lock (_sync) { if (ReferenceEquals(_connection, connection) && _sessionId == session) _sentStandby = policy; }
+        }
+        finally { _equalizerWriter.Release(); }
     }
     private double Gain(Receiver receiver) => _muted ? 0 : _settings.Gain(_receiver?.Id ?? receiver.Id);
     private async Task SendGainAsync()
@@ -279,34 +460,53 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         var attempts = 0;
         while (!cancellation.IsCancellationRequested)
         {
-            lock (_sync) { if (epoch == _generation && _receiver is not null) receiver = _receiver; }
+            lock (_sync)
+            {
+                if (epoch != _generation || _receiver is null) return;
+                if (attempts > 0) _receiver = RestartReceiver(_receiver, _settings);
+                receiver = _receiver;
+            }
             var startedAt = 0L;
             try
             {
                 var settings = _settings;
                 var peers = new List<object>();
                 string? volumeHost = null;
+                var hosts = new Dictionary<string, string>();
                 foreach (var member in receiver.Peers.OrderByDescending(p => p.IsLeader))
                 {
                     var host = await ResolveAsync(member.Address, cancellation).ConfigureAwait(false);
                     volumeHost ??= host;
-                    peers.Add(new { host, port = member.Port, codecs = member.Codecs.Select(x => (int)x).ToArray() });
+                    hosts[member.Id] = host;
+                    peers.Add(new { receiver_id = member.Id, host, port = member.Port, codecs = member.Codecs.Select(x => (int)x).ToArray(), profile = PeerProfile(receiver, member, settings) });
                 }
                 await using var connection = factory.Open();
                 var session = Guid.NewGuid().ToString("N");
                 SetConnection(connection, session);
                 try
                 {
-                    lock (_sync) { if (epoch == _generation) { _diagnostics = _diagnostics with { Transport = null, Warnings = [] }; _warnings.Clear(); _deviceVolume = new(); _volumeEdit?.Cancel(); _snapshot = _snapshot with { Metrics = null }; } }
+                    lock (_sync) { if (epoch == _generation) { _diagnostics = _diagnostics with { Transport = null, Warnings = [], Negotiated = [], ClockStatus = null }; _warnings.Clear(); _deviceVolume = new(); _memberVolumes.Clear(); _memberHosts.Clear(); foreach (var pair in hosts) _memberHosts[pair.Key] = pair.Value; _volumeEdit?.Cancel(); _snapshot = _snapshot with { Metrics = null }; } }
                     Publish(epoch, PlaybackState.Connecting, attempts > 0 ? L.Format("Reconnecting ({0}/{1})", attempts, settings.MaxReconnectAttempts) : L.Get("Connecting…"));
                     var deadline = DateTime.UtcNow + _timing.Connect;
+                    await connection.SendAsync(session, "hello", null, cancellation).ConfigureAwait(false);
+                    var hello = await ReadEventAsync(connection, session, _timing.Connect, cancellation).ConfigureAwait(false);
+                    EngineHandshake.RequireStreamingCapabilities(hello);
+                    EngineHandshake.RequireCapabilities(hello, "standby_release");
+                    if (settings.CaptureMode == "application") EngineHandshake.RequireCapabilities(hello, "application_capture");
+                    if (receiver.IsSoftwareGroup) EngineHandshake.RequireCapabilities(hello, "member_volume");
+                    var capabilities = await ReceiverCapabilityCatalog.QueryConnectionAsync(connection, session, hello, receiver, cancellation).ConfigureAwait(false);
+                    var selected = capabilities.Select(id => ProfileOptions(receiver, receiver.Peers.Single(p => p.Id == id), settings), settings.SampleRate(receiver));
+                    if (capabilities.Members.Count > 0 && selected.Count == 0) throw new InvalidOperationException(L.Get("The receiver does not support this stream profile. Choose Automatic or a supported option in Receivers."));
+                    var sampleRate = selected.FirstOrDefault()?.Profile.SampleRate ?? (int.TryParse(settings.SampleRate(receiver), out var explicitRate) ? explicitRate : 44100);
                     await _equalizerWriter.WaitAsync(cancellation).ConfigureAwait(false);
                     try
                     {
-                        await connection.SendAsync(session, "start", new { peers, source = "loopback", duration_ms = 0, latency_ms = settings.Latency(receiver.Id), gain = Gain(receiver), timing = "ptp", capture_endpoint = settings.EffectiveEndpoint, sample_rate = int.Parse(settings.StreamSampleRate), equalizer = EffectiveEqualizer().WireParameters() }, cancellation).ConfigureAwait(false);
+                        await connection.SendAsync(session, "start", new { peers, group_mode = receiver.IsSoftwareGroup ? "software_stereo" : receiver.IsGroup ? "native_stereo" : "single", group_id = receiver.IsGroup && !receiver.IsSoftwareGroup ? receiver.StereoId : null, source = settings.CaptureMode == "application" ? "application" : "loopback", capture_application_path = settings.CaptureMode == "application" ? settings.CaptureApplicationPath : null, capture_process_id = settings.CaptureMode == "application" ? settings.CaptureApplicationInstance?.ProcessId : null, capture_process_started_at = settings.CaptureMode == "application" ? settings.CaptureApplicationInstance?.StartedAt : null, standby = StandbyParameters(settings, receiver.Id), duration_ms = 0, latency_ms = settings.Latency(receiver.Id), gain = Gain(receiver), timing = "ptp", capture_endpoint = settings.EffectiveEndpoint, sample_rate = sampleRate, equalizer = EffectiveEqualizer().WireParameters() }, cancellation).ConfigureAwait(false);
+                        lock (_sync) { if (epoch == _generation) _snapshot = _snapshot with { StreamRate = sampleRate }; }
                         lock (_sync) { if (epoch == _generation && ReferenceEquals(_connection, connection)) _equalizerReady = true; }
                     }
                     finally { _equalizerWriter.Release(); }
+                    await SendStandbyAsync().ConfigureAwait(false);
                     await SendEqualizerAsync(cancellation: cancellation).ConfigureAwait(false);
                     while (true)
                     {
@@ -317,6 +517,14 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         var kind = item.Text("event");
                         if (kind == "error") throw new EngineFailure(EngineNotice.Parse(item));
                         if (kind == "stopped") throw new IOException(L.Get("The audio session ended unexpectedly."));
+                        if (kind == "negotiated")
+                        {
+                            lock (_sync) { if (epoch != _generation) continue; _diagnostics = _diagnostics with { Negotiated = (_diagnostics.Negotiated ?? []).Where(n => item.Text("receiver_id").Length > 0 ? n.Text("receiver_id") != item.Text("receiver_id") : n.Text("host") != item.Text("host")).Append(item.Clone()).ToArray() }; }
+                        }
+                        if (kind is "clock_status" or "scheduler_status")
+                        {
+                            lock (_sync) { if (epoch != _generation) continue; _diagnostics = kind == "clock_status" ? _diagnostics with { ClockStatus = item.Clone() } : _diagnostics with { SchedulerStatus = item.Clone() }; }
+                        }
                         if (kind is "equalizer_changed" or "equalizer_error")
                         {
                             lock (_sync) { if (epoch != _generation || item.Integer("sequence") != _equalizerSequence) continue; }
@@ -325,9 +533,32 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         if (kind == "streaming")
                         {
                             startedAt = Stopwatch.GetTimestamp();
-                            if (_settings.MuteWhileStreaming) await audio.MuteAsync(_settings.EffectiveEndpoint).ConfigureAwait(false);
+                            lock (_sync) { if (epoch != _generation) continue; _transportStreaming = true; }
+                            await ApplyLocalMuteAsync().ConfigureAwait(false);
                             log?.Invoke($"Streaming started: {receiver.Id}; target latency {settings.Latency(receiver.Id)} ms; reconnect attempts {attempts}");
                             Publish(epoch, PlaybackState.Streaming);
+                        }
+                        else if (kind == "standby")
+                        {
+                            startedAt = Stopwatch.GetTimestamp();
+                            await RestoreAudioAsync().ConfigureAwait(false);
+                            var message = item.Text("reason") switch
+                            {
+                                "application_unavailable" => L.Get("Waiting for the selected application to start."),
+                                "application_ambiguous" => L.Get("Multiple application instances are running. Select an instance in Settings → Audio capture."),
+                                _ => L.Get("AirPlay session released. Waiting for audio.")
+                            };
+                            Publish(epoch, PlaybackState.Standby, message);
+                        }
+                        else if (kind == "resuming")
+                        {
+                            startedAt = 0; deadline = DateTime.UtcNow + _timing.Connect;
+                            Publish(epoch, PlaybackState.Connecting, L.Get("Audio detected; reconnecting…"));
+                        }
+                        else if (kind == "device_volume" && startedAt != 0 && receiver.IsSoftwareGroup)
+                        {
+                            lock (_sync) { if (epoch != _generation) continue; var id = _memberHosts.FirstOrDefault(p => p.Value == item.Text("host")).Key; if (id is not null) _memberVolumes[id] = (_memberVolumes.GetValueOrDefault(id) ?? new()).Receive(item); }
+                            PublishCurrent(epoch);
                         }
                         else if (kind == "device_volume" && startedAt != 0 && item.Text("host") == volumeHost)
                         {
@@ -358,13 +589,11 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                             lock (_sync) { if (epoch != _generation) continue; _diagnostics = _diagnostics with { Transport = TransportMetrics.Parse(item) }; }
                             var current = Snapshot; Publish(epoch, current.State, current.Message);
                         }
-                        else if (kind == "capture_metrics" && startedAt != 0 && item.TryGetProperty("metrics", out var metrics))
+                        else if (kind == "capture_metrics" && item.TryGetProperty("metrics", out var metrics))
                         {
                             var parsed = new StreamMetrics(metrics.Number("capture_to_send_p95_ms"), metrics.Number("max_queue_age_ms"), metrics.Integer("underrun_packets"), metrics.Integer("dropped_frames"), metrics.Integer("input_rate") is { } rate ? (int)rate : null);
-                            var lastAudio = metrics.Number("last_audio_qpc_ns") ?? 0;
-                            var silence = lastAudio > 0 ? (Stopwatch.GetTimestamp() * (1e9 / Stopwatch.Frequency) - lastAudio) / 1e9 : Stopwatch.GetElapsedTime(startedAt).TotalSeconds;
-                            var threshold = _settings.ReadOptions(Snapshot.Receiver?.Id ?? receiver.Id).StandbySeconds ?? _settings.StandbySilenceSeconds;
-                            Publish(epoch, _settings.StandbyEnabled && silence >= threshold ? PlaybackState.Standby : PlaybackState.Streaming, metrics: parsed);
+                            var current = Snapshot;
+                            Publish(epoch, current.State, current.Message, metrics: parsed);
                         }
                     }
                 }
@@ -386,9 +615,10 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                 }
                 log?.Invoke($"Session failure: {JsonSerializer.Serialize(_diagnostics)}\n{error}");
                 Publish(epoch, PlaybackState.Error, notice.Detail);
-                if (!_settings.ForceReconnect || attempts > _settings.MaxReconnectAttempts || notice.Retryable == false || notice.Retryable is null && IsAuthenticationFailure(error.Message)) return;
+                if (!(_settings.ForceReconnect || receiver.IsSoftwareGroup || notice.Code is "timeline_expired" or "clock_lost") || attempts > _settings.MaxReconnectAttempts || notice.Retryable == false || notice.Retryable is null && IsAuthenticationFailure(error.Message)) return;
             }
             var delay = TimeSpan.FromMilliseconds(Math.Min(_timing.Retry.TotalMilliseconds * Math.Pow(2, attempts - 1), 8000));
+            log?.Invoke($"Session reconnect reason=transport_fault; code={_diagnostics.LastFault?.Code}; attempt={attempts}; delay_ms={delay.TotalMilliseconds}");
             Publish(epoch, PlaybackState.Connecting, L.Format("Disconnected; reconnecting ({0}/{1})", attempts, _settings.MaxReconnectAttempts));
             await Task.Delay(delay, cancellation).ConfigureAwait(false);
             lock (_sync) { if (epoch == _generation) _diagnostics = _diagnostics with { ReconnectCount = _diagnostics.ReconnectCount + 1 }; }
@@ -404,17 +634,20 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             try
             {
                 Publish(epoch, PlaybackState.Pairing, L.Format("Pairing {0} ({1})", member.Name, member.Address));
-                await connection.SendAsync(session, "pair", new { peer = new { host = await ResolveAsync(member.Address, cancellation).ConfigureAwait(false), port = member.Port } }, cancellation).ConfigureAwait(false);
+                await connection.SendAsync(session, "hello", null, cancellation).ConfigureAwait(false);
+                EngineHandshake.RequireCapabilities(await ReadEventAsync(connection, session, _timing.Connect, cancellation).ConfigureAwait(false), member.RequiresPassword ? ["receiver_password"] : []);
+                await connection.SendAsync(session, "pair", new { password_required = member.RequiresPassword, peer = new { host = await ResolveAsync(member.Address, cancellation).ConfigureAwait(false), port = member.Port } }, cancellation).ConfigureAwait(false);
                 while (true)
                 {
                     var item = await ReadEventAsync(connection, session, _timing.Connect, cancellation).ConfigureAwait(false);
                     switch (item.Text("event"))
                     {
                         case "pin_required":
+                        case "password_required":
                             using (var pinTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation))
                             {
                                 pinTimeout.CancelAfter(_timing.Pin);
-                                var pin = await requestPin(member, pinTimeout.Token).ConfigureAwait(false);
+                                var pin = await requestPin(member with { RequiresPassword = item.Text("event") == "password_required" }, pinTimeout.Token).ConfigureAwait(false);
                                 if (string.IsNullOrWhiteSpace(pin)) { Publish(epoch, PlaybackState.Idle, L.Get("Pairing cancelled.")); throw new PairCancelledException(); }
                                 await connection.SendAsync(session, "pair_pin", new { pin }, cancellation).ConfigureAwait(false);
                             }
@@ -431,8 +664,8 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private sealed class EngineFailure(EngineNotice notice) : IOException(notice.Detail) { public EngineNotice Notice { get; } = notice; }
     private sealed class PairCancelledException : OperationCanceledException;
     private static bool IsAuthenticationFailure(string message) => new[] { "pairing", "srp", "verification", "credentials", "signature", "identity", "authentication" }.Any(word => message.Contains(word, StringComparison.OrdinalIgnoreCase));
-    private void SetConnection(IEngineConnection connection, string session) { lock (_sync) { _connection = connection; _sessionId = session; _equalizerReady = false; } }
-    private void ClearConnection(IEngineConnection connection) { lock (_sync) if (ReferenceEquals(_connection, connection)) { _connection = null; _sessionId = null; _equalizerReady = false; } }
+    private void SetConnection(IEngineConnection connection, string session) { lock (_sync) { _connection = connection; _sessionId = session; _equalizerReady = false; _sentStandby = null; } }
+    private void ClearConnection(IEngineConnection connection) { lock (_sync) if (ReferenceEquals(_connection, connection)) { _connection = null; _sessionId = null; _equalizerReady = false; _sentStandby = null; } }
     private static async Task RequestStopAsync(IEngineConnection connection, string session)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
@@ -461,6 +694,23 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     }
     private async Task RestoreAudioAsync()
     {
+        lock (_sync) _transportStreaming = false;
+        await ApplyLocalMuteAsync().ConfigureAwait(false);
+    }
+    private async Task ApplyLocalMuteAsync()
+    {
+        await _audioWriter.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            bool mute; string? endpoint;
+            lock (_sync) { mute = _transportStreaming && _settings.ShouldMuteEndpoint; endpoint = _settings.EffectiveEndpoint; }
+            if (mute) await audio.MuteAsync(endpoint).ConfigureAwait(false);
+            else await RestoreAudioCoreAsync().ConfigureAwait(false);
+        }
+        finally { _audioWriter.Release(); }
+    }
+    private async Task RestoreAudioCoreAsync()
+    {
         try { await audio.RestoreAsync().ConfigureAwait(false); } catch (Exception error) { log?.Invoke(L.Format("Failed to restore local mute state: {0}", error.Message)); }
     }
     private void Publish(long epoch, PlaybackState state, string message = "", StreamMetrics? metrics = null)
@@ -469,7 +719,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         lock (_sync)
         {
             if (epoch != _generation) return;
-            snapshot = new(state, _receiver, message, metrics ?? _snapshot.Metrics, _receiver is null ? 0 : _settings.Latency(_receiver.Id), _diagnostics, int.TryParse(_settings.StreamSampleRate, out var streamRate) ? streamRate : 0, _deviceVolume);
+            snapshot = new(state, _receiver, message, metrics ?? _snapshot.Metrics, _receiver is null ? 0 : _settings.Latency(_receiver.Id), _diagnostics, _receiver is null ? 0 : _snapshot.StreamRate, _deviceVolume, new Dictionary<string, DeviceVolumeState>(_memberVolumes)) { Generation = epoch };
             _snapshot = snapshot;
         }
         Changed?.Invoke(snapshot);
@@ -479,5 +729,6 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         lock (_sync) { _equalizerDisposed = true; _equalizerEdit?.Cancel(); _equalizerEdit = null; _equalizerEditTask = null; }
         await StopAsync().ConfigureAwait(false);
         _serial.Dispose();
+        _audioWriter.Dispose();
     }
 }

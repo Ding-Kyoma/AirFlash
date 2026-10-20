@@ -91,11 +91,12 @@ fn client_proof_pin(private: &[u8], salt: &[u8], server: &[u8], pin: &str) -> Re
     })
 }
 fn srp_handshake(conn: &mut Connection, pin: &str, transient: bool) -> Result<Zeroizing<Vec<u8>>> {
-    srp_handshake_prompt(conn, transient, || Ok(pin.to_owned()))
+    srp_handshake_prompt(conn, transient, false, || Ok(pin.to_owned()))
 }
 fn srp_handshake_prompt(
     conn: &mut Connection,
     transient: bool,
+    password_mode: bool,
     get_pin: impl FnOnce() -> Result<String>,
 ) -> Result<Zeroizing<Vec<u8>>> {
     let headers = [
@@ -111,10 +112,7 @@ fn srp_handshake_prompt(
     let m2 = tlv_decode(&conn.request("POST", "/pair-setup", &headers, &m1)?.body)?;
     ensure!(m2.get(&6) == Some(&vec![2]), "expected pairing M2");
     let pin = Zeroizing::new(get_pin()?);
-    ensure!(
-        (4..=8).contains(&pin.len()) && pin.bytes().all(|b| b.is_ascii_digit()),
-        "PIN must contain 4..8 digits"
-    );
+    validate_secret(&pin, password_mode)?;
     let mut private = Zeroizing::new([0u8; 32]);
     OsRng.fill_bytes(private.as_mut());
     let proof = client_proof_pin(
@@ -148,6 +146,25 @@ pub fn transient(conn: &mut Connection) -> Result<Zeroizing<Vec<u8>>> {
     enable_control(conn, &key);
     Ok(key)
 }
+fn validate_secret(secret: &str, password_mode: bool) -> Result<()> {
+    if password_mode {
+        ensure!(
+            !secret.is_empty() && secret.len() <= 256 && !secret.contains(['\r', '\n', '\0']),
+            "invalid receiver password"
+        );
+    } else {
+        ensure!(
+            (4..=8).contains(&secret.len()) && secret.bytes().all(|b| b.is_ascii_digit()),
+            "PIN must contain 4..8 digits"
+        );
+    }
+    Ok(())
+}
+pub fn transient_password(conn: &mut Connection, password: &str) -> Result<Zeroizing<Vec<u8>>> {
+    let key = srp_handshake_prompt(conn, true, true, || Ok(password.to_owned()))?;
+    enable_control(conn, &key);
+    Ok(key)
+}
 
 #[derive(serde::Serialize, serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct Credentials {
@@ -166,7 +183,7 @@ pub fn pair_prompt(
 ) -> Result<Credentials> {
     use crate::crypto::{auth_open, auth_seal};
     use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-    let key = srp_handshake_prompt(conn, false, get_pin)?;
+    let key = srp_handshake_prompt(conn, false, false, get_pin)?;
     let mut secret = Zeroizing::new([0; 32]);
     OsRng.fill_bytes(secret.as_mut());
     let signing = SigningKey::from_bytes(&secret);
@@ -327,7 +344,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod protocol_tests {
+pub(crate) mod protocol_tests {
     use super::*;
     use crate::{
         crypto::{auth_open, auth_seal},
@@ -335,7 +352,33 @@ mod protocol_tests {
     };
     use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
     use std::{net::TcpListener, thread};
-    fn respond(c: &mut Connection, request: &Message, body: &[u8]) {
+    #[test]
+    fn receiver_password_uses_transient_srp_without_numeric_pin_rules() {
+        assert!(validate_secret("not-a-pin", false).is_err());
+        assert!(validate_secret("not-a-pin", true).is_ok());
+        assert!(validate_secret("\n", true).is_err());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut c = Connection::from_stream(socket, Cancellation::default()).unwrap();
+            let key = server_srp(&mut c, "synthetic-password");
+            c.encrypt(
+                derive(&key, "Control-Salt", "Control-Read-Encryption-Key"),
+                derive(&key, "Control-Salt", "Control-Write-Encryption-Key"),
+            );
+            let r = c.read().unwrap();
+            respond(&mut c, &r, b"password-authenticated");
+        });
+        let mut c = Connection::connect(address, Cancellation::default()).unwrap();
+        transient_password(&mut c, "synthetic-password").unwrap();
+        assert_eq!(
+            c.request("GET", "/info", &[], &[]).unwrap().body,
+            b"password-authenticated"
+        );
+        server.join().unwrap();
+    }
+    pub(crate) fn respond(c: &mut Connection, request: &Message, body: &[u8]) {
         let seq = &request.headers["cseq"];
         c.write(
             format!(
@@ -347,7 +390,7 @@ mod protocol_tests {
         .unwrap();
         c.write(body).unwrap();
     }
-    fn server_srp(c: &mut Connection, pin: &str) -> Vec<u8> {
+    pub(crate) fn server_srp(c: &mut Connection, pin: &str) -> Vec<u8> {
         let request = c.read().unwrap();
         assert!(request.first.contains("/pair-pin-start"));
         respond(c, &request, &[]);

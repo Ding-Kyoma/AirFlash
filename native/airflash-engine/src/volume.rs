@@ -15,16 +15,28 @@ pub struct Command {
     pub percent: u8,
 }
 #[derive(Clone, Default)]
-pub struct Control(Arc<Mutex<Option<Command>>>);
+pub struct Control(Arc<Mutex<std::collections::HashMap<String, Command>>>);
 impl Control {
     pub fn set(&self, command: Command) {
+        self.set_member("", command);
+    }
+    pub fn set_member(&self, host: &str, command: Command) {
         let mut latest = self.0.lock().unwrap();
-        if latest.is_none_or(|old| command.sequence > old.sequence) {
-            *latest = Some(command);
+        if !latest.contains_key(host) && latest.len() >= 3 {
+            return;
+        }
+        if latest
+            .get(host)
+            .is_none_or(|old| command.sequence > old.sequence)
+        {
+            latest.insert(host.to_owned(), command);
         }
     }
     fn latest(&self) -> Option<Command> {
-        *self.0.lock().unwrap()
+        self.for_host("")
+    }
+    fn for_host(&self, host: &str) -> Option<Command> {
+        self.0.lock().unwrap().get(host).copied()
     }
 }
 pub type Peer = (String, String, Arc<Mutex<Connection>>);
@@ -96,6 +108,13 @@ pub struct Worker {
 impl Worker {
     /// Peers are ordered with the stereo leader first by the desktop controller.
     pub fn start(peers: Vec<Peer>, control: Control) -> Result<Self> {
+        Self::start_scoped(peers, control, String::new())
+    }
+    pub fn start_member(peer: Peer, control: Control) -> Result<Self> {
+        let host = peer.0.clone();
+        Self::start_scoped(vec![peer], control, host)
+    }
+    fn start_scoped(peers: Vec<Peer>, control: Control, scope: String) -> Result<Self> {
         ensure!(!peers.is_empty(), "volume worker requires a receiver");
         let stop = Cancellation::default();
         let done = stop.clone();
@@ -104,7 +123,7 @@ impl Worker {
             let mut pending = Pending::default();
             let mut next = Instant::now();
             while !done.is_cancelled() {
-                let command = control.latest();
+                let command = if scope.is_empty() {control.latest()} else {control.for_host(&scope)};
                 let changed = command.map(|c| c.sequence) != pending.command.map(|c| c.sequence);
                 if !changed && Instant::now() < next {
                     thread::sleep(Duration::from_millis(20));

@@ -10,6 +10,7 @@ public sealed class ReceiverOptions : ObservableObject
     {
         AutoConnect = source.AutoConnect; Hidden = source.Hidden; Volume = source.Volume;
         LatencyMode = source.LatencyMode; CustomBufferMs = source.CustomBufferMs; StandbySeconds = source.StandbySeconds;
+        Codec = source.Codec; SampleRate = source.SampleRate; Transport = source.Transport; Timing = source.Timing;
     }
     private bool? _AutoConnect = null;
     public bool? AutoConnect { get => _AutoConnect; set => Set(ref _AutoConnect, value); }
@@ -23,11 +24,36 @@ public sealed class ReceiverOptions : ObservableObject
     public int? CustomBufferMs { get => _CustomBufferMs; set => Set(ref _CustomBufferMs, value); }
     private double? _StandbySeconds = null;
     public double? StandbySeconds { get => _StandbySeconds; set => Set(ref _StandbySeconds, value); }
+    private string _codec = "auto", _transport = "auto", _timing = "auto";
+    private string? _sampleRate;
+    public string Codec { get => _codec; set => Set(ref _codec, value); }
+    public string? SampleRate { get => _sampleRate; set => Set(ref _sampleRate, value); }
+    public string Transport { get => _transport; set => Set(ref _transport, value); }
+    public string Timing { get => _timing; set => Set(ref _timing, value); }
+}
+public sealed class SoftwareStereoGroup : ObservableObject
+{
+    public string Id { get; set; } = "software:" + Guid.NewGuid().ToString("N");
+    private string _name = "Stereo", _leftId = "", _rightId = "", _sampleRate = "44100";
+    private int _leftOffsetMs, _rightOffsetMs;
+    public string Name { get => _name; set => Set(ref _name, value); }
+    public string LeftId { get => _leftId; set => Set(ref _leftId, value); }
+    public string RightId { get => _rightId; set => Set(ref _rightId, value); }
+    public string SampleRate { get => _sampleRate; set => Set(ref _sampleRate, value); }
+    public int LeftOffsetMs { get => _leftOffsetMs; set => Set(ref _leftOffsetMs, value); }
+    public int RightOffsetMs { get => _rightOffsetMs; set => Set(ref _rightOffsetMs, value); }
+    public SoftwareStereoGroup Clone() => new() { Id = Id, Name = Name, LeftId = LeftId, RightId = RightId, SampleRate = SampleRate, LeftOffsetMs = LeftOffsetMs, RightOffsetMs = RightOffsetMs };
+    public void CopyFrom(SoftwareStereoGroup source)
+    {
+        Name = source.Name; LeftId = source.LeftId; RightId = source.RightId; SampleRate = source.SampleRate;
+        LeftOffsetMs = source.LeftOffsetMs; RightOffsetMs = source.RightOffsetMs;
+    }
+    public void Swap() { (LeftId, RightId) = (RightId, LeftId); (LeftOffsetMs, RightOffsetMs) = (RightOffsetMs, LeftOffsetMs); }
 }
 public sealed record ManualReceiver(string Id, string Name, string Host, int Port);
 public sealed class AppSettings : ObservableObject
 {
-    public int SchemaVersion { get; set; } = 2;
+    public int SchemaVersion { get; set; } = 4;
     private bool _StartAtLogin = false;
     public bool StartAtLogin { get => _StartAtLogin; set => Set(ref _StartAtLogin, value); }
     private bool _MuteWhileStreaming = true;
@@ -48,8 +74,6 @@ public sealed class AppSettings : ObservableObject
     public string Theme { get => _Theme; set => Set(ref _Theme, value); }
     private string _DiscoveryInterfaceId = "";
     public string DiscoveryInterfaceId { get => _DiscoveryInterfaceId; set => Set(ref _DiscoveryInterfaceId, value ?? ""); }
-    private string _StreamSampleRate = "44100";
-    public string StreamSampleRate { get => _StreamSampleRate; set => Set(ref _StreamSampleRate, value); }
     private EqualizerSettings _equalizer = new();
     public EqualizerSettings Equalizer { get => _equalizer; set => Set(ref _equalizer, value ?? new()); }
     private string _LatencyMode = "normal";
@@ -64,6 +88,11 @@ public sealed class AppSettings : ObservableObject
     public string CaptureMode { get => _CaptureMode; set => Set(ref _CaptureMode, value); }
     private string? _CaptureEndpoint = null;
     public string? CaptureEndpoint { get => _CaptureEndpoint; set => Set(ref _CaptureEndpoint, value); }
+    private string? _CaptureApplicationPath;
+    public string? CaptureApplicationPath { get => _CaptureApplicationPath; set => Set(ref _CaptureApplicationPath, value); }
+    private CaptureApplication? _CaptureApplicationInstance;
+    [JsonIgnore] public CaptureApplication? CaptureApplicationInstance { get => _CaptureApplicationInstance; set => Set(ref _CaptureApplicationInstance, value); }
+    public bool ShouldMuteEndpoint => MuteWhileStreaming && CaptureMode != "application";
     public void RefreshCaptureEndpoint() => Notify(nameof(CaptureEndpoint));
     private int _MasterVolume = 100;
     public int MasterVolume { get => _MasterVolume; set => Set(ref _MasterVolume, value); }
@@ -71,6 +100,7 @@ public sealed class AppSettings : ObservableObject
     public Dictionary<string, ReceiverOptions> Receivers { get; set; } = new(StringComparer.Ordinal);
     public Dictionary<string, string> ReceiverAliases { get; set; } = new(StringComparer.Ordinal);
     public ObservableCollection<ManualReceiver> ManualReceivers { get; set; } = [];
+    public ObservableCollection<SoftwareStereoGroup> SoftwareGroups { get; set; } = [];
     [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; set; }
     public ReceiverOptions Options(string id)
     {
@@ -84,7 +114,13 @@ public sealed class AppSettings : ObservableObject
         return (options.LatencyMode ?? LatencyMode) switch { "realtime" => 120, "buffered" => 500, "custom" => Math.Clamp(options.CustomBufferMs ?? CustomBufferMs, 0, 2000), _ => 200 };
     }
     public double Gain(string id) => Math.Clamp(MasterVolume, 0, 100) / 100d;
-    public string? EffectiveEndpoint => CaptureMode == "loopback" ? null : CaptureEndpoint;
+    public string? SampleRate(Receiver receiver) => receiver.IsSoftwareGroup ? SoftwareGroups.Single(g => g.Id == receiver.Id).SampleRate : ReadOptions(receiver.Id).SampleRate;
+    public bool UsesDeviceLatency(Receiver receiver) => (receiver.IsSoftwareGroup ? receiver.Peers : [receiver]).Any(r =>
+    {
+        var options = ReadOptions(r.Id);
+        return options.LatencyMode is not null || LatencyMode == "custom" && options.CustomBufferMs is not null;
+    });
+    public string? EffectiveEndpoint => CaptureMode == "endpoint" ? CaptureEndpoint : null;
     public string? Validate()
     {
         if (UiLanguage is not ("system" or "en" or "zh")) return L.Get("Select a valid language.");
@@ -93,20 +129,31 @@ public sealed class AppSettings : ObservableObject
         if (MasterVolume is < 0 or > 100) return L.Get("Master volume must be between 0 and 100.");
         if (MaxReconnectAttempts is < 1 or > 20) return L.Get("Retry attempts must be between 1 and 20.");
         if (!Modes.Contains(LatencyMode)) return L.Get("Select a valid latency mode.");
-        if (!SampleRates.Contains(StreamSampleRate)) return L.Get("Select a valid stream sample rate.");
         if (Equalizer.Validate() is { } equalizerError) return equalizerError;
         if (CustomBufferMs is < 0 or > 2000) return L.Get("Custom latency must be between 0 and 2000 ms.");
         if (!double.IsFinite(StandbySilenceSeconds) || StandbySilenceSeconds is < 5 or > 300) return L.Get("Standby threshold must be between 5 and 300 seconds.");
-        if (CaptureMode is not ("loopback" or "endpoint")) return L.Get("Select a valid capture mode.");
+        if (CaptureMode is not ("loopback" or "endpoint" or "application")) return L.Get("Select a valid capture mode.");
         if (CaptureMode == "endpoint" && string.IsNullOrWhiteSpace(CaptureEndpoint)) return L.Get("Select a capture endpoint.");
+        if (CaptureMode == "application" && string.IsNullOrWhiteSpace(CaptureApplicationPath)) return L.Get("Select an application.");
         foreach (var options in Receivers.Values)
         {
+            if (options.Codec is not ("auto" or "pcm" or "alac") || options.Transport is not ("auto" or "realtime" or "buffered") || options.Timing is not ("auto" or "ptp" or "ntp" or "follow")) return L.Get("Invalid receiver stream profile.");
+            if (options.SampleRate is not null && !SampleRates.Contains(options.SampleRate)) return L.Get("Select a valid stream sample rate.");
             if (options.Volume is < 0 or > 100) return L.Get("Device volume must be between 0 and 100.");
             if (options.LatencyMode is not null && !Modes.Contains(options.LatencyMode)) return L.Get("Invalid device latency mode.");
             if (options.CustomBufferMs is < 0 or > 2000) return L.Get("Device custom latency must be between 0 and 2000 ms.");
             if (options.StandbySeconds is { } seconds && (!double.IsFinite(seconds) || seconds is < 5 or > 300)) return L.Get("Device standby threshold must be between 5 and 300 seconds.");
         }
         if (ManualReceivers.Any(r => string.IsNullOrWhiteSpace(r.Host) || r.Port is < 1 or > 65535)) return L.Get("Manual receivers require a valid address and port (1–65535).");
+        var groupIds = new HashSet<string>(StringComparer.Ordinal);
+        var members = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var group in SoftwareGroups)
+        {
+            if (!group.Id.StartsWith("software:", StringComparison.Ordinal) || !groupIds.Add(group.Id) || string.IsNullOrWhiteSpace(group.Name) || !SampleRates.Contains(group.SampleRate)) return L.Get("Invalid software stereo group.");
+            foreach (var id in new[] { group.LeftId, group.RightId })
+                if (string.IsNullOrWhiteSpace(id) || id.StartsWith("software:", StringComparison.Ordinal) || id.StartsWith("stereo:", StringComparison.Ordinal) || !members.Add(ReceiverIdentity.Resolve(id, ReceiverAliases))) return L.Get("Stereo groups require two distinct independent receivers.");
+            if (group.LeftOffsetMs is < -500 or > 500 || group.RightOffsetMs is < -500 or > 500) return L.Get("Synchronization offset must be between -500 and 500 ms.");
+        }
         return null;
     }
     public void CopyFrom(AppSettings source)
@@ -116,14 +163,21 @@ public sealed class AppSettings : ObservableObject
         AutoConnectOnDiscover = source.AutoConnectOnDiscover; ForceReconnect = source.ForceReconnect;
         MaxReconnectAttempts = source.MaxReconnectAttempts; UiLanguage = source.UiLanguage; Theme = source.Theme;
         DiscoveryInterfaceId = source.DiscoveryInterfaceId;
-        StreamSampleRate = source.StreamSampleRate;
         Equalizer.CopyFrom(source.Equalizer);
         LatencyMode = source.LatencyMode; CustomBufferMs = source.CustomBufferMs;
         StandbyEnabled = source.StandbyEnabled; StandbySilenceSeconds = source.StandbySilenceSeconds;
         CaptureMode = source.CaptureMode; CaptureEndpoint = source.CaptureEndpoint;
+        CaptureApplicationPath = source.CaptureApplicationPath; CaptureApplicationInstance = source.CaptureApplicationInstance;
         MasterVolume = source.MasterVolume; LastReceiverId = source.LastReceiverId;
         Extra = source.Extra?.ToDictionary(p => p.Key, p => p.Value.Clone());
         ReceiverAliases = new(source.ReceiverAliases, StringComparer.Ordinal);
+        foreach (var group in SoftwareGroups.Where(g => source.SoftwareGroups.All(s => s.Id != g.Id)).ToArray()) SoftwareGroups.Remove(group);
+        for (var i = 0; i < source.SoftwareGroups.Count; i++)
+        {
+            var next = source.SoftwareGroups[i]; var current = SoftwareGroups.FirstOrDefault(g => g.Id == next.Id);
+            if (current is null) SoftwareGroups.Insert(i, next.Clone());
+            else { current.CopyFrom(next); var index = SoftwareGroups.IndexOf(current); if (index != i) SoftwareGroups.Move(index, i); }
+        }
         foreach (var id in Receivers.Keys.Except(source.Receivers.Keys).ToArray()) Receivers.Remove(id);
         foreach (var (id, options) in source.Receivers) Options(id).CopyFrom(options);
         foreach (var receiver in ManualReceivers.Where(r => !source.ManualReceivers.Contains(r)).ToArray()) ManualReceivers.Remove(receiver);
@@ -134,7 +188,12 @@ public sealed class AppSettings : ObservableObject
             if (index < 0) ManualReceivers.Insert(i, receiver); else if (index != i) ManualReceivers.Move(index, i);
         }
     }
-    public AppSettings Clone() => JsonSerializer.Deserialize<AppSettings>(JsonSerializer.Serialize(this, JsonOptions), JsonOptions)!;
+    public AppSettings Clone()
+    {
+        var clone = JsonSerializer.Deserialize<AppSettings>(JsonSerializer.Serialize(this, JsonOptions), JsonOptions)!;
+        clone.CaptureApplicationInstance = CaptureApplicationInstance;
+        return clone;
+    }
     public static readonly string[] Modes = ["realtime", "normal", "buffered", "custom"];
     public static readonly string[] SampleRates = ["44100", "48000"];
     public static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, WriteIndented = true, PropertyNameCaseInsensitive = true, IgnoreReadOnlyProperties = true };
@@ -147,9 +206,13 @@ public static class SettingsMerge
         var original = JsonSerializer.SerializeToNode(baseline, AppSettings.JsonOptions)!;
         var edited = JsonSerializer.SerializeToNode(draft, AppSettings.JsonOptions)!;
         var latest = JsonSerializer.SerializeToNode(current, AppSettings.JsonOptions)!;
-        return Patch(original, edited, latest)!.Deserialize<AppSettings>(AppSettings.JsonOptions)!;
+        var result = Patch(original, edited, latest)!.Deserialize<AppSettings>(AppSettings.JsonOptions)!;
+        result.CaptureApplicationInstance = baseline.CaptureApplicationInstance != draft.CaptureApplicationInstance
+            ? draft.CaptureApplicationInstance : current.CaptureApplicationInstance;
+        if (!string.Equals(result.CaptureApplicationInstance?.Path, result.CaptureApplicationPath, StringComparison.OrdinalIgnoreCase)) result.CaptureApplicationInstance = null;
+        return result;
     }
-    public static bool Equal(AppSettings left, AppSettings right) => JsonNode.DeepEquals(JsonSerializer.SerializeToNode(left, AppSettings.JsonOptions), JsonSerializer.SerializeToNode(right, AppSettings.JsonOptions));
+    public static bool Equal(AppSettings left, AppSettings right) => (left.CaptureMode != "application" && right.CaptureMode != "application" || left.CaptureApplicationInstance == right.CaptureApplicationInstance) && JsonNode.DeepEquals(JsonSerializer.SerializeToNode(left, AppSettings.JsonOptions), JsonSerializer.SerializeToNode(right, AppSettings.JsonOptions));
     private static JsonNode? Patch(JsonNode? original, JsonNode? edited, JsonNode? latest)
     {
         if (JsonNode.DeepEquals(original, edited)) return latest?.DeepClone();
