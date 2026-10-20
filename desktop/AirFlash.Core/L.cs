@@ -9,6 +9,7 @@ public static class L
 {
     private static readonly Dictionary<string, string> ChineseSimplified = LoadStrings("AirFlash.Core.Strings.zh.json");
     private static readonly Dictionary<string, string> ChineseTraditional = LoadStrings("AirFlash.Core.Strings.zh-TW.json");
+    private static readonly Dictionary<string, string> German = LoadStrings("AirFlash.Core.Strings.de.json");
     private static Dictionary<string, string> _strings = [];
     public static bool IsChinese { get; private set; }
 
@@ -22,6 +23,7 @@ public static class L
                 return "zh-TW";
             var language = preference.Split('-')[0];
             if (language.Equals("zh", StringComparison.OrdinalIgnoreCase)) return "zh";
+            if (language.Equals("de", StringComparison.OrdinalIgnoreCase)) return "de";
             if (language.Equals("en", StringComparison.OrdinalIgnoreCase)) return "en";
         }
         return "en";
@@ -35,19 +37,21 @@ public static class L
         {
             "zh-TW" => ChineseTraditional,
             "zh"    => ChineseSimplified,
+            "de"    => German,
             _       => []
         };
         var culture = CultureInfo.GetCultureInfo(lang switch
         {
             "zh-TW" => "zh-TW",
             "zh"    => "zh-CN",
+            "de"    => "de-DE",
             _       => "en-US"
         });
         CultureInfo.CurrentUICulture = culture;
         CultureInfo.DefaultThreadCurrentUICulture = culture;
     }
 
-    public static string Get(string english) => IsChinese && _strings.TryGetValue(english, out var translated) ? translated : english;
+    public static string Get(string english) => _strings.TryGetValue(english, out var translated) ? translated : english;
     public static string Format(string english, params object?[] args) => string.Format(CultureInfo.CurrentCulture, Get(english), args);
 
     private static Dictionary<string, string> LoadStrings(string resourceName)

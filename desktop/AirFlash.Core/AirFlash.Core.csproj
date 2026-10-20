@@ -6,5 +6,6 @@
   <ItemGroup>
     <EmbeddedResource Include="Strings.zh.json" WithCulture="false" LogicalName="AirFlash.Core.Strings.zh.json"/>
     <EmbeddedResource Include="Strings.zh-TW.json" WithCulture="false" LogicalName="AirFlash.Core.Strings.zh-TW.json"/>
+    <EmbeddedResource Include="Strings.de.json" WithCulture="false" LogicalName="AirFlash.Core.Strings.de.json"/>
   </ItemGroup>
 </Project>
