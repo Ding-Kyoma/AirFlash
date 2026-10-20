@@ -7,9 +7,13 @@ namespace AirFlash.App.Services;
 public static class AppPaths
 {
     public const string Name = "AirFlash";
-    public static string Version => typeof(AppPaths).Assembly.GetName().Version!.ToString(3);
-    public static string VersionLabel => $"AirFlash {Version}{(IsPreview ? " · Preview" : "")} · WPF";
-    public static bool IsPreview => typeof(AppPaths).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Contains("-rc.", StringComparison.OrdinalIgnoreCase) == true;
+    private static Version AssemblyVersion => typeof(AppPaths).Assembly.GetName().Version!;
+    private static string? InformationalVersion => typeof(AppPaths).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+    public static string Version => AssemblyVersion.ToString(3);
+    public static string DisplayVersion => AppVersion.Normalize(InformationalVersion, AssemblyVersion);
+    public static string VersionLabel => AppVersion.Label(InformationalVersion, AssemblyVersion);
+    public static bool IsPreview => AppVersion.IsPreview(InformationalVersion, AssemblyVersion);
+    public static bool IsDevelopment => AppVersion.IsDevelopment(InformationalVersion, AssemblyVersion);
     public static string DataDirectory { get; set; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), Name);
     public static string LogDirectory => Path.Combine(DataDirectory, "logs");
     public static void Log(string message)

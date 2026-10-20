@@ -24,7 +24,7 @@ internal static class Program
                 if (index >= 0 && index + 1 < args.Length)
                     AppPaths.DataDirectory = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(args[index + 1]))!, "compat-logs");
             }
-            AppPaths.Log($"Startup stage={stage} version={AppPaths.Version} os={Environment.OSVersion.Version} architecture={RuntimeInformation.ProcessArchitecture}");
+            AppPaths.Log($"Startup stage={stage} version={AppPaths.DisplayVersion} os={Environment.OSVersion.Version} architecture={RuntimeInformation.ProcessArchitecture}");
             if (!WindowsCapabilities.Current.Supported) throw new PlatformNotSupportedException(WindowsCompatibility.Requirement);
             stage = "wpf-resources";
             var app = new App();

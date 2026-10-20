@@ -142,13 +142,17 @@ uv sync --locked
 pwsh scripts/build-native.ps1 -Check
 pwsh scripts/dotnet.ps1 restore AirFlash.sln --locked-mode
 pwsh scripts/dotnet.ps1 run --project AirFlash.App/AirFlash.App.csproj
-pwsh scripts/build.ps1
+pwsh scripts/build-dev.ps1
 ```
 
 构建生成：
 
-- `dist/AirFlash.exe`
-- `dist/AirFlash-X.Y.Z.msi`
+- `dist/dev/AirFlash.exe`
+- `dist/dev/AirFlash-X.Y.Z-dev.<commit>.msi`
+
+开发包以本地最近一个正式 `vX.Y.Z` 标签为基准，并附加当前提交号；它不会保留版本号或推送标签。安装开发 MSI 前，请先卸载已安装的同版本正式包。
+
+只有正式发版时才使用 `pwsh scripts/build-release.ps1`；它会要求干净的发布分支、保留下一个正式版本，并把产物写入 `dist/`。
 
 Rust 引擎会嵌入 WPF 可执行文件，运行时释放到
 `%LOCALAPPDATA%/AirFlash/engine/<hash>` 内容寻址缓存。

@@ -164,15 +164,22 @@ uv sync --locked
 pwsh scripts/build-native.ps1 -Check
 pwsh scripts/dotnet.ps1 restore AirFlash.sln --locked-mode
 pwsh scripts/dotnet.ps1 run --project AirFlash.App/AirFlash.App.csproj
-pwsh scripts/build.ps1
+pwsh scripts/build-dev.ps1
 ```
 
-The build produces:
+The development build produces:
 
-- `dist/AirFlash.exe`
-- `dist/AirFlash-X.Y.Z.msi`
+- `dist/dev/AirFlash.exe`
+- `dist/dev/AirFlash-X.Y.Z-dev.<commit>.msi`
 
-Run `AirFlash-X.Y.Z.msi` directly. It installs the self-contained executable and provides optional desktop and Start menu shortcuts.
+The development package is labeled from the latest stable `vX.Y.Z` tag and the
+current commit. It does not reserve a release version or push a tag. Uninstall an
+existing same-version AirFlash package before installing a development MSI.
+
+Use `pwsh scripts/build-release.ps1` only when performing a release; it requires a
+clean release branch, reserves the next numeric version, and writes `dist/`.
+
+Run the MSI directly. It installs the self-contained executable and provides optional desktop and Start menu shortcuts.
 AirFlash uses the Windows DNS-SD API and does not require Bonjour or install a background service.
 The Rust engine is embedded in the WPF executable and extracted to a content-addressed cache under `%LOCALAPPDATA%/AirFlash/engine/<hash>` at runtime.
 
