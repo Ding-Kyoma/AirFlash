@@ -53,7 +53,8 @@ public sealed class SoftwareStereoGroup : ObservableObject
 public sealed record ManualReceiver(string Id, string Name, string Host, int Port);
 public sealed class AppSettings : ObservableObject
 {
-    public int SchemaVersion { get; set; } = 4;
+    public const int CurrentSchemaVersion = 4;
+    public int SchemaVersion { get; set; } = CurrentSchemaVersion;
     private bool _StartAtLogin = false;
     public bool StartAtLogin { get => _StartAtLogin; set => Set(ref _StartAtLogin, value); }
     private bool _MuteWhileStreaming = true;
@@ -123,6 +124,9 @@ public sealed class AppSettings : ObservableObject
     public string? EffectiveEndpoint => CaptureMode == "endpoint" ? CaptureEndpoint : null;
     public string? Validate()
     {
+        if (Receivers is null || ReceiverAliases is null || ManualReceivers is null || SoftwareGroups is null
+            || SoftwareGroups.Any(group => group is null) || Receivers.Values.Any(value => value is null))
+            return L.Get("Configuration contains invalid receiver or manual-receiver collections.");
         if (UiLanguage is not ("system" or "en" or "zh" or "de")) return L.Get("Select a valid language.");
         if (Theme is not ("system" or "dark" or "light")) return L.Get("Select a valid theme.");
         if (DiscoveryInterfaceId is null || (DiscoveryInterfaceId.Length > 0 && !Guid.TryParse(DiscoveryInterfaceId, out _))) return L.Get("Select a valid network interface.");
@@ -144,7 +148,8 @@ public sealed class AppSettings : ObservableObject
             if (options.CustomBufferMs is < 0 or > 2000) return L.Get("Device custom latency must be between 0 and 2000 ms.");
             if (options.StandbySeconds is { } seconds && (!double.IsFinite(seconds) || seconds is < 5 or > 300)) return L.Get("Device standby threshold must be between 5 and 300 seconds.");
         }
-        if (ManualReceivers.Any(r => string.IsNullOrWhiteSpace(r.Host) || r.Port is < 1 or > 65535)) return L.Get("Manual receivers require a valid address and port (1–65535).");
+        var manualIds = new HashSet<string>(StringComparer.Ordinal);
+        if (ManualReceivers.Any(r => r is null || string.IsNullOrWhiteSpace(r.Id) || string.IsNullOrWhiteSpace(r.Host) || r.Port is < 1 or > 65535 || !manualIds.Add(r.Id))) return L.Get("Manual receivers require unique, nonempty identifiers and a valid address and port (1–65535).");
         var groupIds = new HashSet<string>(StringComparer.Ordinal);
         var members = new HashSet<string>(StringComparer.Ordinal);
         foreach (var group in SoftwareGroups)
