@@ -3,6 +3,11 @@ using AirFlash.Core;
 using Xunit;
 namespace AirFlash.Tests;
 
+// This fixture changes process-wide localization and must run without other collections.
+[CollectionDefinition("Localization", DisableParallelization = true)]
+public sealed class LocalizationCollection;
+
+[Collection("Localization")]
 public sealed class LocalizationTests
 {
     [Theory]
