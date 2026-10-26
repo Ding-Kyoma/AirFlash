@@ -92,8 +92,10 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand RetryEngineCommand { get; }
     public bool CanEditGlobalLatency => !_closing && !_resetting && !(_snapshot.State is PlaybackState.Connecting or PlaybackState.Streaming or PlaybackState.Standby && _snapshot.Receiver is { } receiver && _settings.UsesDeviceLatency(receiver));
     public string GlobalLatencyHint => CanEditGlobalLatency ? "" : L.Get("This device uses its receiver latency mode. Adjust it in Settings → Receivers.");
+    public ObservableCollection<StreamChoice> LatencyChoices { get; } = [];
     public string LatencyMode { get => _settings.LatencyMode; set { if (!CanEditGlobalLatency || value == _settings.LatencyMode || value is null) return; _settings.LatencyMode = value; VolumeChanged(); Notify(); RefreshGlobalLatency(); } }
     private void RefreshGlobalLatency() { Notify(nameof(CanEditGlobalLatency)); Notify(nameof(GlobalLatencyHint)); }
+    internal void RefreshLatencyChoices() => StreamChoice.Update(LatencyChoices, Choices.LatenciesFor(_settings.CustomBufferMs));
     public AsyncCommand StopCommand { get; }
     public AsyncCommand MuteCommand { get; }
     public event Action? SettingsChanged;
@@ -138,6 +140,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         StopCommand = new(() => StopAsync(), ShowError, () => _snapshot.IsActive);
         MuteCommand = new(async () => { await Session.SetMutedAsync(!Session.Muted); Notify(nameof(Muted)); Notify(nameof(MuteLabel)); }, ShowError);
         MergeManualReceivers();
+        RefreshLatencyChoices();
     }
     public void Start()
     {
@@ -504,6 +507,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
                 if (before.DiscoveryInterfaceId != _settings.DiscoveryInterfaceId) _discovery.SetInterface(_settings.DiscoveryInterfaceId);
                 var oldCatalog = AllReceivers;
                 MergeManualReceivers(); RefreshReceivers();
+                RefreshLatencyChoices();
                 Notify(nameof(Settings)); Notify(nameof(MasterVolume)); Notify(nameof(LatencyMode));
                 RefreshGlobalLatency();
                 SettingsChanged?.Invoke();
@@ -557,6 +561,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             ReceiverMigrations = new Dictionary<string, string>(); _autoAttempted.Clear();
             _discovery.SetInterface(_settings.DiscoveryInterfaceId);
             _known.Clear(); MergeManualReceivers(); RefreshReceivers();
+            RefreshLatencyChoices();
             Notify(nameof(Settings)); Notify(nameof(MasterVolume)); Notify(nameof(LatencyMode));
             _restart.Schedule();
             _resetCompleted = true;

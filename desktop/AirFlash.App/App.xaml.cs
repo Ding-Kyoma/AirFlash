@@ -89,7 +89,7 @@ public partial class App : Application
             _viewModel = new(store, new WindowsDiscovery(log: AppPaths.Log), new Autostart(), audio, factory, Dispatcher, _engine);
             _viewModel.ResetCompleted += Quit;
             _panel = new(_viewModel); MainWindow = _panel;
-            _panel.SettingsRequested += ShowSettings; _panel.QuitRequested += Quit;
+            _panel.SettingsRequested += ShowSettings; _panel.LatencySettingsRequested += ShowSettingsPage; _panel.QuitRequested += Quit;
             _tray = new(_panel, _viewModel, ShowSettings, Quit); _panel.Tray = _tray;
             _instance.Listen(() => Dispatcher.BeginInvoke(() => { if (_settings is not null) _settings.Activate(); else _panel.ShowPanel(); }));
             _viewModel.SettingsChanged += OnSettingsChanged;
@@ -119,25 +119,36 @@ public partial class App : Application
             if (_quitting || _viewModel is null) return;
             L.Initialize(_uiLanguage == "system" ? null : [_uiLanguage]);
             Resources["LatencyChoices"] = Choices.Latencies;
+            _viewModel.RefreshLatencyChoices();
             var showSettings = _settings?.IsVisible == true;
             var page = _settings?.ViewModel.SelectedPage ?? 0;
             var showPanel = _panel?.IsVisible == true;
             _settings?.Close();
             _tray?.Dispose(); _panel?.ShutdownPanel();
             _panel = new(_viewModel); MainWindow = _panel;
-            _panel.SettingsRequested += ShowSettings; _panel.QuitRequested += Quit;
+            _panel.SettingsRequested += ShowSettings; _panel.LatencySettingsRequested += ShowSettingsPage; _panel.QuitRequested += Quit;
             _tray = new(_panel, _viewModel, ShowSettings, Quit); _panel.Tray = _tray;
             foreach (var row in _viewModel.Receivers) row.Refresh();
             if (showSettings) { ShowSettings(); _settings!.ViewModel.SelectedPage = page; }
             else if (showPanel) _panel.ShowPanel();
         }, System.Windows.Threading.DispatcherPriority.ContextIdle);
     }
-    private void ShowSettings()
+    private void ShowSettings() => ShowSettings(null);
+    private void ShowSettingsPage(int page) => ShowSettings(page);
+    private void ShowSettings(int? page)
     {
         if (_viewModel is null) return;
         _panel?.Hide();
-        if (_settings is not null) { if (_settings.WindowState == WindowState.Minimized) _settings.WindowState = WindowState.Normal; _settings.Activate(); return; }
-        _settings = new(_viewModel); _settings.Closed += (_, _) => _settings = null; _settings.Show(); _settings.Activate();
+        if (_settings is not null)
+        {
+            if (page is { } selected) _settings.ViewModel.SelectedPage = selected;
+            if (_settings.WindowState == WindowState.Minimized) _settings.WindowState = WindowState.Normal;
+            _settings.Activate(); return;
+        }
+        _settings = new(_viewModel); _settings.Closed += (_, _) => _settings = null;
+        _settings.Show();
+        if (page is { } initial) _settings.ViewModel.SelectedPage = initial;
+        _settings.Activate();
     }
     private async void Quit()
     {

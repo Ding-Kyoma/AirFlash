@@ -62,6 +62,8 @@
   "Normal · 200 ms": "Normal · 200 ms",
   "Buffered · 500 ms": "Gepuffert · 500 ms",
   "Custom": "Benutzerdefiniert",
+  "Custom · {0} ms": "Benutzerdefiniert · {0} ms",
+  "Latency settings": "Latenzeinstellungen",
   "Use global setting": "Globale Einstellung verwenden",
   "On": "Ein",
   "Off": "Aus",
