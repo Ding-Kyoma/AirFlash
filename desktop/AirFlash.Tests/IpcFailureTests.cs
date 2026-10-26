@@ -8,7 +8,7 @@ namespace AirFlash.Tests;
 public sealed class IpcFailureTests
 {
     private static readonly TimeSpan Limit = TimeSpan.FromSeconds(4);
-    private static readonly SessionTiming Timing = new(TimeSpan.FromMilliseconds(150), TimeSpan.FromMilliseconds(150), Limit, TimeSpan.Zero);
+    private static readonly SessionTiming Timing = new(Limit, Limit, Limit, TimeSpan.Zero);
     private const string Rejection = "{\"version\":1,\"id\":\"\",\"session_id\":\"\",\"event\":\"error\",\"code\":\"command_error\",\"channel\":\"ipc\",\"host\":null,\"retryable\":false,\"message\":\"synthetic command rejection\"}";
     private static AppSettings Settings() => new() { ForceReconnect = true, MaxReconnectAttempts = 1, MuteWhileStreaming = true };
     private static Receiver Receiver() => new("synthetic-ipc", "Synthetic IPC", "192.0.2.10", 7000);
