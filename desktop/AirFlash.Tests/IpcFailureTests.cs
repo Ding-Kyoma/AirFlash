@@ -70,7 +70,7 @@ public sealed class IpcFailureTests
         var connection = new Connection(); var factory = new Factory(connection);
         await using var controller = new SessionController(factory, new Audio(false), timing: Timing);
         var streaming = Signal(); controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Streaming) streaming.TrySetResult(); };
-        await controller.StartAsync(Receiver(), Settings()); await connection.Started.Task.WaitAsync(Limit);
+        await controller.StartAsync(Receiver(), Settings()); await connection.Starting.Task.WaitAsync(Limit);
         connection.Raw(envelope); connection.Current("streaming");
         await streaming.Task.WaitAsync(Limit);
         Assert.Null(controller.Snapshot.Diagnostics?.LastFault); Assert.Equal(1, factory.OpenCount);
@@ -146,8 +146,8 @@ public sealed class IpcFailureTests
             if (command == "hello")
             {
                 _session = session;
-                Started.TrySetResult();
                 Current("hello", new { capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "standby_release", "member_volume", "receiver_password", "application_capture" } });
+                Started.TrySetResult();
             }
             if (command is "start" or "pair") { _session = session; Starting.TrySetResult(); }
             if (command == "stop") _events.Writer.TryComplete();
