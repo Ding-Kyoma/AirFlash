@@ -60,6 +60,8 @@
   "Normal · 200 ms": "一般 · 200 ms",
   "Buffered · 500 ms": "緩衝 · 500 ms",
   "Custom": "自訂",
+  "Custom · {0} ms": "自訂 · {0} ms",
+  "Latency settings": "延遲設定",
   "Use global setting": "跟隨全域設定",
   "On": "開啟",
   "Off": "關閉",

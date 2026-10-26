@@ -68,6 +68,13 @@ internal static class ReceiverSettingsRegression
             await Until(() => app.Snapshot.State == PlaybackState.Streaming); await Pump(); panel.ShowPanel(); await Pump();
             var latency = Descendants(panel).OfType<ComboBox>().Single(c => System.Windows.Automation.AutomationProperties.GetName(c) == L.Get("Global latency mode"));
             Check(!app.CanEditGlobalLatency && !latency.IsEnabled && app.GlobalLatencyHint.Length > 0, "playing independent receiver latency disables global dropdown and explains where to adjust it", checks);
+            var latencySettingsButton = Descendants(panel).OfType<Button>().Single(b => System.Windows.Automation.AutomationProperties.GetName(b) == L.Get("Latency settings"));
+            var latencyPage = -1;
+            void OnLatencySettings(int page) => latencyPage = page;
+            panel.LatencySettingsRequested += OnLatencySettings;
+            latencySettingsButton.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await Pump();
+            panel.LatencySettingsRequested -= OnLatencySettings;
+            Check(latencyPage == SettingsViewModel.ReceiversPage, "disabled global latency routes its settings button to receiver latency", checks);
             var global = app.LatencyMode; app.LatencyMode = "buffered";
             Check(app.LatencyMode == global && store.Saved.LatencyMode == global, "disabled global latency rejects writes", checks);
             Check(row.CodecChoices[0].Label == L.Format("Automatic ({0})", "ALAC") && row.TimingChoices[0].Label == L.Format("Automatic ({0})", L.Get("Follow receiver PTP clock")), "automatic labels show negotiated codec and receiver clock role", checks);

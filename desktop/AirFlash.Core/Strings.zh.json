@@ -62,6 +62,8 @@
   "Normal · 200 ms": "正常 · 200 ms",
   "Buffered · 500 ms": "缓冲 · 500 ms",
   "Custom": "自定义",
+  "Custom · {0} ms": "自定义 · {0} ms",
+  "Latency settings": "延迟设置",
   "Use global setting": "跟随全局",
   "On": "开启",
   "Off": "关闭",

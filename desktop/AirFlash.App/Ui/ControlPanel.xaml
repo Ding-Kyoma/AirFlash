@@ -1,11 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:loc="clr-namespace:AirFlash.App.Ui" xmlns:vm="clr-namespace:AirFlash.App.ViewModels" x:Class="AirFlash.App.Ui.ControlPanel" Title="AirFlash" Width="440" SizeToContent="Height" WindowStyle="None" ResizeMode="NoResize" ShowInTaskbar="False" Topmost="True" UseLayoutRounding="True" SnapsToDevicePixels="True" PreviewKeyDown="OnKeyDown" Deactivated="OnDeactivated" Closing="OnClosing">
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:loc="clr-namespace:AirFlash.App.Ui" x:Class="AirFlash.App.Ui.ControlPanel" Title="AirFlash" Width="440" SizeToContent="Height" WindowStyle="None" ResizeMode="NoResize" ShowInTaskbar="False" Topmost="True" UseLayoutRounding="True" SnapsToDevicePixels="True" PreviewKeyDown="OnKeyDown" Deactivated="OnDeactivated" Closing="OnClosing">
   <Window.Resources>
     <!-- Application-owned vectors keep these icons independent of installed fonts. -->
     <Geometry x:Key="SettingsIconGeometry">M 10.19,4.72 L 10.44,2.12 13.56,2.12 13.81,4.72 15.86,5.57 17.88,3.91 20.09,6.12 18.43,8.14 19.28,10.19 21.88,10.44 21.88,13.56 19.28,13.81 18.43,15.86 20.09,17.88 17.88,20.09 15.86,18.43 13.81,19.28 13.56,21.88 10.44,21.88 10.19,19.28 8.14,18.43 6.12,20.09 3.91,17.88 5.57,15.86 4.72,13.81 2.12,13.56 2.12,10.44 4.72,10.19 5.57,8.14 3.91,6.12 6.12,3.91 8.14,5.57 Z M 15.5,12 A 3.5,3.5 0 1 1 8.5,12 A 3.5,3.5 0 1 1 15.5,12 Z</Geometry>
     <Geometry x:Key="ReceiverIconGeometry">M 8,2 H 16 A 3,3 0 0 1 19,5 V 19 A 3,3 0 0 1 16,22 H 8 A 3,3 0 0 1 5,19 V 5 A 3,3 0 0 1 8,2 Z M 15,8 A 3,3 0 1 1 9,8 A 3,3 0 1 1 15,8 Z M 14,16 A 2,2 0 1 1 10,16 A 2,2 0 1 1 14,16 Z</Geometry>
     <Geometry x:Key="PlayIconGeometry">M 6,3 L 21,12 6,21 Z</Geometry>
     <Geometry x:Key="StopIconGeometry">M 4,4 H 20 V 20 H 4 Z</Geometry>
+    <Geometry x:Key="LatencyIconGeometry">M 3,6 H 21 M 8,3 V 9 M 3,12 H 21 M 16,9 V 15 M 3,18 H 21 M 11,15 V 21</Geometry>
     <Style x:Key="VolumeSlider" TargetType="Slider" BasedOn="{StaticResource {x:Type Slider}}">
       <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}"/>
       <Style.Resources>
@@ -164,9 +165,17 @@
           <Grid.ColumnDefinitions>
             <ColumnDefinition Width="*"/>
             <ColumnDefinition Width="190"/>
+            <ColumnDefinition Width="Auto"/>
           </Grid.ColumnDefinitions>
           <TextBlock Text="{loc:Text 'Global latency mode'}" VerticalAlignment="Center" Style="{StaticResource Hint}"/>
-          <ComboBox Grid.Column="1" ItemsSource="{x:Static vm:Choices.Latencies}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding LatencyMode, Mode=TwoWay}" IsEnabled="{Binding CanEditGlobalLatency}" ToolTip="{Binding GlobalLatencyHint}" ToolTipService.ShowOnDisabled="True" DropDownOpened="OnPopupOpened" DropDownClosed="OnPopupClosed" AutomationProperties.Name="{loc:Text 'Global latency mode'}"/>
+          <ComboBox Grid.Column="1" ItemsSource="{Binding LatencyChoices}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding LatencyMode, Mode=TwoWay}" IsEnabled="{Binding CanEditGlobalLatency}" ToolTip="{Binding GlobalLatencyHint}" ToolTipService.ShowOnDisabled="True" DropDownOpened="OnPopupOpened" DropDownClosed="OnPopupClosed" AutomationProperties.Name="{loc:Text 'Global latency mode'}"/>
+          <Button Grid.Column="2" Style="{StaticResource IconButton}" Margin="6,0,0,0" ToolTip="{loc:Text 'Latency settings'}" AutomationProperties.Name="{loc:Text 'Latency settings'}" Click="OnLatencySettings">
+            <Viewbox Width="15" Height="15" Stretch="Uniform">
+              <Grid Width="24" Height="24">
+                <Path Data="{StaticResource LatencyIconGeometry}" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType={x:Type Button}}}" StrokeThickness="1.6" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"/>
+              </Grid>
+            </Viewbox>
+          </Button>
         </Grid>
         <TextBlock Text="{Binding GlobalLatencyHint}" Style="{StaticResource Hint}" Margin="2,0,2,12" Visibility="{Binding GlobalLatencyHint, Converter={StaticResource NonEmpty}}"/>
         <Border Padding="12" Margin="0,0,0,10" CornerRadius="10" Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource LineBrush}" BorderThickness="1" Visibility="{Binding Settings.ShowMasterControl, Converter={StaticResource BoolVisibility}}">

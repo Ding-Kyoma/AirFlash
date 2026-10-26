@@ -29,7 +29,8 @@ public static class Choices
 {
     public static Choice[] Languages => [new("system", L.Get("System default")), new("zh", "简体中文"), new("de", "Deutsch"), new("en", "English")];
     public static Choice[] Themes => [new("system", L.Get("System default")), new("dark", L.Get("Dark")), new("light", L.Get("Light"))];
-    public static Choice[] Latencies => [new("realtime", L.Get("Real-time · 120 ms")), new("normal", L.Get("Normal · 200 ms")), new("buffered", L.Get("Buffered · 500 ms")), new("custom", L.Get("Custom"))];
+    public static Choice[] Latencies => LatenciesFor(null);
+    public static Choice[] LatenciesFor(int? customMs) => [new("realtime", L.Get("Real-time · 120 ms")), new("normal", L.Get("Normal · 200 ms")), new("buffered", L.Get("Buffered · 500 ms")), new("custom", customMs is { } ms ? L.Format("Custom · {0} ms", ms) : L.Get("Custom"))];
     public static Choice[] ReceiverLatencies => [new(null, L.Get("Use global setting")), .. Latencies];
     public static Choice[] AutoConnect => [new(null, L.Get("Use global setting")), new(true, L.Get("On")), new(false, L.Get("Off"))];
     public static Choice[] Codecs => [new("auto", L.Get("Automatic (prefer ALAC)")), new("pcm", "PCM"), new("alac", "ALAC")];
