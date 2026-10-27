@@ -7,6 +7,37 @@ namespace AirFlash.Tests;
 
 public sealed class SessionTests
 {
+    [Fact]
+    public async Task ClockStartupFailureRetainsPerPeerDiagnosticsAndEnginePathInLog()
+    {
+        var process = new FakeConnection(autoReady: false);
+        var logs = new ConcurrentQueue<string>();
+        await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(),
+            logs.Enqueue, Fast with { Connect = TimeSpan.FromSeconds(10) });
+        await controller.StartAsync(Pod(), Settings());
+        await process.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        process.EmitData(new
+        {
+            @event = "clock_status", phase = "starting",
+            engine_path = @"C:\Users\Test\AppData\Local\AirFlash\engine\hash\airflash-engine.exe",
+            members = new[] { new { host = "127.0.0.1", mode = "receiver", phase = "waiting_sync_pair", ready = false } },
+            network = new { event_received = 4, general_received = 6 }
+        });
+        process.EmitData(new
+        {
+            @event = "error", code = "clock_not_ready", channel = "clock", host = "127.0.0.1",
+            retryable = true, message = "PTP exchange did not become ready: 127.0.0.1 (waiting_sync_pair)."
+        });
+        await Until(() => controller.Snapshot.State == PlaybackState.Error && process.Disposed);
+        var diagnostics = controller.Snapshot.Diagnostics!;
+        Assert.Equal("127.0.0.1", diagnostics.LastFault!.Host);
+        var status = diagnostics.ClockStatus!.Value;
+        Assert.Equal("waiting_sync_pair", status.GetProperty("members")[0].Text("phase"));
+        Assert.Equal(6, status.GetProperty("network").Integer("general_received"));
+        Assert.Contains(logs, line => line.Contains("Session failure:") &&
+            line.Contains("airflash-engine.exe") && line.Contains("waiting_sync_pair"));
+    }
+
     private static Receiver Pod(string id = "a") => new(id, id, "127.0.0.1");
     private static AppSettings Settings() => new() { AutoConnectOnDiscover = false, ForceReconnect = false, MasterVolume = 10 };
     private static readonly SessionTiming Fast = new(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1), TimeSpan.FromMilliseconds(10));

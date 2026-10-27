@@ -138,6 +138,9 @@ Use **Settings > About > Check for updates** to check for a stable release and o
 
 The real-time profile targets 120 ms; target and local transport timings are not measurements of end-to-end acoustic latency.
 
+For `PTP exchange did not become ready`, see [PTP startup troubleshooting](docs/PTP-TROUBLESHOOTING.md)
+for clock diagnostics and the correct engine process and UDP firewall rules.
+
 See [Release workflow](docs/RELEASING.md) for version reservation and publishing.
 
 See [Icon maintenance](docs/ICONS.md) for the vector source, generated resources, and high-DPI verification.

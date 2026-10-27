@@ -3,8 +3,9 @@
 use crate::rtsp::Cancellation;
 use anyhow::{Context, Result};
 use std::{
-    collections::HashMap,
-    net::{IpAddr, UdpSocket},
+    collections::{HashMap, VecDeque},
+    io,
+    net::{IpAddr, SocketAddr, UdpSocket},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -92,32 +93,87 @@ pub struct PtpMaster {
     pub received: Arc<AtomicU64>,
     states: Arc<Mutex<HashMap<IpAddr, PeerState>>>,
     pub mmcss: Arc<Mutex<(bool, bool)>>,
+    network: Arc<Mutex<NetworkSnapshot>>,
     cancel: Cancellation,
     worker: Option<JoinHandle<()>>,
 }
 #[derive(Default)]
 struct PeerState {
     follow: bool,
+    active: bool,
+    local_address: Option<IpAddr>,
     exchanges: u64,
     last: Option<Instant>,
     first: Option<Instant>,
     clock_id: Option<u64>,
-    sync: Option<(u16, u64)>,
-    sync_pair: Option<(u64, u64)>,
+    pending_syncs: VecDeque<PendingSync>,
+    sync_pair: Option<SyncSample>,
     delay: Option<(u16, u64)>,
     offset: Option<f64>,
-    sync_age: Option<Instant>,
     delay_age: Option<Instant>,
-    sync_correction: f64,
     source_id: Option<u64>,
     source_port: Option<u16>,
-    subscriptions: [Option<Subscription>; 3],
+    subscriptions: [VecDeque<Subscription>; 3],
     granted_until: [Option<Instant>; 3],
     received_grants: u64,
-    last_request: Option<(u8, u16)>,
+    last_request: Option<(u8, u16, Instant)>,
     grants: u64,
     round_trip_ns: Option<f64>,
     jitter_ns: Option<f64>,
+    next_subscription: Option<Instant>,
+    exchange_interval: Option<Duration>,
+    packets: PacketSnapshot,
+}
+const SAMPLE_LIFETIME: Duration = Duration::from_secs(2);
+const MAX_PENDING_SYNCS: usize = 32;
+const SUBSCRIPTION_RETRY: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Copy)]
+struct SyncSample {
+    origin: u64,
+    received: u64,
+    correction: f64,
+    at: Instant,
+}
+struct PendingSync {
+    sequence: u16,
+    at: Instant,
+    sync: Option<(u64, f64)>,
+    follow: Option<(u64, f64)>,
+    complete: bool,
+}
+#[derive(Clone, Default, serde::Serialize)]
+pub struct SocketFailure {
+    operation: &'static str,
+    kind: String,
+    os_code: Option<i32>,
+}
+impl SocketFailure {
+    fn new(operation: &'static str, error: &io::Error) -> Self {
+        Self {
+            operation,
+            kind: format!("{:?}", error.kind()),
+            os_code: error.raw_os_error(),
+        }
+    }
+}
+#[derive(Clone, Default, serde::Serialize)]
+pub struct NetworkSnapshot {
+    event_received: u64,
+    general_received: u64,
+    unknown_peer: u64,
+    receive_errors: u64,
+    last_receive_error: Option<SocketFailure>,
+}
+#[derive(Clone, Default, serde::Serialize)]
+pub struct PacketSnapshot {
+    raw_received: u64,
+    received_by_type: [u64; 16],
+    rejected: u64,
+    last_rejection: Option<&'static str>,
+    send_errors: u64,
+    last_send_error: Option<SocketFailure>,
+    pdelay_responses: u64,
 }
 #[derive(Clone, serde::Serialize)]
 pub struct PeerSnapshot {
@@ -133,6 +189,10 @@ pub struct PeerSnapshot {
     pub active_subscriptions: usize,
     pub round_trip_ns: Option<f64>,
     pub jitter_ns: Option<f64>,
+    pub local_address: Option<IpAddr>,
+    pub phase: &'static str,
+    pub packets: PacketSnapshot,
+    pub exchange_timeout_ms: u128,
 }
 #[derive(Clone, Copy)]
 struct Subscription {
@@ -144,10 +204,120 @@ fn subscription_index(kind: u8) -> Option<usize> {
     [0, 9, 11].iter().position(|value| *value == kind)
 }
 impl PeerState {
+    fn reject(&mut self, reason: &'static str) {
+        self.packets.rejected += 1;
+        self.packets.last_rejection = Some(reason);
+    }
+    fn exchange_timeout(&self) -> Duration {
+        self.exchange_interval
+            .map(|interval| interval.saturating_mul(3))
+            .unwrap_or(Duration::from_secs(3))
+            .clamp(Duration::from_secs(3), Duration::from_secs(12))
+    }
+    fn startup_timeout(&self) -> Duration {
+        (self.exchange_timeout() + Duration::from_secs(2)).max(Duration::from_secs(8))
+    }
+    fn phase(&self, now: Instant) -> &'static str {
+        if !self.active {
+            "waiting_session"
+        } else if self.ready(now) {
+            "ready"
+        } else if self.packets.raw_received == 0 {
+            "no_rx"
+        } else if self.packets.received_by_type.iter().sum::<u64>() == 0 {
+            "rx_rejected"
+        } else if self.follow && self.clock_id.is_none() {
+            "waiting_announce"
+        } else if self.follow
+            && self
+                .sync_pair
+                .is_none_or(|sample| now.duration_since(sample.at) >= SAMPLE_LIFETIME)
+        {
+            "waiting_sync_pair"
+        } else if self.follow && self.offset.is_none() {
+            "waiting_delay_response"
+        } else {
+            "waiting_exchanges"
+        }
+    }
+    fn subscription_due(&self, now: Instant) -> bool {
+        self.next_subscription.is_none_or(|at| now >= at)
+    }
+    fn subscription_needed(&self, index: usize, now: Instant) -> bool {
+        // An unready peer may have lost the negotiated stream despite a live lease.
+        !self.ready(now)
+            || self.granted_until[index].is_none_or(|until| until <= now + Duration::from_secs(5))
+    }
+    fn remember_sync(&mut self, data: &[u8], local_ns: u64, now: Instant) {
+        let sequence = u16::from_be_bytes([data[30], data[31]]);
+        let kind = data[0] & 15;
+        let origin = if kind == 8 || data[6] & 2 == 0 {
+            match read_timestamp(&data[34..44]) {
+                Some(value) => Some(value),
+                None => {
+                    self.reject("timestamp");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        self.pending_syncs
+            .retain(|entry| now.duration_since(entry.at) < SAMPLE_LIFETIME);
+        let index = match self
+            .pending_syncs
+            .iter()
+            .position(|e| e.sequence == sequence)
+        {
+            Some(index) => index,
+            None => {
+                if self.pending_syncs.len() == MAX_PENDING_SYNCS {
+                    self.pending_syncs.pop_front();
+                }
+                self.pending_syncs.push_back(PendingSync {
+                    sequence,
+                    at: now,
+                    sync: None,
+                    follow: None,
+                    complete: false,
+                });
+                self.pending_syncs.len() - 1
+            }
+        };
+        let entry = &mut self.pending_syncs[index];
+        if entry.complete {
+            return;
+        }
+        if kind == 0 && entry.sync.is_none() {
+            entry.sync = Some((local_ns, correction(data)));
+            if let Some(origin) = origin {
+                entry.follow = Some((origin, 0.0));
+            }
+        } else if kind == 8 && entry.follow.is_none() {
+            entry.follow = Some((origin.unwrap(), correction(data)));
+        }
+        if let (Some((received, sync_correction)), Some((origin, follow_correction))) =
+            (entry.sync, entry.follow)
+        {
+            entry.complete = true;
+            // A late older pair must not replace the newest complete sample.
+            if self
+                .sync_pair
+                .is_none_or(|sample| received > sample.received)
+            {
+                self.sync_pair = Some(SyncSample {
+                    origin,
+                    received,
+                    correction: sync_correction + follow_correction,
+                    at: entry.at,
+                });
+            }
+        }
+    }
     fn exchanged(&mut self, now: Instant) {
         if self
             .last
-            .is_none_or(|last| now.duration_since(last) > Duration::from_secs(3))
+            .is_none_or(|last| now.duration_since(last) >= self.exchange_timeout())
         {
             self.exchanges = 0;
             self.first = Some(now);
@@ -162,7 +332,7 @@ impl PeerState {
                 .is_some_and(|first| now.duration_since(first) >= Duration::from_millis(250))
             && self
                 .last
-                .is_some_and(|last| now.duration_since(last) < Duration::from_secs(3))
+                .is_some_and(|last| now.duration_since(last) < self.exchange_timeout())
             && (!self.follow || self.offset.is_some())
     }
 }
@@ -214,11 +384,28 @@ fn unicast_grants(request: &[u8], clock_id: u64, seq: u16) -> Vec<Vec<u8>> {
     grants
 }
 fn valid_packet(data: &[u8]) -> bool {
-    data.len() >= 34
-        && data[0] >> 4 == 1
-        && data[1] & 0xf == 2
-        && data[4] == 0
-        && u16::from_be_bytes([data[2], data[3]]) as usize == data.len()
+    packet_rejection(data).is_none()
+}
+fn packet_rejection(data: &[u8]) -> Option<&'static str> {
+    if data.len() < 34 {
+        return Some("short_header");
+    }
+    if data[0] >> 4 != 1 || data[1] & 15 != 2 {
+        return Some("profile_or_version");
+    }
+    if data[4] != 0 {
+        return Some("domain");
+    }
+    let minimum = match data[0] & 15 {
+        0 | 1 | 8 | 12 => 44,
+        2 | 3 | 9 | 10 => 54,
+        11 => 64,
+        _ => 34,
+    };
+    if data.len() < minimum || usize::from(u16::from_be_bytes([data[2], data[3]])) != data.len() {
+        return Some("length");
+    }
+    None
 }
 fn correction(data: &[u8]) -> f64 {
     i64::from_be_bytes(data[8..16].try_into().unwrap()) as f64 / 65536.0
@@ -238,12 +425,15 @@ fn followed_packet(s: &mut PeerState, data: &[u8], local_ns: u64, now: Instant, 
             || s.source_port != Some(source_port)
         {
             let subscriptions = if s.source_id.is_none() {
-                s.subscriptions
+                std::mem::take(&mut s.subscriptions)
             } else {
-                [None; 3]
+                Default::default()
             };
             *s = PeerState {
                 follow: true,
+                active: s.active,
+                local_address: s.local_address,
+                packets: std::mem::take(&mut s.packets),
                 clock_id: Some(id),
                 source_id: Some(source),
                 source_port: Some(source_port),
@@ -253,53 +443,34 @@ fn followed_packet(s: &mut PeerState, data: &[u8], local_ns: u64, now: Instant, 
         }
     }
     if s.source_id != Some(source) || s.source_port != Some(source_port) {
+        s.reject("source_identity");
         return;
     }
     if kind == 12 {
         receive_grants(s, data, own_id, now);
     }
-    if kind == 0 && data.len() >= 44 {
-        s.sync = Some((seq, local_ns));
-        s.sync_age = Some(now);
-        s.sync_correction = correction(data);
-        if data[6] & 2 == 0 {
-            // A one-step clock carries its origin directly.
-            if let Some(origin) = read_timestamp(&data[34..44]) {
-                s.sync_pair = Some((origin, local_ns));
-            }
-        }
-    }
-    if kind == 8
-        && data.len() >= 44
-        && s.sync_age
-            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(2))
-    {
-        if let (Some((sequence, received)), Some(origin)) = (s.sync, read_timestamp(&data[34..44]))
-        {
-            if sequence == seq {
-                s.sync_pair = Some((origin, received));
-                s.sync_correction += correction(data);
-                s.sync = None;
-            }
-        }
+    if (kind == 0 || kind == 8) && data.len() >= 44 {
+        s.remember_sync(data, local_ns, now);
     }
     if kind == 9
         && data.len() >= 54
         && data[44..52] == own_id.to_be_bytes()
         && data[52..54] == 0x8005u16.to_be_bytes()
-        && s.sync_age
-            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(2))
+        && s.sync_pair
+            .is_some_and(|sample| now.duration_since(sample.at) < SAMPLE_LIFETIME)
         && s.delay_age
             .is_some_and(|at| now.duration_since(at) < Duration::from_secs(2))
     {
-        if let (Some((sequence, sent)), Some((origin, received)), Some(remote_received)) =
+        if let (Some((sequence, sent)), Some(sample), Some(remote_received)) =
             (s.delay, s.sync_pair, read_timestamp(&data[34..44]))
         {
             if sequence == seq {
-                let outward = (origin as i128 - received as i128) as f64 + s.sync_correction;
+                let outward =
+                    (sample.origin as i128 - sample.received as i128) as f64 + sample.correction;
                 let inward = (remote_received as i128 - sent as i128) as f64 - correction(data);
                 let rtt = inward - outward;
                 if !(0.0..=250_000_000.0).contains(&rtt) {
+                    s.reject("round_trip");
                     return;
                 }
                 let offset = (outward + inward) / 2.0;
@@ -308,6 +479,7 @@ fn followed_packet(s: &mut PeerState, data: &[u8], local_ns: u64, now: Instant, 
                 if s.offset
                     .is_some_and(|old| (old - offset).abs() > 5_000_000.0)
                 {
+                    s.reject("offset_jump");
                     s.exchanges = 0;
                     s.first = None;
                     s.last = None;
@@ -317,8 +489,12 @@ fn followed_packet(s: &mut PeerState, data: &[u8], local_ns: u64, now: Instant, 
                 s.exchanged(now);
                 s.delay = None;
                 s.delay_age = None;
+            } else {
+                s.reject("delay_sequence");
             }
         }
+    } else if kind == 9 {
+        s.reject("delay_identity_or_stale_sample");
     }
 }
 fn receive_grants(s: &mut PeerState, data: &[u8], own_id: u64, now: Instant) {
@@ -339,7 +515,10 @@ fn receive_grants(s: &mut PeerState, data: &[u8], own_id: u64, now: Instant) {
         if kind == 5 && length == 8 {
             let body = &data[at + 4..at + 12];
             if let Some(index) = subscription_index(body[0] >> 4) {
-                if let Some(pending) = s.subscriptions[index] {
+                if let Some(pending) = s.subscriptions[index]
+                    .iter()
+                    .find(|p| p.sequence == sequence)
+                {
                     let interval = body[1] as i8;
                     let seconds = u32::from_be_bytes(body[2..6].try_into().unwrap());
                     if sequence == pending.sequence
@@ -354,7 +533,7 @@ fn receive_grants(s: &mut PeerState, data: &[u8], own_id: u64, now: Instant) {
                         s.granted_until[index] =
                             Some(now + Duration::from_secs(u64::from(seconds)));
                         s.received_grants += 1;
-                        s.subscriptions[index] = None;
+                        s.subscriptions[index].clear();
                     }
                 }
             }
@@ -419,6 +598,8 @@ impl PtpMaster {
         let state = states.clone();
         let mmcss = Arc::new(Mutex::new((false, false)));
         let priority_state = mmcss.clone();
+        let network = Arc::new(Mutex::new(NetworkSnapshot::default()));
+        let worker_network = network.clone();
         let worker = thread::Builder::new()
             .name("airplay-ptp".into())
             .spawn(move || {
@@ -430,14 +611,30 @@ impl PtpMaster {
                     // The guard belongs to this worker until it exits.
                     let _priority = priority;
                     ptp_loop(
-                        &event, &general, &peers, &followers, &clock, clock_id, &rx, &stop, &state,
+                        &event,
+                        &general,
+                        &peers,
+                        &clock,
+                        clock_id,
+                        &rx,
+                        &stop,
+                        &state,
+                        &worker_network,
                     );
                 }
                 #[cfg(not(windows))]
                 {
                     let _ = priority_state;
                     ptp_loop(
-                        &event, &general, &peers, &followers, &clock, clock_id, &rx, &stop, &state,
+                        &event,
+                        &general,
+                        &peers,
+                        &clock,
+                        clock_id,
+                        &rx,
+                        &stop,
+                        &state,
+                        &worker_network,
                     );
                 }
             })?;
@@ -446,9 +643,29 @@ impl PtpMaster {
             received,
             states,
             mmcss,
+            network,
             cancel,
             worker: Some(worker),
         })
+    }
+    /// SETPEERS establishes the session's timing relationship. Send fresh timing
+    /// requests afterwards even if the receiver ignored pre-session traffic.
+    pub fn activate(&self, host: IpAddr, local_address: IpAddr) {
+        if let Some(peer) = self.states.lock().unwrap().get_mut(&host) {
+            peer.active = true;
+            peer.local_address = Some(local_address);
+            peer.next_subscription = None;
+        }
+    }
+    pub fn network_snapshot(&self) -> NetworkSnapshot {
+        self.network.lock().unwrap().clone()
+    }
+    pub fn startup_timeout(&self, host: IpAddr) -> Duration {
+        self.states
+            .lock()
+            .unwrap()
+            .get(&host)
+            .map_or(Duration::from_secs(8), PeerState::startup_timeout)
     }
     pub fn snapshots(&self) -> Vec<PeerSnapshot> {
         let now = Instant::now();
@@ -473,6 +690,10 @@ impl PtpMaster {
                     .count(),
                 round_trip_ns: s.round_trip_ns,
                 jitter_ns: s.jitter_ns,
+                local_address: s.local_address,
+                phase: s.phase(now),
+                packets: s.packets.clone(),
+                exchange_timeout_ms: s.exchange_timeout().as_millis(),
             })
             .collect();
         result.sort_by_key(|s| s.host);
@@ -499,53 +720,158 @@ impl PtpMaster {
         ))
     }
 }
+fn send_ptp(
+    socket: &UdpSocket,
+    packet: &[u8],
+    destination: SocketAddr,
+    peer: &mut PeerState,
+    operation: &'static str,
+) -> bool {
+    match socket.send_to(packet, destination) {
+        Ok(sent) if sent == packet.len() => true,
+        result => {
+            let error = result.err().unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::WriteZero, "partial PTP datagram")
+            });
+            peer.packets.send_errors += 1;
+            peer.packets.last_send_error = Some(SocketFailure::new(operation, &error));
+            false
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn respond_to_delay(
+    event: &UdpSocket,
+    general: &UdpSocket,
+    destination: IpAddr,
+    data: &[u8],
+    received_ns: u64,
+    clock: &Clock,
+    clock_id: u64,
+    s: &mut PeerState,
+    now: Instant,
+) {
+    let kind = data[0] & 15;
+    // Peer delay measures the link, regardless of who supplies its timeline.
+    if kind != 2 && (kind != 1 || s.follow) {
+        return;
+    }
+    let sequence = u16::from_be_bytes([data[30], data[31]]);
+    if s.last_request.is_some_and(|(old_kind, old_sequence, at)| {
+        old_kind == kind
+            && old_sequence == sequence
+            && now.duration_since(at) < s.exchange_timeout()
+    }) {
+        return;
+    }
+    let mut response = header(
+        if kind == 1 { 9 } else { 3 },
+        54,
+        clock_id,
+        sequence,
+        if kind == 1 { 0x0408 } else { 0x0608 },
+        -3,
+    );
+    timestamp(&mut response[34..44], received_ns);
+    response[44..54].copy_from_slice(&data[20..30]);
+    let sent = if kind == 1 {
+        send_ptp(
+            general,
+            &response,
+            (destination, 320).into(),
+            s,
+            "delay_response",
+        )
+    } else {
+        let sent = send_ptp(
+            event,
+            &response,
+            (destination, 319).into(),
+            s,
+            "pdelay_response",
+        );
+        let mut follow = header(10, 54, clock_id, sequence, 0x0408, -3);
+        timestamp(&mut follow[34..44], clock.now_ns());
+        follow[44..54].copy_from_slice(&data[20..30]);
+        let followed = send_ptp(
+            general,
+            &follow,
+            (destination, 320).into(),
+            s,
+            "pdelay_follow_up",
+        );
+        if sent && followed {
+            s.packets.pdelay_responses += 1;
+        }
+        sent && followed
+    };
+    if sent {
+        s.last_request = Some((kind, sequence, now));
+        if !s.follow {
+            // Only use bounded, explicit intervals. 0x7f/0x80 are unspecified.
+            let interval = data[33] as i8;
+            if (-7..=2).contains(&interval) {
+                s.exchange_interval = Some(Duration::from_secs_f64(2f64.powi(i32::from(interval))));
+            }
+            s.exchanged(now);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ptp_loop(
     event: &UdpSocket,
     general: &UdpSocket,
     peers: &[IpAddr],
-    followers: &[IpAddr],
     clock: &Clock,
     clock_id: u64,
     rx: &AtomicU64,
     stop: &Cancellation,
     state: &Mutex<HashMap<IpAddr, PeerState>>,
+    network: &Mutex<NetworkSnapshot>,
 ) {
     let mut seq = 0u16;
     let mut last_announce = Instant::now() - Duration::from_secs(2);
     let mut next_sync = Instant::now();
-    let mut next_subscription = Instant::now();
     let mut buf = [0u8; 2048];
     while !stop.is_cancelled() {
         let now = Instant::now();
         if now >= next_sync {
             for peer in peers {
-                if followers.contains(peer) {
-                    if now >= next_subscription {
-                        let remote = state
-                            .lock()
-                            .unwrap()
-                            .get(peer)
-                            .and_then(|s| s.source_id.zip(s.source_port));
-                        for kind in [0, 9, 11] {
+                let mut states = state.lock().unwrap();
+                let s = states.get_mut(peer).unwrap();
+                if !s.active {
+                    continue;
+                }
+                if s.follow {
+                    if s.subscription_due(now) {
+                        let remote = s.source_id.zip(s.source_port);
+                        for (index, kind) in [0, 9, 11].into_iter().enumerate() {
+                            if !s.subscription_needed(index, now) {
+                                continue;
+                            }
                             let request = subscription(clock_id, remote, seq, kind);
-                            if general.send_to(&request, (*peer, 320)).is_ok() {
-                                state.lock().unwrap().get_mut(peer).unwrap().subscriptions
-                                    [subscription_index(kind).unwrap()] = Some(Subscription {
+                            if send_ptp(general, &request, (*peer, 320).into(), s, "subscribe") {
+                                let pending = &mut s.subscriptions[index];
+                                pending.retain(|p| now.duration_since(p.sent) < SAMPLE_LIFETIME);
+                                if pending.len() == 4 {
+                                    pending.pop_front();
+                                }
+                                pending.push_back(Subscription {
                                     sequence: seq,
                                     interval: request[49] as i8,
                                     sent: now,
                                 });
                             }
                         }
+                        s.next_subscription = Some(now + SUBSCRIPTION_RETRY);
                     }
                     if now.duration_since(last_announce) >= Duration::from_secs(1) {
                         let mut req = header(1, 44, clock_id, seq, 0x0408, 0);
                         let sent = clock.now_ns();
                         timestamp(&mut req[34..44], sent);
-                        if event.send_to(&req, (*peer, 319)).is_ok() {
-                            let mut states = state.lock().unwrap();
-                            let s = states.get_mut(peer).unwrap();
+                        if send_ptp(event, &req, (*peer, 319).into(), s, "delay_request") {
                             s.delay = Some((seq, sent));
                             s.delay_age = Some(now);
                         }
@@ -553,92 +879,102 @@ fn ptp_loop(
                     continue;
                 }
                 let (sync, follow) = sync_pair(clock_id, seq, clock.now_ns());
-                let _ = event.send_to(&sync, (*peer, 319));
-                let _ = general.send_to(&follow, (*peer, 320));
+                send_ptp(event, &sync, (*peer, 319).into(), s, "sync");
+                send_ptp(general, &follow, (*peer, 320).into(), s, "follow_up");
                 if now.duration_since(last_announce) >= Duration::from_secs(1) {
-                    let _ = general.send_to(&announce(clock_id, seq, clock.now_ns()), (*peer, 320));
+                    send_ptp(
+                        general,
+                        &announce(clock_id, seq, clock.now_ns()),
+                        (*peer, 320).into(),
+                        s,
+                        "announce",
+                    );
                 }
             }
             if now.duration_since(last_announce) >= Duration::from_secs(1) {
                 last_announce = now;
             }
             seq = seq.wrapping_add(1);
-            if now >= next_subscription {
-                next_subscription = now + Duration::from_secs(10);
-            }
             next_sync = now + Duration::from_millis(125);
         }
-        for socket in [&event, &general] {
+        for (socket_index, socket) in [event, general].into_iter().enumerate() {
             let until = Instant::now() + Duration::from_millis(1);
             for _ in 0..128 {
                 if Instant::now() >= until {
                     break;
                 }
-                let Ok((n, addr)) = socket.recv_from(&mut buf) else {
-                    break;
+                let (n, addr) = match socket.recv_from(&mut buf) {
+                    Ok(packet) => packet,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        let mut counters = network.lock().unwrap();
+                        counters.receive_errors += 1;
+                        counters.last_receive_error = Some(SocketFailure::new(
+                            if socket_index == 0 {
+                                "receive_event"
+                            } else {
+                                "receive_general"
+                            },
+                            &error,
+                        ));
+                        break;
+                    }
                 };
-                if !peers.contains(&addr.ip())
-                    || !valid_packet(&buf[..n])
-                    || ![319, 320].contains(&addr.port())
                 {
-                    continue;
+                    let mut counters = network.lock().unwrap();
+                    if socket_index == 0 {
+                        counters.event_received += 1;
+                    } else {
+                        counters.general_received += 1;
+                    }
+                    if !peers.contains(&addr.ip()) {
+                        counters.unknown_peer += 1;
+                        continue;
+                    }
                 }
-                let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
-                if length > n || length < 34 {
+                let local_received = clock.now_ns();
+                let received_at = Instant::now();
+                let mut states = state.lock().unwrap();
+                let s = states.get_mut(&addr.ip()).unwrap();
+                s.packets.raw_received += 1;
+                let rejection = if ![319, 320].contains(&addr.port()) {
+                    Some("source_port")
+                } else {
+                    packet_rejection(&buf[..n])
+                };
+                if let Some(reason) = rejection {
+                    s.reject(reason);
                     continue;
                 }
                 rx.fetch_add(1, Ordering::Relaxed);
                 let kind = buf[0] & 0xf;
+                s.packets.received_by_type[usize::from(kind)] += 1;
                 let request_seq = u16::from_be_bytes([buf[30], buf[31]]);
-                let local_received = clock.now_ns();
-                let mut states = state.lock().unwrap();
-                let s = states.get_mut(&addr.ip()).unwrap();
-                if s.follow {
-                    followed_packet(s, &buf[..length], local_received, now, clock_id);
+                if !s.active {
+                    continue;
                 }
-                if kind == 12 && length >= 44 {
-                    for grant in unicast_grants(&buf[..length], clock_id, request_seq) {
-                        if general.send_to(&grant, (addr.ip(), 320)).is_ok() {
+                if s.follow && [0, 8, 9, 11, 12].contains(&kind) {
+                    followed_packet(s, &buf[..n], local_received, received_at, clock_id);
+                }
+                if kind == 12 {
+                    for grant in unicast_grants(&buf[..n], clock_id, request_seq) {
+                        if send_ptp(general, &grant, (addr.ip(), 320).into(), s, "grant") {
                             s.grants += 1;
                         }
                     }
                 }
-                if !s.follow
-                    && (kind == 1 || kind == 2)
-                    && length >= if kind == 1 { 44 } else { 54 }
-                {
-                    if s.last_request == Some((kind, request_seq))
-                        && s.last
-                            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(3))
-                    {
-                        continue;
-                    }
-                    s.last_request = Some((kind, request_seq));
-                    let response_kind = if kind == 1 { 9 } else { 3 };
-                    let mut response = header(
-                        response_kind,
-                        54,
-                        clock_id,
-                        request_seq,
-                        if kind == 1 { 0x0408 } else { 0x0608 },
-                        -3,
-                    );
-                    timestamp(&mut response[34..44], local_received);
-                    response[44..54].copy_from_slice(&buf[20..30]);
-                    if kind == 1 {
-                        if general.send_to(&response, (addr.ip(), 320)).is_ok() {
-                            s.exchanged(now);
-                        }
-                    } else {
-                        let _ = event.send_to(&response, (addr.ip(), 319));
-                        let mut follow = header(10, 54, clock_id, request_seq, 0x0408, -3);
-                        timestamp(&mut follow[34..44], clock.now_ns());
-                        follow[44..54].copy_from_slice(&buf[20..30]);
-                        if general.send_to(&follow, (addr.ip(), 320)).is_ok() {
-                            s.exchanged(now);
-                        }
-                    }
-                }
+                respond_to_delay(
+                    event,
+                    general,
+                    addr.ip(),
+                    &buf[..n],
+                    local_received,
+                    clock,
+                    clock_id,
+                    s,
+                    received_at,
+                );
             }
         }
         thread::sleep(Duration::from_millis(2));
@@ -733,7 +1069,7 @@ mod tests {
             ..Default::default()
         };
         followed_packet(&mut s, &announce(8, 0, 0), 0, now, 7);
-        s.subscriptions[0] = Some(Subscription {
+        s.subscriptions[0].push_back(Subscription {
             sequence: 3,
             interval: -3,
             sent: now,
@@ -782,3 +1118,6 @@ mod tests {
         assert_eq!(announce(id, 0, 0).len(), 76);
     }
 }
+#[cfg(test)]
+#[path = "clock_tests.rs"]
+mod regression_tests;

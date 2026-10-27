@@ -212,6 +212,19 @@ impl ProbeOptions {
         Ok(())
     }
 }
+fn clock_status(timer: &PtpMaster, hosts: &[IpAddr], phase: &str) -> Json {
+    let members: Vec<_> = timer
+        .snapshots()
+        .into_iter()
+        .filter(|peer| hosts.contains(&peer.host))
+        .collect();
+    json!({
+        "event":"clock_status", "phase":phase, "members":members,
+        "network":timer.network_snapshot(), "mmcss":*timer.mmcss.lock().unwrap(),
+        "engine_path":std::env::current_exe().ok(),
+        "event_port":319, "general_port":320,
+    })
+}
 fn dictionary(items: Vec<(&str, Value)>) -> Value {
     Value::Dictionary(
         items
@@ -468,6 +481,7 @@ impl Member {
                 &member.uri,
                 &Value::Array(peers),
             )?;
+            ptp.as_ref().unwrap().activate(peer.host, local);
         }
         let requested_latency = peer.profile.latency_ms.unwrap_or(options.latency_ms);
         let latency = (requested_latency as u64 * rate as u64) / 1000;
@@ -906,25 +920,63 @@ fn run_stream(
         );
         return Ok(StreamEnd::Finished);
     }
+    let timing_peers: Vec<_> = members
+        .iter()
+        .filter(|member| member.selection.ptp)
+        .map(|member| member.peer.host)
+        .collect();
     if let Some(timer) = &ptp {
-        let until = Instant::now() + Duration::from_secs(8);
+        let started = Instant::now();
+        let mut next_status = started;
         while members
             .iter()
             .any(|m| m.selection.ptp && !timer.ready(m.peer.host))
         {
             cancel.check()?;
-            if Instant::now() >= until {
+            let now = Instant::now();
+            let timeout = timing_peers
+                .iter()
+                .map(|host| timer.startup_timeout(*host))
+                .max()
+                .unwrap_or(Duration::from_secs(8));
+            if now >= next_status || now.duration_since(started) >= timeout {
+                emit(clock_status(timer, &timing_peers, "starting"));
+                next_status = now + Duration::from_millis(500);
+            }
+            if now.duration_since(started) >= timeout {
+                let failed: Vec<_> = timer
+                    .snapshots()
+                    .into_iter()
+                    .filter(|peer| timing_peers.contains(&peer.host) && !peer.ready)
+                    .collect();
+                if failed.is_empty() {
+                    break; // The worker completed the exchange at the deadline.
+                }
+                let details = failed
+                    .iter()
+                    .map(|peer| format!("{} ({})", peer.host, peer.phase))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let hint = if failed.iter().any(|peer| peer.phase == "no_rx") {
+                    " Check UDP 319/320 access for airflash-engine.exe on this network."
+                } else {
+                    ""
+                };
                 return Err(Fault::new(
-                    "",
+                    failed
+                        .first()
+                        .map(|peer| peer.host.to_string())
+                        .unwrap_or_default(),
                     "clock",
                     "clock_not_ready",
                     true,
-                    "PTP exchange did not become ready",
+                    format!("PTP exchange did not become ready: {details}.{hint}"),
                 )
                 .into());
             }
             thread::sleep(Duration::from_millis(10));
         }
+        emit(clock_status(timer, &timing_peers, "ready"));
     }
     let clock_id = ptp.as_ref().map(|p| p.clock_id);
     let rate = options.sample_rate;
@@ -1080,8 +1132,18 @@ fn send_packets(
                     .iter()
                     .any(|m| m.selection.ptp && !timer.ready(m.peer.host))
                 {
+                    let hosts: Vec<_> = members
+                        .iter()
+                        .filter(|m| m.selection.ptp)
+                        .map(|m| m.peer.host)
+                        .collect();
+                    emit(clock_status(timer, &hosts, "lost"));
                     return Err(Fault::new(
-                        "",
+                        hosts
+                            .iter()
+                            .find(|host| !timer.ready(**host))
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
                         "clock",
                         "clock_lost",
                         true,
@@ -1171,18 +1233,12 @@ fn send_packets(
             }
             if now >= next_metrics {
                 if let Some(timer) = &ptp {
-                    let snapshots: Vec<_> = timer
-                        .snapshots()
-                        .into_iter()
-                        .filter(|s| {
-                            members
-                                .iter()
-                                .any(|m| m.selection.ptp && m.peer.host == s.host)
-                        })
+                    let hosts: Vec<_> = members
+                        .iter()
+                        .filter(|m| m.selection.ptp)
+                        .map(|m| m.peer.host)
                         .collect();
-                    emit(
-                        json!({"event":"clock_status","members":snapshots,"mmcss":*timer.mmcss.lock().unwrap()}),
-                    );
+                    emit(clock_status(timer, &hosts, "streaming"));
                 }
                 if let Some(source) = &live {
                     emit(json!({"event":"capture_metrics","metrics":source.metrics()}));
