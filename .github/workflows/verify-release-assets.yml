@@ -1,0 +1,82 @@
+name: Verify existing release assets
+run-name: Verify AirFlash ${{ inputs.version }} assets
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Existing reserved X.Y.Z version to validate without rebuilding'
+        type: string
+        required: true
+      exe_sha256:
+        description: 'Expected AirFlash.exe SHA-256'
+        type: string
+        required: true
+      msi_sha256:
+        description: 'Expected versioned MSI SHA-256'
+        type: string
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: airflash-release
+  cancel-in-progress: false
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2025
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_CHANNEL: stable
+      RELEASE_VERSION: ${{ inputs.version }}
+      EXPECTED_EXE_SHA256: ${{ inputs.exe_sha256 }}
+      EXPECTED_MSI_SHA256: ${{ inputs.msi_sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate reservation and fetch exact draft assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:RELEASE_VERSION
+          if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { throw 'Expected canonical X.Y.Z version.' }
+          foreach ($hash in @($env:EXPECTED_EXE_SHA256, $env:EXPECTED_MSI_SHA256)) {
+            if ($hash -notmatch '^[0-9a-fA-F]{64}$') { throw 'Expected SHA-256 digests.' }
+          }
+          $source = git rev-parse "refs/tags/reserved/$version"
+          if ($LASTEXITCODE -ne 0) { throw 'Missing version reservation.' }
+          $release = gh release view "v$version" --repo $env:GITHUB_REPOSITORY --json targetCommitish,isDraft | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $release.targetCommitish -ne $source -or -not $release.isDraft) { throw 'Expected a draft targeting the reserved source commit.' }
+          git checkout --detach $source
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot select reserved installer test sources.' }
+          New-Item -ItemType Directory -Path dist,artifacts/installer-test -Force | Out-Null
+          gh release download "v$version" --repo $env:GITHUB_REPOSITORY --pattern AirFlash.exe --pattern "AirFlash-$version.msi" --pattern SHA256SUMS.txt --dir dist
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot download draft assets.' }
+          $expected = @{ 'AirFlash.exe' = $env:EXPECTED_EXE_SHA256; "AirFlash-$version.msi" = $env:EXPECTED_MSI_SHA256 }
+          $lines = @(Get-Content -LiteralPath dist/SHA256SUMS.txt)
+          if ($lines.Count -ne 2) { throw 'Expected two checksums.' }
+          foreach ($name in $expected.Keys) {
+            $actual = (Get-FileHash -LiteralPath (Join-Path dist $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $expected[$name].ToLowerInvariant() -or $lines -notcontains "$actual  $name") { throw "Asset checksum mismatch: $name" }
+          }
+          $info = [Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path dist/AirFlash.exe))
+          if (('{0}.{1}.{2}' -f $info.FileMajorPart,$info.FileMinorPart,$info.FileBuildPart) -ne $version) { throw 'EXE version mismatch.' }
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $db = $installer.OpenDatabase((Resolve-Path "dist/AirFlash-$version.msi").Path, 0)
+          $view = $db.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = 'ProductVersion'")
+          $view.Execute(); $record = $view.Fetch()
+          if ($record.StringData(1) -ne $version) { throw 'MSI version mismatch.' }
+          $view.Close()
+          foreach ($item in @($record,$view,$db,$installer)) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($item) }
+          @{ version = $version; source = $source; exe_sha256 = $env:EXPECTED_EXE_SHA256; msi_sha256 = $env:EXPECTED_MSI_SHA256 } | ConvertTo-Json | Set-Content artifacts/installer-test/verified-assets.json
+      - name: Installer lifecycle in disposable runner
+        shell: pwsh
+        run: ./scripts/test-installer.ps1
+      - name: Preserve installer verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: airflash-existing-assets-${{ inputs.version }}-${{ github.run_id }}
+          path: artifacts/installer-test/
+          retention-days: 14

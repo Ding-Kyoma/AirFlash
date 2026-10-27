@@ -26,6 +26,19 @@ Installer lifecycle tests run only in the disposable GitHub runner. First releas
 
 Local agent instructions, worktree hooks and history backups are deliberately not distributed. They live only in the maintainer's Git common directory and ignored files.
 
+## Publishing an already built reserved version
+
+When explicitly publishing an existing successful local build, preserve its version,
+reservation and binary bytes. Update release notes, then create a draft release targeting
+the full commit from `reserved/X.Y.Z` and upload only `AirFlash.exe`, the versioned MSI,
+and `SHA256SUMS.txt`. Dispatch **Verify existing release assets** from `main`, supplying
+that version and the independently checked EXE/MSI SHA-256 digests. It verifies the
+draft's target, asset hashes and versions, then runs the reserved commit's installer
+lifecycle tests in a disposable Windows runner without rebuilding or reserving a version.
+Publish the draft only after that run succeeds and after rechecking the uploaded asset
+digests. Keep the published tag on the reserved source commit. Failed installation
+validation leaves the release in draft; any replacement build must use a new version.
+
 ## Single-NIC discovery preview
 
 Keep the feature on `codex/nic-discovery-preview` and open a PR against `main`; do not merge until users validate it. Dispatch the existing **Release** workflow with branch `codex/nic-discovery-preview` (`gh workflow run release.yml --ref codex/nic-discovery-preview`). The selected branch is the explicit preview channel; `main` remains the stable channel. The preview branch's workflow reserves the next numeric version (including any previous preview reservations), runs the same tests, builds and verifies the EXE/MSI, checks installer lifecycle in a disposable runner, and uploads an artifact named `airflash-preview-<version>-<sha>`. A failed attempt consumes its reserved version; fix the branch and dispatch again for a new one.

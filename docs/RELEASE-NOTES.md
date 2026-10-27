@@ -1,21 +1,19 @@
-# AirFlash 0.5.0
+# AirFlash 0.5.4
 
-Changes since AirFlash 0.4.0.
+Changes since AirFlash 0.5.0.
 
 ## Features
 
-- Capture a selected application and its child processes on Windows build 20348 or later.
-- Add optional silence standby: release the AirPlay session during silence and reconnect when audio returns.
-- Add experimental two-receiver software stereo, independent receiver volume, and per-receiver codec, sample rate, transport, and clock settings.
-- Add German UI and **Reset and restart** to clear settings and pairing.
+- Show the configured custom latency in the control panel and open receiver settings from the latency display.
+- Include per-receiver clock phases, packet counts, rejected-packet reasons, socket errors, and the audio engine path in PTP startup failure diagnostics.
 
 ## Bug Fixes
 
-- Retain active playback during passive receiver updates and apply short fades during audio recovery.
-- Preserve configuration backups during recovery and migration; report save failures instead of silently losing changes.
-- Normalize pairing PINs, bound pairing waits, clean up canceled sessions, and report credential and engine errors accurately.
-- Ensure newly packaged MSIs include the current executable instead of a cached build.
+- Start PTP timing after session peer setup and retry lost clock subscriptions within the startup window.
+- Answer peer-delay requests while following a receiver's clock.
+- Match out-of-order Sync and Follow_Up messages without overwriting pending pairs or refreshing expired timing samples.
+- Account for bounded advertised exchange intervals when waiting for clock readiness and detecting lost timing exchanges.
 
-Software stereo and mixed-brand playback still require hardware validation. Standby reconnection may miss opening audio.
+These PTP changes have automated and localhost simulation coverage. Confirmation on affected HomePod setups is still needed; network or firewall restrictions can still prevent timing traffic.
 
-Download **AirFlash-0.5.0.msi** or portable **AirFlash.exe**; verify with **SHA256SUMS.txt**. Binaries are unsigned.
+Download **AirFlash-0.5.4.msi** or portable **AirFlash.exe**; verify with **SHA256SUMS.txt**. Binaries are unsigned.
