@@ -9,7 +9,7 @@ use crate::{
 };
 use std::{
     io::Read,
-    net::{TcpListener, UdpSocket},
+    net::{SocketAddr, TcpListener, UdpSocket},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -477,12 +477,15 @@ fn cancelling_second_member_stream_setup_tears_down_both_without_sending_audio()
     left.worker.join().unwrap();
     right.worker.join().unwrap();
 }
-fn ptp_receiver(ip: &'static str, done: Arc<AtomicBool>) -> thread::JoinHandle<()> {
-    let ptp_event = UdpSocket::bind((ip, 319)).unwrap();
+fn ptp_receiver(
+    ptp_event: UdpSocket,
+    ptp_general: UdpSocket,
+    master_event: SocketAddr,
+    done: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
     ptp_event
         .set_read_timeout(Some(Duration::from_millis(10)))
         .unwrap();
-    let ptp_general = UdpSocket::bind((ip, 320)).unwrap();
     ptp_general
         .set_read_timeout(Some(Duration::from_millis(10)))
         .unwrap();
@@ -499,7 +502,7 @@ fn ptp_receiver(ip: &'static str, done: Arc<AtomicBool>) -> thread::JoinHandle<(
                 request[20..28].copy_from_slice(&42u64.to_be_bytes());
                 request[28..30].copy_from_slice(&1u16.to_be_bytes());
                 request[30..32].copy_from_slice(&seq.to_be_bytes());
-                ptp_event.send_to(&request, "127.0.0.1:319").unwrap();
+                ptp_event.send_to(&request, master_event).unwrap();
                 seq = seq.wrapping_add(1);
                 next = Instant::now() + Duration::from_millis(100);
             }
@@ -510,21 +513,35 @@ fn ptp_receiver(ip: &'static str, done: Arc<AtomicBool>) -> thread::JoinHandle<(
 }
 #[test]
 fn mixed_transports_share_sample_timeline_route_channels_and_close_together() {
-    let left = mock("127.0.0.2", true, true, Channel::Left, -80, true);
+    // PTP receiver ports are protocol-fixed, so each mock gets its own
+    // loopback address; the sender's sockets below take OS-chosen ports.
+    let (left_ip, left_event, left_general) = crate::test_net::ptp_receiver_sockets();
+    let (right_ip, right_event, right_general) = crate::test_net::ptp_receiver_sockets();
+    let left = mock(&left_ip.to_string(), true, true, Channel::Left, -80, true);
     // One clock domain: the realtime member uses the same PTP timing as the
     // buffered member; mixed transports are still allowed.
-    let mut right = mock("127.0.0.3", false, false, Channel::Right, 25, true);
+    let mut right = mock(
+        &right_ip.to_string(),
+        false,
+        false,
+        Channel::Right,
+        25,
+        true,
+    );
     right.peer.profile.timing = Timing::Ptp;
+    let master_event = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let master_general = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let master_event_addr = master_event.local_addr().unwrap();
     let done = left.stop.clone();
-    let left_ptp = ptp_receiver("127.0.0.2", done.clone());
-    let right_ptp = ptp_receiver("127.0.0.3", done);
+    let left_ptp = ptp_receiver(left_event, left_general, master_event_addr, done.clone());
+    let right_ptp = ptp_receiver(right_event, right_general, master_event_addr, done);
     let clock = crate::clock::Clock::new();
     let timer = crate::clock::PtpMaster::from_sockets(
         vec![left.peer.host, right.peer.host],
         vec![],
         clock.clone(),
-        UdpSocket::bind("127.0.0.1:319").unwrap(),
-        UdpSocket::bind("127.0.0.1:320").unwrap(),
+        master_event,
+        master_general,
     )
     .unwrap();
     let path = std::env::temp_dir().join(format!("airflash-mixed-{}.wav", uuid::Uuid::new_v4()));
