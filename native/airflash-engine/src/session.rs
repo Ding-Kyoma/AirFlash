@@ -362,11 +362,17 @@ impl Member {
                 .filter(|p| p.profile.follow_receiver_clock)
                 .map(|p| p.host)
                 .collect();
-            *ptp = Some(PtpMaster::start_with_followers(
-                peers,
-                followers,
-                clock.clone(),
-            )?);
+            let timer = PtpMaster::start_with_followers(peers, followers, clock.clone())?;
+            // BMCA runs here because it must: before RECORD there is no timeline and
+            // no audio, so yielding cannot be heard. A receiver that announces a
+            // lower priority1 becomes the master; silence or a worse dataset leaves
+            // us as master. This never re-runs mid-session.
+            let verdict = timer.negotiate(peer.host, BRMCA_NEGOTIATION_TIMEOUT);
+            if verdict.yield_master {
+                timer.yield_to(peer.host);
+            }
+            emit(json!({"event":"bmca_verdict","host":peer.host,"yielded":verdict.yield_master,"our_p1":verdict.our_p1,"remote_p1":verdict.remote_p1,"remote_is_master":verdict.remote_is_master,"probes":verdict.probes}));
+            *ptp = Some(timer);
         }
         let clock_id = selection.ptp.then(|| ptp.as_ref().unwrap().clock_id);
         emit(
@@ -1571,6 +1577,9 @@ pub fn requested_lead() -> i64 {
 pub fn reset_lead() {
     LEAD_MS.store(0, std::sync::atomic::Ordering::Release);
 }
+/// Time allowed for the receiver's Announce to arrive before SETUP. Three probes
+/// are sent 300 ms apart, so this only rides out one late reply.
+const BRMCA_NEGOTIATION_TIMEOUT: Duration = Duration::from_millis(1_200);
 /// A receiver that has accepted RTP this recently is still listening, even if the
 /// control channel is unhappy.
 const MEDIA_HEALTH_WINDOW: Duration = Duration::from_secs(2);

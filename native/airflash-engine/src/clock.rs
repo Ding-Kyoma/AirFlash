@@ -59,6 +59,39 @@ fn tlv(data: &[u8]) -> Vec<u8> {
     out.extend(data);
     out
 }
+/// How a SETUP-time BMCA negotiation ended. Reported to the desktop so a session
+/// that follows the receiver says why.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct Verdict {
+    /// True when the receiver outranks us and we become the slave.
+    pub yield_master: bool,
+    pub our_p1: u8,
+    pub remote_p1: Option<u8>,
+    pub remote_is_master: bool,
+    /// Announces we asked for before deciding (bounded).
+    pub probes: u8,
+}
+/// The single key WAC's "Mac-style negotiation" compares. It does not use
+/// `priority2` (absent from the binary) or `stepsRemoved` (parsed, never compared),
+/// so neither does this: a lower `priority1` from a peer that announces as master
+/// wins, and anything else — including silence — leaves us as master.
+pub fn decide(our_p1: u8, remote: Option<BmcaDataset>, probes: u8) -> Verdict {
+    let remote_is_master = remote.is_some_and(|dataset| dataset.grandmaster != 0);
+    let remote_p1 = remote.map(|dataset| dataset.priority1);
+    Verdict {
+        yield_master: remote_is_master && remote_p1.is_some_and(|p1| p1 < our_p1),
+        our_p1,
+        remote_p1,
+        remote_is_master,
+        probes,
+    }
+}
+/// Our advertised priority1. Deliberately lax: preferring the receiver's clock is
+/// the whole point of the negotiation, and a tie keeps us as master.
+pub const OUR_PRIORITY1: u8 = 96;
+/// Announces asked for before giving up and staying master.
+const BMCA_PROBE_ATTEMPTS: u8 = 3;
+const BMCA_PROBE_INTERVAL: Duration = Duration::from_millis(300);
 /// The grandfather dataset an Announce carries, in the fields BMCA compares first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BmcaDataset {
@@ -185,11 +218,12 @@ struct PeerState {
     exchange_interval: Option<Duration>,
     packets: PacketSnapshot,
     /// Grandfather dataset from the last Announce this peer sent, plus whether it
-    /// beats our own. Reported, not acted on: switching the clock role mid-session
-    /// would move every member's timeline, which is a bigger decision than a
-    /// comparison can make safely.
+    /// beats our own.
     bmca: Option<BmcaDataset>,
     better_master: bool,
+    /// Announces requested while deciding the clock role at SETUP.
+    bmca_probes: u8,
+    next_probe: Option<Instant>,
 }
 const SAMPLE_LIFETIME: Duration = Duration::from_secs(2);
 const MAX_PENDING_SYNCS: usize = 32;
@@ -807,8 +841,46 @@ impl PtpMaster {
             peer.next_subscription = None;
         }
     }
-    pub fn network_snapshot(&self) -> NetworkSnapshot {
-        self.network.lock().unwrap().clone()
+    /// Wait for the receiver's Announce and decide the clock role, once, before
+    /// RECORD. The worker sends the probes; this only waits, so no SETUP traffic
+    /// can be delayed by more than `timeout`.
+    pub fn negotiate(&self, host: IpAddr, timeout: Duration) -> Verdict {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let (remote, probes, following) = {
+                let states = self.states.lock().unwrap();
+                match states.get(&host) {
+                    Some(peer) => (peer.bmca, peer.bmca_probes, peer.follow),
+                    None => (None, 0, false),
+                }
+            };
+            // Already following (configured to): the receiver is the master by
+            // policy, so there is nothing to negotiate.
+            if following {
+                return decide(OUR_PRIORITY1, remote, probes);
+            }
+            if remote.is_some() || probes >= BMCA_PROBE_ATTEMPTS {
+                return decide(OUR_PRIORITY1, remote, probes);
+            }
+            if Instant::now() >= deadline {
+                return decide(OUR_PRIORITY1, remote, probes);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    /// Become the slave of `host`: stop announcing and follow its Sync/Follow_Up.
+    /// Only meaningful before RECORD, which is where `negotiate` is called.
+    pub fn yield_to(&self, host: IpAddr) {
+        let mut states = self.states.lock().unwrap();
+        if let Some(peer) = states.get_mut(&host) {
+            peer.follow = true;
+            peer.next_subscription = None;
+            // The Announce we already decoded stays as telemetry, but the packet
+            // counters start clean so readiness is measured on the followed path.
+            peer.packets = PacketSnapshot::default();
+        }
+    }
+    pub fn network_snapshot(&self) -> NetworkSnapshot {        self.network.lock().unwrap().clone()
     }
     pub fn startup_timeout(&self, host: IpAddr) -> Duration {
         self.states
@@ -1048,6 +1120,19 @@ fn ptp_loop(
                         s,
                         "announce",
                     );
+                }
+                // BMCA runs once, before RECORD: ask the receiver to announce so we
+                // can compare priority1, with a bounded number of probes. A peer
+                // that never announces simply leaves us as master.
+                if s.bmca.is_none()
+                    && s.bmca_probes < BMCA_PROBE_ATTEMPTS
+                    && s.next_probe.is_none_or(|at| now >= at)
+                {
+                    let probe = subscription(clock_id, None, seq, 11);
+                    if send_ptp(general, &probe, (*peer, 320).into(), s, "subscribe") {
+                        s.bmca_probes += 1;
+                        s.next_probe = Some(now + BMCA_PROBE_INTERVAL);
+                    }
                 }
             }
             if now.duration_since(last_announce) >= Duration::from_secs(1) {
@@ -1320,6 +1405,58 @@ mod tests {
         // A device with a better class and the same priority does.
         let appliance = BmcaDataset { clock_class: 20, ..own };
         assert_eq!(appliance.compare(&own), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn bmca_decides_on_priority1_alone_and_stays_master_otherwise() {
+        let ours = OUR_PRIORITY1;
+        // A receiver that announces a lower priority1 as master wins the role.
+        let better = BmcaDataset {
+            priority1: ours - 1,
+            grandmaster: 0x1234,
+            ..BmcaDataset::local(0)
+        };
+        let verdict = decide(ours, Some(better), 1);
+        assert!(verdict.yield_master);
+        assert_eq!(verdict.remote_p1, Some(ours - 1));
+        assert!(verdict.remote_is_master);
+
+        // A worse priority1 never wins, even with a better clock class: the
+        // negotiation WAC uses compares one key.
+        let worse = BmcaDataset {
+            priority1: ours + 1,
+            clock_class: 6,
+            grandmaster: 0x1234,
+            ..BmcaDataset::local(0)
+        };
+        assert!(!decide(ours, Some(worse), 1).yield_master);
+
+        // A tie keeps us as master, which is what makes the choice deterministic.
+        let tie = BmcaDataset {
+            grandmaster: 0x1234,
+            ..BmcaDataset::local(0)
+        };
+        assert!(!decide(ours, Some(tie), 1).yield_master);
+    }
+
+    #[test]
+    fn silence_or_an_empty_announce_leaves_us_as_master() {
+        // No answer at all: fail open, and record how many probes went unanswered.
+        let silent = decide(OUR_PRIORITY1, None, BMCA_PROBE_ATTEMPTS);
+        assert!(!silent.yield_master);
+        assert!(!silent.remote_is_master);
+        assert_eq!(silent.remote_p1, None);
+        assert_eq!(silent.probes, BMCA_PROBE_ATTEMPTS);
+
+        // An Announce with no grandmaster identity does not claim the role.
+        let anonymous = BmcaDataset {
+            priority1: 10,
+            grandmaster: 0,
+            ..BmcaDataset::local(0)
+        };
+        let verdict = decide(OUR_PRIORITY1, Some(anonymous), 1);
+        assert!(!verdict.yield_master);
+        assert!(!verdict.remote_is_master);
     }
 
     #[test]

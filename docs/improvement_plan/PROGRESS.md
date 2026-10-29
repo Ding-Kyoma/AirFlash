@@ -157,20 +157,30 @@ Wi-Fi AP 把音频放进 WMM 语音队列。QoS 服务被禁用或缺失时注�
 
 ---
 
-## P1-6 / P3-7 BMCA（只做到「看得见」，没有切换角色）
+## P1-6 / P3-7 BMCA（按 Q17/Q27 的答复实现 SETUP 期协商）
 
-`clock.rs`
+`clock.rs`、`session.rs`
 
-- 新增 `BmcaDataset`（`priority1`、`clockClass`、`accuracy`、`variance`、`priority2`、
-  grandmaster identity、`stepsRemoved`）与 `parse_announce()`，按 IEEE 1588 的比较
-  顺序 `compare()`；`BmcaDataset::local(clock_id)` 是我们自己广播的数据集
-  （priority1=96、class=248，故意偏松，让真正的 grandmaster 赢）。
-- 跟随方收到 Announce 时记录对端数据集，快照里新增
+- `BmcaDataset`（`priority1`、`clockClass`、`accuracy`、`variance`、`priority2`、
+  grandmaster identity、`stepsRemoved`）与 `parse_announce()`；快照里新增
   `bmca_priority1/clock_class/priority2/grandmaster/steps_removed` 与
-  `better_master`，`clock_status` 每秒带出，便于判断「谁该当 master」。
-- **没有做**主动让位（role switch）。原因：中途换时钟会移动所有成员的
-  timeline，`SETRATEANCHORTIME` 也要重发；在没有第二台 HomePod 可验证的情况下
-  自动切换的风险高于收益。数据已经全部采到，切换留给确认后的下一轮（Q27）。
+  `better_master`，`clock_status` 每秒带出。
+- **协商按 Q27 放在 SETUP 期**（`Member::connect` 里，`RECORD` 之前，此时没有
+  timeline、没有音频，所以让位听不见）：
+  1. PTP 启动后，仍在 master 角色时向接收端发 **Announce 订阅探测**，最多 3 次、
+     间隔 300 ms；`negotiate()` 最多等 1.2 s。
+  2. **判据只有 `priority1`** + `remote_is_master`（Announce 带有效 grandmaster
+     identity），与 WAC 的「Mac-style negotiation」一致；`priority2`
+     （WAC 二进制里 0 命中）和 `stepsRemoved`（解析但不参与决定）都不作为比较键。
+  3. 对端 `priority1` 更低 → `yield_to()`：转为 slave，之后只发 `Delay_Req`、
+     订阅 `Sync/Follow_Up`，不再发 Announce。否则（对端更差、相等、或压根不
+     应答）**保持自己是 master**（fail-open）。
+  4. 每次会话发一条 `bmca_verdict` 事件（`yielded`/`our_p1`/`remote_p1`/
+     `remote_is_master`/`probes`），便于从日志判断为什么当了 master。
+- **代价**：master 路径每次都多花最多约 1.2 s 启动探测（对端不应答时），与 WAC
+  的「probe → re-probing → giving up」同构。
+- **没验证的部分**：真实 HomePod 是否应答 Announce、以及它的 `priority1` 具体值，
+  都没有设备实测；如果它始终不应答，行为等价于改造前（保持 master）。
 
 ---
 
@@ -179,7 +189,6 @@ Wi-Fi AP 把音频放进 WMM 语音队列。QoS 服务被禁用或缺失时注�
 | 项目 | 现状 | 备注 |
 | --- | --- | --- |
 | P0-4 封面（`image/jpeg`） | 未做 | 尺寸/格式约束需要设备确认，见 Q10；失败也不能干扰音频 |
-| P1-6 / P3-7 BMCA 主动让位 | 半成品 | 数据集与比较已完成，切换角色未做，见 Q27 |
 | P3-2 TXT 预测（bit40 + `srcvers`） | 未开始 | 发现逻辑在 C#，需要确认 HomePod 上报的 TXT 字段 |
 | P3-3 抢占检测 | 未开始 | 依赖元数据事件 |
 | 采集进程退出后自动重开 | 部分 | 现在引擎结束会话、由桌面端重连；进程内自愈未做 |
@@ -199,7 +208,6 @@ Wi-Fi AP 把音频放进 WMM 语音队列。QoS 服务被禁用或缺失时注�
 | P0-2 自适应判据（Q22） | 一分钟 3 次时间线恢复 | 保留该策略层，但**必须叠加 p99 迟到**，否则对慢性迟到不敏感 |
 | P3-1 遥控命令（Q25） | 解析 RTSP 事件里的 `mrCommand` | 同时接受 `SendInput` + `VK_MEDIA_*` 的输入事件路径 |
 | P1-9 事件通道（Q16/Q25） | EOF 后整条会话重启 | 按答复的重建策略细化（不重建音频链路） |
-| P1-6/P3-7 BMCA（Q17，部分确认） | 数据集比较已做，未让位 | 等 Q27 的答复再定是否切换角色 |
 
 数值微调但方向已确认的：Q2（budget 用「该发多少包 vs 实际发了多少包」折算，
 不是裸毫秒常数）、Q7（漂移上限口径）、Q13（`DATA_DISCONTINUITY` 判伪的额外条件）、
