@@ -4,6 +4,7 @@
 //! What was missing (roadmap P0-5) is the ability to answer "why did this session
 //! stutter": lateness distribution, capture age, retransmission gaps, an explicit
 //! underflow classification, timeline recovery counters and a session epoch.
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     io::Write,
@@ -128,6 +129,124 @@ pub enum UnderflowCause {
     IdleKeepalive,
 }
 
+/// Why the timeline was reset.
+///
+/// The reference implementation logs `[TIMELINE] reset reason=<reason>` and
+/// exposes the last one as the `last_timeline_reset_reason` diagnostic field; the
+/// nine names below are its complete enum. They are also the CSV column suffixes,
+/// so renaming a variant is a format change.
+///
+/// Only [`TimelineResetReason::ConfirmedTransportFailure`] is a drift signal.
+/// `track_change`, `user_seek`, `flush` and `silence_resume` are neutral or
+/// user-initiated, `latency_change` is our own lead adjustment, and
+/// `receiver_rejected_flush` / `session_restart` are their own diagnoses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimelineResetReason {
+    /// A fresh playback timeline was established for a new start, not a repair.
+    Start,
+    TrackChange,
+    UserSeek,
+    ReceiverRejectedFlush,
+    SessionRestart,
+    /// The only reliable drift signal: delivery was confirmed to have failed.
+    ConfirmedTransportFailure,
+    SilenceResume,
+    /// Our own adaptive lead adjustment; must stay distinguishable from a fault.
+    LatencyChange,
+    Flush,
+}
+
+impl TimelineResetReason {
+    /// Declaration order, which is also the CSV column order.
+    pub const ALL: [Self; 9] = [
+        Self::Start,
+        Self::TrackChange,
+        Self::UserSeek,
+        Self::ReceiverRejectedFlush,
+        Self::SessionRestart,
+        Self::ConfirmedTransportFailure,
+        Self::SilenceResume,
+        Self::LatencyChange,
+        Self::Flush,
+    ];
+
+    /// The wire/CSV label, identical to the reference enum's spelling.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::TrackChange => "track_change",
+            Self::UserSeek => "user_seek",
+            Self::ReceiverRejectedFlush => "receiver_rejected_flush",
+            Self::SessionRestart => "session_restart",
+            Self::ConfirmedTransportFailure => "confirmed_transport_failure",
+            Self::SilenceResume => "silence_resume",
+            Self::LatencyChange => "latency_change",
+            Self::Flush => "flush",
+        }
+    }
+}
+
+/// Timeline resets by cause. There is deliberately no bare total: a single number
+/// would make a user pressing "next" or our own lead change look like drift.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TimelineResets {
+    pub start: u32,
+    pub track_change: u32,
+    pub user_seek: u32,
+    pub receiver_rejected_flush: u32,
+    pub session_restart: u32,
+    pub confirmed_transport_failure: u32,
+    pub silence_resume: u32,
+    pub latency_change: u32,
+    pub flush: u32,
+}
+
+impl TimelineResets {
+    pub fn record(&mut self, reason: TimelineResetReason) {
+        let slot = match reason {
+            TimelineResetReason::Start => &mut self.start,
+            TimelineResetReason::TrackChange => &mut self.track_change,
+            TimelineResetReason::UserSeek => &mut self.user_seek,
+            TimelineResetReason::ReceiverRejectedFlush => &mut self.receiver_rejected_flush,
+            TimelineResetReason::SessionRestart => &mut self.session_restart,
+            TimelineResetReason::ConfirmedTransportFailure => {
+                &mut self.confirmed_transport_failure
+            }
+            TimelineResetReason::SilenceResume => &mut self.silence_resume,
+            TimelineResetReason::LatencyChange => &mut self.latency_change,
+            TimelineResetReason::Flush => &mut self.flush,
+        };
+        *slot = slot.saturating_add(1);
+    }
+
+    pub const fn field(&self, reason: TimelineResetReason) -> u32 {
+        match reason {
+            TimelineResetReason::Start => self.start,
+            TimelineResetReason::TrackChange => self.track_change,
+            TimelineResetReason::UserSeek => self.user_seek,
+            TimelineResetReason::ReceiverRejectedFlush => self.receiver_rejected_flush,
+            TimelineResetReason::SessionRestart => self.session_restart,
+            TimelineResetReason::ConfirmedTransportFailure => self.confirmed_transport_failure,
+            TimelineResetReason::SilenceResume => self.silence_resume,
+            TimelineResetReason::LatencyChange => self.latency_change,
+            TimelineResetReason::Flush => self.flush,
+        }
+    }
+
+    pub const fn total(&self) -> u32 {
+        self.start
+            + self.track_change
+            + self.user_seek
+            + self.receiver_rejected_flush
+            + self.session_restart
+            + self.confirmed_transport_failure
+            + self.silence_resume
+            + self.latency_change
+            + self.flush
+    }
+}
+
 /// One counter block per streaming session. Owned by the send loop; readers build
 /// a JSON snapshot through [`SessionTelemetry::snapshot`].
 #[derive(Default)]
@@ -165,6 +284,10 @@ pub struct SessionTelemetry {
     pub servo_filtered_ms: f64,
     pub servo_drift_ppb: f64,
     pub lead_extra_ms: f64,
+    /// Timeline resets by cause; never collapsed into a single count.
+    pub timeline_resets: TimelineResets,
+    /// The most recent cause, `None` when the timeline was never reset.
+    pub last_timeline_reset_reason: Option<TimelineResetReason>,
     pub lateness: Histogram,
     pub capture_age: Histogram,
     pub rtx_gap: Histogram,
@@ -191,6 +314,12 @@ impl SessionTelemetry {
             UnderflowCause::IdleKeepalive => self.underruns_idle += 1,
         }
     }
+    /// Record one timeline reset. Callers pass the cause explicitly; a site that
+    /// does not fit one of the nine reasons must not stay untagged.
+    pub fn record_timeline_reset(&mut self, reason: TimelineResetReason) {
+        self.timeline_resets.record(reason);
+        self.last_timeline_reset_reason = Some(reason);
+    }
     pub fn snapshot(&self) -> Value {
         json!({
             "session_epoch": self.session_epoch,
@@ -208,6 +337,10 @@ impl SessionTelemetry {
             "capture_glitches": self.capture_glitches,
             "events_dropped": self.events_dropped,
             "lead_extra_ms": round3(self.lead_extra_ms),
+            "timeline_resets": self.timeline_resets,
+            "last_timeline_reset_reason": self
+                .last_timeline_reset_reason
+                .map_or("none", TimelineResetReason::name),
             "servo": {
                 "engagements": self.servo_engagements,
                 "releases": self.servo_releases,
@@ -230,7 +363,12 @@ pub fn next_session_epoch() -> u64 {
 
 /// The roadmap §12.3 field list, in order. The CSV header is generated from this
 /// array, so changing the order is a format change and must be deliberate.
-pub const SUMMARY_COLUMNS: [&str; 18] = [
+///
+/// `rebuild_count` is gone: it was a bare count that mixed user track changes and
+/// our own lead adjustments into what looked like drift. The nine
+/// `timeline_resets_<reason>` columns are flat so a spreadsheet `SUM` keeps per
+/// cause, and `last_timeline_reset_reason` records the most recent one.
+pub const SUMMARY_COLUMNS: [&str; 27] = [
     "session_id",
     "topology",
     "codec",
@@ -248,8 +386,20 @@ pub const SUMMARY_COLUMNS: [&str; 18] = [
     "p99_lateness_ms",
     "max_lateness_ms",
     "duration_s",
-    "rebuild_count",
+    "timeline_resets_start",
+    "timeline_resets_track_change",
+    "timeline_resets_user_seek",
+    "timeline_resets_receiver_rejected_flush",
+    "timeline_resets_session_restart",
+    "timeline_resets_confirmed_transport_failure",
+    "timeline_resets_silence_resume",
+    "timeline_resets_latency_change",
+    "timeline_resets_flush",
+    "last_timeline_reset_reason",
 ];
+
+/// The CSV/JSON label for "no timeline reset in this session".
+pub const NO_TIMELINE_RESET: &str = "none";
 
 /// One finished streaming session, in the shape roadmap §12.3 asks for.
 ///
@@ -275,9 +425,18 @@ pub struct SessionSummary {
     pub p99_lateness_ms: f64,
     pub max_lateness_ms: f64,
     pub duration_s: f64,
-    pub rebuild_count: u64,
+    pub timeline_resets: TimelineResets,
+    /// One of the nine reason labels, or [`NO_TIMELINE_RESET`].
+    pub last_timeline_reset_reason: &'static str,
 }
 impl SessionSummary {
+    fn last_reason(&self) -> &'static str {
+        if self.last_timeline_reset_reason.is_empty() {
+            NO_TIMELINE_RESET
+        } else {
+            self.last_timeline_reset_reason
+        }
+    }
     /// The additive IPC event. Consumers of `transport_metrics`/`capture_metrics`
     /// never see a changed shape; this is a new `event` value they can ignore.
     pub fn event(&self) -> Value {
@@ -300,7 +459,8 @@ impl SessionSummary {
             "p99_lateness_ms": self.p99_lateness_ms,
             "max_lateness_ms": self.max_lateness_ms,
             "duration_s": self.duration_s,
-            "rebuild_count": self.rebuild_count,
+            "timeline_resets": self.timeline_resets,
+            "last_timeline_reset_reason": self.last_reason(),
         })
     }
     pub fn csv_header() -> String {
@@ -308,8 +468,13 @@ impl SessionSummary {
     }
     /// One CSV row. Only the opaque `session_id` can ever need quoting; every
     /// other field is a number or a fixed enum label.
+    ///
+    /// The nine reset counters are flat columns rather than one object because a
+    /// spreadsheet can then `SUM` a single cause across sessions without parsing
+    /// JSON. `TimelineResetReason::ALL` and [`SUMMARY_COLUMNS`] must stay in the
+    /// same declared order; the header test locks that down.
     pub fn csv_row(&self) -> String {
-        [
+        let mut fields = vec![
             csv_field(&self.session_id),
             csv_field(self.topology),
             csv_field(self.codec),
@@ -327,9 +492,12 @@ impl SessionSummary {
             format!("{:.3}", self.p99_lateness_ms),
             format!("{:.3}", self.max_lateness_ms),
             format!("{:.3}", self.duration_s),
-            self.rebuild_count.to_string(),
-        ]
-        .join(",")
+        ];
+        for reason in TimelineResetReason::ALL {
+            fields.push(self.timeline_resets.field(reason).to_string());
+        }
+        fields.push(csv_field(self.last_reason()));
+        fields.join(",")
     }
 }
 
@@ -589,6 +757,10 @@ mod tests {
     }
 
     fn known_summary() -> SessionSummary {
+        let mut timeline_resets = TimelineResets::default();
+        timeline_resets.record(TimelineResetReason::ConfirmedTransportFailure);
+        timeline_resets.record(TimelineResetReason::ConfirmedTransportFailure);
+        timeline_resets.record(TimelineResetReason::LatencyChange);
         SessionSummary {
             session_id: "session-42".into(),
             topology: "software_stereo",
@@ -607,8 +779,116 @@ mod tests {
             p99_lateness_ms: 9.876,
             max_lateness_ms: 12.345,
             duration_s: 30.5,
-            rebuild_count: 0,
+            timeline_resets,
+            last_timeline_reset_reason: TimelineResetReason::LatencyChange.name(),
         }
+    }
+
+    #[test]
+    fn each_reason_lands_in_its_own_bucket_and_no_bucket_leaks() {
+        for reason in TimelineResetReason::ALL {
+            let mut resets = TimelineResets::default();
+            resets.record(reason);
+            assert_eq!(resets.field(reason), 1, "{reason:?} must count once");
+            assert_eq!(resets.total(), 1, "{reason:?} must not count twice");
+            for other in TimelineResetReason::ALL {
+                if other != reason {
+                    assert_eq!(
+                        resets.field(other),
+                        0,
+                        "{reason:?} leaked into {other:?}"
+                    );
+                }
+            }
+            assert_eq!(resets.field(reason), 1);
+        }
+        // Every reason once: nine, and each bucket holds exactly one.
+        let mut all = TimelineResets::default();
+        for reason in TimelineResetReason::ALL {
+            all.record(reason);
+        }
+        assert_eq!(all.total(), 9);
+        for reason in TimelineResetReason::ALL {
+            assert_eq!(all.field(reason), 1, "{reason:?}");
+        }
+        // A repeated cause only grows its own bucket.
+        all.record(TimelineResetReason::LatencyChange);
+        assert_eq!(all.latency_change, 2);
+        assert_eq!(all.total(), 10);
+    }
+
+    #[test]
+    fn latency_change_and_silence_resume_are_not_transport_failures() {
+        let mut resets = TimelineResets::default();
+        resets.record(TimelineResetReason::LatencyChange);
+        resets.record(TimelineResetReason::SilenceResume);
+        resets.record(TimelineResetReason::LatencyChange);
+        assert_eq!(resets.latency_change, 2);
+        assert_eq!(resets.silence_resume, 1);
+        assert_eq!(
+            resets.confirmed_transport_failure, 0,
+            "our own lead change and a silence resume must never look like drift"
+        );
+        resets.record(TimelineResetReason::ConfirmedTransportFailure);
+        assert_eq!(resets.confirmed_transport_failure, 1);
+        assert_eq!(resets.latency_change, 2);
+        assert_eq!(resets.silence_resume, 1);
+
+        let mut telemetry = SessionTelemetry::new();
+        telemetry.record_timeline_reset(TimelineResetReason::SilenceResume);
+        telemetry.record_timeline_reset(TimelineResetReason::LatencyChange);
+        assert_eq!(
+            telemetry.last_timeline_reset_reason,
+            Some(TimelineResetReason::LatencyChange)
+        );
+        assert_eq!(
+            telemetry.snapshot()["last_timeline_reset_reason"],
+            json!("latency_change")
+        );
+        assert_eq!(
+            telemetry.snapshot()["timeline_resets"]["confirmed_transport_failure"],
+            json!(0)
+        );
+    }
+
+    #[test]
+    fn a_session_without_resets_is_all_zero_and_still_emits_one_summary() {
+        let summary = SessionSummary {
+            session_id: "session-clean".into(),
+            ..Default::default()
+        };
+        assert_eq!(summary.timeline_resets, TimelineResets::default());
+        assert_eq!(summary.timeline_resets.total(), 0);
+        assert_eq!(summary.last_reason(), NO_TIMELINE_RESET);
+        let row = summary.csv_row();
+        let fields: Vec<_> = row.split(',').collect();
+        assert_eq!(fields.len(), SUMMARY_COLUMNS.len());
+        for (column, value) in SUMMARY_COLUMNS.iter().zip(&fields) {
+            if column.starts_with("timeline_resets_") {
+                assert_eq!(*value, "0", "{column} must be zero");
+            }
+        }
+        assert_eq!(fields[SUMMARY_COLUMNS.len() - 1], NO_TIMELINE_RESET);
+
+        let root = std::env::temp_dir().join(format!("airflash-clean-{}", uuid::Uuid::new_v4()));
+        let path = root.join("session-summary.csv");
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        crate::session::emit_session_summary(&summary, Some(path.as_path()), &|event| {
+            sink.lock().unwrap().push(event)
+        });
+        let emitted = events.lock().unwrap();
+        assert_eq!(emitted.len(), 1, "a clean session emits exactly one summary");
+        assert_eq!(emitted[0]["event"], json!("session_summary"));
+        assert_eq!(
+            emitted[0]["last_timeline_reset_reason"],
+            json!(NO_TIMELINE_RESET)
+        );
+        assert!(emitted[0].get("rebuild_count").is_none());
+        drop(emitted);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 2, "header plus one clean row");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -616,11 +896,29 @@ mod tests {
         let summary = known_summary();
         let event = summary.event();
         assert_eq!(event["event"], json!("session_summary"));
+        // The plain columns are top-level; the nine reset buckets are one nested
+        // object in JSON (the CSV keeps them flat for aggregation).
         for column in SUMMARY_COLUMNS {
+            if column.starts_with("timeline_resets_") || column == "last_timeline_reset_reason" {
+                continue;
+            }
             assert!(event.get(column).is_some(), "missing field {column}");
         }
-        // Only the event discriminator is extra; the declared list is complete.
-        assert_eq!(event.as_object().unwrap().len(), SUMMARY_COLUMNS.len() + 1);
+        assert!(event.get("rebuild_count").is_none());
+        let resets = event["timeline_resets"].as_object().unwrap();
+        assert_eq!(resets.len(), TimelineResetReason::ALL.len());
+        for reason in TimelineResetReason::ALL {
+            assert_eq!(
+                resets[reason.name()],
+                json!(summary.timeline_resets.field(reason)),
+                "missing reset bucket {}",
+                reason.name()
+            );
+        }
+        assert_eq!(
+            event["last_timeline_reset_reason"],
+            json!(TimelineResetReason::LatencyChange.name())
+        );
         // Redaction never changes the shape of an already identity-free record.
         assert_eq!(redact(&event), event);
     }
@@ -629,6 +927,18 @@ mod tests {
     fn summary_csv_uses_the_declared_column_order_and_hides_identities() {
         let summary = known_summary();
         assert_eq!(SessionSummary::csv_header(), SUMMARY_COLUMNS.join(","));
+        // The nine reason columns are present, in the enum's declared order, and
+        // the retired bare count is gone.
+        let header: Vec<_> = SessionSummary::csv_header().split(',').map(str::to_owned).collect();
+        let expected: Vec<_> = TimelineResetReason::ALL
+            .iter()
+            .map(|reason| format!("timeline_resets_{}", reason.name()))
+            .collect();
+        let start = SUMMARY_COLUMNS.len() - 1 - expected.len();
+        assert_eq!(&header[start..start + expected.len()], expected.as_slice());
+        assert_eq!(header[SUMMARY_COLUMNS.len() - 1], "last_timeline_reset_reason");
+        assert!(!header.iter().any(|column| column == "rebuild_count"));
+
         let row = summary.csv_row();
         let fields: Vec<_> = row.split(',').collect();
         assert_eq!(fields.len(), SUMMARY_COLUMNS.len(), "row: {row}");
@@ -651,7 +961,18 @@ mod tests {
                 "p99_lateness_ms" => assert_eq!(fields[index], "9.876"),
                 "max_lateness_ms" => assert_eq!(fields[index], "12.345"),
                 "duration_s" => assert_eq!(fields[index], "30.500"),
-                "rebuild_count" => assert_eq!(fields[index], "0"),
+                "timeline_resets_start" => assert_eq!(fields[index], "0"),
+                "timeline_resets_track_change" => assert_eq!(fields[index], "0"),
+                "timeline_resets_user_seek" => assert_eq!(fields[index], "0"),
+                "timeline_resets_receiver_rejected_flush" => assert_eq!(fields[index], "0"),
+                "timeline_resets_session_restart" => assert_eq!(fields[index], "0"),
+                "timeline_resets_confirmed_transport_failure" => {
+                    assert_eq!(fields[index], "2")
+                }
+                "timeline_resets_silence_resume" => assert_eq!(fields[index], "0"),
+                "timeline_resets_latency_change" => assert_eq!(fields[index], "1"),
+                "timeline_resets_flush" => assert_eq!(fields[index], "0"),
+                "last_timeline_reset_reason" => assert_eq!(fields[index], "latency_change"),
                 other => panic!("unexpected column {other}"),
             }
         }

@@ -6,6 +6,7 @@ use crate::{
     preemption,
     rtp::{self, FRAMES, PCM_BYTES, Packetizer},
     rtsp::{Cancellation, Connection},
+    telemetry::TimelineResetReason,
     transport::{
         EventWorker, Fault, FeedbackTiming, FeedbackWorker, Health, MediaSchedule, MediaTransport,
     },
@@ -1080,6 +1081,9 @@ fn run_session(
         None,
         &standby,
         &mut takeovers,
+        // A finite qualification is a single fresh timeline: the baseline of its
+        // own row, not a reset.
+        None,
         &emit,
         clocks,
     ) {
@@ -1134,6 +1138,10 @@ fn run_live(
     // Persist across reclaims: "taken over N times in a row" is a property of
     // this live playback run, not of one Member/connection.
     let mut takeovers = preemption::TakeoverCounters::default();
+    // Q40: why the *next* attempt builds a fresh timeline. `None` for the first
+    // attempt — that schedule is the baseline of the row, so a normal stop stays
+    // all-zero. Every resumed attempt must name its cause here.
+    let mut reset_before: Option<TimelineResetReason> = None;
     while !cancel.is_cancelled() {
         if let Some(live) = &source {
             emit_capture_warnings(live, &emit);
@@ -1141,6 +1149,10 @@ fn run_live(
         if source.as_ref().is_some_and(crate::live::Loopback::ended) {
             source = None;
             paused = None;
+            // The capture source ended outside a transport end; the next loop
+            // reopens it and starts playback again. This is a fresh start, not a
+            // reconnect after a fault.
+            reset_before = Some(TimelineResetReason::Start);
         }
         if source.is_none() && options.source == "loopback" {
             // The capture thread repairs an endpoint in place. Reaching this
@@ -1235,6 +1247,7 @@ fn run_live(
             Some(live),
             &standby,
             &mut takeovers,
+            reset_before,
             &emit,
             (Clock::new(), None),
         ) {
@@ -1246,6 +1259,9 @@ fn run_live(
                 // consecutive counter above limits how often this can happen;
                 // there is no inner retry loop here.
                 live.discard_stale();
+                // The next attempt is a reconnect after the receiver was taken
+                // over: the engine-side timeline restarts with the new session.
+                reset_before = Some(TimelineResetReason::SessionRestart);
                 continue;
             }
             Err(error) => return Err(error),
@@ -1255,10 +1271,18 @@ fn run_live(
             StreamEnd::SourceEnded => {
                 source = None;
                 paused = None;
+                // A new capture source starts a new playback timeline. There is
+                // no "source restart" reason in the nine; `start` is the closest
+                // fit and is flagged in QUESTIONS Q42.
+                reset_before = Some(TimelineResetReason::Start);
             }
             StreamEnd::Silence(at) => {
                 paused = Some(at);
                 emit(json!({"event":"standby","reason":"silence"}));
+                // Standby released the receiver, so resuming rebuilds the whole
+                // timeline: this is exactly the `silence_resume` bucket and must
+                // stay distinguishable from a transport failure.
+                reset_before = Some(TimelineResetReason::SilenceResume);
             }
         }
     }
@@ -1276,6 +1300,7 @@ fn run_stream(
     provided: Option<&crate::live::Loopback>,
     standby: &crate::standby::Control,
     takeovers: &mut preemption::TakeoverCounters,
+    reset_before: Option<TimelineResetReason>,
     emit: &impl Fn(Json),
     clocks: (Clock, Option<PtpMaster>),
 ) -> Result<StreamEnd> {
@@ -1490,6 +1515,7 @@ fn run_stream(
         ptp.as_ref(),
         takeovers,
         &samples,
+        reset_before,
         emit,
     );
     #[cfg(windows)]
@@ -1516,6 +1542,7 @@ fn send_packets(
     ptp: Option<&PtpMaster>,
     takeovers: &mut preemption::TakeoverCounters,
     samples: &[i16],
+    reset_before: Option<TimelineResetReason>,
     emit: &impl Fn(Json),
 ) -> Result<StreamEnd> {
     let rate = options.sample_rate;
@@ -1559,9 +1586,15 @@ fn send_packets(
         }
     }
     let duration = Duration::from_millis(options.duration_ms as u64);
+    // Q40: creating the schedule is the row's baseline, not a reset, so a normal
+    // stop stays all-zero. A resumed attempt is created *because* something reset
+    // the previous timeline; the caller passes that cause explicitly.
     let mut schedule = MediaSchedule::new(start, rate);
     let mut packets = 0u64;
     let mut telemetry = crate::telemetry::SessionTelemetry::new();
+    if let Some(reason) = reset_before {
+        telemetry.record_timeline_reset(reason);
+    }
     let mut capture_baseline: Option<crate::live::Metrics> = None;
     for member in members.iter_mut() {
         member.start_feedback(start)?;
@@ -1734,6 +1767,11 @@ fn send_packets(
                 if applied != 0 {
                     applied_lead += applied;
                     telemetry.lead_extra_ms = applied_lead as f64;
+                    // The timeline anchor moved because *we* asked for a different
+                    // playout lead, not because delivery failed. Keeping this in
+                    // its own bucket is what stops the adaptive ladder from
+                    // masquerading as drift (Q40).
+                    telemetry.record_timeline_reset(TimelineResetReason::LatencyChange);
                     emit(json!({"event":"lead_changed","channel":"scheduler","host":null,"requested_ms":wanted,"applied_ms":applied_lead,"ceiling_ms":ceiling,"shift_ms":round3(schedule.shift.as_secs_f64() * 1000.0)}));
                 }
             }
@@ -1752,6 +1790,9 @@ fn send_packets(
                 source.report_lateness(late.as_secs_f64() * 1000.0);
             }
             if options.duration_ms > 0 {
+                // Finite qualification: `recover` only skips slots so seq/rtptime
+                // stay linear. Skipped slots are not a reset (the timeline keeps
+                // its origin), so nothing is recorded here.
                 schedule.recover(now, false)?;
             } else if recovery_left == 0 {
                 let earliest = members
@@ -1766,6 +1807,11 @@ fn send_packets(
                 match schedule.late_action(now, earliest) {
                     crate::transport::LateAction::OnTime => {}
                     crate::transport::LateAction::Silence(fill) => {
+                        // Filling the scheduled slots with silence keeps the
+                        // timeline intact: seq and rtptime are still linear, so
+                        // this is *not* a reset and must not be counted as
+                        // `silence_resume` (that bucket is the standby pause →
+                        // resume path, which builds a brand-new timeline).
                         recovery_left = fill;
                         schedule.recoveries += 1;
                         telemetry.gap_filled += fill;
@@ -1783,6 +1829,13 @@ fn send_packets(
                         // anchor moves, one frame of phase margin ahead of now.
                         let Some(shift) = schedule.reanchor(now) else {
                             telemetry.expired += 1;
+                            // Delivery was late beyond both the silence window and
+                            // the re-anchor budget; a fresh session is the only
+                            // answer, which is a confirmed transport failure rather
+                            // than a local adjustment.
+                            telemetry.record_timeline_reset(
+                                TimelineResetReason::ConfirmedTransportFailure,
+                            );
                             emit(
                                 json!({"event":"warning","code":"timeline_reanchor_exhausted","channel":"scheduler","host":null,"recovered":false,"message":"Sender stalled past the re-anchor budget; a fresh group timeline is required"}),
                             );
@@ -1798,6 +1851,16 @@ fn send_packets(
                         telemetry.reanchored = schedule.reanchored;
                         telemetry.reanchor_shift_us = schedule.reanchor_shift_us;
                         if !shift.is_zero() {
+                            // Q40 mapping: AirFlash has no "sender stall" reason of
+                            // its own. The deadline was missed beyond silence
+                            // coverage, so delivery of the timeline has factually
+                            // failed; `confirmed_transport_failure` is the closest
+                            // of the nine and the only drift-signalling bucket.
+                            // Flagged in QUESTIONS Q42. A no-op re-anchor
+                            // (`shift == 0`) moved nothing and is not counted.
+                            telemetry.record_timeline_reset(
+                                TimelineResetReason::ConfirmedTransportFailure,
+                            );
                             recovery_left = 0;
                             if let Some(source) = &live {
                                 // Everything queued is older than the new deadline.
@@ -1811,7 +1874,10 @@ fn send_packets(
                 }
             }
             // A deliberate lead change (adaptive latency ladder) keeps its value;
-            // only an automatic re-anchor surplus is slewed back.
+            // only an automatic re-anchor surplus is slewed back. Relaxing is the
+            // unwind of an already-counted re-anchor, not a new timeline reset:
+            // counting it would turn one stall into a stream of `latency_change`
+            // events that nobody caused.
             if applied_lead == 0 {
                 schedule.relax(now, late);
             }
@@ -1992,6 +2058,10 @@ fn send_packets(
                         thread::sleep(Duration::from_millis(2));
                     }
                 }
+                // A normal stop sends one faded final packet and drains it. That
+                // is a deliberate end of the timeline, not a `flush` reset: the
+                // receiver is never asked to discard queued audio, so a normal
+                // stop keeps every reset bucket at zero.
                 emit(json!({"event":"timeline_drained","faded":sent}));
             }
             Ok(())
@@ -2105,18 +2175,19 @@ fn session_summary(
         // samples, without exposing histogram internals.
         max_lateness_ms: round3(telemetry.lateness.percentile_ms(1.0)),
         duration_s: round3(duration.as_secs_f64()),
-        // No counter counts audio-session rebuilds: this record *is* the session,
-        // and the reconnect happens outside it. `expired` is the engine's only
-        // in-session counter for "this timeline needed a fresh session", which is
-        // the drift symptom the report correlates with `rebuild_count`.
-        rebuild_count: telemetry.expired,
+        // Q40: the record says *why* the timeline was reset, never how many times
+        // in total. `confirmed_transport_failure` is the only drift signal.
+        timeline_resets: telemetry.timeline_resets,
+        last_timeline_reset_reason: telemetry
+            .last_timeline_reset_reason
+            .map_or(crate::telemetry::NO_TIMELINE_RESET, |reason| reason.name()),
     }
 }
 
 /// Best-effort end-of-session record. The IPC event is always emitted; the CSV
 /// append is attempted only when `path` is given, and every I/O error is logged
 /// to stderr (the desktop drains engine stderr into its log) and swallowed.
-fn emit_session_summary(
+pub(crate) fn emit_session_summary(
     summary: &crate::telemetry::SessionSummary,
     path: Option<&std::path::Path>,
     emit: &impl Fn(Json),
@@ -3379,6 +3450,7 @@ mod tests {
                     None,
                     &mut takeovers,
                     &[],
+                    None,
                     &|_| {},
                 )
             })
@@ -3460,6 +3532,7 @@ mod tests {
             None,
             &mut takeovers,
             &[],
+            None,
             &|event| sink.lock().unwrap().push(event),
         );
         assert!(matches!(&outcome, Ok(StreamEnd::Finished)), "{outcome:?}");
@@ -3470,8 +3543,22 @@ mod tests {
             "a normal stop must emit exactly one summary: {summaries:?}"
         );
         for column in crate::telemetry::SUMMARY_COLUMNS {
+            if column.starts_with("timeline_resets_") {
+                continue;
+            }
             assert!(summaries[0].get(column).is_some(), "missing {column}");
         }
+        // A normal stop has no reset: every bucket is zero and the last reason is
+        // the sentinel, not an empty string and not a fabricated `start`.
+        let resets = summaries[0]["timeline_resets"].as_object().unwrap();
+        for reason in crate::telemetry::TimelineResetReason::ALL {
+            assert_eq!(resets[reason.name()], json!(0), "{}", reason.name());
+        }
+        assert_eq!(
+            summaries[0]["last_timeline_reset_reason"],
+            crate::telemetry::NO_TIMELINE_RESET
+        );
+        assert!(summaries[0].get("rebuild_count").is_none());
         drop(members);
         server.join().unwrap();
     }
@@ -3514,6 +3601,7 @@ mod tests {
             None,
             &mut takeovers,
             &[],
+            None,
             &|event| sink.lock().unwrap().push(event),
         );
         assert!(outcome.is_err(), "the injected fault must end the session");
@@ -3552,8 +3640,13 @@ mod tests {
         telemetry.underruns_idle = 9;
         telemetry.servo_engagements = 3;
         telemetry.servo_step_resets = 6;
+        // `expired` stays a telemetry counter (the `timeline_expired` symptom),
+        // but it is no longer a summary column: only the reason buckets are.
         telemetry.expired = 1;
         telemetry.lead_extra_ms = 45.0;
+        telemetry.record_timeline_reset(TimelineResetReason::ConfirmedTransportFailure);
+        telemetry.record_timeline_reset(TimelineResetReason::LatencyChange);
+        telemetry.record_timeline_reset(TimelineResetReason::LatencyChange);
         let summary = session_summary(
             &options,
             std::slice::from_ref(&member),
@@ -3586,7 +3679,66 @@ mod tests {
         );
         assert_eq!(summary.max_lateness_ms, 3.0);
         assert_eq!(summary.duration_s, 12.5);
-        assert_eq!(summary.rebuild_count, 1);
+        // Q40: the buckets come from the reason sites, never from `expired`.
+        assert_eq!(summary.timeline_resets.confirmed_transport_failure, 1);
+        assert_eq!(summary.timeline_resets.latency_change, 2);
+        assert_eq!(summary.timeline_resets.silence_resume, 0);
+        assert_eq!(summary.timeline_resets.total(), 3);
+        assert_eq!(summary.last_timeline_reset_reason, "latency_change");
+        let event = summary.event();
+        assert!(event.get("rebuild_count").is_none());
+        assert_eq!(
+            event["timeline_resets"]["confirmed_transport_failure"],
+            json!(1)
+        );
+        assert_eq!(event["last_timeline_reset_reason"], json!("latency_change"));
+    }
+
+    #[test]
+    fn a_resumed_attempt_records_the_cause_it_was_started_with() {
+        // The standby pause ends the previous attempt; the resume builds a fresh
+        // timeline and must report `silence_resume`, not a transport failure.
+        let options = summary_options("", "single", 40);
+        let (member, receiver, server) = local_member();
+        member
+            .media
+            .connect_audio(receiver.local_addr().unwrap())
+            .unwrap();
+        let gain = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0.0f32.to_bits()));
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let mut members = vec![member];
+        let mut takeovers = preemption::TakeoverCounters::default();
+        let outcome = send_packets(
+            &options,
+            &Cancellation::default(),
+            &gain,
+            crate::volume::Control::default(),
+            None,
+            &crate::standby::Control::default(),
+            &Clock::new(),
+            None,
+            &mut members,
+            None,
+            &mut takeovers,
+            &[],
+            Some(TimelineResetReason::SilenceResume),
+            &|event| sink.lock().unwrap().push(event),
+        );
+        assert!(matches!(&outcome, Ok(StreamEnd::Finished)), "{outcome:?}");
+        let summaries = summary_events(&events);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0]["timeline_resets"]["silence_resume"], json!(1));
+        assert_eq!(
+            summaries[0]["timeline_resets"]["confirmed_transport_failure"],
+            json!(0)
+        );
+        assert_eq!(
+            summaries[0]["last_timeline_reset_reason"],
+            json!("silence_resume")
+        );
+        drop(members);
+        server.join().unwrap();
     }
 
     #[test]
