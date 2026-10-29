@@ -529,10 +529,11 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private async Task RunStreamAsync(Receiver receiver, long epoch, CancellationToken cancellation)
     {
         var attempts = 0;
-        // Q40 companion record: how many reconnects this playback run had already
-        // done when the next attempt started, and why the latest one happened.
+        // Q43 companion record: how many reconnects this playback run had already
+        // done when the next attempt started, and the whole fault story (first,
+        // count and the compact sequence) instead of only the latest reason.
         var reconnects = 0;
-        var reconnectReason = DesktopSessionLog.NoReconnect;
+        var transportFaults = new List<string>();
         while (!cancellation.IsCancellationRequested)
         {
             lock (_sync)
@@ -699,7 +700,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                     // decides whether to reconnect: the engine's row for this
                     // session already exists or is being written now. The join key
                     // is this id; the engine appends "-<session_epoch>".
-                    _sessionRecords(new DesktopSessionRecord(session, reconnects, reconnectReason));
+                    _sessionRecords(DesktopSessionLog.FromFaults(session, reconnects, transportFaults));
                 }
             }
             catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { return; }
@@ -717,7 +718,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                 // This is the one reconnect notion the desktop already has; the
                 // companion record only reports it, it does not add a second one.
                 ++reconnects;
-                reconnectReason = $"transport_fault:{notice.Code}";
+                transportFaults.Add(notice.Code);
             }
             var delay = TimeSpan.FromMilliseconds(Math.Min(_timing.Retry.TotalMilliseconds * Math.Pow(2, attempts - 1), 8000));
             log?.Invoke($"Session reconnect reason=transport_fault; code={_diagnostics.LastFault?.Code}; attempt={attempts}; delay_ms={delay.TotalMilliseconds}");

@@ -479,32 +479,43 @@ public sealed class SessionTests
         await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(2)); Assert.True(first.Disposed); Assert.NotEqual(first.Session, second.Session);
     }
     [Fact]
-    public async Task DesktopSessionRecordJoinsTheEngineRowAndCarriesTheReconnectReason()
+    public async Task DesktopSessionRecordJoinsTheEngineRowAndCarriesTheWholeFaultStory()
     {
-        var first = new FakeConnection(); var second = new FakeConnection();
+        var first = new FakeConnection(); var second = new FakeConnection(); var third = new FakeConnection();
         var records = new ConcurrentQueue<DesktopSessionRecord>();
-        await using var controller = new SessionController(new FakeFactory(first, second), new FakeAudio(),
+        await using var controller = new SessionController(new FakeFactory(first, second, third), new FakeAudio(),
             timing: Fast, sessionRecords: records.Enqueue);
-        var settings = Settings(); settings.ForceReconnect = true; settings.MaxReconnectAttempts = 1;
+        var settings = Settings(); settings.ForceReconnect = true; settings.MaxReconnectAttempts = 2;
         await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
         first.Emit("error", message: "network lost");
         await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        second.Emit("error", message: "network lost");
+        await third.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
         await controller.StopAsync();
-        await Until(() => records.Count == 2);
+        await Until(() => records.Count == 3);
         var rows = records.ToArray();
         // The join key is exactly the session id the engine receives on the wire;
         // the engine appends "-<session_epoch>" to it in session-summary.csv.
         Assert.Equal(first.Commands.Single(c => c.Command == "start").Session, rows[0].SessionId);
         Assert.Equal(first.Session, rows[0].SessionId);
         Assert.Equal(0, rows[0].DesktopReconnects);
-        Assert.Equal(DesktopSessionLog.NoReconnect, rows[0].DesktopReconnectReason);
+        Assert.Equal(DesktopSessionLog.NoReconnect, rows[0].TransportFaultFirst);
+        Assert.Equal(0, rows[0].TransportFaultCount);
+        Assert.Equal(DesktopSessionLog.NoReconnect, rows[0].TransportFaultSeq);
         Assert.Equal(second.Commands.Single(c => c.Command == "start").Session, rows[1].SessionId);
         Assert.Equal(second.Session, rows[1].SessionId);
         Assert.Equal(1, rows[1].DesktopReconnects);
-        // Reuses the existing reconnect path: the reason is its fault code, and it
-        // is already distinguishable from the engine's timeline-reset reasons.
-        Assert.Equal("transport_fault:engine_error", rows[1].DesktopReconnectReason);
-        Assert.DoesNotContain("127.0.0.1", rows[1].SessionId + rows[1].DesktopReconnectReason);
+        // Reuses the existing reconnect path: the fault codes are its engine codes,
+        // and they are already distinguishable from the engine's reset reasons.
+        Assert.Equal("engine_error", rows[1].TransportFaultFirst);
+        Assert.Equal(1, rows[1].TransportFaultCount);
+        Assert.Equal("engine_error", rows[1].TransportFaultSeq);
+        Assert.Equal(third.Commands.Single(c => c.Command == "start").Session, rows[2].SessionId);
+        Assert.Equal(third.Session, rows[2].SessionId);
+        Assert.Equal(2, rows[2].DesktopReconnects);
+        Assert.Equal(2, rows[2].TransportFaultCount);
+        Assert.Equal("engine_error;engine_error", rows[2].TransportFaultSeq);
+        Assert.DoesNotContain("127.0.0.1", rows[1].SessionId + rows[1].TransportFaultSeq);
     }
     [Fact]
     public async Task AuthenticationFailureDoesNotReconnect()
