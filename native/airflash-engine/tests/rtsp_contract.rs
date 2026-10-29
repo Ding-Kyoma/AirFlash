@@ -170,6 +170,38 @@ fn idle_eof_and_authentication_failure_are_distinct() {
 }
 
 #[test]
+fn a_poisoned_connection_never_carries_another_request() {
+    use airflash_engine::rtsp::WireError;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut buffer = [0; 64];
+        // A forced takeover poisons the old RTSP session; nothing may be written
+        // to it, in particular not the TEARDOWN of the reclaim.
+        assert!(socket.read(&mut buffer).is_err());
+    });
+    let mut connection = Connection::connect(address, Cancellation::default()).unwrap();
+    connection.poison();
+    assert!(connection.is_poisoned());
+    let error = connection.write(b"TEARDOWN rtsp://127.0.0.1/test RTSP/1.0\r\n\r\n");
+    assert!(matches!(
+        error.unwrap_err().downcast_ref::<WireError>(),
+        Some(WireError::Poisoned)
+    ));
+    assert!(
+        connection
+            .finish_session("rtsp://127.0.0.1/test")
+            .is_err(),
+        "a poisoned session must not send TEARDOWN either"
+    );
+    server.join().unwrap();
+}
+
+#[test]
 fn delayed_reply_from_timed_out_volume_query_is_not_next_response() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut connection = Connection::connect(listener.local_addr().unwrap(), Cancellation::default()).unwrap();

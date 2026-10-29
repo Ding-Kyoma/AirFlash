@@ -665,7 +665,9 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                             }
                             log?.Invoke($"Engine warning: {item}");
                             _ = AdaptLeadAsync(connection, session, epoch, item);
-                            var current = Snapshot; Publish(epoch, current.State, current.Message);
+                            var current = Snapshot;
+                            var takeover = notice.Code == "preempted" && notice.Reason == "takeover";
+                            Publish(epoch, current.State, takeover ? L.Get("Another device took over this AirPlay session. AirFlash reclaimed it.") : current.Message);
                         }
                         else if (kind == "transport_metrics" && startedAt != 0)
                         {
@@ -742,7 +744,14 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         }
     }
     private static PlaybackState FailureState(EngineNotice notice) => notice.Code == "preempted" ? PlaybackState.Preempted : PlaybackState.Error;
-    private static string FailureMessage(EngineNotice notice) => notice.Code == "preempted" ? L.Get("Another device took over this AirPlay session. Reconnect to claim it back.") : notice.Detail;
+    private static string FailureMessage(EngineNotice notice) => notice.Code switch
+    {
+        // The engine separates a single takeover from hitting the consecutive
+        // limit so the user knows whether reconnecting can help.
+        "preempted" when notice.Reason == "limit" => L.Get("Another device keeps taking over this AirPlay session. AirFlash yielded and will not reconnect automatically."),
+        "preempted" => L.Get("Another device took over this AirPlay session. Reconnect to claim it back."),
+        _ => notice.Detail
+    };
     private EngineNotice? RecordFailure(long epoch, Exception error)
     {
         var notice = error is EngineFailure engineFailure ? engineFailure.Notice : new EngineNotice("host_error", "", "desktop", error.Message);

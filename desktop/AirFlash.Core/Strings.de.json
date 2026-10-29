@@ -49,6 +49,8 @@
   "Connection error": "Verbindungsfehler",
   "Taken over by another device": "Von einem anderen Gerät übernommen",
   "Another device took over this AirPlay session. Reconnect to claim it back.": "Ein anderes Gerät hat diese AirPlay-Sitzung übernommen. Stellen Sie die Verbindung erneut her, um sie zurückzuholen.",
+  "Another device keeps taking over this AirPlay session. AirFlash yielded and will not reconnect automatically.": "Ein anderes Gerät übernimmt diese AirPlay-Sitzung immer wieder. AirFlash gibt auf und verbindet sich nicht automatisch erneut.",
+  "Another device took over this AirPlay session. AirFlash reclaimed it.": "Ein anderes Gerät hat diese AirPlay-Sitzung übernommen. AirFlash hat sie zurückgeholt.",
   "Reconnect": "Erneut verbinden",
   "Ready": "Bereit",
   "{0} · target {1} ms": "{0} · Ziel {1} ms",

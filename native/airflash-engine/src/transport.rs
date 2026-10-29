@@ -1,7 +1,7 @@
 //! Session health and bounded media recovery, shared by production and localhost tests.
 use crate::{
     crypto::derive,
-    preemption::{self, Evidence, Signal},
+    preemption::{self, Signal},
     rtp::{self, FRAMES, Packetizer, Retransmit},
     rtsp::{Cancellation, Connection, WireError},
 };
@@ -34,6 +34,10 @@ pub struct Fault {
     pub channel: String,
     pub retryable: bool,
     pub message: String,
+    /// Structured sub-reason for faults that share one code. `PREEMPTED` uses
+    /// `takeover` and `limit`; the desktop distinguishes the two messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 impl std::fmt::Display for Fault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -59,7 +63,12 @@ impl Fault {
             channel: channel.into(),
             retryable,
             message: message.to_string(),
+            reason: None,
         }
+    }
+    pub fn with_reason(mut self, reason: &str) -> Self {
+        self.reason = Some(reason.into());
+        self
     }
     pub fn from_error(host: impl ToString, channel: &str, error: &anyhow::Error) -> Self {
         if let Some(fault) = error.downcast_ref::<Self>() {
@@ -128,11 +137,9 @@ struct HealthState {
     degraded: Option<Fault>,
     notices: VecDeque<Value>,
     commands: crate::events::Inbox,
-    /// Control-plane evidence that another controller may have taken over.
-    preemption: Evidence,
-    /// The fault to use if the preemption window expires without corroboration.
-    /// It keeps today's classification (auth failure, peer closed, ...) intact.
-    preemption_fallback: Option<Fault>,
+    /// Control-plane symptoms of a takeover. They are evidence only: the
+    /// session thread probes the receiver's live `statusFlags` before deciding.
+    preemption_signals: Vec<Signal>,
 }
 #[derive(Clone, Default)]
 pub struct Health(Arc<Mutex<HealthState>>);
@@ -189,57 +196,18 @@ impl Health {
     pub fn clear_degraded(&self) {
         self.0.lock().unwrap().degraded = None;
     }
-    /// Record one control-plane signal. Signals alone never end the session; they
-    /// are only half of the preemption verdict.
+    /// Record one control-plane symptom. Symptoms alone never end the session:
+    /// the session thread drains them and probes the receiver's live status.
     pub fn preemption_signal(&self, signal: Signal) {
-        self.0
-            .lock()
-            .unwrap()
-            .preemption
-            .record(signal, Instant::now());
-    }
-    /// The peer restarted its PTP association; `at` is when the change was seen,
-    /// so repeated polling cannot extend the evidence window.
-    pub fn preemption_association_changed(&self, at: Instant) {
-        self.0.lock().unwrap().preemption.association_changed(at);
-    }
-    /// Media stopped arriving (one healthy-to-unhealthy transition, not every poll
-    /// while it stays down).
-    pub fn preemption_media_stopped(&self, at: Instant) {
-        self.0.lock().unwrap().preemption.media_stopped(at);
-    }
-    pub fn preemption_verdict(&self, now: Instant) -> Option<preemption::Verdict> {
-        self.0
-            .lock()
-            .unwrap()
-            .preemption
-            .classify(now, preemption::WINDOW)
-    }
-    pub fn has_preemption_signal(&self, now: Instant) -> bool {
-        self.0
-            .lock()
-            .unwrap()
-            .preemption
-            .has_fresh_signal(now, preemption::WINDOW)
-    }
-    /// Hold the generic fault until the preemption window closes. If corroboration
-    /// arrives first the session reports `preempted`; otherwise this exact fault is
-    /// returned, preserving the pre-existing classification.
-    pub fn defer_for_preemption(&self, fault: Fault) {
         let mut state = self.0.lock().unwrap();
-        if state.preemption_fallback.is_none() {
-            state.preemption_fallback = Some(fault);
+        if state.preemption_signals.len() == 8 {
+            state.preemption_signals.remove(0);
         }
+        state.preemption_signals.push(signal);
     }
-    pub fn take_expired_preemption_fault(&self, now: Instant) -> Option<Fault> {
-        let mut state = self.0.lock().unwrap();
-        if state
-            .preemption
-            .has_fresh_signal(now, preemption::WINDOW)
-        {
-            return None;
-        }
-        state.preemption_fallback.take()
+    /// Take the symptoms collected since the previous poll.
+    pub fn take_preemption_signals(&self) -> Vec<Signal> {
+        std::mem::take(&mut self.0.lock().unwrap().preemption_signals)
     }
     fn notice(&self, host: &str, channel: &str, code: &str, message: &str, recovered: bool) {
         let mut state = self.0.lock().unwrap();
@@ -372,13 +340,11 @@ impl FeedbackWorker {
                         if fault.code != "feedback_rejected" {
                             health.0.lock().unwrap().metrics.feedback_failures += 1;
                         }
-                        if health.has_preemption_signal(Instant::now()) {
-                            // A takeover signal is on record. Hold the generic fault
-                            // until the corroboration window closes so media stopping
-                            // or a PTP re-association can still turn this into
-                            // `preempted`.
-                            health.defer_for_preemption(fault);
-                        } else if matches!(fault.code.as_str(), "authentication_failed" | "session_rejected") {
+                        // Control-plane symptoms are only evidence. A 403 is
+                        // deliberately not `authentication_failed`: the session
+                        // thread probes `statusFlags` and decides. 401/454 keep
+                        // their old classification.
+                        if matches!(fault.code.as_str(), "authentication_failed" | "session_rejected") {
                             health.fail(fault);
                         } else {
                             // Feedback is a health probe, not the audio path: keep
@@ -527,11 +493,23 @@ fn feedback_loop(
                 &format!("Receiver feedback returned {status}; retrying while audio continues"),
                 false,
             );
+        } else if status == 403 {
+            // Evidence, not a verdict: the feedback channel is unusable, but the
+            // session thread probes the receiver's live `statusFlags` before
+            // deciding whether this was a takeover. 401/454 keep the old path.
+            return Err(Fault::new(
+                host,
+                "feedback",
+                "forbidden",
+                true,
+                format!("Receiver web/control request was forbidden: {}", response.first),
+            )
+            .into());
         } else {
             return Err(Fault::new(
                 host,
                 "feedback",
-                if matches!(status, 401 | 403) {
+                if status == 401 {
                     "authentication_failed"
                 } else {
                     "session_rejected"
@@ -686,12 +664,6 @@ impl MediaTransport {
     }
     pub fn reset_watchdog(&mut self, now: Instant) {
         self.last_success = now;
-    }
-    /// Test hook: make the next health poll see stale media without waiting out
-    /// the production failure timeout.
-    #[cfg(test)]
-    pub(crate) fn expire_media(&mut self, now: Instant) {
-        self.last_success = now - Duration::from_secs(60);
     }
     pub fn metrics(&self) -> Value {
         let mut v = serde_json::to_value(&self.metrics).unwrap();
