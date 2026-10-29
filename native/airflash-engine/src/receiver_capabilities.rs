@@ -1,6 +1,6 @@
 //! Read-only /info queries and the same profile negotiation used by playback.
 use crate::{
-    profile::{Codec, CompatFingerprint, Formats, Profile, Timing, Transport},
+    profile::{Codec, CompatFingerprint, Formats, Profile, Timing, TimingPlan, Transport},
     rtsp::{Cancellation, Connection},
     session::Peer,
 };
@@ -27,11 +27,12 @@ pub struct Capabilities {
 }
 /// Enumerate the codec/transport/timing combinations this receiver accepts.
 ///
-/// The fingerprint comes from the same `/info` parse playback uses, so the
-/// prediction and the runtime answer to the same named questions. It carries no
-/// model/firmware evidence here on purpose: capability prediction has always
-/// been made from formats and the peer's own feature word alone, and adding the
-/// model would change the values reported over IPC.
+/// The fingerprint comes from the same `/info` parse playback uses, and the
+/// timing answer comes from the same shared `select_timing` decision the session
+/// runtime uses. The fingerprint carries no model/firmware evidence here on
+/// purpose: capability prediction has always been made from formats and the
+/// peer's own feature word alone, and adding the model would change the values
+/// reported over IPC.
 pub fn choices(fingerprint: &CompatFingerprint, evidence: &Profile) -> Vec<ProfileChoice> {
     let mut result = Vec::new();
     for rate in [44100, 48000] {
@@ -40,6 +41,7 @@ pub fn choices(fingerprint: &CompatFingerprint, evidence: &Profile) -> Vec<Profi
             ("pcm", Codec::Pcm),
             ("alac", Codec::Alac),
         ] {
+            let plan = TimingPlan::single(fingerprint, codec);
             for (transport_name, transport) in [
                 ("auto", Transport::Auto),
                 ("realtime", Transport::Realtime),
@@ -64,7 +66,7 @@ pub fn choices(fingerprint: &CompatFingerprint, evidence: &Profile) -> Vec<Profi
                             || timing_name == "auto" && evidence.follow_receiver_clock,
                         ..evidence.clone()
                     };
-                    if let Ok(compat) = fingerprint.negotiate(&profile, rate, false) {
+                    if let Ok(compat) = fingerprint.negotiate_planned(plan, &profile, rate, false) {
                         result.push(ProfileChoice {
                             codec: codec_name,
                             transport: transport_name,
