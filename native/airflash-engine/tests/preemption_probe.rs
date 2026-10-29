@@ -2,16 +2,18 @@
 //! listeners. No real receiver and no HomePod.
 use airflash_engine::{
     preemption::{
-        self, action_for, action_for_result, ProbeAction, ProbeOutcome, ReceiverLiveness,
-        PASSWORD_REQUIRED, RECEIVER_SESSION_ACTIVE, STEREO_PARTNER_UNREACHABLE,
+        self, action_for, action_for_result, LivenessSample, ProbeAction, ProbeOutcome,
+        ReceiverLiveness, Verdict, PASSWORD_REQUIRED, RECEIVER_SESSION_ACTIVE,
+        STEREO_PARTNER_UNREACHABLE,
     },
     rtsp::{Cancellation, Connection},
 };
 use plist::{Dictionary, Value};
 use std::{
+    io::ErrorKind,
     net::{SocketAddr, TcpListener},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 fn info_body(status_flags: Option<u64>) -> Vec<u8> {
@@ -234,32 +236,181 @@ fn the_liveness_probe_is_a_bare_tcp_connect_to_the_control_port() {
     let (socket, _) = listener.accept().unwrap();
     drop(socket);
     drop(listener);
+    // Q42: a closed port answers with a RST, and a RST means the *host* is
+    // alive and its stack answered. The timeout is deliberately generous — the
+    // point is the state, not how fast the local stack rejects, so a slow
+    // loopback must not turn the RST into a timeout.
+    let refused =
+        preemption::receiver_liveness(address.ip(), address.port(), Duration::from_secs(10));
     assert_eq!(
-        preemption::receiver_liveness(address.ip(), address.port(), preemption::LIVENESS_TIMEOUT),
-        ReceiverLiveness::Dead,
-        "a refused connect means the device is gone"
+        refused,
+        ReceiverLiveness::Refused,
+        "a closed control port is refused, never dead: the host answered"
     );
-}
-
-#[test]
-fn dead_liveness_reclaims_with_healthy_media_and_is_never_busy() {
-    // Q34's combine table, with the liveness value a real refused connect
-    // produced (not a hand-written enum).
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
-    let liveness =
-        preemption::receiver_liveness(address.ip(), address.port(), preemption::LIVENESS_TIMEOUT);
-    assert_eq!(liveness, ReceiverLiveness::Dead);
-    // Even with statusFlags claiming an active session, a dead receiver while
-    // our media is healthy is a reclaim — not another sender's session.
+    assert!(
+        !refused.reachable(),
+        "a refusal cannot serve statusFlags either"
+    );
+    assert!(
+        refused.host_answered(),
+        "the RST is proof of life, which is why refused is not dead"
+    );
+    assert_eq!(refused.name(), "refused");
+    // Action-wise it is still a fail-open reclaim, never another sender's
+    // session, whatever statusFlags would have said.
     for hold in [false, true] {
-        let outcome = preemption::combine(true, liveness, Some(RECEIVER_SESSION_ACTIVE), hold);
+        let outcome = preemption::combine(true, refused, Some(RECEIVER_SESSION_ACTIVE), hold);
         assert_eq!(outcome, ProbeOutcome::Gone);
         assert_eq!(action_for(outcome), ProbeAction::Reclaim);
         assert_ne!(outcome, ProbeOutcome::BusyElsewhere);
         assert_ne!(action_for(outcome), ProbeAction::Requeue);
     }
+}
+
+#[test]
+fn timeout_host_unreachable_and_network_unreachable_are_dead() {
+    // The three errors Q42 names as "the host is not there". They are tested
+    // through the same classifier the socket probe uses, so no real network is
+    // needed to pin the state.
+    for kind in [
+        ErrorKind::TimedOut,
+        ErrorKind::HostUnreachable,
+        ErrorKind::NetworkUnreachable,
+    ] {
+        let liveness = preemption::liveness_from_error(&std::io::Error::from(kind));
+        assert_eq!(
+            liveness,
+            ReceiverLiveness::Dead,
+            "{kind:?} means the host is not there"
+        );
+        assert!(!liveness.host_answered());
+        assert!(!liveness.reachable());
+        assert_eq!(
+            preemption::combine(true, liveness, None, true),
+            ProbeOutcome::Gone
+        );
+        assert_eq!(action_for(ProbeOutcome::Gone), ProbeAction::Reclaim);
+    }
+    // A refusal is the opposite: the host answered, so it must not be folded
+    // into dead (Q42's correction of Q34).
+    assert_eq!(
+        preemption::liveness_from_error(&std::io::Error::from(ErrorKind::ConnectionRefused)),
+        ReceiverLiveness::Refused
+    );
+    assert_ne!(
+        preemption::liveness_from_error(&std::io::Error::from(ErrorKind::ConnectionRefused)),
+        preemption::liveness_from_error(&std::io::Error::from(ErrorKind::TimedOut))
+    );
+    // Everything else is only "temporarily unknown".
+    for kind in [ErrorKind::ConnectionReset, ErrorKind::PermissionDenied] {
+        assert_eq!(
+            preemption::liveness_from_error(&std::io::Error::from(kind)),
+            ReceiverLiveness::Unknown,
+            "{kind:?} proves neither life nor death"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_chain_escalates_to_dead_and_one_ok_resets_it() {
+    let base = Instant::now();
+    let mut tracker = preemption::Tracker::default();
+    tracker.observe(preemption::Signal::ConnectionClose, base);
+    assert!(tracker.due(base));
+    let mut now = base;
+    for step in 1..preemption::LIVENESS_PATIENCE {
+        now += preemption::LIVENESS_RETRY;
+        let note = tracker.observe_liveness(
+            LivenessSample::Probe(ReceiverLiveness::Unknown),
+            now,
+        );
+        assert_eq!(
+            note.verdict,
+            Verdict::Unknown,
+            "unknown sample {step} is still temporary"
+        );
+        assert_eq!(tracker.liveness_failures(), step);
+        // The session loop keeps sampling while the verdict is undecided;
+        // without it the patience limit could never be reached.
+        tracker.await_liveness(now);
+        assert_eq!(tracker.scheduled(), Some(now + preemption::LIVENESS_RETRY));
+    }
+    now += preemption::LIVENESS_RETRY;
+    let escalated = tracker.observe_liveness(
+        LivenessSample::Probe(ReceiverLiveness::Unknown),
+        now,
+    );
+    assert_eq!(
+        escalated.verdict,
+        Verdict::Dead,
+        "the patience limit turns a chain of unknowns into a death"
+    );
+    assert_eq!(escalated.verdict.liveness(), ReceiverLiveness::Dead);
+    assert_eq!(escalated.verdict.name(), "dead");
+    let outcome = preemption::combine(true, escalated.verdict.liveness(), None, true);
+    assert_eq!(outcome, ProbeOutcome::Gone);
+    assert_eq!(action_for(outcome), ProbeAction::Reclaim);
+    // One successful probe resets the counter, so the next unknown starts over.
+    assert_eq!(
+        tracker
+            .observe_liveness(LivenessSample::Probe(ReceiverLiveness::Alive), now)
+            .verdict,
+        Verdict::Alive
+    );
+    assert_eq!(tracker.liveness_failures(), 0);
+    assert_eq!(
+        tracker
+            .observe_liveness(LivenessSample::Probe(ReceiverLiveness::Unknown), now)
+            .verdict,
+        Verdict::Unknown,
+        "after a reset the patience limit has to be earned again"
+    );
+}
+
+#[test]
+fn all_receivers_failing_at_once_is_a_local_problem_and_marks_none_dead() {
+    // Two receivers, both probes failed in the same round. Q42: the common
+    // cause is our own routing/interface, so no device is marked dead and the
+    // healthy session keeps playing.
+    let probes = [ReceiverLiveness::Dead, ReceiverLiveness::Unknown];
+    assert!(preemption::local_network_suspected(&probes, 2));
+    for probe in probes {
+        let mut tracker = preemption::Tracker::default();
+        let note = tracker.observe_liveness(LivenessSample::LocalSuspect, Instant::now());
+        assert_eq!(
+            note.verdict,
+            Verdict::Unknown,
+            "a group-wide failure is not this device's death"
+        );
+        assert_eq!(
+            tracker.liveness_failures(),
+            0,
+            "the failure is not counted against the device"
+        );
+        assert_eq!(
+            preemption::combine(true, note.verdict.liveness(), None, true),
+            ProbeOutcome::OursActive,
+            "healthy media + unknown liveness keeps our session"
+        );
+        assert_eq!(action_for(ProbeOutcome::OursActive), ProbeAction::FallThrough);
+        // The raw probe still says what the socket said.
+        assert!(!probe.reachable());
+    }
+    // One receiver failing is that receiver's problem, never "all failed".
+    assert!(!preemption::local_network_suspected(
+        &[ReceiverLiveness::Dead],
+        1
+    ));
+    // One live receiver proves the local network works.
+    assert!(!preemption::local_network_suspected(
+        &[ReceiverLiveness::Dead, ReceiverLiveness::Alive],
+        2
+    ));
+    // A refusal proves the host answered: an all-refused round is not local.
+    assert!(!preemption::local_network_suspected(
+        &[ReceiverLiveness::Refused, ReceiverLiveness::Refused],
+        2
+    ));
 }
 
 #[test]
