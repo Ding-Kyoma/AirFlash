@@ -561,7 +561,6 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
 | P3-9 AAC-ELD / OPUS | 未开始 | 需要接收端能力探测与编码器验证 |
 | P0-4 封面（`image/jpeg`） | 未做 | 尺寸/格式约束需要设备确认，见 Q10；失败也不能干扰音频 |
 | P0-3 帧级 `interval_correction` | 未做 | 见上文，现用连续重采样代替 |
-| §12.3 会话摘要 | 未做 | 每次会话结束输出一行 JSON/CSV 的汇总尚未实现 |
 | 音量事件（音箱旋钮/遥控器） | 部分 | 事件里的 `volume` 已解析并转发，但还没写回设备音量状态 |
 
 ## 按答复待返工（下一轮）
@@ -745,3 +744,58 @@ Q24（同上）。
   样本，暂不改现有 `pw` 语义。门禁只把 `NotAirPlay2` 当作 classic 证据，
   `ClaimsAirPlay2Outdated` 设备 SETUP 失败时仍落到引擎 detail/网络/密码分类；
   是否需要独立门禁文案、组规则是否要把它算作 classic，见 Q39。
+
+## §12.3 会话摘要（已完成）
+
+`native/airflash-engine/src/telemetry.rs`、`src/session.rs`、`src/main.rs`
+
+- **一行一条**：每完成一次流式会话（正常停止、循环内故障、teardown），在既有
+  IPC 事件流上输出**恰好一条** `{"event":"session_summary", ...}`，并同时向
+  `%APPDATA%\AirFlash\logs\session-summary.csv` 追加一行（文件不存在时先写表头）。
+  位置就是 WPF 的 `AppPaths.LogDirectory`，引擎侧沿用 `credentials.rs` 的
+  `APPDATA\AirFlash` 约定，没有另造目录。
+- **字段固定为报告 §12.3 的 18 列，顺序即 CSV 表头**：
+  `session_id, topology, codec, timing, applied_lead_ms, packets, rtx_req,
+  rtx_resent, underruns, gap_filled, reanchored, servo_engagements,
+  baseline_resets, mean_lateness_ms, p99_lateness_ms, max_lateness_ms,
+  duration_s, rebuild_count`。**这就是「积累 50 次后回答哪个环节拖后腿」的前置
+  条件**：报告里的五条推论（rebuild/gap/rtx/underrun/servo）都直接读这张表，
+  不再需要 IPC 工具或人工拼日志。
+- **全部来自既有计数器，没有为摘要新增音频路径计数**：
+  - `session_id` = IPC 请求的 `session_id` + 本次流式尝试的 `session_epoch`
+    （standby 唤醒/重连会产生新尝试，必须可区分）；用 `serde(skip)` 由
+    `main.rs` 填入，不进线协议。
+  - `topology` = 既有 `group_mode`（`single` / `native_stereo` /
+    `software_stereo`；未设置的多成员回退 `group`）；`codec`/`timing` = 协商后
+    的 `CompatProfile`，同组只有一个决定，取首个成员。
+  - `packets` = `SessionTelemetry.packets`；`rtx_req`/`rtx_resent` = 各成员
+    `MediaMetrics.retransmit_requests` / `retransmits_sent` 之和。
+  - `underruns` 只算「有音乐时的欠载」；空闲保活欠载不是 dropout，不计入。
+    `gap_filled`/`reanchored` = 调度器同名计数器。
+  - `mean/p99/max_lateness_ms` = 既有 lateness 直方图（p99 取保守上沿，max 用
+    `percentile_ms(1.0)`）。
+  - `servo_engagements` = 采集伺服 engagement；`baseline_resets` 取
+    `ServoCounters.steps`（断点后整环清零），是现有唯一的重置计数器，代码里
+    注明了这个映射。
+  - `rebuild_count` 没有直接计数器：取 `SessionTelemetry.expired`（时间线过期、
+    必须换新会话），也就是报告用来关联漂移的量；实际重连发生在本次记录之外。
+    口径见 Q40。
+  - `duration_s` = 发送循环开始到写摘要的墙钟时长；`applied_lead_ms` = 调度器
+    实际应用的 lead。
+- **脱敏与 best-effort**：JSON 先过 `telemetry::redact`（全是数字/枚举，形状
+  不变）；CSV 只有数字、固定枚举和 `session_id`，不含 host/MAC/路径/密钥。
+  写文件失败只 `eprintln!`（桌面端把引擎 stderr 收进日志），不返回错误，也不
+  影响音频或控制路径；事件仍照发。
+- **恰好一次**：摘要只有一个调用点——`send_packets` 的发送循环之后。故障从
+  闭包返回后仍会走最终 metrics + 摘要，再做 TEARDOWN；最后一包的 drain 用
+  闭包包住 `?`，避免它的错误跳过摘要。握手/建链阶段失败的尝试没有 session
+  计数器，不产生摘要（这一行只描述真正开始流媒体的会话）。
+- **测试**：正常停止恰好一条、注入 `Health` 故障后仍恰好一条且 TEARDOWN 照常
+  发生、已知计数逐字段对账（含 idle underrun 不计入）、写文件失败不影响会话；
+  telemetry 侧覆盖 JSON 字段/redact 形状、CSV 列序与无身份字段、追加时只写一次
+  表头。
+- **验证**：Rust lib 209 passed + 1 ignored、main 2、集成 35 passed + 1 ignored，
+  合计 246 passed / 2 ignored；clippy `-D warnings` 无告警；
+  `build-native.ps1 -Check` 通过；.NET 547 通过；pytest 141 通过；ruff 无问题。
+  .NET 首次全量运行时 `EngineStandbyReleasesMuteAndMetricsCannotOverrideState`
+  偶发一次事件时序空引用，单跑与全量重跑均通过。
