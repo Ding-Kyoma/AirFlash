@@ -118,6 +118,13 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         _discovery.SetInterface(_settings.DiscoveryInterfaceId);
         Session = new(factory, audio, AppPaths.Log);
         Session.Changed += SessionChanged;
+        // A receiver's own buttons arrive as transport commands; forward them to the
+        // media keys so the app that is playing reacts, without touching the stream.
+        Session.RemoteCommandReceived += command =>
+        {
+            if (command.VirtualKey is not { } key) return;
+            _dispatcher.BeginInvoke(() => AirFlash.App.Input.MediaKeys.Press(key, AppPaths.Log));
+        };
         // Now Playing is polled from SMTC and pushed only when it actually changed;
         // the engine turns it into the receiver's SET_PARAMETER payloads.
         NowPlaying = new NowPlayingPump(new AirFlash.App.Metadata.SmtcNowPlayingSource(AppPaths.Log), log: AppPaths.Log);

@@ -93,17 +93,24 @@
 会话循环每秒用 `check_control(media_healthy)` 判定：只有「媒体也停了」才把降级
 升级为终止。窗口 2 秒。
 
-## P3-1 `mrCommand` 解析（已完成）
+## P3-1 `mrCommand` 解析与执行（已完成）
 
-`native/airflash-engine/src/events.rs`
+`native/airflash-engine/src/events.rs`、`AirFlash.Core/RemoteCommand.cs`、
+`AirFlash.App/Input/MediaKeys.cs`
 
-事件通道的 body 过去被 `200 OK`  acknowledgment 后直接丢弃。现在解析
+事件通道的 body 过去被 `200 OK` acknowledgment 后直接丢弃。现在解析
 `mrCommand` / `command` / `cmd` / `action`，同时接受字符串与 MRP 数字编码，
 支持命令数组与可选 `volume`（0–1、0–100、dBFS 三种线上形式），以
 `remote_command` 事件转给桌面端。无法识别的 body 返回空结果而不是报错，
 事件通道不会因为一条怪消息掉线。
 
 队列有界（32 条），超限丢最旧的并计数。
+
+按 Q25 的答复补上**执行端**：`RemoteCommand` 把命令映射到媒体键
+（`play/pause/toggle`→`VK_MEDIA_PLAY_PAUSE`、`next`→`VK_MEDIA_NEXT_TRACK`、
+`previous`→`VK_MEDIA_PREV_TRACK`、`stop`→`VK_MEDIA_STOP`），由
+`MediaKeys.Press()` 用 `SendInput` 注入；音量类命令没有对应媒体键，留给应用
+自己处理。注入失败只记日志，不影响推流。
 
 ## P1-8 掩盖升级（已完成）
 
@@ -221,7 +228,6 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
 | P2-12 组拓扑原子化 + 失败回滚 | 未开始 | 屏障已有（全部 connect 后才等 PTP）；缺的是中途失败时 `TEARDOWN` 已建好的成员并重试 |
 | P2-13 兼容 profile | 未开始 | 把散落的 if 收成 `CompatBehavior`，按 `srcvers`/`model` 指纹选择 |
 | P2-14 诊断导出 | 部分 | `diag_summary` + `--self-check` 已能给结构化引擎摘要；缺脱敏与实际导出文件 |
-| P3-1 反向控制的执行端 | 部分 | 引擎已解析事件并转 `remote_command`；桌面端还没真去控制播放器（Q25：`SendInput` + `VK_MEDIA_*`） |
 | P3-3 抢占检测 | 未开始 | 按 Q18 用「未预期 TEARDOWN + 随后重新 announce」组合特征 |
 | P3-4 MRP 隧道 | 未开始 | 大工程 |
 | P3-5 经典 RAOP / 初代 AirPlay | 未开始 | 大工程 |

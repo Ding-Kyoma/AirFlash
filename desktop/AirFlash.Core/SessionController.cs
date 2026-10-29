@@ -40,6 +40,10 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private bool _equalizerReady, _equalizerDisposed;
     private (bool Enabled, double Seconds)? _sentStandby;
     public event Action<string?>? EqualizerFeedback;
+    /// <summary>Raised when a receiver sends a transport command back (its own
+    /// buttons, or a remote pointed at it). The engine has already acknowledged it;
+    /// acting on it is the desktop's job.</summary>
+    public event Action<RemoteCommand>? RemoteCommandReceived;
     public Task PreviewEqualizerAsync(Guid owner, EqualizerSettings equalizer)
     {
         if (equalizer.Validate() is { } error) throw new ArgumentException(error, nameof(equalizer));
@@ -638,6 +642,16 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                                 if (wasPending && _deviceVolume.Target is null) _volumeEdit?.Cancel();
                             }
                             PublishCurrent(epoch);
+                        }
+                        else if (kind == "remote_command" && startedAt != 0)
+                        {
+                            lock (_sync) { if (epoch != _generation) continue; }
+                            foreach (var command in RemoteCommand.Parse(item))
+                            {
+                                log?.Invoke($"Remote command from {command.Host ?? "receiver"}: {command.Name}");
+                                try { RemoteCommandReceived?.Invoke(command); }
+                                catch (Exception error) { log?.Invoke($"Remote command {command.Name} failed: {error.Message}"); }
+                            }
                         }
                         else if (kind == "warning" && startedAt != 0)
                         {
