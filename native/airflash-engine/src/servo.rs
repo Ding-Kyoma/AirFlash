@@ -25,34 +25,28 @@ pub struct ServoConfig {
     /// Low-pass coefficient for the lateness sample (0.2 ≈ 50 ms at 5 ms/packet).
     pub alpha: f64,
     /// A single sample this far from the filtered error is a discontinuity, not drift.
+    /// WAC resets the whole loop here, it does not just move the baseline.
     pub step_ms: f64,
-    /// Inside this band the sender is considered on time; the integral freezes.
-    pub dead_band_ms: f64,
-    /// Filtered error that engages the integral term.
+    /// |filtered| above this engages the loop.
     pub engage_ms: f64,
-    /// Filtered error that releases it again (hysteresis, lower than `engage_ms`).
+    /// |filtered| at or below this releases it again (asymmetric hysteresis: the
+    /// thresholds are deliberately not the same value).
     pub release_ms: f64,
-    /// Proportional gain in ppm per ms of filtered lateness.
-    pub kp_ppm_per_ms: f64,
-    /// Integral gain in ppm per (ms · s).
-    pub ki_ppm_per_ms_s: f64,
-    /// Absolute correction ceiling; the capture loop clamps again at ±500 ppm.
+    /// Output gain: `correction_ppb = filtered_ns / 20`, i.e. 50 ppm per ms of
+    /// filtered lateness.
+    pub ppm_per_ms: f64,
+    /// Absolute correction ceiling. WAC clamps silently here instead of re-anchoring.
     pub max_ppm: f64,
-    /// Anti-windup clamp on the integral term.
-    pub integral_limit_ms_s: f64,
 }
 impl Default for ServoConfig {
     fn default() -> Self {
         Self {
             alpha: 0.2,
             step_ms: 250.0,
-            dead_band_ms: 2.0,
             engage_ms: 5.0,
-            release_ms: 2.0,
-            kp_ppm_per_ms: 20.0,
-            ki_ppm_per_ms_s: 25.0,
-            max_ppm: 300.0,
-            integral_limit_ms_s: 60.0,
+            release_ms: 1.0,
+            ppm_per_ms: 50.0,
+            max_ppm: 50.0,
         }
     }
 }
@@ -63,7 +57,6 @@ impl Default for ServoConfig {
 pub struct LatenessServo {
     cfg: ServoConfig,
     filtered_ms: f64,
-    integral_ms_s: f64,
     correction_ppm: f64,
     engaged: bool,
     last: Option<Instant>,
@@ -83,7 +76,6 @@ impl LatenessServo {
         Self {
             cfg,
             filtered_ms: 0.0,
-            integral_ms_s: 0.0,
             correction_ppm: 0.0,
             engaged: false,
             last: None,
@@ -102,42 +94,36 @@ impl LatenessServo {
         if !sample_ms.is_finite() {
             return;
         }
-        let dt = self
-            .last
-            .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
         self.last = Some(now);
         self.samples += 1;
-        // A step is a discontinuity, not drift: reset the baseline instead of
-        // integrating a 300 ms stall into a slow pitch change.
+        // A walk this large is a discontinuity, not drift. WAC clears the whole
+        // loop here (filter, correction and engagement) and re-warms it, so a
+        // 300 ms stall never turns into a slow pitch change.
         if (sample_ms - self.filtered_ms).abs() > self.cfg.step_ms {
-            self.filtered_ms = sample_ms;
-            self.integral_ms_s = 0.0;
+            self.filtered_ms = 0.0;
             self.correction_ppm = 0.0;
+            self.engaged = false;
             self.steps += 1;
             return;
         }
         self.filtered_ms += self.cfg.alpha * (sample_ms - self.filtered_ms);
-        if !self.engaged && self.filtered_ms >= self.cfg.engage_ms {
+        // The dead band is asymmetric on purpose: engage above +5 ms, release at
+        // or below 1 ms, so a value hovering around the threshold does not flap.
+        let magnitude = self.filtered_ms.abs();
+        if !self.engaged && magnitude > self.cfg.engage_ms {
             self.engaged = true;
             self.engagements += 1;
-        } else if self.engaged && self.filtered_ms <= self.cfg.release_ms {
+        } else if self.engaged && magnitude <= self.cfg.release_ms {
             self.engaged = false;
-            self.integral_ms_s *= 0.5;
             self.releases += 1;
         }
         if !self.engaged {
-            // Bleed any residual bias away rather than holding it forever.
-            self.correction_ppm *= 0.9;
-            if self.correction_ppm.abs() < 0.5 {
-                self.correction_ppm = 0.0;
-            }
+            self.correction_ppm = 0.0;
             return;
         }
-        let error = (self.filtered_ms - self.cfg.dead_band_ms).max(0.0);
-        let seconds = dt.as_secs_f64().min(0.25); // ignore implausible gaps
-        self.integral_ms_s = (self.integral_ms_s + error * seconds)
-            .clamp(-self.cfg.integral_limit_ms_s, self.cfg.integral_limit_ms_s);
-        let raw = self.cfg.kp_ppm_per_ms * error + self.cfg.ki_ppm_per_ms_s * self.integral_ms_s;
+        // `correction_ppb = filtered_ns / 20`; the ceiling is silent, which is why
+        // saturation is counted instead of being reported as a fault.
+        let raw = self.filtered_ms * self.cfg.ppm_per_ms;
         let clamped = raw.clamp(-self.cfg.max_ppm, self.cfg.max_ppm);
         if (clamped - raw).abs() > f64::EPSILON {
             self.saturated += 1;
@@ -392,18 +378,68 @@ mod tests {
     }
 
     #[test]
-    fn a_step_resets_the_baseline_instead_of_integrating() {
+    fn a_step_clears_the_whole_loop_so_nothing_is_integrated() {
         let start = Instant::now();
         let mut servo = LatenessServo::default();
         for step in 0..200 {
             servo.update(1.0, at(start, step * 8));
         }
-        // A 300 ms stall is a discontinuity, not drift.
+        // A 300 ms stall is a discontinuity, not drift: filter, correction and
+        // engagement are all cleared, and the next samples re-warm from zero.
         servo.update(300.0, at(start, 200 * 8));
         assert_eq!(servo.counters().steps, 1);
         assert_eq!(servo.correction_ppm(), 0.0);
         assert!(!servo.engaged(), "a single step must not engage the loop");
-        assert!((servo.filtered_ms() - 300.0).abs() < 1e-9);
+        assert_eq!(servo.filtered_ms(), 0.0);
+        // Re-warming from zero: a 250 ms sample is below the engage threshold for a
+        // long time because alpha is small.
+        servo.update(20.0, at(start, 201 * 8));
+        assert!((servo.filtered_ms() - 4.0).abs() < 1e-9);
+        assert!(!servo.engaged());
+    }
+
+    #[test]
+    fn the_gain_is_fifty_ppm_per_ms_and_saturates_silently() {
+        let start = Instant::now();
+        let mut servo = LatenessServo::default();
+        // Drive the filter to a steady 12 ms: 12 ms × 50 ppm/ms = 600 ppm, which
+        // the ±50 ppm ceiling cuts back; saturation is counted, not reported.
+        for step in 0..600 {
+            servo.update(12.0, at(start, step * 8));
+        }
+        assert!(servo.engaged());
+        assert_eq!(servo.correction_ppm(), 50.0);
+        assert!(servo.counters().saturated > 0);
+        // A small, steady error stays inside the linear range.
+        let mut calm = LatenessServo::default();
+        for step in 0..600 {
+            calm.update(0.6, at(start, step * 8));
+        }
+        assert!(!calm.engaged(), "0.6 ms of filtered error is inside the dead band");
+        assert_eq!(calm.correction_ppm(), 0.0);
+    }
+
+    #[test]
+    fn engagement_uses_hysteresis_not_a_single_threshold() {
+        let start = Instant::now();
+        let mut servo = LatenessServo::default();
+        // Ramp to 6 ms: engages just above 5 ms.
+        for step in 0..400 {
+            servo.update(6.0, at(start, step * 8));
+        }
+        assert!(servo.engaged());
+        // Settle at 2 ms of filtered error: between 1 and 5 ms, so it stays engaged.
+        for step in 400..2000 {
+            servo.update(2.0, at(start, step * 8));
+        }
+        assert!(servo.engaged(), "2 ms is inside the hysteresis band");
+        assert!(servo.correction_ppm() > 0.0);
+        // Below 1 ms it releases.
+        for step in 2000..4000 {
+            servo.update(0.5, at(start, step * 8));
+        }
+        assert!(!servo.engaged());
+        assert_eq!(servo.correction_ppm(), 0.0);
     }
 
     #[test]

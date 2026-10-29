@@ -192,10 +192,10 @@
 
 | 项 | 现在 | 按答复应改成 |
 | --- | --- | --- |
-| **[否决]** P0-2 运行中改 lead（Q8/Q21） | `set_lead` 通过 `MediaSchedule.shift` 移动时间轴起点，`base_ns` 跟着动 | **lead 与 `base_ns` 解耦**：改 lead 只改本地发送提前量，协议窗口与 RTP 原点保持不变；上限取对端 `latencyMax` 而不是固定 2000 ms |
+| ~~P0-2 运行中改 lead（Q8/Q21）~~ **已按答复修正** | `set_lead` 只改 sync 锚点偏移，`base_ns` 保持不可变（`base_ns + anchor_shift_ns() + frames`），不发 `SETRATEANCHORTIME` | 上限改为对端声明的 `latency_ms + 100 ms`（`lead_ceiling`），超出被夹住并在 `lead_changed` 里报 `ceiling_ms` |
 | **[否决]** P2-11 QoS（Q26） | `setsockopt(IP_TOS)` 打 DSCP 46 | 改用 **qWAVE**：`QOSAddSocketToFlow` + `QOSTrafficTypeVoice`，失败时优雅退化 |
 | **[否决]** P0-4 SMTC 策略（Q12） | 2 s 轮询 + 300 ms 稳定窗 | 按答复改成事件驱动（SMTC 的 `MediaPropertiesChanged`/`TimelinePropertiesChanged`），进度策略按答复的阈值 |
-| P0-3 伺服常数（Q5/Q6） | 外层 kp=20 ppm/ms、ki=25 ppm/(ms·s)、上限 300 ppm | `correction_ppb = filtered_ns / 20`、夹 **±50 ppm**；我们 ±500 ppm 的重采样量程够用，缺的是增益与死区 |
+| ~~P0-3 伺服常数（Q5/Q6）~~ **已按答复修正** | 外层改为 `correction_ppb = filtered_ns / 20`（50 ppm/ms），夹 ±50 ppm，**无积分项**；engage >5 ms / release ≤1 ms 非对称迟滞；250 ms 断点改为**整机重置**（filter/correction/engaged 全清零再预热）；饱和静默计数 |
 | P0-2 自适应判据（Q22） | 一分钟 3 次时间线恢复 | 保留该策略层，但**必须叠加 p99 迟到**，否则对慢性迟到不敏感 |
 | P3-1 遥控命令（Q25） | 解析 RTSP 事件里的 `mrCommand` | 同时接受 `SendInput` + `VK_MEDIA_*` 的输入事件路径 |
 | P1-9 事件通道（Q16/Q25） | EOF 后整条会话重启 | 按答复的重建策略细化（不重建音频链路） |
