@@ -76,7 +76,7 @@ fn mock_with_model(
     ap2: bool,
     model: Option<&'static str>,
 ) -> Mock {
-    mock_with_cancel_and_model(ip, buffered, alac, channel, offset, ap2, model, None)
+    mock_with_cancel_and_model(ip, buffered, alac, channel, offset, ap2, model, None, true)
 }
 fn mock_with_cancel(
     ip: &str,
@@ -96,8 +96,33 @@ fn mock_with_cancel(
         ap2,
         Some("AudioAccessory5,1"),
         cancel_on_stream,
+        true,
     )
 }
+/// A receiver that is only probed with `/info`: the test expects the group to
+/// be refused before pairing or SETUP.
+fn mock_probe_only(
+    ip: &str,
+    alac: bool,
+    channel: Channel,
+    offset: i32,
+    ap2: bool,
+) -> Mock {
+    mock_with_cancel_and_model(
+        ip,
+        false,
+        alac,
+        channel,
+        offset,
+        ap2,
+        Some("AudioAccessory5,1"),
+        None,
+        false,
+    )
+}
+/// `pair` = false models a receiver that is only probed: the session must be
+/// refused between `/info` and pairing, so the worker records any request after
+/// `/info` (there must be none) and then closes.
 #[allow(clippy::too_many_arguments)]
 fn mock_with_cancel_and_model(
     ip: &str,
@@ -108,6 +133,7 @@ fn mock_with_cancel_and_model(
     ap2: bool,
     model: Option<&'static str>,
     cancel_on_stream: Option<Cancellation>,
+    pair: bool,
 ) -> Mock {
     let control = TcpListener::bind((ip, 0)).unwrap();
     let event = TcpListener::bind((ip, 0)).unwrap();
@@ -200,6 +226,23 @@ fn mock_with_cancel_and_model(
         let request = c.read().unwrap();
         assert!(request.first.starts_with("GET /info"));
         respond(&mut c, &request, &plist_bytes(&info));
+        if !pair {
+            // The group is refused after the `/info` probes: the client must
+            // close this connection without sending anything else. Record a
+            // stray request (a SETUP here would be the bug this test guards)
+            // and stop instead of answering it.
+            if let Ok(request) = c.read() {
+                method_out.lock().unwrap().push(
+                    request
+                        .first
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_owned(),
+                );
+            }
+            return;
+        }
         let secret = server_srp(&mut c, "3939");
         c.encrypt(
             derive(&secret, "Control-Salt", "Control-Read-Encryption-Key"),
@@ -606,7 +649,7 @@ fn mixed_transports_share_sample_timeline_route_channels_and_close_together() {
         "every member must stay on the group's PTP clock"
     );
     assert!(
-        !events.iter().any(|e| e["code"] == "group_timing_divergence"),
+        !events.iter().any(|e| e["code"] == "group_timing_plan"),
         "identical fingerprints must not warn"
     );
 }
@@ -666,7 +709,7 @@ fn an_airplay2_group_keeps_ptp_on_every_member() {
     assert!(
         !events
             .iter()
-            .any(|event| event["code"] == "group_timing_divergence")
+            .any(|event| event["code"] == "group_timing_plan")
     );
 }
 /// Q33: a mixed HomePod + Apple TV group is PTP, and the Apple TV joins the
@@ -737,14 +780,14 @@ fn a_mixed_homepod_and_apple_tv_group_runs_one_ptp_clock_domain() {
     assert!(
         !events
             .iter()
-            .any(|event| event["event"] == "warning" && event["code"] == "group_timing_divergence"),
+            .any(|event| event["event"] == "warning" && event["code"] == "group_timing_plan"),
         "a uniform group PTP plan must not emit a user-facing warning"
     );
 }
-/// The bug fix: one member without bit40 makes the whole group NTP.
+/// An all-classic multi-member group still runs NTP on every member.
 #[test]
-fn one_member_without_airplay2_downgrades_the_whole_group_without_a_warning() {
-    let mut left = mock("127.0.0.2", false, false, Channel::Left, 0, true);
+fn an_all_classic_group_keeps_ntp_on_every_member() {
+    let mut left = mock("127.0.0.2", false, false, Channel::Left, 0, false);
     let mut right = mock("127.0.0.3", false, false, Channel::Right, 0, false);
     left.peer.receiver_id = "left".into();
     right.peer.receiver_id = "right".into();
@@ -784,14 +827,71 @@ fn one_member_without_airplay2_downgrades_the_whole_group_without_a_warning() {
     assert_eq!(negotiated.len(), 2);
     assert!(
         negotiated.iter().all(|event| event["timing"] == "ntp"),
-        "one member without AirPlay 2 must not leave its partner on PTP"
+        "an all-classic group must stay on NTP"
     );
-    // Q33: this is still a valid group decision, not a user-facing warning.
-    // The evidence summary goes to the engine log only.
+    // The plan is still a valid group decision, not a user-facing warning.
     assert!(
         !events
             .iter()
-            .any(|event| event["event"] == "warning" && event["code"] == "group_timing_divergence"),
-        "group_timing_divergence must not use the user-facing warning channel"
+            .any(|event| event["event"] == "warning" && event["code"] == "group_timing_plan"),
+        "the group timing diagnostic must not use the user-facing warning channel"
+    );
+}
+
+/// Q39: a group whose members disagree on AirPlay 2 evidence is refused after
+/// the `/info` probes and before any SETUP -- never downgraded to NTP.
+#[test]
+fn a_mixed_group_is_refused_before_any_setup() {
+    let mut left = mock_probe_only("127.0.0.2", false, Channel::Left, 0, true);
+    let mut right = mock_probe_only("127.0.0.3", false, Channel::Right, 0, false);
+    left.peer.receiver_id = "left".into();
+    right.peer.receiver_id = "right".into();
+    left.peer.profile.timing = Timing::Auto;
+    right.peer.profile.timing = Timing::Auto;
+    let path = quiet_wav();
+    let options:ProbeOptions=serde_json::from_value(serde_json::json!({"peers":[],"source":"wav","duration_ms":400,"gain":0.1,"latency_ms":200,"wav_path":path,"group_mode":"software_stereo","handshake_only":true})).unwrap();
+    let options = ProbeOptions {
+        peers: vec![left.peer.clone(), right.peer.clone()],
+        ..options
+    };
+    let events = Mutex::new(Vec::new());
+    let eq = crate::equalizer::Control::new(options.equalizer, 44100).unwrap();
+    let outcome = run_session(
+        options,
+        Cancellation::default(),
+        Arc::new(AtomicU32::new(0.1f32.to_bits())),
+        crate::volume::Control::default(),
+        eq,
+        |event| events.lock().unwrap().push(event),
+        (crate::clock::Clock::new(), None),
+    );
+    std::fs::remove_file(path).unwrap();
+    // The probe-only mocks record every request after `/info`; nothing may have
+    // arrived, and in particular no SETUP was ever sent to either receiver.
+    for (mock, name) in [(&left, "left"), (&right, "right")] {
+        assert!(
+            mock.methods.lock().unwrap().is_empty(),
+            "{name} received a request after /info"
+        );
+        assert!(
+            mock.setups.lock().unwrap().is_empty(),
+            "{name} received a session SETUP"
+        );
+        assert!(mock.packets.lock().unwrap().is_empty());
+    }
+    left.worker.join().unwrap();
+    right.worker.join().unwrap();
+    let fault = outcome
+        .expect_err("a mixed group must not start")
+        .downcast::<crate::transport::Fault>()
+        .expect("the refusal must be a structured engine fault");
+    assert_eq!(fault.code, "mixed_timing_group");
+    assert_eq!(fault.code, crate::profile::MixedTimingGroup::CODE);
+    assert_eq!(fault.channel, "setup");
+    assert!(!fault.retryable, "a mixed group will not become legal on retry");
+    assert!(
+        fault.message.contains("Please connect them separately."),
+        "{}",
+        fault.message
     );
 }
