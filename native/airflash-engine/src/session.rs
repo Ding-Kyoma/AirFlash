@@ -1184,16 +1184,19 @@ fn send_packets(
                     .service_buffered(Instant::now())
                     .map_err(|e| Fault::from_error(member.peer.host, "buffered", &e))?;
             }
-            // Adaptive latency: the desktop side asks for more or less media held at
-            // the receiver; the shift is applied to the live timeline, so no session
-            // rebuild and no audible restart is needed.
-            let wanted = requested_lead();
+            // Adaptive latency: the desktop asks for more or less media held at the
+            // receiver. `base_ns` stays immutable — the published mapping is
+            // `base_ns + anchor_shift + frames`, so a lead change moves the sync
+            // anchor without rewriting the session's origin (a rewritten origin is
+            // exactly what makes the receiver jump a segment).
+            let ceiling = lead_ceiling(members);
+            let wanted = requested_lead().min(ceiling);
             if wanted != applied_lead {
                 let applied = schedule.add_shift(wanted - applied_lead);
                 if applied != 0 {
                     applied_lead += applied;
                     telemetry.lead_extra_ms = applied_lead as f64;
-                    emit(json!({"event":"lead_changed","channel":"scheduler","host":null,"requested_ms":wanted,"applied_ms":applied_lead,"shift_ms":round3(schedule.shift.as_secs_f64() * 1000.0)}));
+                    emit(json!({"event":"lead_changed","channel":"scheduler","host":null,"requested_ms":wanted,"applied_ms":applied_lead,"ceiling_ms":ceiling,"shift_ms":round3(schedule.shift.as_secs_f64() * 1000.0)}));
                 }
             }
             let deadline = schedule.deadline();
@@ -1542,9 +1545,23 @@ fn round3(value: f64) -> f64 {
 /// so a process-wide cell keeps `set_lead` from having to thread another parameter
 /// through six call sites. Zero means "whatever the timeline needs".
 static LEAD_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-/// Ceiling for an operator-requested lead. Two seconds matches the re-anchor cap:
-/// beyond that the receiver's own buffer is the limit, not ours.
+/// Absolute ceiling for an operator-requested lead. The effective ceiling is the
+/// receiver's declared buffer (`lead_ceiling`); this only bounds a request when the
+/// device never declared one.
 pub const MAX_LEAD_MS: i64 = 2000;
+/// The adaptive range WAC allows above the chosen latency is +100 ms. Staying inside
+/// the device's own buffer is what keeps a larger lead from simply overflowing.
+pub const LEAD_HEADROOM_MS: i64 = 100;
+/// Extra lead a request may add, from what the receivers actually promised to buffer.
+fn lead_ceiling(members: &[Member]) -> i64 {
+    lead_ceiling_from(members.iter().filter_map(|m| m.peer.profile.latency_ms))
+}
+fn lead_ceiling_from(declared: impl Iterator<Item = u32>) -> i64 {
+    declared
+        .max()
+        .map_or(MAX_LEAD_MS, |ms| i64::from(ms) + LEAD_HEADROOM_MS)
+        .clamp(LEAD_HEADROOM_MS, MAX_LEAD_MS)
+}
 pub fn request_lead(ms: i64) {
     LEAD_MS.store(ms.clamp(0, MAX_LEAD_MS), std::sync::atomic::Ordering::Release);
 }
@@ -1580,6 +1597,21 @@ mod simulation;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lead_ceiling_follows_what_the_receiver_promised_to_buffer() {
+        // No declared buffer: only the absolute cap applies.
+        assert_eq!(lead_ceiling_from(std::iter::empty()), MAX_LEAD_MS);
+        // A solo HomePod buffer of 250 ms allows 250 + 100 ms of lead.
+        assert_eq!(lead_ceiling_from([250].into_iter()), 350);
+        // A stereo pair uses the largest member, not the smallest.
+        assert_eq!(lead_ceiling_from([120, 300].into_iter()), 400);
+        // Tiny values still leave the +100 ms headroom available.
+        assert_eq!(lead_ceiling_from([10].into_iter()), 110);
+        // And nothing exceeds the absolute cap.
+        assert_eq!(lead_ceiling_from([5000].into_iter()), MAX_LEAD_MS);
+        // A request above the ceiling is clamped before it reaches the scheduler.
+        assert_eq!(5000.min(lead_ceiling_from([250].into_iter())), 350);
+    }
     // Exercises the production media loop and TEARDOWN against two localhost
     // RTSP/UDP peers, with a synthetic capture queue and no HAP/audio devices.
     fn local_member() -> (Member, UdpSocket, JoinHandle<()>) {
