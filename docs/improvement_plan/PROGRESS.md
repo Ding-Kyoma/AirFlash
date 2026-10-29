@@ -87,8 +87,13 @@
 反馈/事件通道故障过去直接 `fail()` 整个会话。现在分两级：
 
 - `degrade()`：控制面故障，记为 `control_degraded`，媒体仍在送达就继续播，
-  并通过 `warning` 上报（`feedback_lost`）。
-- `fail()`：认证失败、会话被拒（401/403/454），重连是唯一解，立即失败。
+  并通过 `warning` 上报。**运行中的 `/feedback` 被拒（任何非 200，含
+  401/403/454）属于这一级**：只发一条 `feedback_rejected` warning 并降级，
+  不再 `fail()`、不产生抢占证据、不写 `ended_at`；Q34 的 WAC 原文是
+  `feedback failure is not media failure`。
+- `fail()`：只留给 SETUP 阶段（含 SETUP 前的 `/info`）的 401/403/454 和真正的
+  认证/加密失败——此时还没有媒体，重连才是唯一解，`authentication_failed`
+  仍不可重试。运行中的 `/feedback` 拒绝永远不走这条路（Q16 边界不变）。
 
 会话循环每秒用 `check_control(media_healthy)` 判定：只有「媒体也停了」才把降级
 升级为终止。窗口 2 秒。
@@ -360,7 +365,7 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   `GET /info`，复用 `rtsp::Connection` 与二进制 plist 解析，不引入第二个 HTTP
   客户端；默认超时 2 s，超时、连接失败、RTSP 错误、plist 错误都返回 `Err`。
   控制面只有未预期 `TEARDOWN` 和 `Connection: close` 两条线索会触发探测；
-  `403` 按 Q32 归到访问/认证错误，见下。
+  运行中 `/feedback` 的 `403`（以及任何拒绝状态）按 Q34 只降级控制通道，见下。
 - **位定义已落定（Q31 答复）**：不再保留 `ANOTHER_SENDER_BIT = None`，改成三个
   64 位常量，命名与 WAC 相同：`RECEIVER_SESSION_ACTIVE = 0x20000`（131072，
   bit17，`ReceiverStatusFlags.ReceiverSessionActive`）、
@@ -392,10 +397,13 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
      接管后仍会成功、只看媒体健康会停在 `OursActive`」的担心，按 Q32 的裁决
      让位于 RTP 健康这一更硬的信号；真正的接管由控制面证据 + 有限期信任 +
      busy 上限共同兜底。
-  2. **`403` 降级**：`403` 只当访问/认证错误处理（`transport.rs` 的 feedback
-     路径返回 `authentication_failed`，与 `401` 同类；不再产生抢占证据、不再写
-     `ended_at`、不再触发 `/info` 探测）。真正表示「会话已结束」的控制面信号
-     只剩未预期的 `TEARDOWN`；`Connection: close` 仍只是证据。
+  2. **运行中 `/feedback` 拒绝只降级控制通道**（Q34）：`401`/`403`/`454`
+     和任何其他非 200 状态都返回可重试的 `feedback_rejected`，由
+     `Health::degrade()` 记为 `control_degraded` 并只发一条 warning；只要 RTP
+     仍在发就继续播，不 `fail()`、不产生抢占证据、不写 `ended_at`、不再触发
+     `/info` 探测。SETUP 阶段（媒体开始前）的 `401`/`403`/`454` 仍走终结性的
+     `authentication_failed`，这条 Q16 边界没有变。真正表示「会话已结束」的
+     控制面信号只剩未预期的 `TEARDOWN`；`Connection: close` 仍只是证据。
   3. **busy 队列有上限**：连续确认的 `BusyElsewhere` 达到 `BUSY_LIMIT=3` 次后，
      `ProbeAction::ReclaimBusyExhausted` 强制回收并打印 `busy_exhausted`
      warning，队列不可能无限循环；随后的回收仍要过 `TakeoverCounter`，所以
@@ -455,10 +463,11 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   发回已被接管的会话；回收只能走新连接（与 Q16 的「加密 RTSP 不能中途
   re-key」一致）。`run_live` 同时 `discard_stale()`，避免旧 capture backlog
   灌进新会话。
-- **保留的边界**：我们自己发起的 `TEARDOWN` 仍不算抢占；`401` 与 `403` 都归
-  `authentication_failed`（Q32 把 403 归到访问/认证错误，不再当抢占证据），
-  `454` 仍是 `session_rejected`；`preempted` 的 `Member::close()` 仍不回发
-  TEARDOWN。
+- **保留的边界**：我们自己发起的 `TEARDOWN` 仍不算抢占；**SETUP 阶段**
+  （媒体开始前）的 `401`/`403`/`454` 仍是不可重试的
+  `authentication_failed`（Q16），**运行中** `/feedback` 的任何拒绝状态都只走
+  可重试的 `feedback_rejected` 降级路径（Q34）；`preempted` 的
+  `Member::close()` 仍不回发 TEARDOWN。
 - **不会形成无限循环/重连风暴**：一个 live 循环里每个探测周期最多回收一次；
   busy 时只排下一次探测，不重建会话，连续 `BUSY_LIMIT` 次确认后强制回收；
   `OursActive` 不排队，等下一个控制面信号再探；连续计数到上限立即让步。
@@ -496,9 +505,12 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
     `OursActive` / `BusyElsewhere`；bit14+bit7 与 `1<<40` 高位不影响 `Free`；
     高位 + bit17 仍能识别会话；缺 `statusFlags` 为 `Unknown`；连接拒绝/静默
     超时为 `Err` 且判决为回收。
-  - `tests/continuity.rs`：`/feedback` 返回 403 时 fault 是
-    `authentication_failed`、不可重试，并且 `take_preemption_signals()` 为空
-    （403 不再触发 `statusFlags` 探测）。
+  - `tests/continuity.rs`：运行中 `/feedback` 返回 401/403/454 时只把控制通道
+    记为可重试的 `feedback_rejected`（不是 `authentication_failed` /
+    `session_rejected`），`health.check()` 仍为 Ok、RTP 继续发包、只发一条
+    `warning`、`take_preemption_signals()` 为空；控制降级 + 媒体不健康时
+    `check_control(false)` 仍然失败。`session.rs` 的边界测试同时断言 SETUP 阶段
+    的 401/403/454 仍是不可重试的 `authentication_failed`。
   - `tests/rtsp_contract.rs`：中毒连接不写出任何请求，`finish_session` 也
     不写 TEARDOWN。
   - `session.rs`：TEARDOWN + 两次 Free 时第一次返回 `Waiting`（排确认），
@@ -520,9 +532,9 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
     被接管三种状态下 bit17 是否分别置位/清零、接管瞬间 `/info` 是否仍可读、
     字段是否始终是整数，都没有实测。代码已按 WAC 的位定义实现，异常一律按
     `Unknown` fail-open 回收。
-  - 真机 403 语义：现在 `/feedback` 403 走 `authentication_failed` 并结束当前
-    会话。WAC 也只把它归为访问/认证错误，没有说明「音频仍在流时是否该立刻
-    中断」；真机上 403 但音频正常的情况未验证，见 Q34。
+  - 真机 403 语义：现在运行中 `/feedback` 403 只降级控制通道并保持会话
+    （Q34，WAC 的 `keeping healthy media session`）。真机上 HomePod 在什么条件
+    下会对 `/feedback` 回 403、音频是否仍然正常，仍未实测。
   - RTP 健康与真接管：按 Q32 的无条件规则，UDP 发送仍「成功」时 bit17 会被判成
     `OursActive` 而不回收。真接管时 ICMP/端口关闭能否在多长时间内让
     `media_healthy` 变假、从而进入 busy 路径，未实测，见 Q34。

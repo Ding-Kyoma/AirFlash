@@ -91,12 +91,7 @@ fn feedback_grace_keeps_one_request_and_accepts_late_encrypted_reply() {
 }
 #[test]
 fn feedback_retries_only_complete_transient_responses() {
-    for statuses in [
-        vec![503, 503, 200],
-        vec![503, 503, 503],
-        vec![403],
-        vec![454],
-    ] {
+    for statuses in [vec![503, 503, 200], vec![503, 503, 503]] {
         let (conn, peer) = pair();
         let expected = statuses.clone();
         let health = Health::default();
@@ -120,41 +115,111 @@ fn feedback_retries_only_complete_transient_responses() {
             fast(),
         )
         .unwrap();
-        until(|| health.snapshot().feedback_successes > 0 || health.control_degraded().is_some() || health.check().is_err());
+        until(|| {
+            health.snapshot().feedback_successes > 0
+                || health.control_degraded().is_some()
+                || health.check().is_err()
+        });
         if expected.last() == Some(&200) {
             health.check().unwrap();
             assert_eq!(health.snapshot().feedback_failures, 2);
-        } else if let Some(fault) = health.control_degraded() {
+        } else {
+            let fault = health.control_degraded().expect("transient retries exhausted");
             assert!(fault.retryable);
             assert_eq!(fault.channel, "feedback");
+            assert_eq!(fault.code, "feedback_rejected");
             // Control-plane faults no longer end a session whose media is healthy.
             assert!(health.check().is_ok());
             assert!(health.check_control(true).is_ok(), "healthy media keeps playing");
             assert!(health.check_control(false).is_err(), "media stopped: now it is fatal");
+            assert_eq!(health.snapshot().feedback_failures, 3);
+            assert!(health.take_preemption_signals().is_empty());
             // A rebuilt channel clears the verdict without touching the session.
             health.clear_degraded();
             assert!(health.control_degraded().is_none());
             assert!(health.check_control(false).is_ok());
-        } else {
-            // Receiver rejected the session: reconnecting is the only fix, so this
-            // stays a hard failure rather than a degradation.
-            let error = health.check().unwrap_err();
-            let fault = error.downcast_ref::<Fault>().unwrap();
-            assert_eq!(fault.channel, "feedback");
-            assert!(matches!(fault.code.as_str(), "authentication_failed" | "session_rejected"));
-            if expected == vec![403] {
-                // Q32: 403 is an access/authentication error, never "another
-                // controller took our session". It must not start a
-                // statusFlags probe (which is what latching the old tracker
-                // would eventually wedge).
-                assert_eq!(fault.code, "authentication_failed");
-                assert!(!fault.retryable);
-                assert!(
-                    health.take_preemption_signals().is_empty(),
-                    "a 403 must never become preemption evidence"
-                );
-            }
         }
+        drop(worker);
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn a_running_feedback_rejection_degrades_and_keeps_media_flowing() {
+    // Q34/WAC: "feedback failure is not media failure". A rejected `/feedback`
+    // probe is a control-plane symptom only — never a session-ending fault.
+    for status in [401, 403, 454] {
+        let (conn, peer) = pair();
+        let health = Health::default();
+        let server = thread::spawn(move || {
+            let mut c = Connection::from_stream(peer, Cancellation::default()).unwrap();
+            let msg = c.read().unwrap();
+            assert!(msg.first.starts_with("POST /feedback"));
+            let seq = &msg.headers["cseq"];
+            c.write(
+                format!("RTSP/1.0 {status} Rejected\r\nCSeq: {seq}\r\nContent-Length: 0\r\n\r\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(50));
+        });
+        let worker = FeedbackWorker::start(
+            Arc::new(Mutex::new(conn)),
+            "test".into(),
+            health.clone(),
+            fast(),
+        )
+        .unwrap();
+        until(|| health.control_degraded().is_some() || health.check().is_err());
+        assert!(
+            health.check().is_ok(),
+            "a running feedback {status} must never fail the session"
+        );
+        let fault = health
+            .control_degraded()
+            .expect("a rejected feedback channel degrades the control plane");
+        assert_eq!(fault.channel, "feedback");
+        assert_eq!(fault.code, "feedback_rejected");
+        assert_ne!(fault.code, "authentication_failed");
+        assert_ne!(fault.code, "session_rejected");
+        assert!(fault.retryable);
+        assert!(fault.message.contains(&status.to_string()));
+        assert!(fault.message.contains("keeping healthy media session"));
+        assert!(
+            health.take_preemption_signals().is_empty(),
+            "a feedback {status} must never feed the preemption tracker"
+        );
+        assert_eq!(health.snapshot().feedback_failures, 1);
+        // Exactly one warning, through the existing `warning` event shape.
+        let notices = health.notices();
+        let warnings = notices
+            .iter()
+            .filter(|n| n["event"] == "warning" && n["channel"] == "feedback")
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1, "status {status} logs one warning");
+        assert_eq!(warnings[0]["code"], "feedback_rejected");
+        assert_eq!(warnings[0]["host"], "test");
+        assert_eq!(warnings[0]["recovered"], false);
+        // Healthy media: the live loop's verdict stays "keep playing".
+        assert!(health.check_control(true).is_ok());
+        // Unchanged escalation: degraded control + unhealthy media still ends it.
+        assert!(health.check_control(false).is_err());
+
+        // RTP is independent of the feedback probe and keeps flowing.
+        let (mut media, audio_peer, _control_peer) = media();
+        let pcm = vec![0; PCM_BYTES];
+        let now = Instant::now();
+        for _ in 0..3 {
+            media.send(&pcm, false, now, now, &health).unwrap();
+        }
+        assert_eq!(media.metrics.packets_sent, 3);
+        assert!(media.media_healthy(Instant::now(), Duration::from_secs(2)));
+        audio_peer
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut buf = [0; 2048];
+        assert!(audio_peer.recv_from(&mut buf).unwrap().0 > 0);
+
         drop(worker);
         server.join().unwrap();
     }
