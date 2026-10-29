@@ -66,6 +66,7 @@ fn capabilities() -> Vec<&'static str> {
         "member_volume",
         "receiver_password",
         "standby_release",
+        "now_playing",
         "diagnostics",
     ];
     if airflash_engine::applications::supported() {
@@ -73,6 +74,9 @@ fn capabilities() -> Vec<&'static str> {
     }
     values
 }
+
+/// Monotonic sequence for metadata updates: the worker ignores stale ones.
+static NEXT_METADATA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn equalizer_event(running: Option<&Running>, session: &str, params: Value) -> Value {
     #[derive(Deserialize)]
@@ -189,7 +193,7 @@ fn main() {
             "hello" => send(
                 &request.id,
                 &request.session_id,
-                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"experimental","live_loopback":true,"capabilities":capabilities(),"commands":["hello","get_receiver_capabilities","list_applications","start","probe","stop","set_gain","set_equalizer","set_standby","set_device_volume","set_lead","pair","pair_pin"],"production_ready":false}),
+                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"experimental","live_loopback":true,"capabilities":capabilities(),"commands":["hello","get_receiver_capabilities","list_applications","start","probe","stop","set_gain","set_equalizer","set_standby","set_device_volume","set_lead","set_now_playing","pair","pair_pin"],"production_ready":false}),
             ),
             "get_receiver_capabilities" => {
                 let result = (|| -> anyhow::Result<_> {
@@ -391,6 +395,19 @@ fn main() {
                         );
                     }
                 }
+            }
+            "set_now_playing" => {
+                // Desktop metadata (title/artist/album/position) is forwarded to every
+                // receiver as SET_PARAMETER by the session's metadata worker.
+                let now: airflash_engine::metadata::NowPlaying =
+                    serde_json::from_value(request.params.clone()).unwrap_or_default();
+                let sequence = NEXT_METADATA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                airflash_engine::metadata::global().set(sequence, now);
+                send(
+                    &request.id,
+                    &request.session_id,
+                    json!({"event":"metadata_accepted","sequence":sequence}),
+                );
             }
             "set_lead" => {
                 // Adaptive latency: shift the live timeline instead of restarting.

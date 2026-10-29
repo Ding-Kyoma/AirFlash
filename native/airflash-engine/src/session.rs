@@ -1096,12 +1096,18 @@ fn send_packets(
         .collect::<Vec<_>>();
     let volume_workers = if options.group_mode == "software_stereo" {
         volume_peers
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|p| crate::volume::Worker::start_member(p, volume.clone()))
             .collect::<Result<Vec<_>>>()?
     } else {
-        vec![crate::volume::Worker::start(volume_peers, volume)?]
+        vec![crate::volume::Worker::start(volume_peers.clone(), volume)?]
     };
+    let metadata_worker = crate::metadata::Worker::start(
+        volume_peers,
+        crate::metadata::global().clone(),
+    )
+    .ok();
     let mut next_metrics = start + Duration::from_secs(1);
     let mut applied_lead = 0i64;
     let mut last_marker = 0u64;
@@ -1126,6 +1132,11 @@ fn send_packets(
                 }
             }
             for worker in &volume_workers {
+                for event in worker.events.try_iter() {
+                    emit(event);
+                }
+            }
+            if let Some(worker) = &metadata_worker {
                 for event in worker.events.try_iter() {
                     emit(event);
                 }
