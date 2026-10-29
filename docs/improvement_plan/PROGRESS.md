@@ -581,7 +581,7 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
 不是裸毫秒常数）、Q7（漂移上限口径）、Q13（`DATA_DISCONTINUITY` 判伪的额外条件）、
 Q24（同上）。
 
-## P2-13b / P2-13c 组内时钟域（已完成，Q33 修正）
+## P2-13b / P2-13c / P2-13d 组内时钟域（已完成，Q33 + Q39 修正）
 
 `native/airflash-engine/src/profile.rs`、`src/session.rs`、
 `src/receiver_capabilities.rs`、`src/session_simulation.rs`、
@@ -598,13 +598,30 @@ Q24（同上）。
   | --- | --- |
   | 空组 | NTP（不会发生，防御性默认） |
   | 单成员 | 完全沿用 97 行表刻画的单机行为（`solo_timing()`），PTP/NTP 不变 |
-  | 任一成员没有 AirPlay 2 证据（bit40 且 `srcvers >= 354.54.6`） | **整组 NTP** |
+  | 全部成员都没有 AirPlay 2 证据（bit40 且 `srcvers >= 354.54.6`） | **整组 NTP** |
   | 多成员且全部有 AP2 证据（HomePod 组 / Mixed Apple / 未知厂商 AP2 组） | **整组 PTP，无一例外** |
+  | 成员之间 AP2 证据不一致（混组） | **拒绝**：`mixed_timing_group`，SETUP 之前失败（P2-13d） |
 
   「Apple TV 单机 = NTP」只在 `n == 1` 分支成立；一旦进多设备，成员的单机
   答案不再参与整组决策，Apple TV 必须作为 PTP follower 加入发送端的时钟域。
   这是 P2-13c 相对 P2-13b「组内取最保守」的修正：旧规则会把 Mixed Apple
   group 错误地压到 NTP，和 WAC 的 `n > 1` 分支相反。
+- **混组是拒绝，不是降级（P2-13d，Q39）**：WAC 不会创建混组，三层独立守卫
+  各挡一次 —— `:4410` 的 UI 选择（`selected.Select(d => d.SupportsAirPlay2)
+  .Distinct().Count() > 1` 直接 return）、`:8316` `AddMember` 与 `:8404`
+  批量设置（成员表都不让混）、后端再拒一次
+  （`AirPlay 2 and classic RAOP cannot share one timing group` → UI 文案
+  `Device_MixedTimingGroupUnsupported`「…Please connect them separately.」）。
+  因此 `CreateTopologyPlan` 的 `Any(!SupportsAirPlay2)` 只可能覆盖「**全员
+  非 AP2**」这一种情况，语义等价于 `All(!SupportsAirPlay2)`；它不是「混组
+  降级」分支。
+  AF 的对应实现：`profile::select_timing` 在成员 AP2 证据不一致时返回
+  `Err(MixedTimingGroup)`（`TimingPlan::select` 原样上抛），`session.rs`
+  的 `run_stream` 在全部 `/info` 探测之后、任何 SETUP 之前返回
+  `Fault { code: "mixed_timing_group", channel: "setup", retryable: false }`，
+  并通过 stderr 保留证据摘要。P2-13b 的「任一成员缺 AP2 → 整组 NTP」分支
+  已删除：静默降级会让 AP2 成员丢掉 PTP/多房间同步而用户毫不知情，正是
+  Q39 要求避免的「半个 AP2 会话」。单成员仍走 `solo_timing()`，行为不变。
 - **只算一次、所有成员共用**：`TimingEvidence`、`TimingPlan` 与
   `CompatFingerprint::negotiate_planned(plan, …)` 不变。`session.rs` 的
   `run_stream` 仍是两阶段：先对全部成员做 `/info` 探测（失败仍按原逻辑重试
@@ -629,34 +646,40 @@ Q24（同上）。
   它是**设计决定**，对齐 WAC 的运行时断言
   （`snapshot.Timing == plan.Timing`，不一致即判整份遥测无效）。这段说明已
   写进 `negotiate_planned` 的文档注释，避免以后有人误以为协议强制一组一域。
-- **分歧告警降级（P2-13c）**：`group_timing_warning` 改名为
+- **组计划诊断只进日志（P2-13c / P2-13d）**：`group_timing_warning` 改名为
   `group_timing_diagnostic`，不再发 `{"event":"warning", ...}`，只把
-  `group_timing_divergence: <每个成员的 receiver_id/IP、是否 AP2、单机会选
-  什么、显式请求什么>; forced PTP/NTP for the whole group` 写到引擎 stderr
-  日志。桌面端 `SessionController` 的 `warning` 通道因此完全看不到它，
-  「SETUP 前 `startedAt == 0` 被丢弃」的问题也随之消失。内容仍保留在日志与
-  诊断导出里；一条组建立最多一行，不按成员或按包重复。
+  `group_timing_plan: <每个成员的 receiver_id/IP、是否 AP2、单机会选
+  什么、显式请求什么>; one PTP/NTP clock domain for the group` 写到引擎
+  stderr 日志。它解释的是「组计划如何压过成员各自的单机答案」，**不再描述
+  任何整组降级** —— 混组在计划产生之前就被拒绝，根本走不到这条日志。桌面端
+  `SessionController` 的 `warning` 通道因此完全看不到它，「SETUP 前
+  `startedAt == 0` 被丢弃」的问题也随之消失。内容仍保留在日志与诊断导出里；
+  一条组建立最多一行，不按成员或按包重复。
 - **预判（`receiver_capabilities`）不变**：`choices()` 仍用
   `TimingPlan::single(fingerprint, codec)`，输入仍只有 `supportedFormats` +
   对端 `features`（没有 model/srcvers），IPC 的 `selected_timing` 输出没有
   变化。它是**单接收器**答案：一台 Apple TV 的预判仍显示 `ntp`，而实际加入
   多设备组时运行时会按组计划给它 PTP；组时钟不在这条 per-receiver IPC 响应
   里，统一在 `session::run_stream` 决定。代码注释已写明这个边界。
-- **测试**：`session_simulation.rs` 的 mock 新增 model 覆盖与
-  `timingPeerInfo` 记录；新增「Mixed HomePod + Apple TV 全 AP2 → 两人都
-  PTP，且 Apple TV 的 SETUP 带 timingPeerInfo」「一人缺 bit40 → 两人都 NTP，
-  且不发用户可见 warning」两个握手级测试；原全 AP2 HomePod 组测试保持。
-  `tests/compat_profile.rs` 的 97 行表一行没改，另追加组规则（HomePod 组 /
-  通用 AP2 组 / Mixed Apple 组 / 缺 bit40 降级 / 单机不变）与
-  `negotiate_planned` 的断言。Rust 全量：lib 203（202 passed + 1 ignored），
-  main 2，集成测试 34 passed（soak 1 ignored），共 238 passed / 2 ignored。
+- **测试**：`session_simulation.rs` 的 mock 新增 model 覆盖、`timingPeerInfo`
+  记录和「只探测不配对」（`pair = false`）模式；新增「Mixed HomePod +
+  Apple TV 全 AP2 → 两人都 PTP，且 Apple TV 的 SETUP 带 timingPeerInfo」
+  「全经典组 → 两人都 NTP」「混组 → `mixed_timing_group` 失败，两个 mock 在
+  `/info` 之后没有收到任何请求（因此没有 SETUP）」三个握手级测试；原全 AP2
+  HomePod 组测试保持。`tests/compat_profile.rs` 的 97 行表一行没改，另追加
+  组规则（HomePod 组 / 通用 AP2 组 / Mixed Apple 组 / 全经典组 NTP / 混组
+  拒绝 / 单机不变）与 `negotiate_planned` 的断言。Rust 全量：lib 204
+  （203 passed + 1 ignored），main 2，集成测试 35 passed（soak 1 ignored），
+  共 240 passed / 2 ignored。
 - **没验证/没做的**：
   - 没有真机，也没有抓包确认：一台真实 Apple TV 加入 PTP 组后是否真的作为
     PTP follower 跟发送端时钟（`timingPeerInfo` 被接受、PTP offset 样本
     ≥30）；这是 Q33 之后最关键的未知项。
-  - 没有真机确认「AP1 + AP2 组」在真实接收器上接受整组 NTP；老 HomePod 对
-    PTP 的偏好只在模拟器里成立。WAC 的证据支持整组走 Classic RAOP/NTP，
-    但真机是否出声仍未验证。
+  - 没有真机体验过「混组被拒绝」：引擎在 `/info` 之后、SETUP 之前返回
+    `mixed_timing_group`，桌面显示本地化文案；这条路径只有 localhost 模拟
+    接收器覆盖，真实 HomePod + 老 AP1 设备混选时的界面表现未验证。
+    （上一版记录的「AP1 + AP2 组整组 NTP 是否能出声」不再成立：这种组现在
+    根本不会开始，不再是需要真机验证的兼容性问题。）
   - `/info` 的 `name` 仅作为 model 缺失/为 `Unknown` 时的兜底；没有真实
     `/info` 样本证明各型号的 `name` 字符串，也没有真机验证。
   - Q33 的 `n == 1 && allHomePod && isPcm -> NTP` 分支没有采用：AF 的 97 行
@@ -709,7 +732,8 @@ Q24（同上）。
   | 证据 | 分类 | 用户文案 |
   | --- | --- | --- |
   | 引擎 `authentication_failed`，或 `session_rejected` + TXT `pw=true`；或 MFi 文本（仅展示启发式） | 密码/配对（通用认证失败） | 需要密码或配对；MFi 文本换成 MFi 文案 |
-  | setup 通道 + TXT 证明 classic-only（组内任一成员 `NotAirPlay2`） | 仅经典 | AirFlash 暂不能推流 |
+  | 引擎 `mixed_timing_group`（Q39：混组在 SETUP 之前被拒） | 混组拒绝 | AirPlay 2 与经典 AirPlay 1/RAOP 设备不能同组，请分开连接 |
+  | setup 通道 + TXT 证明 classic-only（`NotAirPlay2`；组内混组会先命中 `mixed_timing_group`） | 仅经典 | AirFlash 暂不能推流 |
   | 桌面 `network_error`（DNS/`SocketException`）、`socket_error`、`connection_reset`、`read_timeout`、`write_failed`、`peer_closed`、`feedback_timeout` | 网络 | 检查设备与网络 |
   | 其他（含 `preempted`/`timeline_expired`/`clock_lost`） | 不分类 | 保留引擎的 `Detail` |
   桌面内部新增的 `network_error` 只用于 `EngineNotice`，不进入 IPC 契约。
