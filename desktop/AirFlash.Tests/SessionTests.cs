@@ -479,6 +479,34 @@ public sealed class SessionTests
         await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(2)); Assert.True(first.Disposed); Assert.NotEqual(first.Session, second.Session);
     }
     [Fact]
+    public async Task DesktopSessionRecordJoinsTheEngineRowAndCarriesTheReconnectReason()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection();
+        var records = new ConcurrentQueue<DesktopSessionRecord>();
+        await using var controller = new SessionController(new FakeFactory(first, second), new FakeAudio(),
+            timing: Fast, sessionRecords: records.Enqueue);
+        var settings = Settings(); settings.ForceReconnect = true; settings.MaxReconnectAttempts = 1;
+        await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        first.Emit("error", message: "network lost");
+        await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await controller.StopAsync();
+        await Until(() => records.Count == 2);
+        var rows = records.ToArray();
+        // The join key is exactly the session id the engine receives on the wire;
+        // the engine appends "-<session_epoch>" to it in session-summary.csv.
+        Assert.Equal(first.Commands.Single(c => c.Command == "start").Session, rows[0].SessionId);
+        Assert.Equal(first.Session, rows[0].SessionId);
+        Assert.Equal(0, rows[0].DesktopReconnects);
+        Assert.Equal(DesktopSessionLog.NoReconnect, rows[0].DesktopReconnectReason);
+        Assert.Equal(second.Commands.Single(c => c.Command == "start").Session, rows[1].SessionId);
+        Assert.Equal(second.Session, rows[1].SessionId);
+        Assert.Equal(1, rows[1].DesktopReconnects);
+        // Reuses the existing reconnect path: the reason is its fault code, and it
+        // is already distinguishable from the engine's timeline-reset reasons.
+        Assert.Equal("transport_fault:engine_error", rows[1].DesktopReconnectReason);
+        Assert.DoesNotContain("127.0.0.1", rows[1].SessionId + rows[1].DesktopReconnectReason);
+    }
+    [Fact]
     public async Task AuthenticationFailureDoesNotReconnect()
     {
         var process = new FakeConnection(); var factory = new FakeFactory(process); await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
