@@ -336,18 +336,20 @@ impl PeerState {
         let Some((origin, received, correction_ns, at)) = complete else {
             return;
         };
-        // A late older pair must not replace the newest complete sample.
-        if self
+        // A late older pair must not replace the newest complete sample, and it
+        // must not rewind the exchange streak either.
+        if !self
             .sync_pair
             .is_none_or(|sample| received > sample.received)
         {
-            self.sync_pair = Some(SyncSample {
-                origin,
-                received,
-                correction: correction_ns,
-                at,
-            });
+            return;
         }
+        self.sync_pair = Some(SyncSample {
+            origin,
+            received,
+            correction: correction_ns,
+            at,
+        });
         if self.follow {
             // A complete pair already yields the receiver-to-local offset. The
             // omitted path delay is sub-millisecond on a local network and far

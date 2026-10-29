@@ -296,6 +296,29 @@ fn localhost_follower_locks_after_receiver_drops_the_first_subscription() {
 }
 
 #[test]
+fn stale_pair_cannot_rewind_the_sync_offset_or_exchange_streak() {
+    let start = Instant::now();
+    let mut state = follower(start);
+    let receiver_offset: i128 = 5_000_000_000;
+    let newest = 2_000_000_000u64;
+    let (sync, follow) = sync_pair(8, 2, (newest as i128 + receiver_offset) as u64);
+    followed_packet(&mut state, &sync, newest + 10_000, start, 7);
+    followed_packet(&mut state, &follow, newest + 20_000, start, 7);
+    let stale = 1_000_000_000u64;
+    let later = start + Duration::from_millis(125);
+    let (sync, follow) = sync_pair(8, 1, (stale as i128 + receiver_offset) as u64);
+    followed_packet(&mut state, &sync, stale + 10_000, later, 7);
+    followed_packet(&mut state, &follow, stale + 20_000, later, 7);
+    assert_eq!(state.exchanges, 1);
+    assert_eq!(
+        state.sync_pair.map(|sample| sample.received),
+        Some(newest + 10_000)
+    );
+    let offset = state.sync_offset.expect("sync offset");
+    assert!((offset - (receiver_offset as f64 - 10_000.0)).abs() < 1.0);
+}
+
+#[test]
 fn follower_locks_from_sync_pairs_when_delay_responses_stay_unusable() {
     // Receivers such as HomePod OS 27 answer the delay request with timestamps
     // that contradict their own sync timestamps. The session must still obtain a
