@@ -1,6 +1,6 @@
 //! Read-only /info queries and the same profile negotiation used by playback.
 use crate::{
-    profile::{Codec, Formats, Profile, Timing, Transport},
+    profile::{Codec, CompatFingerprint, Formats, Profile, Timing, Transport},
     rtsp::{Cancellation, Connection},
     session::Peer,
 };
@@ -25,7 +25,14 @@ pub struct Capabilities {
     pub known: bool,
     pub profiles: Vec<ProfileChoice>,
 }
-pub fn choices(formats: Formats, evidence: &Profile, codecs: &[u8]) -> Vec<ProfileChoice> {
+/// Enumerate the codec/transport/timing combinations this receiver accepts.
+///
+/// The fingerprint comes from the same `/info` parse playback uses, so the
+/// prediction and the runtime answer to the same named questions. It carries no
+/// model/firmware evidence here on purpose: capability prediction has always
+/// been made from formats and the peer's own feature word alone, and adding the
+/// model would change the values reported over IPC.
+pub fn choices(fingerprint: &CompatFingerprint, evidence: &Profile) -> Vec<ProfileChoice> {
     let mut result = Vec::new();
     for rate in [44100, 48000] {
         for (codec_name, codec) in [
@@ -57,28 +64,19 @@ pub fn choices(formats: Formats, evidence: &Profile, codecs: &[u8]) -> Vec<Profi
                             || timing_name == "auto" && evidence.follow_receiver_clock,
                         ..evidence.clone()
                     };
-                    // Timing is predicted from the peer's own advertisement, not
-                    // from whatever a live session would inherit: without a model
-                    // name this is the only evidence available here.
-                    if let Ok(selected) = formats.negotiate(&profile, codecs, rate, false) {
+                    if let Ok(compat) = fingerprint.negotiate(&profile, rate, false) {
                         result.push(ProfileChoice {
                             codec: codec_name,
                             transport: transport_name,
                             timing: timing_name,
                             sample_rate: rate,
-                            selected_codec: if selected.alac { "alac" } else { "pcm" },
-                            selected_transport: if selected.transport == Transport::Buffered {
+                            selected_codec: compat.codec_name(),
+                            selected_transport: if compat.uses_buffered_stream() {
                                 "buffered"
                             } else {
                                 "realtime"
                             },
-                            selected_timing: if !selected.ptp {
-                                "ntp"
-                            } else if profile.follow_receiver_clock {
-                                "follow"
-                            } else {
-                                "ptp"
-                            },
+                            selected_timing: compat.timing_label(),
                         });
                     }
                 }
@@ -93,19 +91,27 @@ pub fn query(peer: &Peer, cancellation: Cancellation) -> Result<Capabilities> {
         cancellation,
     )?;
     let info = connection.request("GET", "/info", &[], &[])?.plist()?;
-    let formats = Formats::parse(&info);
+    let fingerprint =
+        CompatFingerprint::from_formats(Formats::parse(&info), &peer.profile, &peer.codecs);
     Ok(Capabilities {
         receiver_id: peer.receiver_id.clone(),
         host: peer.host,
         port: peer.port,
-        known: formats.realtime.is_some() || formats.buffered.is_some(),
-        profiles: choices(formats, &peer.profile, &peer.codecs),
+        known: fingerprint.advertises_audio(),
+        profiles: choices(&fingerprint, &peer.profile),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Capability prediction works from the parsed formats plus the peer's own
+    /// evidence, exactly like `query` does.
+    fn fingerprint(formats: Formats, evidence: &Profile) -> CompatFingerprint {
+        CompatFingerprint::from_formats(formats, evidence, &[])
+    }
+
     #[test]
     fn capability_query_only_reads_info_and_closes_without_pairing_or_setup() {
         use std::io::{Read, Write};
@@ -166,7 +172,7 @@ mod tests {
             follow_receiver_clock: true,
             ..Profile::default()
         };
-        let items = choices(formats, &evidence, &[]);
+        let items = choices(&fingerprint(formats, &evidence), &evidence);
         assert!(items.iter().any(|p| p.sample_rate == 48000
             && p.codec == "auto"
             && p.transport == "auto"
@@ -195,7 +201,10 @@ mod tests {
             features: Some(0),
             ..Formats::default()
         };
-        let items = choices(formats, &Profile::default(), &[]);
+        let items = choices(
+            &fingerprint(formats, &Profile::default()),
+            &Profile::default(),
+        );
         assert!(
             items
                 .iter()
@@ -219,7 +228,7 @@ mod tests {
             follow_receiver_clock: true,
             ..Profile::default()
         };
-        let items = choices(formats, &evidence, &[]);
+        let items = choices(&fingerprint(formats, &evidence), &evidence);
         assert!(
             items
                 .iter()
@@ -257,7 +266,7 @@ mod tests {
                         follow_receiver_clock,
                         ..Profile::default()
                     };
-                    let items = choices(formats, &evidence, &[]);
+                    let items = choices(&fingerprint(formats, &evidence), &evidence);
                     assert!(!items.is_empty());
                     for item in items {
                         // Reconstruct the wire profile used by SessionController:
@@ -285,35 +294,23 @@ mod tests {
                                 || item.timing == "auto" && follow_receiver_clock,
                             ..evidence.clone()
                         };
-                        let selected = formats
-                            .negotiate(&profile, &[], item.sample_rate, true)
+                        let selected = fingerprint(formats, &evidence)
+                            .negotiate(&profile, item.sample_rate, true)
                             .unwrap_or_else(|error| {
                                 panic!(
                                     "offered {item:?} failed playback: {error}; features={features:?}, evidence={evidence:?}"
                                 )
                             });
-                        assert_eq!(
-                            item.selected_codec,
-                            if selected.alac { "alac" } else { "pcm" }
-                        );
+                        assert_eq!(item.selected_codec, selected.codec_name());
                         assert_eq!(
                             item.selected_transport,
-                            if selected.transport == Transport::Buffered {
+                            if selected.uses_buffered_stream() {
                                 "buffered"
                             } else {
                                 "realtime"
                             }
                         );
-                        assert_eq!(
-                            item.selected_timing,
-                            if !selected.ptp {
-                                "ntp"
-                            } else if profile.follow_receiver_clock {
-                                "follow"
-                            } else {
-                                "ptp"
-                            }
-                        );
+                        assert_eq!(item.selected_timing, selected.timing_label());
                     }
                 }
             }
