@@ -339,5 +339,12 @@
   "Cannot reset pairing data through a linked directory.": "無法透過連結目錄重設配對資料。",
   "Unsupported group sample rate: {0}": "立體聲群組取樣率不受支援：{0}",
   "Group sample rate: {0} (pending verification)": "立體聲群組取樣率：{0}（待驗證）",
-  "Reset failed and startup settings could not be restored.": "重設失敗，且無法還原開機啟動設定。"
+  "Reset failed and startup settings could not be restored.": "重設失敗，且無法還原開機啟動設定。",
+  "AirPlay 2": "AirPlay 2",
+  "Classic AirPlay only": "僅經典 AirPlay",
+  "AirPlay 2 support unknown": "AirPlay 2 支援未知",
+  "This device only supports classic AirPlay. AirFlash cannot stream to it yet.": "此裝置僅支援經典 AirPlay，AirFlash 目前無法向其推流。",
+  "This device requires a password or pairing that AirFlash could not complete. Pair it again in Receivers.": "此裝置需要密碼或配對，AirFlash 無法完成。請在「接收器」中重新配對。",
+  "This device requires MFi authentication, which AirFlash cannot perform without Apple hardware.": "此裝置要求 MFi 認證，AirFlash 無法在沒有 Apple 硬體的情況下完成。",
+  "Could not reach the receiver over the network. Check that it is powered on and on the same network as this PC.": "無法透過網路連線接收器。請確認裝置已開機，並與本機處於同一網路。"
 }

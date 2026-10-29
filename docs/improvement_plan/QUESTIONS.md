@@ -1454,6 +1454,63 @@ P2-13b 已把协商改成「先探测全组、再算一个 `TimingPlan`、最后
 
 ---
 
+### Q34. 任务说明要求写 `Strings.json`，但仓库里没有这个文件 `[待答复]`
+
+P3-2 桌面半的任务说明要求「每个新用户可见字符串都加进 `Strings.json`、
+`Strings.zh.json`、`Strings.zh-TW.json`、`Strings.de.json`」。实际仓库里
+只有后三个语言文件：`L.cs` 只加载 zh / zh-TW / de，`AirFlash.Core.csproj` 也只
+嵌入这三个资源；英文键本身就是 `L.Get` 的回退值，历史上从来没有
+`Strings.json`。
+
+本轮把 7 个新键按现有约定写进了三个语言文件，没有新建英文目录。需要确认：
+
+1. 是否应该新建一个英文 `Strings.json` 并嵌入？如果建，放**全量**英文键还是
+   只放新增键？只放新增键会形成一个不完整、又容易被误认为权威的目录。
+2. 如果保持现状，任务说明里的「四个文件」是否应改成「英文键 + 三个语言文件」，
+   避免下一轮再按字面找 `Strings.json`？
+
+> **答复**：（待补充）
+
+---
+
+### Q35. bit40 置位但 `srcvers` 缺失时，列表标 unknown 还是 classic？ `[待答复]`
+
+WAC 的 `SupportsAirPlay2` 在 `Version.TryParse` 失败时返回 false，
+`CreateTopologyPlan` 随即按 Classic RAOP 处理。但任务同时要求「AirPlay 2 状态
+未知的设备绝不能显示成 classic」。
+
+本轮桌面标注的取舍是：
+
+- `features` 缺失 → unknown；
+- `features` 存在且 bit40 = 0 → classic；
+- bit40 = 1、`srcvers` 可解析但 < 354.54.6 → classic；
+- bit40 = 1、`srcvers` 缺失/不可解析 → **unknown**（设备自称 AP2，但版本无法
+  确认，不把它断言成 classic）。
+
+`SupportsAirPlay2` 本身仍严格按 WAC 返回 false。这个 UI 三态是否同意？如果希望
+与 WAC 的布尔判定完全一致（bit40 = 1 但版本缺失也算 classic），只需改
+`AirPlayCapability.Classify` 的一个分支。
+
+> **答复**：（待补充）
+
+---
+
+### Q36. MFi 门禁没有引擎 code，也没有 TXT 证据，桌面只能匹配消息文本 `[待答复]`
+
+报告 15 §15.3 提到 WAC 有明确错误
+`Device requires MFi authentication (not implementable without Apple hardware)`，
+但全仓库 grep `mfi` 在引擎与桌面均为 0 命中：引擎不会返回独立 code，TXT 的
+`features` 位里也没有已确认的 MFi 位。
+
+本轮 `GateFailure` 只在 `code=mfi_required` 或 message 含 `MFi` 时分类；真实
+MFi 设备今天仍会显示通用 fault。要让这条分类真正可用，需要引擎在 SETUP/认证
+失败时识别并返回独立 code（例如 `mfi_required`），或确认某个 TXT/feature 位
+能作为证据。下一轮是否在引擎侧补这个 code？桌面半本轮没有改引擎。
+
+> **答复**：（待补充）
+
+---
+
 ## 答复区
 
 > 已在每条条目下方就地回填（`> **答复**`）。下面是需要**优先改代码**的 4 条，按影响排序。

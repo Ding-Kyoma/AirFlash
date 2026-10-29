@@ -356,5 +356,12 @@
   "Cannot reset pairing data through a linked directory.": "Kopplungsdaten können nicht über ein verlinktes Verzeichnis zurückgesetzt werden.",
   "Unsupported group sample rate: {0}": "Nicht unterstützte Abtastrate der Gruppe: {0}",
   "Group sample rate: {0} (pending verification)": "Abtastrate der Gruppe: {0} (Verifizierung ausstehend)",
-  "Reset failed and startup settings could not be restored.": "Das Zurücksetzen ist fehlgeschlagen, und die Starteinstellungen konnten nicht wiederhergestellt werden."
+  "Reset failed and startup settings could not be restored.": "Das Zurücksetzen ist fehlgeschlagen, und die Starteinstellungen konnten nicht wiederhergestellt werden.",
+  "AirPlay 2": "AirPlay 2",
+  "Classic AirPlay only": "Nur klassisches AirPlay",
+  "AirPlay 2 support unknown": "AirPlay-2-Unterstützung unbekannt",
+  "This device only supports classic AirPlay. AirFlash cannot stream to it yet.": "Dieses Gerät unterstützt nur klassisches AirPlay. AirFlash kann derzeit nicht dorthin streamen.",
+  "This device requires a password or pairing that AirFlash could not complete. Pair it again in Receivers.": "Dieses Gerät erfordert ein Kennwort oder eine Kopplung, die AirFlash nicht abschließen konnte. Koppeln Sie es erneut unter Empfänger.",
+  "This device requires MFi authentication, which AirFlash cannot perform without Apple hardware.": "Dieses Gerät erfordert eine MFi-Authentifizierung, die AirFlash ohne Apple-Hardware nicht durchführen kann.",
+  "Could not reach the receiver over the network. Check that it is powered on and on the same network as this PC.": "Der Empfänger ist im Netzwerk nicht erreichbar. Prüfen Sie, ob er eingeschaltet und mit demselben Netzwerk wie dieser PC verbunden ist."
 }

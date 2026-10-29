@@ -13,6 +13,8 @@ public sealed record Receiver(string Id, string Name, string Address, int Port =
     public Receiver[] Members { get; init; } = [];
     public byte[] Codecs { get; init; } = [];
     public ulong? Features { get; init; }
+    /// <summary>TXT <c>srcvers</c>, kept verbatim for capability evidence and diagnostics.</summary>
+    public string SourceVersion { get; init; } = "";
     public bool RequiresPassword { get; init; }
     public bool FollowReceiverClock { get; init; }
     public bool IsSoftwareGroup { get; init; }
@@ -21,7 +23,18 @@ public sealed record Receiver(string Id, string Name, string Address, int Port =
     public string[] Aliases { get; init; } = [];
     public bool IsGroup => IsSoftwareGroup || Members.Length > 0 || Id.StartsWith("stereo:", StringComparison.Ordinal);
     public bool Complete => !IsGroup || Members.Length == 2 && Members.All(m => m.Online && !m.IsGroup && (!IsSoftwareGroup || m.StereoId.Length == 0));
-    public string Detail => IsSoftwareGroup ? L.Get("Software stereo · experimental") : IsGroup ? L.Format("HomePod stereo · {0}/2", Members.Length) : Model.Length > 0 ? Model : L.Get("AirFlash receiver");
+    /// <summary>TXT-only three-way evidence; missing features never become classic.</summary>
+    public AirPlaySupport Support => AirPlayCapability.Classify(Features, SourceVersion);
+    /// <summary>WAC's list predicate: TXT bit 40 and <c>srcvers &gt;= 354.54.6</c>.</summary>
+    public bool SupportsAirPlay2 => AirPlayCapability.SupportsAirPlay2(Features, SourceVersion);
+    private string CapabilityDetail => Support switch
+    {
+        AirPlaySupport.AirPlay2 => L.Get("AirPlay 2"),
+        AirPlaySupport.ClassicOnly => L.Get("Classic AirPlay only"),
+        _ => L.Get("AirPlay 2 support unknown")
+    };
+    private string BaseDetail => Model.Length > 0 ? Model : L.Get("AirFlash receiver");
+    public string Detail => IsSoftwareGroup ? L.Get("Software stereo · experimental") : IsGroup ? L.Format("HomePod stereo · {0}/2", Members.Length) : $"{BaseDetail} · {CapabilityDetail}";
     [JsonIgnore] public IEnumerable<Receiver> Peers => IsGroup ? Members : [this];
     public string TransportKey => string.Join(";", Peers.OrderBy(p => p.Address, StringComparer.Ordinal).ThenBy(p => p.Port).Select(p => $"{p.Address}:{p.Port}:{(IsGroup && p.IsLeader)}:{p.Channel}:{p.SyncOffsetMs}"));
     public static string PhysicalKey(string identity, string address) => string.IsNullOrWhiteSpace(identity) ? address : ReceiverIdentity.Normalize(identity);
@@ -73,6 +86,7 @@ public static class ReceiverAggregator
                 Aliases = aliases,
                 Codecs = codecText.Split(',').Select(x => byte.TryParse(x, out var value) ? (byte?)value : null).OfType<byte>().ToArray(),
                 Features = ParseFeatures(Field(group, "features") is { Length: > 0 } features ? features : Field(group, "ft")),
+                SourceVersion = Field(group, "srcvers"),
                 RequiresPassword = Field(group, "pw").Equals("true", StringComparison.OrdinalIgnoreCase),
                 FollowReceiverClock = Model(service).StartsWith("AudioAccessory", StringComparison.Ordinal) && Field(group, "igl") == "1" && Field(group, "tsid").Length == 0 && Field(group, "pgid").Length == 0 && int.TryParse(Field(group, "osvers").Split('.')[0], out var os) && os >= 27
             };
