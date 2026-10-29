@@ -2378,6 +2378,142 @@ P3-2b 按 Q36 把列表标注拆成四态，路由仍严格用 WAC 的布尔。`
 
 ---
 
+### Q40. §12.3 的 `rebuild_count` 统计哪一类重建？ `[已确认]`
+
+报告只给了字段名和「`rebuild_count > 0` 且间隔 ~10 min → 漂移（P0-3 未做完）」
+的推论，没有定义计数口径。引擎现在没有「音频会话重建」计数器：一次
+`run_session`/`run_live` 里的每次流式尝试就是一条摘要，真正的重连发生在这条
+记录之外（桌面端收到 fault 后换新 `session_id` 重开）。
+
+我们暂定：`rebuild_count = SessionTelemetry.expired`，即时间线过期、必须换新
+会话的次数（`timeline_expired`，正是报告用来关联漂移的症状）；**不**包括事件
+通道 `event_rebuilds`、抢占回收或桌面端的网络重连。`baseline_resets` 同理取
+`ServoCounters.steps`（断点后整环清零），没有单独计数器。
+
+**需要确认**：`rebuild_count` 想统计的是 (a) 时间线过期导致的重建、(b) 引擎内
+任何新会话/新连接（含事件通道与抢占回收），还是 (c) 桌面端实际发起的重连次数？
+如果是 (c)，这一列需要由桌面端在会话结束时带回，否则在引擎侧会长期为 0。
+
+> **答复**：(a)(b)(c) **都不是**。这条口径之所以难定，是因为 **`rebuild_count` 这个字段名本身就是错的** —— WAC 没有裸计数，它数的是**带原因的时间线重置**。我把它的 reason 枚举从二进制里挖出来了，共 **9 个**。
+>
+> ## 一、WAC 的真实口径：`[TIMELINE] reset reason=<reason>`
+>
+> 〔串〕日志：`[TIMELINE] reset reason=<reason>`（`airplay-audio/src/streamer/sender.rs`）
+> 〔串〕diag 字段：`last_timeline_reset_reason`
+>
+> reason 的完整枚举（`0x6cf1b8`，124 字节连续块，逐字节切分已验证无残余）：
+>
+> ```
+> start
+> track_change
+> user_seek
+> receiver_rejected_flush
+> session_restart
+> confirmed_transport_failure
+> silence_resume
+> latency_change
+> flush
+> ```
+>
+> ⇒ **WAC 不存在「重建次数」这个概念，只有「时间线因为什么被重置」。**
+>
+> ## 二、为什么 `rebuild_count` 这个口径会骗人
+>
+> 把 9 个 reason 按性质分类：
+>
+> | reason | 性质 | 该不该算进"漂移" |
+> |---|---|---|
+> | `start` | 中性（开场） | ❌ |
+> | `track_change` | **用户动作** | ❌ |
+> | `user_seek` | **用户动作** | ❌ |
+> | `flush` | **用户/协议动作** | ❌ |
+> | `silence_resume` | 中性（静音后恢复） | ❌ |
+> | `latency_change` | **我们主动改 lead** | ❌（但要看它是不是过频） |
+> | `session_restart` | 重连 | ⚠️ 看是谁发起的 |
+> | `receiver_rejected_flush` | 接收器拒绝 | ⚠️ 协议层问题 |
+> | **`confirmed_transport_failure`** | **真故障** | ✅ **只有这个** |
+>
+> **`rebuild_count > 0` 的问题一目了然：用户按 50 次"下一首"，或者你自己调 50 次 lead，都会让这个数变成 50** —— 然后你会把它误读成"漂移"。
+>
+> 反过来，`rebuild_count == 0` 也不能证明健康：如果重建发生在引擎记录之外（正是你担心的情况），它永远是 0。
+>
+> ## 三、逐问回答
+>
+> ### (a) 时间线过期导致的重建 → **太窄**
+>
+> 你把 `rebuild_count` 暂定为 `SessionTelemetry.expired`。这只覆盖了 `confirmed_transport_failure` 这一桶，漏掉了：
+> - `receiver_rejected_flush`（协议层拒绝，往往和 FLUSH 时机有关）
+> - `silence_resume`（静音恢复触发的重置 —— 这个如果频繁，是**源侧**问题，不是网络）
+>
+> ### (b) 引擎内任何新会话/新连接（含事件通道与抢占回收）→ **太宽，而且混淆维度**
+>
+> 事件通道重建和媒体时间线重置是**两个不同的东西**。WAC 分得很清楚：`event_rebuilds` 和 timeline reset 是独立计数。混在一起之后，"漂移"这个信号会被事件通道的抖动污染。
+>
+> ### (c) 桌面端实际发起的重连 → **这个确实要，但不该叫 `rebuild_count`**
+>
+> 你的判断是对的：引擎侧看不到桌面端重连。但解法不是"让引擎去统计它看不到的东西"，而是**给桌面端单独的列**：
+>
+> ```
+> engine_timeline_resets_by_reason   ← 引擎出
+> desktop_reconnects                 ← 桌面端出
+> desktop_reconnect_reason           ← 桌面端出
+> ```
+>
+> 一行 CSV 由**写这一行的那一方**汇总。桌面端本来就是会话结束才写行，它手里两边的数都有。
+>
+> ## 四、建议改成「按 reason 分桶」
+>
+> ```rust
+> /// 时间线重置计数器：按原因分桶，永不合并成单一数字。
+> #[derive(Default, Debug, Clone, Copy, Serialize)]
+> pub struct TimelineResets {
+>     pub start: u32,
+>     pub track_change: u32,
+>     pub user_seek: u32,
+>     pub receiver_rejected_flush: u32,
+>     pub session_restart: u32,
+>     pub confirmed_transport_failure: u32,   // ← 漂移的唯一可靠信号
+>     pub silence_resume: u32,
+>     pub latency_change: u32,                // ← 自己改 lead 触发的，要能区分"我干的"和"它坏了"
+>     pub flush: u32,
+> }
+> ```
+>
+> 然后 §12.3 那张推论表里那一行改成：
+>
+> | 观察 | 推论 |
+> |---|---|
+> | `confirmed_transport_failure > 0` 且间隔 ~10 min | **漂移（P0-3 未做完）** —— 这是唯一可靠信号 |
+> | `receiver_rejected_flush > 0` | 协议层问题：FLUSH 时机或 rtptime 连续性 |
+> | `silence_resume` 频繁 | **源侧**问题（源静音被判成需要重置），不是网络 |
+> | `latency_change` 频繁 | 自适应 lead 在反复横跳 → 看 `servo_engagements`，不是漂移 |
+> | `desktop_reconnects > 0` 而上面全 0 | **引擎看不见的那一层**在重连 → 去查桌面端/网络 |
+>
+> **最后一行是关键** —— 它正好覆盖你担心的 (c)，而且不要求引擎去猜。
+>
+> ## 五、`baseline_resets = ServoCounters.steps` → **这个是对的**
+>
+> 〔串〕`airplay-audio/src/timeline_servo.rs:76`：
+> ```
+> PTP timeline servo: <n>ms step is a discontinuity, not drift; relearning baseline
+> ```
+> 对应反汇编里的 `|delta| > 250ms` 分支 → 完全重置并重新学习基线（见报告 §4 的 Servo 分析）。所以 `steps` 就是"基线重学次数"，语义准确。
+>
+> ⚠️ 但同样建议**带上幅度**：单看次数不知道跳了多大。如果方便，再记一个 `baseline_reset_max_step_ms`（`<n>ms step` 里的那个 n 的最大值）—— 250 ms 和 5 s 是完全不同的两种事故。
+>
+> ## 六、结论
+>
+> | 你的问题 | 结论 |
+> |---|---|
+> | 口径该是 (a)(b)(c) 哪个 | **都不是**。改成「按 9 个 reason 分桶」 |
+> | `rebuild_count = SessionTelemetry.expired` | 太窄，只覆盖 `confirmed_transport_failure` 一桶 |
+> | 要不要含事件通道/抢占回收 | **不要** —— 和媒体时间线是两个维度，混了会污染信号 |
+> | 桌面端重连怎么办 | 单独的列 `desktop_reconnects` / `desktop_reconnect_reason`，由写行的一方汇总 |
+> | 漂移的唯一可靠信号 | **`confirmed_transport_failure`**（`rebuild_count > 0` 会同时命中换歌和调 lead） |
+> | `baseline_resets = ServoCounters.steps` | ✅ 对。建议加 `baseline_reset_max_step_ms` |
+
+---
+
 ## 答复区
 
 > 已在每条条目下方就地回填（`> **答复**`）。下面是需要**优先改代码**的 4 条，按影响排序。
@@ -2409,19 +2545,3 @@ P3-2b 按 Q36 把列表标注拆成四态，路由仍严格用 WAC 的布尔。`
 3. **`ComputeRecommendation` 是一次算三方案，不升档**：所以"自适应阶梯"整套是 AF 的净增能力，不必也不该去对齐 WAC 的候选表（那张表里有 30/40 这种**永远用不到**的值）。
 
 ---
-
-### Q40. §12.3 的 `rebuild_count` 统计哪一类重建？ `[待答复]`
-
-报告只给了字段名和「`rebuild_count > 0` 且间隔 ~10 min → 漂移（P0-3 未做完）」
-的推论，没有定义计数口径。引擎现在没有「音频会话重建」计数器：一次
-`run_session`/`run_live` 里的每次流式尝试就是一条摘要，真正的重连发生在这条
-记录之外（桌面端收到 fault 后换新 `session_id` 重开）。
-
-我们暂定：`rebuild_count = SessionTelemetry.expired`，即时间线过期、必须换新
-会话的次数（`timeline_expired`，正是报告用来关联漂移的症状）；**不**包括事件
-通道 `event_rebuilds`、抢占回收或桌面端的网络重连。`baseline_resets` 同理取
-`ServoCounters.steps`（断点后整环清零），没有单独计数器。
-
-**需要确认**：`rebuild_count` 想统计的是 (a) 时间线过期导致的重建、(b) 引擎内
-任何新会话/新连接（含事件通道与抢占回收），还是 (c) 桌面端实际发起的重连次数？
-如果是 (c)，这一列需要由桌面端在会话结束时带回，否则在引擎侧会长期为 0。
