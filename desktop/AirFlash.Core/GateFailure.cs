@@ -7,10 +7,12 @@ public enum GateFailureKind
     None,
     /// <summary>TXT proves the receiver is classic-only, so AirFlash cannot stream to it today.</summary>
     ClassicOnly,
-    /// <summary>The receiver wants a password or pairing AirFlash could not complete.</summary>
+    /// <summary>
+    /// Password/pairing failure, or any authentication failure the desktop cannot
+    /// attribute further. MFi-looking text lands here too (QUESTIONS Q37): it is a
+    /// display heuristic, not an authoritative MFi classification.
+    /// </summary>
     PasswordOrPairing,
-    /// <summary>The receiver asks for an MFi authentication coprocessor.</summary>
-    MfiAuthentication,
     /// <summary>The receiver could not be reached or stopped answering on the network.</summary>
     Network
 }
@@ -38,8 +40,9 @@ public static class GateFailure
     {
         if (notice is null || notice.Code is "preempted" or "timeline_expired" or "clock_lost")
             return GateFailureKind.None;
-        if (IsMfi(notice)) return GateFailureKind.MfiAuthentication;
-        if (IsPassword(notice, receiver)) return GateFailureKind.PasswordOrPairing;
+        // MFi-looking text is folded into the general authentication gate: it may
+        // only change the wording (see Message), never the authoritative kind.
+        if (LooksLikeMfi(notice) || IsPassword(notice, receiver)) return GateFailureKind.PasswordOrPairing;
         // A classic receiver often accepts TCP but cannot answer AirPlay 2 /info
         // at all, so a setup read timeout still points at the capability gate.
         // An unreachable socket (or DNS) failure keeps its network explanation.
@@ -50,22 +53,42 @@ public static class GateFailure
         return GateFailureKind.None;
     }
 
-    public static string? Message(Receiver? receiver, EngineNotice? notice) => Classify(receiver, notice) switch
+    public static string? Message(Receiver? receiver, EngineNotice? notice)
     {
-        GateFailureKind.ClassicOnly => L.Get("This device only supports classic AirPlay. AirFlash cannot stream to it yet."),
-        GateFailureKind.PasswordOrPairing => L.Get("This device requires a password or pairing that AirFlash could not complete. Pair it again in Receivers."),
-        GateFailureKind.MfiAuthentication => L.Get("This device requires MFi authentication, which AirFlash cannot perform without Apple hardware."),
-        GateFailureKind.Network => L.Get("Could not reach the receiver over the network. Check that it is powered on and on the same network as this PC."),
-        _ => null
-    };
+        var kind = Classify(receiver, notice);
+        // The only MFi-specific behaviour is friendlier wording for a failure the
+        // desktop cannot actually distinguish from a generic authentication error.
+        if (kind == GateFailureKind.PasswordOrPairing && LooksLikeMfi(notice))
+            return L.Get("This device requires MFi authentication, which AirFlash cannot perform without Apple hardware.");
+        return kind switch
+        {
+            GateFailureKind.ClassicOnly => L.Get("This device only supports classic AirPlay. AirFlash cannot stream to it yet."),
+            GateFailureKind.PasswordOrPairing => L.Get("This device requires a password or pairing that AirFlash could not complete. Pair it again in Receivers."),
+            GateFailureKind.Network => L.Get("Could not reach the receiver over the network. Check that it is powered on and on the same network as this PC."),
+            _ => null
+        };
+    }
 
-    /// <summary>WAC's group rule: any classic member makes the whole group classic.</summary>
+    /// <summary>
+    /// WAC's group rule for the classic-only explanation: any member with positive
+    /// evidence that it is not AirPlay 2 makes the whole group classic. An
+    /// outdated AirPlay 2 claim (<see cref="AirPlayCapability.ClaimsAirPlay2Outdated"/>)
+    /// is not evidence of absence and is deliberately excluded (Q36); routing still
+    /// sends it down the classic path via <see cref="Receiver.SupportsAirPlay2"/>.
+    /// </summary>
     public static bool HasClassicEvidence(Receiver? receiver)
-        => receiver is not null && receiver.Peers.Any(peer => peer.Support == AirPlaySupport.ClassicOnly);
+        => receiver is not null && receiver.Peers.Any(peer => peer.Support == AirPlayCapability.NotAirPlay2);
 
-    private static bool IsMfi(EngineNotice notice)
-        => notice.Code.Equals("mfi_required", StringComparison.OrdinalIgnoreCase)
-            || notice.Message.Contains("MFi", StringComparison.OrdinalIgnoreCase);
+    /// <summary>
+    /// Best-effort display heuristic only (QUESTIONS Q37). WAC defines an MFi
+    /// error variant but never detects it ("not implementable without Apple
+    /// hardware"), and neither the engine nor the TXT record exposes an MFi
+    /// signal. Never use this to pick a gate kind.
+    /// </summary>
+    private static bool LooksLikeMfi(EngineNotice? notice)
+        => notice is not null
+            && (notice.Code.Equals("mfi_required", StringComparison.OrdinalIgnoreCase)
+                || notice.Message.Contains("MFi", StringComparison.OrdinalIgnoreCase));
 
     private static bool IsPassword(EngineNotice notice, Receiver? receiver)
         => notice.Code.Equals("authentication_failed", StringComparison.OrdinalIgnoreCase)
