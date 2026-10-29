@@ -92,12 +92,59 @@ impl Fault {
         };
         Self::new(host, channel, code, retryable, format!("{error:#}"))
     }
+    /// A failure while opening a session (SETUP, or the `/info` probe before it).
+    ///
+    /// A 401/403/454 here arrives **before any media flows**: the receiver will
+    /// answer the next attempt the same way, so this stays a terminal
+    /// authentication failure (Q16). This deliberately does not share the
+    /// running-feedback classification: the same status on `/feedback` while
+    /// audio is flowing only degrades the control channel (Q34).
+    pub fn from_setup_error(host: impl ToString, error: &anyhow::Error) -> Self {
+        let mut fault = Self::from_error(host, "setup", error);
+        if fault.code == "protocol_error"
+            && let Some(status) = rtsp_status(&format!("{error:#}"))
+            && matches!(status, 401 | 403 | 454)
+        {
+            fault.code = "authentication_failed".into();
+            fault.retryable = false;
+        }
+        fault
+    }
+    /// A running `/feedback` probe rejected by the receiver (any non-200 status).
+    ///
+    /// Q34/WAC: "feedback failure is not media failure" — while RTP is flowing a
+    /// rejected feedback channel is a degraded control channel, never a reason to
+    /// end the session. Callers report it through [`Health::degrade`] and keep
+    /// sending audio; only the media side can escalate it.
+    pub fn feedback_rejected(host: impl ToString, status: u16, first_line: &str) -> Self {
+        Self::new(
+            host,
+            "feedback",
+            "feedback_rejected",
+            true,
+            format!(
+                "Receiver rejected feedback with status {status}; keeping healthy media session: {first_line}"
+            ),
+        )
+    }
     pub fn event(&self) -> Value {
         let mut value = serde_json::to_value(self).unwrap();
         value["event"] = json!("error");
         value["qualified"] = json!(false);
         value
     }
+}
+/// Extract the RTSP status from the context `Connection::request` attaches to a
+/// non-200 answer (`"SETUP <uri>: RTSP/1.0 403 Forbidden"`). Only the setup path
+/// needs it; a running feedback rejection is classified by its explicit status.
+fn rtsp_status(message: &str) -> Option<u16> {
+    message
+        .split("RTSP/1.0 ")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 pub fn error_event(error: &anyhow::Error) -> Value {
     if let Some(fault) = error.downcast_ref::<Fault>() {
@@ -343,18 +390,25 @@ impl FeedbackWorker {
                 if let Err(error) = feedback_loop(&connection, &host, &health, &done, timing) {
                     if !done.is_cancelled() {
                         let fault = Fault::from_error(host, "feedback", &error);
-                        if fault.code != "feedback_rejected" {
-                            health.0.lock().unwrap().metrics.feedback_failures += 1;
-                        }
-                        // 401 and 403 are access/authentication failures in
-                        // the reference classification (Q32): they take the
-                        // existing hard auth path, not the preemption probe.
-                        // 454 and other rejections stay on `session_rejected`.
-                        if matches!(fault.code.as_str(), "authentication_failed" | "session_rejected") {
+                        if fault.code == "feedback_rejected" {
+                            // Q34: a running `/feedback` rejection is a control-plane
+                            // symptom, never a media failure. WAC keeps the healthy
+                            // media session for every rejection status; `degrade()`
+                            // lets the live loop escalate only if media also fails.
+                            health.notice(
+                                &fault.host,
+                                "feedback",
+                                "feedback_rejected",
+                                &fault.message,
+                                false,
+                            );
+                            health.degrade(fault);
+                        } else if matches!(fault.code.as_str(), "authentication_failed" | "session_rejected") {
                             health.fail(fault);
                         } else {
                             // Feedback is a health probe, not the audio path: keep
                             // sending and let `check_control` decide when to give up.
+                            health.0.lock().unwrap().metrics.feedback_failures += 1;
                             health.notice(
                                 &fault.host,
                                 "feedback",
@@ -448,9 +502,6 @@ fn feedback_loop(
             }
         };
         let close_requested = connection.take_close_requested();
-        if close_requested {
-            health.preemption_signal(Signal::ConnectionClose);
-        }
         connection.validate_cseq(&response)?;
         let status = response.status()?;
         if status == 200 {
@@ -496,34 +547,17 @@ fn feedback_loop(
                 &format!("Receiver feedback returned {status}; retrying while audio continues"),
                 false,
             );
-        } else if status == 401 || status == 403 {
-            // 403 is an access/authentication error in the reference
-            // classification (password/PIN/470 family), never "another
-            // controller took the session" (Q32). It goes down the same hard
-            // auth path as 401; it is not preemption evidence and can never
-            // latch `we_hold_session` to false.
-            return Err(Fault::new(
-                host,
-                "feedback",
-                "authentication_failed",
-                false,
-                format!(
-                    "Receiver denied access to the feedback channel (HTTP {status}): {}",
-                    response.first
-                ),
-            )
-            .into());
         } else {
-            return Err(Fault::new(
-                host,
-                "feedback",
-                "session_rejected",
-                status == 454,
-                format!("Receiver feedback rejected: {}", response.first),
-            )
-            .into());
+            // 401/403/454 and every other non-200 answer are a *running* rejection.
+            // Q34/WAC: feedback rejection is never media failure, so this must not
+            // `fail()` the session, must not become preemption evidence, and must
+            // not be classified as a terminal SETUP authentication failure. The
+            // worker exits through `degrade()`; the RTP loop keeps sending.
+            health.0.lock().unwrap().metrics.feedback_failures += 1;
+            return Err(Fault::feedback_rejected(host, status, &response.first).into());
         }
         if close_requested {
+            health.preemption_signal(Signal::ConnectionClose);
             return Err(Fault::new(
                 host,
                 "feedback",

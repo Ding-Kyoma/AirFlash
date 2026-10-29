@@ -843,7 +843,7 @@ fn probe_member(
                 }));
                 std::thread::sleep(MEMBER_SETUP_RETRY_DELAY);
             }
-            Err(error) => return Err(Fault::from_error(peer.host, "setup", &error).into()),
+            Err(error) => return Err(Fault::from_setup_error(peer.host, &error).into()),
         }
     }
 }
@@ -1344,7 +1344,7 @@ fn run_stream(
                     }));
                     std::thread::sleep(MEMBER_SETUP_RETRY_DELAY);
                 }
-                Err(error) => return Err(Fault::from_error(peer.host, "setup", &error).into()),
+                Err(error) => return Err(Fault::from_setup_error(peer.host, &error).into()),
             }
         };
         members.push(member);
@@ -3112,15 +3112,31 @@ mod tests {
         worker.join().unwrap();
     }
     #[test]
-    fn a_setup_403_stays_a_generic_non_retryable_fault() {
-        // A 403 while opening the session is an authentication/setup failure, not
-        // evidence that another controller took over; the classifier is never run
-        // on this path. Keep its existing (non-retryable) classification.
-        let error = anyhow::anyhow!("SETUP rtsp://127.0.0.1/test: RTSP/1.0 403 Forbidden");
-        let fault = Fault::from_error("127.0.0.1", "setup", &error);
-        assert_ne!(fault.code, "preempted");
-        assert_eq!(fault.code, "protocol_error");
-        assert!(!fault.retryable);
+    fn setup_rejections_are_terminal_while_running_feedback_rejections_degrade() {
+        // Q16 boundary: 401/403/454 before streaming starts cannot be fixed on
+        // this connection, so they stay terminal authentication failures. The
+        // classifier is never run on the preemption path.
+        for status in [401, 403, 454] {
+            let error =
+                anyhow::anyhow!("SETUP rtsp://127.0.0.1/test: RTSP/1.0 {status} Rejected");
+            let fault = Fault::from_setup_error("127.0.0.1", &error);
+            assert_eq!(fault.channel, "setup");
+            assert_eq!(fault.code, "authentication_failed");
+            assert!(!fault.retryable);
+            assert_ne!(fault.code, "preempted");
+        }
+        // Q34: the same status on a *running* `/feedback` probe is a different
+        // path — a retryable control-plane degradation, not an auth fault.
+        let feedback = Fault::feedback_rejected("127.0.0.1", 403, "RTSP/1.0 403 Forbidden");
+        assert_eq!(feedback.channel, "feedback");
+        assert_eq!(feedback.code, "feedback_rejected");
+        assert!(feedback.retryable);
+        assert!(feedback.message.contains("keeping healthy media session"));
+        // Non-status setup failures keep their existing generic classification.
+        let generic =
+            Fault::from_setup_error("127.0.0.1", &anyhow::anyhow!("missing stream response"));
+        assert_eq!(generic.code, "protocol_error");
+        assert!(!generic.retryable);
     }
     #[test]
     fn stalled_sender_reanchors_instead_of_rebuilding_and_keeps_seq_linear() {
