@@ -589,7 +589,7 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   - RTP 健康与真接管：按 Q32 的无条件规则，UDP 发送仍「成功」时 bit17 会被判成
     `OursActive` 而不回收。真接管时 ICMP/端口关闭能否在多长时间内让
     `media_healthy` 变假、从而进入 busy 路径，未实测，见 Q34。
-  - TCP 存活探测的真机错误码（Q40，待答复）：Q34 只规定「被拒/超时 ⇒ `Dead`，
+  - TCP 存活探测的真机错误码（Q42，待答复）：Q34 只规定「被拒/超时 ⇒ `Dead`，
     其他错误 ⇒ `Unknown`」。Windows 对同一子网内已关机/拔电的 HomePod 经常返回
     `HostUnreachable`/`NetworkUnreachable`（10065/10051）而不是 refused/timeout；
     按当前实现会落到 `Unknown`（保守 ⇒ `OursActive`），于是「设备关机」不会
