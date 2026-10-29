@@ -1,0 +1,139 @@
+using AirFlash.Core;
+using Xunit;
+namespace AirFlash.Tests;
+
+public sealed class GateFailureTests
+{
+    private const ulong Bit40 = 1UL << 40;
+
+    private static Receiver Physical(ulong? features = null, string sourceVersion = "", bool requiresPassword = false, string model = "Model")
+        => new("receiver", "Receiver", "10.0.0.5") { Model = model, Features = features, SourceVersion = sourceVersion, RequiresPassword = requiresPassword };
+    private static Receiver Classic() => Physical(0UL, "220.68", model: "AirPort Express");
+    private static Receiver AirPlay2() => Physical(Bit40, "366.0", model: "AudioAccessory5,1");
+    private static Receiver Unknown() => Physical();
+    private static EngineNotice Notice(string code, string channel = "setup", string message = "synthetic failure", bool? retryable = false)
+        => new(code, "10.0.0.5", channel, message, retryable);
+
+    [Fact]
+    public void ClassicSetupFailureIsReportedAsTheCapabilityGate()
+    {
+        var notice = Notice("protocol_error");
+        Assert.Equal(GateFailureKind.ClassicOnly, GateFailure.Classify(Classic(), notice));
+        Assert.Equal(L.Get("This device only supports classic AirPlay. AirFlash cannot stream to it yet."), GateFailure.Message(Classic(), notice));
+    }
+
+    [Fact]
+    public void UnknownCapabilityNeverBecomesClassic()
+    {
+        Assert.Equal(GateFailureKind.None, GateFailure.Classify(Unknown(), Notice("protocol_error")));
+        Assert.Null(GateFailure.Message(Unknown(), Notice("protocol_error")));
+        Assert.Equal(GateFailureKind.None, GateFailure.Classify(null, Notice("protocol_error")));
+    }
+
+    [Fact]
+    public void ClassicReceiversThatStopAnsweringKeepTheCapabilityExplanation()
+    {
+        // A classic AirPort Express can accept TCP and never answer AirPlay 2
+        // /info, which reaches the desktop as a setup read timeout.
+        Assert.Equal(GateFailureKind.ClassicOnly, GateFailure.Classify(Classic(), Notice("read_timeout")));
+    }
+
+    [Theory]
+    [InlineData("network_error")]
+    [InlineData("socket_error")]
+    [InlineData("connection_reset")]
+    [InlineData("connection_refused")]
+    public void UnreachableClassicReceiversStillGetTheNetworkExplanation(string code)
+    {
+        Assert.Equal(GateFailureKind.Network, GateFailure.Classify(Classic(), Notice(code)));
+    }
+
+    [Fact]
+    public void ClassicEvidenceOutsideSetupDoesNotRelabelAMidSessionFault()
+    {
+        Assert.Equal(GateFailureKind.None, GateFailure.Classify(Classic(), Notice("protocol_error", channel: "feedback")));
+        Assert.Equal(GateFailureKind.Network, GateFailure.Classify(Classic(), Notice("read_timeout", channel: "feedback")));
+    }
+
+    [Fact]
+    public void GroupWithOneClassicMemberIsClassicLikeWac()
+    {
+        var group = new Receiver("stereo:pair", "Pair", "") { Members = [Classic(), AirPlay2()] };
+        Assert.Equal(GateFailureKind.ClassicOnly, GateFailure.Classify(group, Notice("protocol_error")));
+    }
+
+    [Fact]
+    public void GroupOfAirPlay2MembersIsNotClassic()
+    {
+        var group = new Receiver("stereo:pair", "Pair", "") { Members = [AirPlay2(), AirPlay2()] };
+        Assert.Equal(GateFailureKind.None, GateFailure.Classify(group, Notice("protocol_error")));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void AuthenticationFailureIsAPairingGate(bool requiresPassword)
+    {
+        var receiver = Physical(Bit40, "366.0", requiresPassword);
+        var notice = Notice("authentication_failed", channel: "authentication", message: "synthetic verify rejected");
+        Assert.Equal(GateFailureKind.PasswordOrPairing, GateFailure.Classify(receiver, notice));
+        Assert.Equal(L.Get("This device requires a password or pairing that AirFlash could not complete. Pair it again in Receivers."), GateFailure.Message(receiver, notice));
+    }
+
+    [Fact]
+    public void SessionRejectionIsOnlyAPairingGateWithTxtPasswordEvidence()
+    {
+        Assert.Equal(GateFailureKind.PasswordOrPairing, GateFailure.Classify(Physical(Bit40, "366.0", requiresPassword: true), Notice("session_rejected")));
+        Assert.Equal(GateFailureKind.None, GateFailure.Classify(Physical(Bit40, "366.0"), Notice("session_rejected")));
+    }
+
+    [Fact]
+    public void PasswordEvidenceOnAnyGroupMemberCounts()
+    {
+        var group = new Receiver("stereo:pair", "Pair", "") { Members = [Physical(Bit40, "366.0", requiresPassword: true), AirPlay2()] };
+        Assert.Equal(GateFailureKind.PasswordOrPairing, GateFailure.Classify(group, Notice("session_rejected")));
+    }
+
+    [Theory]
+    [InlineData("mfi_required", "synthetic")]
+    [InlineData("protocol_error", "Device requires MFi authentication (not implementable without Apple hardware)")]
+    [InlineData("authentication_failed", "MFi coprocessor rejected the request")]
+    public void MfiEvidenceHasItsOwnGate(string code, string message)
+    {
+        Assert.Equal(GateFailureKind.MfiAuthentication, GateFailure.Classify(AirPlay2(), Notice(code, message: message)));
+        Assert.Equal(L.Get("This device requires MFi authentication, which AirFlash cannot perform without Apple hardware."), GateFailure.Message(AirPlay2(), Notice(code, message: message)));
+    }
+
+    [Fact]
+    public void MfiEvidenceWinsOverAClassicFeatureBitmap()
+    {
+        Assert.Equal(GateFailureKind.MfiAuthentication, GateFailure.Classify(Classic(), Notice("protocol_error", message: "Device requires MFi authentication")));
+    }
+
+    [Theory]
+    [InlineData("network_error")]
+    [InlineData("socket_error")]
+    [InlineData("connection_reset")]
+    [InlineData("read_timeout")]
+    [InlineData("write_failed")]
+    [InlineData("peer_closed")]
+    [InlineData("feedback_timeout")]
+    public void NetworkCodesKeepTheirExplanation(string code)
+    {
+        Assert.Equal(GateFailureKind.Network, GateFailure.Classify(AirPlay2(), Notice(code)));
+        Assert.Equal(L.Get("Could not reach the receiver over the network. Check that it is powered on and on the same network as this PC."), GateFailure.Message(AirPlay2(), Notice(code)));
+    }
+
+    [Theory]
+    [InlineData("protocol_error")]
+    [InlineData("engine_error")]
+    [InlineData("host_error")]
+    [InlineData("preempted")]
+    [InlineData("timeline_expired")]
+    [InlineData("clock_lost")]
+    public void CodesWithoutGateEvidenceKeepTheEngineDetail(string code)
+    {
+        Assert.Equal(GateFailureKind.None, GateFailure.Classify(AirPlay2(), Notice(code)));
+        Assert.Null(GateFailure.Message(AirPlay2(), Notice(code)));
+    }
+}

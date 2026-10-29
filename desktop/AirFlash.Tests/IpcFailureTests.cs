@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Net.Sockets;
 using System.Text.Json;
 using System.Threading.Channels;
 using AirFlash.Core;
@@ -144,6 +145,58 @@ public sealed class IpcFailureTests
         Assert.Equal(L.Get("Another device keeps taking over this AirPlay session. AirFlash yielded and will not reconnect automatically."), failed.Message);
         Assert.True(connection.Disposed);
         Assert.Equal(1, factory.OpenCount);
+    }
+
+    [Fact]
+    public async Task ClassicOnlySetupFailurePublishesTheCapabilityGateMessage()
+    {
+        var connection = new Connection(); var factory = new Factory(connection);
+        await using var controller = new SessionController(factory, new Audio(false), timing: Timing);
+        var fault = Signal(); controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Error) fault.TrySetResult(); };
+        var receiver = Receiver() with { Model = "AirPort Express", Features = 0UL, SourceVersion = "220.68" };
+        await controller.StartAsync(receiver, Settings());
+        await connection.Starting.Task.WaitAsync(Limit);
+        connection.Current("error", new { code = "protocol_error", channel = "setup", host = "192.0.2.10", retryable = false, message = "SETUP rejected" });
+        await fault.Task.WaitAsync(Limit);
+        Assert.Equal(PlaybackState.Error, controller.Snapshot.State);
+        Assert.Equal(L.Get("This device only supports classic AirPlay. AirFlash cannot stream to it yet."), controller.Snapshot.Message);
+        Assert.Equal("protocol_error", controller.Snapshot.Diagnostics?.LastFault?.Code);
+        Assert.True(connection.Disposed);
+    }
+
+    [Fact]
+    public async Task AuthenticationFailurePublishesThePairingGateMessage()
+    {
+        var connection = new Connection(); var factory = new Factory(connection);
+        await using var controller = new SessionController(factory, new Audio(false), timing: Timing);
+        var fault = Signal(); controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Error) fault.TrySetResult(); };
+        await controller.StartAsync(Receiver(), Settings());
+        await connection.Starting.Task.WaitAsync(Limit);
+        connection.Current("error", new { code = "authentication_failed", channel = "authentication", host = "192.0.2.10", retryable = false, message = "synthetic verify rejected" });
+        await fault.Task.WaitAsync(Limit);
+        Assert.Equal(L.Get("This device requires a password or pairing that AirFlash could not complete. Pair it again in Receivers."), controller.Snapshot.Message);
+        Assert.Equal("authentication_failed", controller.Snapshot.Diagnostics?.LastFault?.Code);
+        Assert.True(connection.Disposed);
+    }
+
+    [Fact]
+    public async Task SocketFailureBeforeAConnectionExistsPublishesTheNetworkGateMessage()
+    {
+        var factory = new UnreachableFactory();
+        await using var controller = new SessionController(factory, new Audio(false), timing: Timing);
+        var fault = Signal(); controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Error) fault.TrySetResult(); };
+        await controller.StartAsync(Receiver(), new AppSettings { ForceReconnect = false, MaxReconnectAttempts = 1 });
+        await fault.Task.WaitAsync(Limit);
+        Assert.Equal(L.Get("Could not reach the receiver over the network. Check that it is powered on and on the same network as this PC."), controller.Snapshot.Message);
+        Assert.Equal("network_error", controller.Snapshot.Diagnostics?.LastFault?.Code);
+        Assert.Equal("desktop", controller.Snapshot.Diagnostics?.LastFault?.Channel);
+        Assert.Equal(1, factory.OpenCount);
+    }
+
+    private sealed class UnreachableFactory : IEngineFactory
+    {
+        public int OpenCount;
+        public IEngineConnection Open() { ++OpenCount; throw new SocketException((int)SocketError.ConnectionRefused); }
     }
 
     [Fact]
