@@ -881,6 +881,25 @@ P3-8 现在对同一可执行文件的多个根实例各开一个 process loopba
 
 ---
 
+## 十、兼容 profile（P2-13）
+
+### Q29. 能力预判要不要带上 `/info` 的 `model`/`sourceVersion`？ `[待答复]`
+
+**我们暂定**：`receiver_capabilities` 的能力预判继续只用 `supportedFormats` +
+桌面端下发的 legacy codec 列表 + 对端自述 `features`，不带 `/info` 的 `model` /
+`sourceVersion`；只有在 `session.rs` 真正建会话时才用完整指纹。
+
+**需要确认**：同一台 HomePod 如果 `/info` 有 bit40、而桌面端下发 `features` 缺
+bit40，预判会把它的 `selected_timing` 算成 `ntp`，实际会话却按 `model` 走 PTP。
+预判要不要也吃型号证据、与运行时保持一致？这会让 `receiver_capabilities` IPC
+事件里 `selected_timing` 的取值发生变化。
+
+**为什么拿不准**：Q18 的答复是「AF 应改用型号 + 拓扑表」，按字面预判也该带；
+但 P2-13 是纯重构，带型号会改变现有预判的取值，超出「行为不变」的范围，
+所以这轮先保持原状。
+
+---
+
 ## 答复区
 
 > 已在每条条目下方就地回填（`> **答复**`）。下面是需要**优先改代码**的 4 条，按影响排序。

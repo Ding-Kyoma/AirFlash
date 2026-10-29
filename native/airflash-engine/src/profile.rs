@@ -120,6 +120,277 @@ fn integer(v: &Value) -> Option<u64> {
     v.as_unsigned_integer()
         .or_else(|| v.as_signed_integer().map(|n| n as u64))
 }
+/// Everything `/info` says about a receiver, parsed exactly once.
+///
+/// Negotiation used to take the model and firmware version as loose parameters
+/// next to the formats, so every call site had to know which raw key to read.
+/// This value turns those fields into named facts (`airplay2`, `ptp_expected`);
+/// callers compare no feature bits of their own.
+#[derive(Clone, Debug, Default)]
+pub struct CompatFingerprint {
+    formats: Formats,
+    /// `/info` feature word; the discovery hint only fills a missing word.
+    features: Option<u64>,
+    source_version: Option<String>,
+    model: Option<String>,
+    legacy_codecs: Vec<u8>,
+}
+impl CompatFingerprint {
+    /// Parse `/info` exactly once. `advertised` is the peer profile the desktop
+    /// sent: its `features` are the discovery hint and its codec list is the
+    /// legacy format evidence.
+    pub fn from_info(info: &Value, advertised: &Profile, legacy_codecs: &[u8]) -> Self {
+        let dictionary = info.as_dictionary();
+        let text = |key: &str| {
+            dictionary
+                .and_then(|d| d.get(key))
+                .and_then(Value::as_string)
+        };
+        Self::from_evidence(
+            Formats::parse(info),
+            advertised,
+            legacy_codecs,
+            text("model"),
+            text("sourceVersion"),
+        )
+    }
+    /// Build a fingerprint from explicit evidence. `/info` parsing and tests use
+    /// this; `model` and `source_version` stay `None` when the caller has no
+    /// model evidence to add.
+    pub fn from_evidence(
+        formats: Formats,
+        advertised: &Profile,
+        legacy_codecs: &[u8],
+        model: Option<&str>,
+        source_version: Option<&str>,
+    ) -> Self {
+        Self {
+            formats,
+            features: formats.features.or(advertised.features),
+            source_version: source_version.map(str::to_owned),
+            model: model.map(str::to_owned),
+            legacy_codecs: legacy_codecs.to_vec(),
+        }
+    }
+    /// Same as [`Self::from_evidence`] without model/firmware evidence, for
+    /// callers that only have the parsed stream formats.
+    pub fn from_formats(formats: Formats, advertised: &Profile, legacy_codecs: &[u8]) -> Self {
+        Self::from_evidence(formats, advertised, legacy_codecs, None, None)
+    }
+    /// AirPlay 2 needs feature bit 40 *and* firmware 354.54.6. Bit 41 is never
+    /// read by the reference implementation and decides nothing here.
+    pub fn airplay2(&self) -> bool {
+        is_airplay2(self.features, self.source_version.as_deref())
+    }
+    /// Model-based timing expectation; `None` means the model is unknown.
+    pub fn ptp_expected(&self) -> Option<bool> {
+        ptp_expected(self.model.as_deref())
+    }
+    /// Whether the receiver advertised at least one audio stream format.
+    pub fn advertises_audio(&self) -> bool {
+        self.formats.realtime.is_some() || self.formats.buffered.is_some()
+    }
+    fn legacy_alac(&self) -> bool {
+        !self.legacy_codecs.is_empty()
+            && !self.legacy_codecs.contains(&0)
+            && self.legacy_codecs.contains(&1)
+    }
+    /// Negotiate the codec, transport and timing for one session profile.
+    ///
+    /// Every decision below reads a named question on this fingerprint; the
+    /// model and firmware version are carried by `self` instead of being loose
+    /// parameters, so no caller can pair the wrong evidence with a receiver.
+    pub fn negotiate(
+        &self,
+        profile: &Profile,
+        rate: u32,
+        inherited_ptp: bool,
+    ) -> Result<CompatProfile> {
+        ensure!(
+            (-500..=500).contains(&profile.sync_offset_ms),
+            "sync offset must be -500..500 ms"
+        );
+        let transport = match profile.transport {
+            Transport::Auto
+                if self.formats.realtime.is_some_and(|f| {
+                    f & (crate::rtp::audio_format(true, rate)
+                        | crate::rtp::audio_format(false, rate))
+                        == 0
+                }) && self
+                    .formats
+                    .buffered
+                    .is_some_and(|f| f & crate::rtp::audio_format(true, rate) != 0) =>
+            {
+                Transport::Buffered
+            }
+            Transport::Auto => Transport::Realtime,
+            forced => forced,
+        };
+        let formats = if transport == Transport::Buffered {
+            self.formats.buffered
+        } else {
+            self.formats.realtime
+        };
+        let supports =
+            |alac| formats.is_some_and(|f| f & crate::rtp::audio_format(alac, rate) != 0);
+        let alac = match profile.codec {
+            Codec::Auto if formats.is_some() => supports(true),
+            Codec::Auto | Codec::Legacy => self.legacy_alac(),
+            Codec::Alac => true,
+            Codec::Pcm => false,
+        };
+        if let Some(f) = formats {
+            ensure!(
+                f & crate::rtp::audio_format(alac, rate) != 0,
+                "requested codec/sample rate is not advertised for this stream"
+            );
+        } else {
+            ensure!(
+                self.legacy_codecs.is_empty() || self.legacy_codecs.contains(&u8::from(alac)),
+                "requested codec is not advertised"
+            );
+        }
+        ensure!(
+            transport != Transport::Buffered || alac,
+            "buffered audio requires ALAC"
+        );
+        // A followed receiver supplies the timeline, so following it is PTP by
+        // definition. A standalone HomePod on HomePod software 27 keeps its own
+        // grandmaster and stays silent on a sender-owned or NTP-timed session;
+        // an absent feature bit or an automatic timing choice must therefore
+        // never downshift a followed receiver to NTP.
+        let ptp = if profile.follow_receiver_clock {
+            ensure!(
+                profile.timing != Timing::Ntp,
+                "following a receiver clock requires PTP timing"
+            );
+            true
+        } else {
+            match profile.timing {
+                Timing::Inherit => inherited_ptp,
+                Timing::Auto => match self.ptp_expected() {
+                    Some(expectation) => expectation,
+                    // Unknown model: rely on AirPlay 2 evidence alone. A peer that
+                    // advertises nothing is an AirPlay 1 device and has no PTP.
+                    None => self.airplay2(),
+                },
+                Timing::Ptp => {
+                    let advertised =
+                        self.ptp_expected() == Some(true) || self.airplay2() || inherited_ptp;
+                    ensure!(
+                        self.ptp_expected() != Some(false) && advertised,
+                        "PTP timing is not advertised"
+                    );
+                    true
+                }
+                Timing::Ntp => false,
+            }
+        };
+        ensure!(
+            transport != Transport::Buffered || ptp,
+            "buffered audio requires PTP timing"
+        );
+        Ok(CompatProfile {
+            fingerprint: self.clone(),
+            alac,
+            transport,
+            ptp,
+            follow_receiver_clock: profile.follow_receiver_clock,
+        })
+    }
+}
+/// The compatibility facts chosen for one receiver in one session: the `/info`
+/// fingerprint plus the negotiated codec, transport and timing.
+///
+/// Session code asks this value (`uses_buffered_stream`, `uses_ptp`,
+/// `follows_receiver_clock`, ...) instead of comparing raw enums and feature
+/// bits at every call site.
+#[derive(Clone, Debug, Default)]
+pub struct CompatProfile {
+    fingerprint: CompatFingerprint,
+    alac: bool,
+    transport: Transport,
+    ptp: bool,
+    follow_receiver_clock: bool,
+}
+impl CompatProfile {
+    /// Derive the fingerprint from `/info` and negotiate the session profile.
+    pub fn derive(
+        info: &Value,
+        profile: &Profile,
+        legacy_codecs: &[u8],
+        rate: u32,
+        inherited_ptp: bool,
+    ) -> Result<Self> {
+        CompatFingerprint::from_info(info, profile, legacy_codecs).negotiate(
+            profile,
+            rate,
+            inherited_ptp,
+        )
+    }
+    pub fn airplay2(&self) -> bool {
+        self.fingerprint.airplay2()
+    }
+    pub fn ptp_expected(&self) -> Option<bool> {
+        self.fingerprint.ptp_expected()
+    }
+    /// ALAC was chosen for this session.
+    pub fn prefers_alac(&self) -> bool {
+        self.alac
+    }
+    /// The session runs a buffered (type 103/TCP) audio stream.
+    pub fn uses_buffered_stream(&self) -> bool {
+        self.transport == Transport::Buffered
+    }
+    /// The session runs PTP; otherwise it runs NTP.
+    pub fn uses_ptp(&self) -> bool {
+        self.ptp
+    }
+    /// The receiver supplies the timeline and the sender follows it.
+    pub fn follows_receiver_clock(&self) -> bool {
+        self.ptp && self.follow_receiver_clock
+    }
+    /// `follow` / `sender` / `ntp`, as reported on the `negotiated` event.
+    pub fn clock_role(&self) -> &'static str {
+        if self.follows_receiver_clock() {
+            "follow"
+        } else if self.ptp {
+            "sender"
+        } else {
+            "ntp"
+        }
+    }
+    /// `ntp` / `follow` / `ptp`, as reported by capability prediction.
+    pub fn timing_label(&self) -> &'static str {
+        if !self.ptp {
+            "ntp"
+        } else if self.follows_receiver_clock() {
+            "follow"
+        } else {
+            "ptp"
+        }
+    }
+    /// `ptp` / `ntp`, as reported on the `negotiated` event.
+    pub fn timing_name(&self) -> &'static str {
+        if self.ptp { "ptp" } else { "ntp" }
+    }
+    /// `PTP` / `NTP`, as sent in the SETUP `timingProtocol` field.
+    pub fn timing_protocol(&self) -> &'static str {
+        if self.ptp { "PTP" } else { "NTP" }
+    }
+    /// `alac` / `pcm`, as reported on IPC events.
+    pub fn codec_name(&self) -> &'static str {
+        if self.alac { "alac" } else { "pcm" }
+    }
+    /// Negotiated stream transport, for the IPC events that serialise the enum.
+    pub fn transport(&self) -> Transport {
+        self.transport
+    }
+    #[cfg(test)]
+    pub(crate) fn unnegotiated() -> Self {
+        Self::default()
+    }
+}
 impl Formats {
     pub fn parse(info: &Value) -> Self {
         let get = |key: &str| {
@@ -155,126 +426,22 @@ impl Formats {
                 .and_then(integer),
         }
     }
+    /// Negotiate without `/info` model/firmware evidence. Session code derives a
+    /// full [`CompatFingerprint`] from `/info` instead; this wrapper exists for
+    /// callers that only have the parsed stream formats.
     pub fn negotiate(
         self,
         profile: &Profile,
         legacy_codecs: &[u8],
         rate: u32,
         inherited_ptp: bool,
-    ) -> Result<Selection> {
-        self.negotiate_with(profile, legacy_codecs, rate, inherited_ptp, None, None)
+    ) -> Result<CompatProfile> {
+        CompatFingerprint::from_formats(self, profile, legacy_codecs).negotiate(
+            profile,
+            rate,
+            inherited_ptp,
+        )
     }
-    /// `model` and `source_version` come from `/info`; they let the timing choice
-    /// follow the device instead of a feature bit that the reference implementation
-    /// never reads.
-    #[allow(clippy::too_many_arguments)]
-    pub fn negotiate_with(
-        self,
-        profile: &Profile,
-        legacy_codecs: &[u8],
-        rate: u32,
-        inherited_ptp: bool,
-        model: Option<&str>,
-        source_version: Option<&str>,
-    ) -> Result<Selection> {
-        ensure!(
-            (-500..=500).contains(&profile.sync_offset_ms),
-            "sync offset must be -500..500 ms"
-        );
-        let transport = match profile.transport {
-            Transport::Auto
-                if self.realtime.is_some_and(|f| {
-                    f & (crate::rtp::audio_format(true, rate)
-                        | crate::rtp::audio_format(false, rate))
-                        == 0
-                }) && self
-                    .buffered
-                    .is_some_and(|f| f & crate::rtp::audio_format(true, rate) != 0) =>
-            {
-                Transport::Buffered
-            }
-            Transport::Auto => Transport::Realtime,
-            forced => forced,
-        };
-        let formats = if transport == Transport::Buffered {
-            self.buffered
-        } else {
-            self.realtime
-        };
-        let supports =
-            |alac| formats.is_some_and(|f| f & crate::rtp::audio_format(alac, rate) != 0);
-        let legacy_alac =
-            !legacy_codecs.is_empty() && !legacy_codecs.contains(&0) && legacy_codecs.contains(&1);
-        let alac = match profile.codec {
-            Codec::Auto if formats.is_some() => supports(true),
-            Codec::Auto | Codec::Legacy => legacy_alac,
-            Codec::Alac => true,
-            Codec::Pcm => false,
-        };
-        if let Some(f) = formats {
-            ensure!(
-                f & crate::rtp::audio_format(alac, rate) != 0,
-                "requested codec/sample rate is not advertised for this stream"
-            );
-        } else {
-            ensure!(
-                legacy_codecs.is_empty() || legacy_codecs.contains(&u8::from(alac)),
-                "requested codec is not advertised"
-            );
-        }
-        ensure!(
-            transport != Transport::Buffered || alac,
-            "buffered audio requires ALAC"
-        );
-        // A followed receiver supplies the timeline, so following it is PTP by
-        // definition. A standalone HomePod on HomePod software 27 keeps its own
-        // grandmaster and stays silent on a sender-owned or NTP-timed session;
-        // an absent feature bit or an automatic timing choice must therefore
-        // never downshift a followed receiver to NTP.
-        let ptp = if profile.follow_receiver_clock {
-            ensure!(
-                profile.timing != Timing::Ntp,
-                "following a receiver clock requires PTP timing"
-            );
-            true
-        } else {
-            match profile.timing {
-                Timing::Inherit => inherited_ptp,
-                Timing::Auto => match ptp_expected(model) {
-                    Some(expectation) => expectation,
-                    // Unknown model: rely on AirPlay 2 evidence alone. A peer that
-                    // advertises nothing is an AirPlay 1 device and has no PTP.
-                    None => is_airplay2(self.features.or(profile.features), source_version),
-                },
-                Timing::Ptp => {
-                    let advertised = ptp_expected(model) == Some(true)
-                        || is_airplay2(self.features.or(profile.features), source_version)
-                        || inherited_ptp;
-                    ensure!(
-                        ptp_expected(model) != Some(false) && advertised,
-                        "PTP timing is not advertised"
-                    );
-                    true
-                }
-                Timing::Ntp => false,
-            }
-        };
-        ensure!(
-            transport != Transport::Buffered || ptp,
-            "buffered audio requires PTP timing"
-        );
-        Ok(Selection {
-            alac,
-            transport,
-            ptp,
-        })
-    }
-}
-#[derive(Clone, Copy, Debug)]
-pub struct Selection {
-    pub alac: bool,
-    pub transport: Transport,
-    pub ptp: bool,
 }
 
 #[cfg(test)]
@@ -308,7 +475,7 @@ mod tests {
                 true
             )
             .unwrap()
-            .alac
+            .prefers_alac()
         );
         assert!(
             f.negotiate(
@@ -339,7 +506,7 @@ mod tests {
                 true
             )
             .unwrap()
-            .transport,
+            .transport(),
             Transport::Buffered
         );
     }
@@ -356,12 +523,16 @@ mod tests {
                 codec: Codec::Auto,
                 ..Default::default()
             };
-            assert!(both.negotiate(&p, &[0, 1], rate, true).unwrap().alac);
+            assert!(
+                both.negotiate(&p, &[0, 1], rate, true)
+                    .unwrap()
+                    .prefers_alac()
+            );
             assert!(
                 !Formats::default()
                     .negotiate(&p, &[0, 1], rate, true)
                     .unwrap()
-                    .alac
+                    .prefers_alac()
             );
             assert!(
                 Formats {
@@ -399,9 +570,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            f.negotiate_with(&p, &[], 44100, false, None, Some("366.0"))
+            CompatFingerprint::from_evidence(f, &p, &[], None, Some("366.0"))
+                .negotiate(&p, 44100, false)
                 .unwrap()
-                .transport,
+                .transport(),
             Transport::Buffered
         );
         assert!(
@@ -450,30 +622,27 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            formats
-                .negotiate_with(&auto, &[], 44100, false, Some("AudioAccessory5,1"), None)
+            CompatFingerprint::from_evidence(formats, &auto, &[], Some("AudioAccessory5,1"), None)
+                .negotiate(&auto, 44100, false)
                 .unwrap()
-                .ptp
+                .uses_ptp()
         );
         // An Apple TV on the same settings is NTP, and forcing PTP is rejected.
         assert!(
-            !formats
-                .negotiate_with(&auto, &[], 44100, false, Some("AppleTV6,2"), None)
+            !CompatFingerprint::from_evidence(formats, &auto, &[], Some("AppleTV6,2"), None)
+                .negotiate(&auto, 44100, false)
                 .unwrap()
-                .ptp
+                .uses_ptp()
         );
         assert!(
-            formats
-                .negotiate_with(
+            CompatFingerprint::from_evidence(formats, &auto, &[], Some("AppleTV6,2"), None)
+                .negotiate(
                     &Profile {
                         timing: Timing::Ptp,
                         ..auto
                     },
-                    &[],
                     44100,
-                    false,
-                    Some("AppleTV6,2"),
-                    None
+                    false
                 )
                 .is_err()
         );
@@ -494,10 +663,16 @@ mod tests {
         };
         // Unknown model, but a modern AirPlay 2 firmware: PTP.
         assert!(
-            formats
-                .negotiate_with(&auto, &[], 44100, false, Some("Speaker9,9"), Some("366.0"))
-                .unwrap()
-                .ptp
+            CompatFingerprint::from_evidence(
+                formats,
+                &auto,
+                &[],
+                Some("Speaker9,9"),
+                Some("366.0")
+            )
+            .negotiate(&auto, 44100, false)
+            .unwrap()
+            .uses_ptp()
         );
         // Unknown model without AirPlay 2 evidence: no PTP, whatever the session
         // asked for, because bit 41 alone means nothing.
@@ -507,16 +682,16 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !quiet
-                .negotiate_with(&auto, &[], 44100, false, Some("Speaker9,9"), Some("366.0"))
+            !CompatFingerprint::from_evidence(quiet, &auto, &[], Some("Speaker9,9"), Some("366.0"))
+                .negotiate(&auto, 44100, false)
                 .unwrap()
-                .ptp
+                .uses_ptp()
         );
         assert!(
-            !quiet
-                .negotiate_with(&auto, &[], 44100, true, Some("Speaker9,9"), Some("366.0"))
+            !CompatFingerprint::from_evidence(quiet, &auto, &[], Some("Speaker9,9"), Some("366.0"))
+                .negotiate(&auto, 44100, true)
                 .unwrap()
-                .ptp
+                .uses_ptp()
         );
     }
     #[test]
@@ -533,12 +708,13 @@ mod tests {
             follow_receiver_clock: true,
             ..Default::default()
         };
-        let selection = formats
-            .negotiate(&followed, &[0, 1], 44100, false)
-            .unwrap();
-        assert!(selection.ptp, "following a receiver clock must stay on PTP");
-        assert!(selection.alac);
-        assert_eq!(selection.transport, Transport::Realtime);
+        let compat = formats.negotiate(&followed, &[0, 1], 44100, false).unwrap();
+        assert!(
+            compat.uses_ptp(),
+            "following a receiver clock must stay on PTP"
+        );
+        assert!(compat.prefers_alac());
+        assert_eq!(compat.transport(), Transport::Realtime);
         assert!(
             formats
                 .negotiate(
@@ -567,7 +743,7 @@ mod tests {
                     false
                 )
                 .unwrap()
-                .ptp
+                .uses_ptp()
         );
     }
     #[test]

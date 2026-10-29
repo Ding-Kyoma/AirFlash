@@ -316,7 +316,7 @@ fn authenticate_with<C, T>(
 }
 
 struct Member {
-    selection: crate::profile::Selection,
+    compat: crate::profile::CompatProfile,
     peer: Peer,
     conn: std::sync::Arc<std::sync::Mutex<Connection>>,
     events: Option<EventWorker>,
@@ -357,17 +357,14 @@ impl Member {
         emit(json!({"event":"phase","host":peer.host,"phase":"info"}));
         let info = conn.request("GET", "/info", &[], &[])?.plist()?;
         let capabilities = info.as_dictionary().context("info is not a dictionary")?;
-        let selection = crate::profile::Formats::parse(&info).negotiate_with(
+        let compat = crate::profile::CompatProfile::derive(
+            &info,
             &peer.profile,
             &peer.codecs,
             options.sample_rate,
             options.timing == "ptp",
-            capabilities.get("model").and_then(Value::as_string),
-            capabilities
-                .get("sourceVersion")
-                .and_then(Value::as_string),
         )?;
-        if selection.ptp && ptp.is_none() {
+        if compat.uses_ptp() && ptp.is_none() {
             let peers = options.peers.iter().map(|p| p.host).collect();
             let followers = options
                 .peers
@@ -387,7 +384,7 @@ impl Member {
             emit(json!({"event":"bmca_verdict","host":peer.host,"yielded":verdict.yield_master,"our_p1":verdict.our_p1,"remote_p1":verdict.remote_p1,"remote_is_master":verdict.remote_is_master,"probes":verdict.probes}));
             *ptp = Some(timer);
         }
-        let clock_id = selection.ptp.then(|| ptp.as_ref().unwrap().clock_id);
+        let clock_id = compat.uses_ptp().then(|| ptp.as_ref().unwrap().clock_id);
         emit(
             json!({"event":"peer_info","host":peer.host,"model":capabilities.get("model").and_then(Value::as_string),"source_version":capabilities.get("sourceVersion").and_then(Value::as_string)}),
         );
@@ -422,12 +419,12 @@ impl Member {
         let rate = options.sample_rate;
         let mut packetizer =
             Packetizer::with_rate(audio_key, rand::random(), initial_rtp, ssrc, rate);
-        let use_alac = selection.alac;
+        let use_alac = compat.prefers_alac();
         if use_alac {
             packetizer.enable_alac();
         }
         let mut member = Self {
-            selection,
+            compat,
             peer: peer.clone(),
             conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
             events: None,
@@ -452,10 +449,7 @@ impl Member {
             ("macAddress", string(sender_id)),
             ("name", string("AirFlash")),
             ("sessionUUID", string(Uuid::new_v4().to_string())),
-            (
-                "timingProtocol",
-                string(if selection.ptp { "PTP" } else { "NTP" }),
-            ),
+            ("timingProtocol", string(member.compat.timing_protocol())),
             ("isMultiSelectAirPlay", Value::Boolean(true)),
             ("groupContainsGroupLeader", Value::Boolean(false)),
             ("senderSupportsRelay", Value::Boolean(false)),
@@ -524,18 +518,16 @@ impl Member {
             ("sr", number(rate as u64)),
             (
                 "type",
-                number(
-                    if selection.transport == crate::profile::Transport::Buffered {
-                        103
-                    } else {
-                        96
-                    },
-                ),
+                number(if member.compat.uses_buffered_stream() {
+                    103
+                } else {
+                    96
+                }),
             ),
             ("supportsDynamicStreamID", Value::Boolean(false)),
             ("streamConnectionID", number(ssrc as u64)),
         ];
-        if selection.transport != crate::profile::Transport::Buffered {
+        if !member.compat.uses_buffered_stream() {
             stream_fields.push(("latencyMin", number(latency)));
             stream_fields.push(("latencyMax", number(latency)));
         }
@@ -559,14 +551,14 @@ impl Member {
             .and_then(Value::as_array)
             .and_then(|a| a.first())
             .context("missing stream response")?;
-        member.remote_control = if selection.transport == crate::profile::Transport::Buffered {
+        member.remote_control = if member.compat.uses_buffered_stream() {
             0
         } else {
             get_port(stream, "controlPort")?
         };
         let data_port = get_port(stream, "dataPort")?;
         member.media.set_control_port(member.remote_control);
-        if selection.transport == crate::profile::Transport::Buffered {
+        if member.compat.uses_buffered_stream() {
             member
                 .media
                 .connect_buffered(SocketAddr::new(peer.host, data_port))?;
@@ -587,7 +579,7 @@ impl Member {
             effective_latency.is_none(),
         );
         emit(
-            json!({"event":"negotiated","receiver_id":peer.receiver_id,"host":peer.host,"port":peer.port,"clock_role":if selection.ptp && peer.profile.follow_receiver_clock {"follow"}else if selection.ptp {"sender"}else {"ntp"},"data_port":data_port,"codec":if use_alac{"alac"}else{"pcm"},"transport":selection.transport,"timing":if selection.ptp{"ptp"}else{"ntp"},"channel":peer.profile.channel,"sync_offset_ms":peer.profile.sync_offset_ms,"qualification":"experimental","sample_rate":rate,"control_port":member.remote_control,"requested_latency_ms":options.latency_ms,"receiver_latency_min_samples":stream.as_dictionary().and_then(|d|d.get("latencyMin")).and_then(Value::as_unsigned_integer),"measured_latency_ms":null}),
+            json!({"event":"negotiated","receiver_id":peer.receiver_id,"host":peer.host,"port":peer.port,"clock_role":member.compat.clock_role(),"data_port":data_port,"codec":member.compat.codec_name(),"transport":member.compat.transport(),"timing":member.compat.timing_name(),"channel":peer.profile.channel,"sync_offset_ms":peer.profile.sync_offset_ms,"qualification":"experimental","sample_rate":rate,"control_port":member.remote_control,"requested_latency_ms":options.latency_ms,"receiver_latency_min_samples":stream.as_dictionary().and_then(|d|d.get("latencyMin")).and_then(Value::as_unsigned_integer),"measured_latency_ms":null}),
         );
         Ok(member)
     }
@@ -626,7 +618,7 @@ impl Member {
                 .into_iter()
                 .find(|snapshot| snapshot.host == self.peer.host)
         });
-        json!({"id":if self.peer.receiver_id.is_empty() {self.peer.host.to_string()} else {self.peer.receiver_id.clone()}, "host":self.peer.host, "ip":self.peer.host, "active":!self.closed, "codec":if self.selection.alac {"alac"}else{"pcm"},"transport":self.selection.transport,"timing":if self.selection.ptp{"ptp"}else{"ntp"},"clock_role":if self.selection.ptp && self.peer.profile.follow_receiver_clock {"follow"} else if self.selection.ptp {"sender"} else {"ntp"},"channel":self.peer.profile.channel,"sync_offset_ms":self.peer.profile.sync_offset_ms,"qualification":"experimental","media":self.media.metrics(), "health":self.health.snapshot(), "ptp_offset_ns":clock.as_ref().and_then(|s| s.offset_ns), "ptp_offset_count":clock.as_ref().map(|s| s.exchanges), "ptp_ready":clock.as_ref().is_some_and(|s| s.ready), "ptp_phase":clock.as_ref().map(|s| s.phase)})
+        json!({"id":if self.peer.receiver_id.is_empty() {self.peer.host.to_string()} else {self.peer.receiver_id.clone()}, "host":self.peer.host, "ip":self.peer.host, "active":!self.closed, "codec":self.compat.codec_name(),"transport":self.compat.transport(),"timing":self.compat.timing_name(),"clock_role":self.compat.clock_role(),"channel":self.peer.profile.channel,"sync_offset_ms":self.peer.profile.sync_offset_ms,"qualification":"experimental","media":self.media.metrics(), "health":self.health.snapshot(), "ptp_offset_ns":clock.as_ref().and_then(|s| s.offset_ns), "ptp_offset_count":clock.as_ref().map(|s| s.exchanges), "ptp_ready":clock.as_ref().is_some_and(|s| s.ready), "ptp_phase":clock.as_ref().map(|s| s.phase)})
     }
     fn close(&mut self) {
         if self.closed {
@@ -995,7 +987,7 @@ fn run_stream(
     }
     let timing_peers: Vec<_> = members
         .iter()
-        .filter(|member| member.selection.ptp)
+        .filter(|member| member.compat.uses_ptp())
         .map(|member| member.peer.host)
         .collect();
     if let Some(timer) = &ptp {
@@ -1003,7 +995,7 @@ fn run_stream(
         let mut next_status = started;
         while members
             .iter()
-            .any(|m| m.selection.ptp && !timer.ready(m.peer.host))
+            .any(|m| m.compat.uses_ptp() && !timer.ready(m.peer.host))
         {
             cancel.check()?;
             let now = Instant::now();
@@ -1121,7 +1113,7 @@ fn send_packets(
                 .unwrap_or(0),
         );
     for member in members.iter() {
-        if member.selection.transport == crate::profile::Transport::Buffered {
+        if member.compat.uses_buffered_stream() {
             let render = offset_time(
                 base_ns,
                 common_latency,
@@ -1264,7 +1256,7 @@ fn send_packets(
                 // silent past the grace, ends the session.
                 let now = Instant::now();
                 if let Some(host) = members.iter().find_map(|m| {
-                    if !m.selection.ptp {
+                    if !m.compat.uses_ptp() {
                         return None;
                     }
                     match timer.stale_for(m.peer.host, now) {
@@ -1276,7 +1268,7 @@ fn send_packets(
                 }) {
                     let hosts: Vec<_> = members
                         .iter()
-                        .filter(|m| m.selection.ptp)
+                        .filter(|m| m.compat.uses_ptp())
                         .map(|m| m.peer.host)
                         .collect();
                     emit(clock_status(timer, &hosts, "lost"));
@@ -1399,7 +1391,7 @@ fn send_packets(
                         m.media.latency(),
                         m.peer.profile.sync_offset_ms,
                     )?;
-                    let (id, network) = if m.selection.ptp {
+                    let (id, network) = if m.compat.uses_ptp() {
                         let (id, t, frozen) = ptp.as_ref().unwrap().timeline_frozen(
                             m.peer.host,
                             local,
@@ -1457,7 +1449,7 @@ fn send_packets(
                 if let Some(timer) = &ptp {
                     let hosts: Vec<_> = members
                         .iter()
-                        .filter(|m| m.selection.ptp)
+                        .filter(|m| m.compat.uses_ptp())
                         .map(|m| m.peer.host)
                         .collect();
                     emit(clock_status(timer, &hosts, "streaming"));
@@ -1817,11 +1809,7 @@ mod tests {
         )
         .unwrap();
         let member = Member {
-            selection: crate::profile::Selection {
-                alac: false,
-                transport: crate::profile::Transport::Realtime,
-                ptp: false,
-            },
+            compat: crate::profile::CompatProfile::unnegotiated(),
             peer: Peer {
                 receiver_id: String::new(),
                 host: "127.0.0.1".parse().unwrap(),
