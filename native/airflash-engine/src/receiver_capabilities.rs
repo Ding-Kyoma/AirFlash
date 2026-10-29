@@ -51,6 +51,10 @@ pub fn choices(formats: Formats, evidence: &Profile, codecs: &[u8]) -> Vec<Profi
                         codec,
                         transport,
                         timing,
+                        // Explicit sender PTP/NTP override automatic following,
+                        // matching the profile sent by SessionController.
+                        follow_receiver_clock: timing_name == "follow"
+                            || timing_name == "auto" && evidence.follow_receiver_clock,
                         ..evidence.clone()
                     };
                     if let Ok(selected) = formats.negotiate(&profile, codecs, rate, true) {
@@ -67,9 +71,7 @@ pub fn choices(formats: Formats, evidence: &Profile, codecs: &[u8]) -> Vec<Profi
                             },
                             selected_timing: if !selected.ptp {
                                 "ntp"
-                            } else if timing_name == "follow"
-                                || timing_name == "auto" && evidence.follow_receiver_clock
-                            {
+                            } else if profile.follow_receiver_clock {
                                 "follow"
                             } else {
                                 "ptp"
@@ -201,5 +203,117 @@ mod tests {
                 .iter()
                 .any(|p| p.timing == "ptp" || p.timing == "follow")
         );
+    }
+
+    #[test]
+    fn follow_evidence_does_not_enable_sender_ptp_or_hide_explicit_ntp() {
+        let formats = Formats {
+            realtime: Some(crate::rtp::audio_format(false, 44100)),
+            features: Some(0),
+            ..Formats::default()
+        };
+        let evidence = Profile {
+            follow_receiver_clock: true,
+            ..Profile::default()
+        };
+        let items = choices(formats, &evidence, &[]);
+        assert!(
+            items
+                .iter()
+                .any(|p| p.timing == "auto" && p.selected_timing == "follow")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|p| p.timing == "follow" && p.selected_timing == "follow")
+        );
+        assert!(
+            !items.iter().any(|p| p.timing == "ptp"),
+            "explicit sender PTP must still require advertised support"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|p| p.timing == "ntp" && p.selected_timing == "ntp"),
+            "explicit NTP disables following, just as it does during playback"
+        );
+    }
+
+    #[test]
+    fn clock_capability_predictions_match_playback_roles_and_feature_sources() {
+        for features in [None, Some(0), Some(1 << 41)] {
+            for evidence_features in [None, Some(0), Some(1 << 41)] {
+                for follow_receiver_clock in [false, true] {
+                    let formats = Formats {
+                        realtime: Some(crate::rtp::audio_format(false, 44100)),
+                        buffered: Some(crate::rtp::audio_format(true, 48000)),
+                        features,
+                    };
+                    let evidence = Profile {
+                        features: evidence_features,
+                        follow_receiver_clock,
+                        ..Profile::default()
+                    };
+                    let items = choices(formats, &evidence, &[]);
+                    assert!(!items.is_empty());
+                    for item in items {
+                        // Reconstruct the wire profile used by SessionController:
+                        // explicit sender PTP/NTP turn off automatic following.
+                        let profile = Profile {
+                            codec: match item.codec {
+                                "auto" => Codec::Auto,
+                                "pcm" => Codec::Pcm,
+                                "alac" => Codec::Alac,
+                                _ => unreachable!(),
+                            },
+                            transport: match item.transport {
+                                "auto" => Transport::Auto,
+                                "realtime" => Transport::Realtime,
+                                "buffered" => Transport::Buffered,
+                                _ => unreachable!(),
+                            },
+                            timing: match item.timing {
+                                "auto" => Timing::Auto,
+                                "ptp" | "follow" => Timing::Ptp,
+                                "ntp" => Timing::Ntp,
+                                _ => unreachable!(),
+                            },
+                            follow_receiver_clock: item.timing == "follow"
+                                || item.timing == "auto" && follow_receiver_clock,
+                            ..evidence.clone()
+                        };
+                        let selected = formats
+                            .negotiate(&profile, &[], item.sample_rate, true)
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "offered {item:?} failed playback: {error}; features={features:?}, evidence={evidence:?}"
+                                )
+                            });
+                        assert_eq!(
+                            item.selected_codec,
+                            if selected.alac { "alac" } else { "pcm" }
+                        );
+                        assert_eq!(
+                            item.selected_transport,
+                            if selected.transport == Transport::Buffered {
+                                "buffered"
+                            } else {
+                                "realtime"
+                            }
+                        );
+                        assert_eq!(
+                            item.selected_timing,
+                            if !selected.ptp {
+                                "ntp"
+                            } else if profile.follow_receiver_clock {
+                                "follow"
+                            } else {
+                                "ptp"
+                            }
+                        );
+                    }
+                }
+            }
+        }
     }
 }
