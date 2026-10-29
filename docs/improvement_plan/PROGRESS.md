@@ -1242,13 +1242,12 @@ Q24（同上）。
   `-<epoch>` 后缀）、桌面 fault 序列超过 5 条截断并保留计数、写文件失败不影响
   会话；telemetry 侧覆盖 JSON 字段/redact 形状、CSV 列序与无身份字段、追加时
   只写一次表头；桌面侧覆盖表头/转义/不可写路径。
-- **验证**（合并 main 后重跑）：Rust lib 246 passed + 1 ignored、main 2、集成
-  40 passed + 1 ignored，合计 288 passed / 2 ignored；clippy `-D warnings`
-  无告警；`build-native.ps1 -Check` 通过；.NET 566 通过；pytest 141 通过；
-  ruff 无问题。本轮没有复现已知偶发（`session_simulation.rs` 的 `AddrInUse`
-  与 .NET standby 的事件时序空引用）；历史记录保留：
-  `EngineStandbyReleasesMuteAndMetricsCannotOverrideState` 曾在首次全量时
-  偶发一次事件时序空引用，单跑与全量重跑均通过。
+- **验证**（合并 main 后重跑）：Rust lib 258 passed + 1 ignored、main 2、集成
+  44 passed + 1 ignored，合计 304 passed / 2 ignored；clippy `-D warnings`
+  无告警；`build-native.ps1 -Check` 通过；.NET 574 通过；pytest 141 通过；
+  ruff 无问题。本轮没有复现 `session_simulation.rs` 的 `AddrInUse`；
+  `EngineStandbyReleasesMuteAndMetricsCannotOverrideState` 在首次全量时复发了
+  一次已知的事件时序空引用，单跑与全量重跑均通过。
 
 ## P3-2c 混组不可表示（桌面，已完成）
 
