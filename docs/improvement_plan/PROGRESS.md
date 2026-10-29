@@ -234,6 +234,21 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
 
 ---
 
+## P2-14 诊断导出（已完成脱敏与导出）
+
+`native/airflash-engine/src/telemetry.rs`、`AirFlash.Core/DiagnosticExport.cs`、
+设置页「导出诊断信息」按钮
+
+- 引擎 `telemetry::redact()`：按 key（`host`/`ip`/`mac`/`path`/`receiver_id` 等）
+  与自由文本里的 IPv4/MAC 一起替换成**稳定假名**（`host-1`、`host-2`…，同一地址
+  全篇同名），`secret`/`password`/`key`/`authorization`/`token` 直接 `[redacted]`；
+  所有计数器、直方图、版本号原样保留。`diag_summary` 现在返回脱敏后的快照。
+- 桌面 `DiagnosticExport`：向引擎要一份脱敏快照（没有引擎时返回 null 而不是抛错），
+  拼上 app/engine 版本、OS、CPU 数、日志尾部 80 行，写到日志目录的
+  `AirFlash-diagnostics-<时间戳>.json`，并打开该目录。
+- 测试：脱敏（同一主机同一假名、自由文本里的 IP 也被替换、数字不变）、快照往返、
+  无引擎不抛错、文件命名。
+
 ## 还没做
 
 | 项目 | 现状 | 备注 |
@@ -241,7 +256,6 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
 | P1-10 标定流程 | 未开始 | 需要真机测延迟/丢包，按报告是「用户自助标定」 |
 | P2-12 组拓扑原子化 + 失败回滚 | 未开始 | 屏障已有（全部 connect 后才等 PTP）；缺的是中途失败时 `TEARDOWN` 已建好的成员并重试 |
 | P2-13 兼容 profile | 未开始 | 把散落的 if 收成 `CompatBehavior`，按 `srcvers`/`model` 指纹选择 |
-| P2-14 诊断导出 | 部分 | `diag_summary` + `--self-check` 已能给结构化引擎摘要；缺脱敏与实际导出文件 |
 | P3-3 抢占检测 | 未开始 | 按 Q18 用「未预期 TEARDOWN + 随后重新 announce」组合特征 |
 | P3-4 MRP 隧道 | 未开始 | 大工程 |
 | P3-5 经典 RAOP / 初代 AirPlay | 未开始 | 大工程 |

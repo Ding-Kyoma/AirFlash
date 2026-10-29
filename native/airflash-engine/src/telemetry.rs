@@ -239,9 +239,156 @@ pub fn diagnostics() -> Value {
         .clone()
 }
 
+/// Replace everything that identifies a network or a machine, keeping the shape and
+/// the numbers.
+///
+/// A diagnostic dump is only useful if it can be attached to an issue, so hosts,
+/// MAC addresses, paths and credential-looking keys are replaced by stable
+/// pseudonyms (`host-1`, `host-2`, ...) rather than dropped: two members keep two
+/// different names, and the same host keeps the same name across the document.
+pub fn redact(value: &Value) -> Value {
+    let mut names = std::collections::BTreeMap::new();
+    redact_into(value, None, &mut names)
+}
+fn redact_into(
+    value: &Value,
+    key: Option<&str>,
+    names: &mut std::collections::BTreeMap<String, String>,
+) -> Value {
+    match value {
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(name, inner)| {
+                    let lowered = name.to_ascii_lowercase();
+                    if matches!(
+                        lowered.as_str(),
+                        "secret" | "password" | "key" | "authorization" | "token"
+                    ) {
+                        (name.clone(), Value::String("[redacted]".into()))
+                    } else {
+                        (name.clone(), redact_into(inner, Some(&lowered), names))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| redact_into(item, key, names))
+                .collect(),
+        ),
+        Value::String(text) if key.is_some_and(is_identity_key) => {
+            Value::String(pseudonym(text, names))
+        }
+        Value::String(text) if looks_like_path(text) => Value::String(pseudonym(text, names)),
+        Value::String(text) => Value::String(scrub_text(text, names)),
+        other => other.clone(),
+    }
+}
+/// Replace addresses that appear inside free text (log lines, messages).
+fn scrub_text(text: &str, names: &mut std::collections::BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | ':' | '-') {
+            token.push(ch);
+        } else {
+            flush_token(&mut token, &mut out, names);
+            out.push(ch);
+        }
+    }
+    flush_token(&mut token, &mut out, names);
+    out
+}
+fn flush_token(
+    token: &mut String,
+    out: &mut String,
+    names: &mut std::collections::BTreeMap<String, String>,
+) {
+    if token.is_empty() {
+        return;
+    }
+    if is_ipv4(token) || is_mac(token) {
+        out.push_str(&pseudonym(token, names));
+    } else {
+        out.push_str(token);
+    }
+    token.clear();
+}
+fn is_ipv4(token: &str) -> bool {
+    let parts: Vec<_> = token.split('.').collect();
+    parts.len() == 4
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.len() <= 3
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && part.parse::<u16>().is_ok_and(|value| value <= 255)
+        })
+}
+fn is_mac(token: &str) -> bool {
+    let separator = if token.contains(':') {
+        ':'
+    } else if token.contains('-') {
+        '-'
+    } else {
+        return false;
+    };
+    let parts: Vec<_> = token.split(separator).collect();
+    parts.len() == 6
+        && parts
+            .iter()
+            .all(|part| part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+fn is_identity_key(key: &str) -> bool {
+    matches!(
+        key,
+        "host" | "ip" | "address" | "addr" | "mac" | "deviceid" | "receiver_id" | "id" | "path"
+    )
+}
+fn looks_like_path(text: &str) -> bool {
+    text.len() > 3 && (text.contains(":\\") || text.starts_with("\\\\") || text.starts_with("/home/") || text.starts_with("/Users/"))
+}
+fn pseudonym(text: &str, names: &mut std::collections::BTreeMap<String, String>) -> String {
+    if let Some(existing) = names.get(text) {
+        return existing.clone();
+    }
+    let label = format!("host-{}", names.len() + 1);
+    names.insert(text.to_string(), label.clone());
+    label
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn redaction_keeps_the_numbers_and_hides_the_identities() {
+        let snapshot = json!({
+            "session_epoch": 4,
+            "packets": 1200,
+            "members": [
+                {"host": "192.168.1.20", "ip": "192.168.1.20", "mac": "02:57:32:41:50:01", "send_errors": 0},
+                {"host": "192.168.1.21", "ip": "192.168.1.21", "send_errors": 3},
+            ],
+            "feedback": {"path": "C:\\Users\\alice\\AppData\\Local\\AirFlash\\log.txt", "rtt_ms": 4.5},
+            "secret": "Events-Write-Encryption-Key",
+            "nested": {"authorization": "Bearer abc", "note": "192.168.1.20 said hello"},
+        });
+        let redacted = redact(&snapshot);
+        let text = redacted.to_string();
+        assert!(!text.contains("192.168.1.20"));
+        assert!(!text.contains("192.168.1.21"));
+        assert!(!text.contains("alice"));
+        assert!(!text.contains("Bearer"));
+        assert_eq!(redacted["packets"], json!(1200));
+        assert_eq!(redacted["feedback"]["rtt_ms"], json!(4.5));
+        assert_eq!(redacted["secret"], json!("[redacted]"));
+        // The same host keeps one pseudonym; a second host gets a different one.
+        assert_eq!(redacted["members"][0]["host"], redacted["members"][0]["ip"]);
+        assert_ne!(redacted["members"][0]["host"], redacted["members"][1]["host"]);
+        assert_eq!(redacted["members"][1]["send_errors"], json!(3));
+    }
+
     #[test]
     fn histogram_tracks_percentiles_and_bounds() {
         let mut h = Histogram::default();
