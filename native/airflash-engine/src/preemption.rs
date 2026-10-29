@@ -1,18 +1,18 @@
-//! Receiver-takeover policy: a live `statusFlags` probe decides, control-plane
-//! symptoms only leave evidence.
+//! Receiver-takeover policy: a live `statusFlags` probe and a receiver-side TCP
+//! liveness probe decide, control-plane symptoms only leave evidence.
 //!
 //! The reference sender does not infer a takeover from what the control channel
 //! does. An unexpected `TEARDOWN` or a `Connection: close` is logged with
-//! context (`policy`, `rtp_healthy`, `packets_prepared`) and then the receiver is
-//! asked directly: `GET /info` and read `statusFlags`. That live answer is the
-//! only criterion:
+//! context (`policy`, `rtp_healthy`, `packets_prepared`, `tcp_reachable`) and
+//! then the receiver is asked directly: `GET /info` and read `statusFlags`. The
+//! live answer is combined with a TCP connect probe of the control port (Q34):
 //!
-//! | probe result | action |
-//! | --- | --- |
-//! | no active session | confirmation probe, then reclaim if it agrees |
-//! | an active session that is ours | not preemption: fall through |
-//! | an active session that is not ours | confirmation probe, then queue |
-//! | probe failed / timed out | reclaim anyway (fail-open) |
+//! | media healthy | TCP reachable | verdict |
+//! | --- | --- | --- |
+//! | yes | Alive | `OursActive` — our session is still being served |
+//! | yes | Dead | `Gone` — the device is gone, reclaim, never `BusyElsewhere` |
+//! | yes | Unknown | `OursActive` — conservative, a failed probe is not a death |
+//! | no | any | consult `statusFlags` (see [`classify`]) |
 //!
 //! The bit values are recovered from the reference implementation (Q31 answer):
 //! `ReceiverStatusFlags.ReceiverSessionActive = 131072 (0x20000, bit 17)`,
@@ -35,19 +35,23 @@
 //! every probe reported our own session as somebody else's, and the queue never
 //! ended.
 //!
-//! Two more guards make every state reachable from a probe finite:
+//! Two guards make every state reachable from a probe finite:
 //! - a state-changing verdict (`Free` or `BusyElsewhere`) is re-probed once
 //!   after [`CONFIRM_DELAY`]; a disagreement keeps the non-destructive outcome
 //!   (never reclaim);
-//! - consecutive confirmed `BusyElsewhere` requeues are bounded by
-//!   [`BUSY_LIMIT`]; at the limit the sender reclaims anyway and logs
-//!   `busy_exhausted`.
+//! - a confirmed `BusyElsewhere` is **queueing, not a takeover**: it backs off
+//!   [`REPROBE_BACKOFF`] (3 s → 6 s → 12 s → 24 s → 60 s, capped at 60 s) and
+//!   polls forever. A receiver that stays busy for an hour is polled once a
+//!   minute; it is never reclaimed for being busy (Q34).
 //!
 //! Re-announcing is never enough on its own: a receiver that is serving another
-//! sender still announces. The anti-storm limiter is a consecutive counter: a
-//! takeover that happens within [`TAKEOVER_WINDOW`] of the previous reclaim
-//! increments the count; at [`TAKEOVER_LIMIT`] the sender yields instead of
-//! fighting for the device.
+//! sender still announces. The anti-storm limiter counts **reclaim → takeover
+//! cycles** (Q34), not time spent queueing: a takeover only continues the run
+//! when it follows a successful reclaim inside [`TAKEOVER_WINDOW`]; otherwise it
+//! starts a new run at 1. At [`TAKEOVER_LIMIT`] the sender yields — a terminal
+//! state that schedules no further probe and resumes only on an explicit
+//! external trigger ([`Tracker::trigger`]) or a new playback run that finds the
+//! receiver `Free`.
 //!
 //! Real-device values are still unverified: the raw `statusFlags` value is
 //! always logged so it can be mapped from a receiver that owns the session.
@@ -57,7 +61,8 @@ use plist::Value;
 use std::{
     collections::HashMap,
     fmt,
-    net::{IpAddr, SocketAddr},
+    io::ErrorKind,
+    net::{IpAddr, SocketAddr, TcpStream},
     time::{Duration, Instant},
 };
 
@@ -65,12 +70,34 @@ use std::{
 /// WAC's probe timeout nor its re-probe interval.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long to wait before asking again when the receiver is busy with another
-/// sender. This is a queue, not a failure retry. Our choice: Q30 recovered
-/// neither WAC's probe timeout nor its re-probe interval; Q31's answer suggests
-/// 3-5 s, so 3 s is the low end of that range and still leaves audible media
-/// alone.
-pub const REPROBE_DELAY: Duration = Duration::from_secs(3);
+/// How long the receiver-side TCP connect probe may take. It is the same budget
+/// as [`PROBE_TIMEOUT`]: both are one control-plane round trip to a LAN address.
+pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The queueing backoff for a confirmed `BusyElsewhere` verdict: 3 s, 6 s,
+/// 12 s, 24 s, then 60 s forever. This is a queue, never a failure retry: a
+/// receiver that stays busy for an hour is polled once a minute and is never
+/// reclaimed for being busy (Q34 §四). The growth factor and the cap are our
+/// choice — WAC only exposed the shape of its takeover limiter, not its re-probe
+/// interval (Q31 suggested 3–5 s for the first interval).
+pub const REPROBE_BACKOFF: [Duration; 5] = [
+    Duration::from_secs(3),
+    Duration::from_secs(6),
+    Duration::from_secs(12),
+    Duration::from_secs(24),
+    Duration::from_secs(60),
+];
+
+/// The backoff cap: after the fifth confirmed busy verdict the interval stays at
+/// 60 s, forever.
+pub const REPROBE_MAX_DELAY: Duration = Duration::from_secs(60);
+
+/// The delay after `requeues` completed requeues. The first requeue waits 3 s,
+/// the second 6 s, then 12 s, 24 s, and 60 s for every later one.
+pub fn requeue_delay(requeues: u32) -> Duration {
+    let index = (requeues as usize).min(REPROBE_BACKOFF.len() - 1);
+    REPROBE_BACKOFF[index]
+}
 
 /// How long the "the receiver ended our session" conclusion is trusted while
 /// RTP is unhealthy. Q32 requires the conclusion to be self-healing; an
@@ -86,21 +113,14 @@ pub const ENDED_TRUST_WINDOW: Duration = Duration::from_secs(2);
 /// WAC's interval.
 pub const CONFIRM_DELAY: Duration = Duration::from_millis(500);
 
-/// Consecutive confirmed `BusyElsewhere` requeues after which the sender stops
-/// queueing and reclaims anyway (`busy_exhausted`). Our choice: Q32 asks for an
-/// upper bound and leaves the number to us. 3 mirrors [`TAKEOVER_LIMIT`] and,
-/// at [`REPROBE_DELAY`] = 3 s, bounds one session attempt to roughly 9 s of
-/// queueing before the reclaim path takes over. The takeover counter still
-/// applies on top, so even repeated forced reclaims end in `yield`.
-pub const BUSY_LIMIT: u32 = 3;
-
-/// A takeover counter reaches this many consecutive reclaims and the sender
-/// yields. Our choice: Q30 only recovered the *shape* of the limiter
-/// (`taken over <n> times in a row`), not WAC's threshold.
+/// A takeover counter reaches this many consecutive reclaim → takeover cycles
+/// and the sender yields. Our choice: Q30 only recovered the *shape* of the
+/// limiter (`taken over <n> times in a row`), not WAC's threshold.
 pub const TAKEOVER_LIMIT: u32 = 3;
 
-/// Two reclaims count as "in a row" only when the second happens at most this
-/// long after the first. Our choice: WAC's window was not recovered either.
+/// A takeover counts as another cycle in the same run only when it happens at
+/// most this long after a **successful reclaim**. Our choice: WAC's window was
+/// not recovered either; Q34 calls it "WAC 的量级" and suggests 30 s.
 pub const TAKEOVER_WINDOW: Duration = Duration::from_secs(30);
 
 /// `ReceiverStatusFlags.ReceiverSessionActive` in the reference implementation:
@@ -163,6 +183,57 @@ pub fn incoming_teardown(method: Option<&str>) -> Option<Signal> {
     (method == Some("TEARDOWN")).then_some(Signal::UnexpectedTeardown)
 }
 
+/// The receiver-side liveness dimension Q34 recovered from the reference
+/// sender: one TCP connect to the control port, not an RTP feedback path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiverLiveness {
+    /// `TcpStream::connect_timeout` succeeded: the receiver is alive.
+    Alive,
+    /// The probe itself failed in a way that does not prove death (DNS, routing,
+    /// another OS error). Never treated as a death — conservative.
+    Unknown,
+    /// The connection was refused or timed out: the device is gone.
+    Dead,
+}
+
+impl ReceiverLiveness {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Alive => "alive",
+            Self::Unknown => "unknown",
+            Self::Dead => "dead",
+        }
+    }
+
+    /// The boolean the reference sender exposes as `tcp_reachable=<b>`. Only a
+    /// completed connect is `true`; `Unknown` did not prove reachability.
+    pub fn reachable(self) -> bool {
+        matches!(self, Self::Alive)
+    }
+}
+
+/// One TCP connect probe against the receiver's control port.
+///
+/// This is the cheap "is the device still there?" dimension WAC uses after a
+/// feedback timeout. It talks no protocol — a bare `connect` on a port we
+/// already open RTSP on — and collapses to [`ReceiverLiveness`]:
+/// refused/timeout is `Dead`, any other error is `Unknown` so an odd local
+/// networking error can never fake a dead device.
+pub fn receiver_liveness(ip: IpAddr, port: u16, timeout: Duration) -> ReceiverLiveness {
+    match TcpStream::connect_timeout(&SocketAddr::new(ip, port), timeout) {
+        Ok(_) => ReceiverLiveness::Alive,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::ConnectionRefused | ErrorKind::TimedOut
+            ) =>
+        {
+            ReceiverLiveness::Dead
+        }
+        Err(_) => ReceiverLiveness::Unknown,
+    }
+}
+
 /// What a live `GET /info` probe could tell us.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProbeOutcome {
@@ -170,9 +241,10 @@ pub enum ProbeOutcome {
     /// whatever the other bits say.
     Free,
     /// The receiver's active session is **ours**: the session bit is set and we
-    /// still hold the session ([`Tracker::we_hold_session`]). Never a reclaim
-    /// trigger — the receiver is still serving us, so the control-plane symptom
-    /// is something else.
+    /// still hold the session ([`Tracker::we_hold_session`]), or healthy media
+    /// plus a reachable receiver made the auxiliary probe irrelevant. Never a
+    /// reclaim trigger — the receiver is still serving us, so the control-plane
+    /// symptom is something else.
     OursActive,
     /// The receiver has an active session and we do not hold it: another sender
     /// owns the device. Queue one re-probe, do not fight.
@@ -181,6 +253,10 @@ pub enum ProbeOutcome {
     /// 64-bit integer. Structurally unclassifiable; the caller reclaims
     /// (fail-open), exactly like a failed probe.
     Unknown,
+    /// The receiver did not answer a TCP connect on its control port while our
+    /// media was still healthy (Q34). The device is gone, not taken over: this
+    /// reclaims and must never be classified as `BusyElsewhere`.
+    Gone,
 }
 
 impl ProbeOutcome {
@@ -190,6 +266,7 @@ impl ProbeOutcome {
             Self::OursActive => "ours_active",
             Self::BusyElsewhere => "busy_elsewhere",
             Self::Unknown => "unknown",
+            Self::Gone => "gone",
         }
     }
 }
@@ -221,6 +298,40 @@ pub fn classify(status_flags: u64, we_hold_session: bool) -> ProbeOutcome {
     }
 }
 
+/// Q34's two-dimension verdict, exactly:
+///
+/// ```text
+/// (media healthy, Alive)   => OursActive
+/// (media healthy, Dead)    => Gone       // the device is gone, not taken over
+/// (media healthy, Unknown) => OursActive // conservative
+/// (!media healthy, _)      => consult statusFlags
+/// ```
+///
+/// The status-flags consultation is [`classify`] (and `Unknown` when the field
+/// is missing), i.e. the fail-open path is unchanged for an unhealthy media
+/// session. `Dead` wins over the flags in every case so it can never resolve to
+/// `BusyElsewhere`: a receiver that cannot accept a TCP connection is not
+/// "busy with another sender", it is unreachable.
+///
+/// `now` is implicit on purpose: the media-health sample and the liveness probe
+/// both belong to the caller's current poll.
+pub fn combine(
+    media_healthy: bool,
+    liveness: ReceiverLiveness,
+    status_flags: Option<u64>,
+    we_hold_session: bool,
+) -> ProbeOutcome {
+    use ReceiverLiveness as L;
+    match (media_healthy, liveness) {
+        (_, L::Dead) => ProbeOutcome::Gone,
+        (true, L::Alive | L::Unknown) => ProbeOutcome::OursActive,
+        (false, _) => match status_flags {
+            Some(flags) => classify(flags, we_hold_session),
+            None => ProbeOutcome::Unknown,
+        },
+    }
+}
+
 fn status_flags(info: &Value) -> Option<u64> {
     info.as_dictionary()?.get("statusFlags")?.as_unsigned_integer()
 }
@@ -246,12 +357,10 @@ fn report_from_info(info: &Value, we_hold_session: bool) -> ProbeReport {
 pub enum ProbeAction {
     /// Stop the old session and take the receiver back on a fresh connection.
     Reclaim,
-    /// The bounded busy queue was exhausted: reclaim even though the receiver
-    /// still reports an active session (`busy_exhausted`). A fail-open exit, so
-    /// a permanently busy (or permanently misreported) receiver can never keep
-    /// the sender queueing forever.
-    ReclaimBusyExhausted,
-    /// Leave the receiver alone for now and ask again after [`REPROBE_DELAY`].
+    /// Leave the receiver alone for now and ask again after the next backoff
+    /// interval ([`requeue_delay`]). There is no upper bound on queueing: a
+    /// confirmed busy receiver is polled forever, never reclaimed for being
+    /// busy (Q34).
     Requeue,
     /// Not preemption: the receiver's active session is ours. Take no
     /// preemption action, so the control symptom falls through to the existing
@@ -265,7 +374,7 @@ pub enum ProbeAction {
 /// The Q30 verdict table, for a probe that completed.
 pub fn action_for(outcome: ProbeOutcome) -> ProbeAction {
     match outcome {
-        ProbeOutcome::Free | ProbeOutcome::Unknown => ProbeAction::Reclaim,
+        ProbeOutcome::Free | ProbeOutcome::Unknown | ProbeOutcome::Gone => ProbeAction::Reclaim,
         // Never a reclaim: the receiver is still serving our own session.
         ProbeOutcome::OursActive => ProbeAction::FallThrough,
         ProbeOutcome::BusyElsewhere => ProbeAction::Requeue,
@@ -274,6 +383,10 @@ pub fn action_for(outcome: ProbeOutcome) -> ProbeAction {
 
 /// The Q30 verdict table including probe failure and timeout: **fail-open**.
 /// Errors must never fall through to the generic transport-fault branch.
+///
+/// The liveness dimension is applied by [`combine`] before this function: a
+/// healthy media session with a reachable (or unproven) receiver never reaches
+/// the error path. When media is unhealthy, a probe error still reclaims.
 pub fn action_for_result(result: &Result<ProbeReport>) -> ProbeAction {
     match result {
         Ok(report) => action_for(report.outcome),
@@ -289,29 +402,44 @@ pub fn action_for_result(result: &Result<ProbeReport>) -> ProbeAction {
 /// a reclaim is never issued: `OursActive` falls through, `BusyElsewhere`
 /// keeps queueing. `Unknown` is not a verdict, so it never counts as a
 /// disagreement; the first verdict stands unchanged.
+///
+/// The settled outcome is returned too: it is what the action is based on, so
+/// the caller can tell a confirmed `Free` (a real takeover cycle) from the
+/// fail-open paths without re-deriving the confirmation rule.
 fn confirm(
     first: ProbeOutcome,
     second: Option<ProbeOutcome>,
-) -> (ProbeAction, Option<(ProbeOutcome, ProbeOutcome)>) {
+) -> (
+    ProbeAction,
+    Option<(ProbeOutcome, ProbeOutcome)>,
+    ProbeOutcome,
+) {
     let Some(second) = second else {
-        return (action_for(first), None);
+        return (action_for(first), None, first);
     };
     if second == ProbeOutcome::Unknown {
-        return (action_for(first), None);
+        return (action_for(first), None, first);
     }
     if second == first {
-        return (action_for(first), None);
+        return (action_for(first), None, first);
     }
-    let action = if first == ProbeOutcome::OursActive || second == ProbeOutcome::OursActive {
-        ProbeAction::FallThrough
-    } else if first == ProbeOutcome::BusyElsewhere || second == ProbeOutcome::BusyElsewhere {
-        ProbeAction::Requeue
-    } else {
-        // Both usable verdicts are in the Free family; nothing destructive
-        // contradicted the first one.
-        action_for(first)
-    };
-    (action, Some((first, second)))
+    if first == ProbeOutcome::OursActive || second == ProbeOutcome::OursActive {
+        return (
+            ProbeAction::FallThrough,
+            Some((first, second)),
+            ProbeOutcome::OursActive,
+        );
+    }
+    if first == ProbeOutcome::BusyElsewhere || second == ProbeOutcome::BusyElsewhere {
+        return (
+            ProbeAction::Requeue,
+            Some((first, second)),
+            ProbeOutcome::BusyElsewhere,
+        );
+    }
+    // Both usable verdicts are in the Free family; nothing destructive
+    // contradicted the first one.
+    (action_for(first), Some((first, second)), first)
 }
 
 /// Whether the receiver's active session is ours, derived **live** from the
@@ -413,7 +541,7 @@ impl ReclaimReason {
     }
 }
 
-/// Result of counting one reclaim for one receiver.
+/// Result of counting one takeover for one receiver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TakeoverVerdict {
     /// Below the limit: reclaim is allowed and `consecutive` is the count.
@@ -422,10 +550,21 @@ pub enum TakeoverVerdict {
     Yield { consecutive: u32 },
 }
 
-/// The "taken over N times in a row" counter, one instance per receiver.
+/// The "taken over N times in a row, each within N s of a reclaim" counter, one
+/// instance per receiver.
+///
+/// The reference sender's counter measures a **cycle rate** — reclaim a
+/// receiver, get taken over again quickly — not how long a sender queued. Only
+/// a successful reclaim arms the window ([`Self::reclaim_succeeded`]); a
+/// takeover that follows it inside [`TAKEOVER_WINDOW`] continues the run, and
+/// one that does not (or that follows no successful reclaim at all) starts a new
+/// run at 1. Queueing for a busy receiver never touches this counter (Q34 §四).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TakeoverCounter {
     consecutive: u32,
+    /// When our last reclaim of this receiver completed (a fresh session is up).
+    /// `None` until the first successful reclaim — the very first takeover of a
+    /// run therefore counts as 1, not as a lost cycle.
     last_reclaim: Option<Instant>,
 }
 
@@ -434,17 +573,27 @@ impl TakeoverCounter {
         self.consecutive
     }
 
-    /// Record one reclaim. A reclaim inside [`TAKEOVER_WINDOW`] of the previous
-    /// one increments the count; a reclaim after the window starts over at 1
-    /// (not 0). Reaching [`TAKEOVER_LIMIT`] yields.
-    pub fn record(&mut self, now: Instant) -> TakeoverVerdict {
+    /// Record a **successful** reclaim: the fresh session is established. Only
+    /// from here can a following takeover continue the same run.
+    pub fn reclaim_succeeded(&mut self, now: Instant) {
+        self.last_reclaim = Some(now);
+    }
+
+    /// Record one genuine takeover of our session.
+    ///
+    /// A takeover inside [`TAKEOVER_WINDOW`] of a successful reclaim is another
+    /// turn of the same reclaim → takeover cycle and increments the count. With
+    /// no such reclaim the count resets to 1 (never 0). Reaching
+    /// [`TAKEOVER_LIMIT`] yields. One takeover consumes the successful-reclaim
+    /// marker, so repeated probes of the same displacement do not count twice.
+    pub fn takeover(&mut self, now: Instant) -> TakeoverVerdict {
         self.consecutive = match self.last_reclaim {
             Some(last) if now.saturating_duration_since(last) <= TAKEOVER_WINDOW => {
                 self.consecutive.saturating_add(1)
             }
             _ => 1,
         };
-        self.last_reclaim = Some(now);
+        self.last_reclaim = None;
         if self.consecutive >= TAKEOVER_LIMIT {
             TakeoverVerdict::Yield {
                 consecutive: self.consecutive,
@@ -465,8 +614,17 @@ pub struct TakeoverCounters {
 }
 
 impl TakeoverCounters {
-    pub fn record(&mut self, host: IpAddr, now: Instant) -> TakeoverVerdict {
-        self.counters.entry(host).or_default().record(now)
+    /// Record that a reclaim of `host` succeeded (a fresh session is up).
+    pub fn reclaimed(&mut self, host: IpAddr, now: Instant) {
+        self.counters
+            .entry(host)
+            .or_default()
+            .reclaim_succeeded(now);
+    }
+
+    /// Record one genuine takeover of `host`'s session.
+    pub fn takeover(&mut self, host: IpAddr, now: Instant) -> TakeoverVerdict {
+        self.counters.entry(host).or_default().takeover(now)
     }
 
     pub fn consecutive(&self, host: IpAddr) -> u32 {
@@ -501,8 +659,8 @@ struct PendingProbe {
     first: ProbeOutcome,
 }
 
-/// What one probe result means after the confirmation rule and the bounded busy
-/// queue have been applied.
+/// What one probe result means after the confirmation rule and the queue
+/// backoff have been applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProbeNote {
     /// True when the diagnostic log line changed (same rule as before): a
@@ -514,8 +672,11 @@ pub struct ProbeNote {
     /// Set when the first and confirmation probes gave different usable
     /// verdicts. The caller logs the disagreement.
     pub disagreement: Option<(ProbeOutcome, ProbeOutcome)>,
-    /// The busy queue hit [`BUSY_LIMIT`] and the verdict was forced to reclaim.
-    pub busy_exhausted: bool,
+    /// The settled verdict is `Free` and the action is [`ProbeAction::Reclaim`]:
+    /// a genuine takeover cycle, the only event that feeds a
+    /// [`TakeoverCounter`]. Queueing (`Requeue`), a dead receiver (`Gone`) and
+    /// the fail-open paths are never takeovers.
+    pub takeover: bool,
 }
 
 /// Per-member evidence and probe scheduling. Only the session thread probes;
@@ -531,8 +692,12 @@ pub struct Tracker {
     ended_at: Option<Instant>,
     /// First state-changing verdict waiting for its confirmation probe.
     pending: Option<PendingProbe>,
-    /// Confirmed `BusyElsewhere` requeues in a row for this session attempt.
-    busy_requeues: u32,
+    /// Completed confirmed-`BusyElsewhere` requeues in the current run. It
+    /// selects the next backoff interval; it is deliberately **not** a limit.
+    requeues: u32,
+    /// Terminal `yielding` state (Q34): no automatic probe is scheduled, and
+    /// signals cannot re-arm one. Only an explicit [`Self::trigger`] leaves it.
+    suspended: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -554,8 +719,9 @@ impl Tracker {
         self.signals.push(signal);
         // A new signal asks for a probe now, unless a probe is already queued.
         // Repeated symptoms must not shorten the confirmation or re-probe
-        // interval.
-        if self.next_probe.is_none() {
+        // interval. A suspended (yielded) tracker never re-arms itself: its
+        // evidence stays recorded, but only an explicit trigger resumes it.
+        if self.next_probe.is_none() && !self.suspended {
             self.next_probe = Some(at);
         }
     }
@@ -564,32 +730,90 @@ impl Tracker {
     /// `we_hold_session` dimension [`classify`] needs. See the free
     /// [`we_hold_session`] for the exact derivation; this only supplies the
     /// tracker's recorded `ended_at`.
+    ///
+    /// One addition: while a **confirmed busy run** is in progress, the stale
+    /// `ended_at` self-heal must not flip the verdict back to `OursActive` after
+    /// [`ENDED_TRUST_WINDOW`]. Two agreeing probes already proved another sender
+    /// owns the receiver; only renewed healthy media can prove it is ours again.
+    /// Without this, the queue could never poll once a minute forever — the
+    /// 2 s window would dissolve the queue on its first backoff round (Q34 §四).
     pub fn we_hold_session(&self, rtp_healthy: bool, now: Instant) -> bool {
-        we_hold_session(rtp_healthy, self.ended_at, now)
+        if rtp_healthy {
+            return true;
+        }
+        if self.queueing() {
+            return false;
+        }
+        we_hold_session(false, self.ended_at, now)
+    }
+
+    /// Whether a confirmed-`BusyElsewhere` queue is in progress: at least one
+    /// confirmed requeue, or a busy verdict waiting for its confirmation.
+    pub fn queueing(&self) -> bool {
+        self.requeues > 0
+            || matches!(
+                self.pending,
+                Some(PendingProbe {
+                    first: ProbeOutcome::BusyElsewhere
+                })
+            )
     }
 
     /// Signals collected since the last call, for the one evidence log line
-    /// that carries `policy`/`rtp_healthy`/`packets_prepared`.
+    /// that carries `policy`/`rtp_healthy`/`packets_prepared`/`tcp_reachable`.
     pub fn take_signals(&mut self) -> Vec<Signal> {
         std::mem::take(&mut self.signals)
     }
 
     pub fn due(&self, now: Instant) -> bool {
-        self.next_probe.is_some_and(|at| now >= at)
+        !self.suspended && self.next_probe.is_some_and(|at| now >= at)
     }
 
     pub fn scheduled(&self) -> Option<Instant> {
         self.next_probe
     }
 
+    /// Enter the terminal `yielding` state (Q34 §四): the receiver keeps being
+    /// reclaimed and taken over in cycles too fast to be a legitimate queue.
+    /// Every queued probe is dropped and nothing is scheduled again — the
+    /// caller reports `preempted(reason="limit")` and stops automatic
+    /// reconnection. This is not a timer: [`Self::trigger`] is the only way back.
+    pub fn suspend(&mut self) {
+        self.suspended = true;
+        self.pending = None;
+        self.next_probe = None;
+    }
+
+    /// Whether the tracker is in the terminal yielded state.
+    pub fn suspended(&self) -> bool {
+        self.suspended
+    }
+
+    /// Explicit external trigger (the user pressed play): the only way out of
+    /// the yielded state other than a brand-new playback run. It re-arms one
+    /// immediate probe and restarts the queue backoff. The low-frequency
+    /// "is it free again?" poll of a *new* run is the other, slower resume
+    /// path: a fresh run starts a fresh tracker whose first probe observes
+    /// `Free`. Returns whether the trigger did anything.
+    pub fn trigger(&mut self, now: Instant) -> bool {
+        if !self.suspended {
+            return false;
+        }
+        self.suspended = false;
+        self.requeues = 0;
+        self.pending = None;
+        self.next_probe = Some(now);
+        true
+    }
+
     /// Feed one probe result back and apply the confirmation rule plus the
-    /// bounded busy queue.
+    /// queue backoff.
     ///
     /// A `Free` or `BusyElsewhere` first verdict is not acted on: it schedules
     /// one confirmation probe after [`CONFIRM_DELAY`]. `OursActive` and the
-    /// fail-open paths (`Unknown`, error, timeout) are acted on immediately.
-    /// A confirmed `BusyElsewhere` queues another probe after [`REPROBE_DELAY`]
-    /// until [`BUSY_LIMIT`], then turns into [`ProbeAction::ReclaimBusyExhausted`].
+    /// fail-open paths (`Unknown`, `Gone`, error, timeout) are acted on
+    /// immediately. A confirmed `BusyElsewhere` queues another probe after the
+    /// next [`REPROBE_BACKOFF`] interval — forever. It never forces a reclaim.
     pub fn note_result(&mut self, result: &Result<ProbeReport>, now: Instant) -> ProbeNote {
         let log = match result {
             Ok(report) => ProbeLog {
@@ -608,8 +832,8 @@ impl Tracker {
 
         if let Some(pending) = self.pending.take() {
             let second = result.as_ref().ok().map(|report| report.outcome);
-            let (action, disagreement) = confirm(pending.first, second);
-            return self.settle(action, disagreement, log_changed, now);
+            let (action, disagreement, settled) = confirm(pending.first, second);
+            return self.settle(action, disagreement, settled, log_changed, now);
         }
 
         match result {
@@ -619,11 +843,15 @@ impl Tracker {
             Ok(report) if report.outcome == ProbeOutcome::BusyElsewhere => {
                 self.schedule_confirmation(ProbeOutcome::BusyElsewhere, log_changed, now)
             }
-            // `OursActive` changes nothing; `Unknown`/error are fail-open and
-            // reclaim immediately. Neither waits for a confirmation.
+            // `OursActive` changes nothing; `Unknown`/`Gone`/error are
+            // fail-open and reclaim immediately. Neither waits for a
+            // confirmation.
             _ => {
                 let action = action_for_result(result);
-                self.settle(action, None, log_changed, now)
+                let settled = result
+                    .as_ref()
+                    .map_or(ProbeOutcome::Unknown, |report| report.outcome);
+                self.settle(action, None, settled, log_changed, now)
             }
         }
     }
@@ -634,6 +862,12 @@ impl Tracker {
         log_changed: bool,
         now: Instant,
     ) -> ProbeNote {
+        // A first verdict that is not another sender's session ends the busy
+        // run immediately: the receiver is free (or ours), so the queue's
+        // backoff must not leak into a later busy run.
+        if first != ProbeOutcome::BusyElsewhere {
+            self.requeues = 0;
+        }
         let due = now + CONFIRM_DELAY;
         self.pending = Some(PendingProbe { first });
         self.next_probe = Some(due);
@@ -641,7 +875,7 @@ impl Tracker {
             log_changed,
             action: ProbeAction::Confirm,
             disagreement: None,
-            busy_exhausted: false,
+            takeover: false,
         }
     }
 
@@ -649,35 +883,35 @@ impl Tracker {
         &mut self,
         action: ProbeAction,
         disagreement: Option<(ProbeOutcome, ProbeOutcome)>,
+        settled: ProbeOutcome,
         log_changed: bool,
         now: Instant,
     ) -> ProbeNote {
-        let (action, busy_exhausted) = match action {
+        let takeover = settled == ProbeOutcome::Free && action == ProbeAction::Reclaim;
+        match action {
             ProbeAction::Requeue => {
-                self.busy_requeues = self.busy_requeues.saturating_add(1);
-                if self.busy_requeues >= BUSY_LIMIT {
-                    // The queue must have an exit even if the receiver keeps
-                    // answering "somebody else" forever (Q32).
-                    self.next_probe = None;
-                    (ProbeAction::ReclaimBusyExhausted, true)
-                } else {
-                    self.next_probe = Some(now + REPROBE_DELAY);
-                    (ProbeAction::Requeue, false)
+                // Queueing is unbounded and backs off: the interval grows
+                // 3 s → 6 s → 12 s → 24 s → 60 s and then stays at 60 s. This
+                // is the *only* thing a busy receiver changes; it is never
+                // turned into a reclaim (Q34 §四).
+                let delay = requeue_delay(self.requeues);
+                self.requeues = self.requeues.saturating_add(1);
+                if !self.suspended {
+                    self.next_probe = Some(now + delay);
                 }
             }
-            ProbeAction::Reclaim | ProbeAction::ReclaimBusyExhausted | ProbeAction::FallThrough => {
-                // Any non-busy verdict breaks the consecutive run.
-                self.busy_requeues = 0;
+            ProbeAction::Reclaim | ProbeAction::FallThrough => {
+                // Any non-busy verdict breaks the consecutive count.
+                self.requeues = 0;
                 self.next_probe = None;
-                (action, false)
             }
             ProbeAction::Confirm => unreachable!("a confirmation is scheduled, not settled"),
-        };
+        }
         ProbeNote {
             log_changed,
             action,
             disagreement,
-            busy_exhausted,
+            takeover,
         }
     }
 }
@@ -972,6 +1206,113 @@ mod tests {
     }
 
     #[test]
+    fn the_combine_table_matches_q34() {
+        use ReceiverLiveness as L;
+        let active = RECEIVER_SESSION_ACTIVE;
+        // Healthy media + reachable (or unproven) receiver: our session, even
+        // when statusFlags says nobody is active.
+        for liveness in [L::Alive, L::Unknown] {
+            for flags in [0u64, active, active | STEREO_PARTNER_UNREACHABLE] {
+                for hold in [false, true] {
+                    assert_eq!(
+                        combine(true, liveness, Some(flags), hold),
+                        ProbeOutcome::OursActive,
+                        "healthy media + {liveness:?} (flags=0x{flags:016x}) is ours"
+                    );
+                }
+            }
+        }
+        // Healthy media + a dead receiver: the device is gone, reclaim.
+        for flags in [0u64, active] {
+            for hold in [false, true] {
+                assert_eq!(
+                    combine(true, L::Dead, Some(flags), hold),
+                    ProbeOutcome::Gone
+                );
+            }
+        }
+        // Unhealthy media: consult statusFlags exactly as before.
+        assert_eq!(
+            combine(false, L::Alive, Some(0), false),
+            ProbeOutcome::Free
+        );
+        assert_eq!(
+            combine(false, L::Alive, Some(active), false),
+            ProbeOutcome::BusyElsewhere
+        );
+        assert_eq!(
+            combine(false, L::Alive, Some(active), true),
+            ProbeOutcome::OursActive
+        );
+        assert_eq!(
+            combine(false, L::Unknown, Some(active), false),
+            ProbeOutcome::BusyElsewhere
+        );
+        assert_eq!(
+            combine(false, L::Alive, None, false),
+            ProbeOutcome::Unknown
+        );
+        // Even with unhealthy media a dead receiver never becomes busy.
+        assert_eq!(
+            combine(false, L::Dead, Some(active), false),
+            ProbeOutcome::Gone
+        );
+    }
+
+    #[test]
+    fn a_dead_receiver_reclaims_and_is_never_busy_elsewhere() {
+        use ReceiverLiveness as L;
+        for media_healthy in [true, false] {
+            for hold in [false, true] {
+                let outcome = combine(
+                    media_healthy,
+                    L::Dead,
+                    Some(RECEIVER_SESSION_ACTIVE),
+                    hold,
+                );
+                assert_eq!(outcome, ProbeOutcome::Gone);
+                assert_eq!(action_for(outcome), ProbeAction::Reclaim);
+                assert_ne!(
+                    action_for(outcome),
+                    ProbeAction::Requeue,
+                    "a device that cannot accept TCP is gone, not another sender's"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_liveness_flag_is_only_true_for_a_completed_connect() {
+        assert!(ReceiverLiveness::Alive.reachable());
+        assert!(!ReceiverLiveness::Unknown.reachable());
+        assert!(!ReceiverLiveness::Dead.reachable());
+        assert_eq!(ReceiverLiveness::Alive.name(), "alive");
+        assert_eq!(ReceiverLiveness::Unknown.name(), "unknown");
+        assert_eq!(ReceiverLiveness::Dead.name(), "dead");
+    }
+
+    #[test]
+    fn a_tcp_connect_probe_reports_alive_or_dead() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        assert_eq!(
+            receiver_liveness(address.ip(), address.port(), PROBE_TIMEOUT),
+            ReceiverLiveness::Alive,
+            "a listening control port is reachable"
+        );
+        // Accept and drop the probe connection so the listener is not left with
+        // a pending handshake.
+        let (socket, _) = listener.accept().unwrap();
+        drop(socket);
+        drop(listener);
+        assert_eq!(
+            receiver_liveness(address.ip(), address.port(), PROBE_TIMEOUT),
+            ReceiverLiveness::Dead,
+            "a refused connection means the device is gone"
+        );
+    }
+
+    #[test]
     fn healthy_rtp_always_wins_over_an_ended_control_state() {
         let base = Instant::now();
         let mut tracker = Tracker::default();
@@ -1038,7 +1379,7 @@ mod tests {
             ProbeAction::Confirm,
             "a lone Free must not reclaim: the receiver may be handing us back"
         );
-        assert!(!first.busy_exhausted);
+        assert!(!first.takeover, "a lone verdict is never a takeover yet");
         assert_eq!(first.disagreement, None);
         assert_eq!(
             tracker.scheduled(),
@@ -1055,7 +1396,29 @@ mod tests {
             ProbeAction::Reclaim,
             "two agreeing Free probes reclaim"
         );
+        assert!(
+            second.takeover,
+            "a confirmed Free is the genuine takeover the cycle counter needs"
+        );
         assert_eq!(tracker.scheduled(), None);
+    }
+
+    #[test]
+    fn a_dead_receiver_or_a_fail_open_probe_is_a_reclaim_but_not_a_takeover() {
+        for result in [
+            Ok(report(ProbeOutcome::Gone)),
+            Ok(report(ProbeOutcome::Unknown)),
+            Err(anyhow!("probe timed out")),
+        ] {
+            let mut tracker = Tracker::default();
+            let note = tracker.note_result(&result, Instant::now());
+            assert_eq!(note.action, ProbeAction::Reclaim);
+            assert!(
+                !note.takeover,
+                "a dead device and an unreadable probe must never feed the takeover counter"
+            );
+            assert_eq!(tracker.scheduled(), None);
+        }
     }
 
     #[test]
@@ -1073,6 +1436,7 @@ mod tests {
                 "OursActive falls through and fail-open reclaims without a wait"
             );
             assert_eq!(tracker.scheduled(), None);
+            assert!(!note.takeover);
         }
     }
 
@@ -1085,22 +1449,20 @@ mod tests {
             tracker.note_result(&free(), at(base, 0)).action,
             ProbeAction::Confirm
         );
-        let note = tracker.note_result(
-            &busy(),
-            at(base, 0) + CONFIRM_DELAY,
-        );
+        let note = tracker.note_result(&busy(), at(base, 0) + CONFIRM_DELAY);
         assert_eq!(
             note.action,
             ProbeAction::Requeue,
             "a disagreement must not reclaim: prefer the non-destructive outcome"
         );
+        assert!(!note.takeover);
         assert_eq!(
             note.disagreement,
             Some((ProbeOutcome::Free, ProbeOutcome::BusyElsewhere))
         );
         assert_eq!(
             tracker.scheduled(),
-            Some(at(base, 0) + CONFIRM_DELAY + REPROBE_DELAY),
+            Some(at(base, 0) + CONFIRM_DELAY + requeue_delay(0)),
             "the queue wins a Free/Busy disagreement"
         );
 
@@ -1112,6 +1474,7 @@ mod tests {
         );
         let note = tracker.note_result(&free(), at(base, 0) + CONFIRM_DELAY);
         assert_eq!(note.action, ProbeAction::Requeue);
+        assert!(!note.takeover);
         assert_eq!(
             note.disagreement,
             Some((ProbeOutcome::BusyElsewhere, ProbeOutcome::Free))
@@ -1133,60 +1496,122 @@ mod tests {
     }
 
     #[test]
-    fn busy_elsewhere_never_loops_forever() {
+    fn queueing_backs_off_forever_and_never_forces_a_reclaim() {
+        // Q34 §四: a confirmed busy receiver is polled with exponential backoff
+        // and never reclaimed for being busy. The sequence is exactly
+        // 3, 6, 12, 24, 60, 60, … seconds.
         let base = Instant::now();
         let mut tracker = Tracker::default();
         tracker.observe(Signal::ConnectionClose, at(base, 0));
+        let expected = [
+            Duration::from_secs(3),
+            Duration::from_secs(6),
+            Duration::from_secs(12),
+            Duration::from_secs(24),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ];
         let mut now = at(base, 0);
-        for attempt in 1..=BUSY_LIMIT {
+        for (index, delay) in expected.into_iter().enumerate() {
             let (note, confirmation) = confirm_busy(&mut tracker, now);
-            if attempt < BUSY_LIMIT {
-                assert_eq!(
-                    note.action,
-                    ProbeAction::Requeue,
-                    "confirmed busy {attempt} still queues"
-                );
-                assert!(!note.busy_exhausted);
-                assert_eq!(
-                    tracker.scheduled(),
-                    Some(confirmation + REPROBE_DELAY),
-                    "the queue never shortens the re-probe interval"
-                );
-                now = confirmation + REPROBE_DELAY;
-            } else {
-                assert_eq!(
-                    note.action,
-                    ProbeAction::ReclaimBusyExhausted,
-                    "after BUSY_LIMIT confirmed busy verdicts the sender must escape"
-                );
-                assert!(note.busy_exhausted);
-                assert_eq!(
-                    tracker.scheduled(),
-                    None,
-                    "the forced reclaim must leave no queued probe behind"
-                );
-            }
+            assert_eq!(
+                note.action,
+                ProbeAction::Requeue,
+                "confirmed busy #{index} queues, it never reclaims"
+            );
+            assert!(!note.takeover, "queueing is not a takeover");
+            assert_eq!(
+                tracker.scheduled(),
+                Some(confirmation + delay),
+                "requeue #{index} must wait {delay:?}"
+            );
+            assert!(!tracker.due(confirmation + delay - Duration::from_millis(1)));
+            assert!(tracker.due(confirmation + delay));
+            now = confirmation + delay;
         }
+        // Well past an hour: still queueing, still no reclaim.
+        now += Duration::from_secs(3600);
+        let (note, confirmation) = confirm_busy(&mut tracker, now);
+        assert_eq!(note.action, ProbeAction::Requeue);
+        assert_eq!(
+            tracker.scheduled(),
+            Some(confirmation + REPROBE_MAX_DELAY),
+            "the tracked interval stays capped at 60 s forever"
+        );
     }
 
     #[test]
-    fn a_non_busy_verdict_resets_the_consecutive_busy_run() {
+    fn requeue_delay_is_the_exact_backoff_sequence() {
+        assert_eq!(requeue_delay(0), Duration::from_secs(3));
+        assert_eq!(requeue_delay(1), Duration::from_secs(6));
+        assert_eq!(requeue_delay(2), Duration::from_secs(12));
+        assert_eq!(requeue_delay(3), Duration::from_secs(24));
+        for later in [4u32, 5, 100, u32::MAX] {
+            assert_eq!(requeue_delay(later), Duration::from_secs(60));
+        }
+        assert_eq!(REPROBE_BACKOFF.len(), 5);
+        assert_eq!(REPROBE_MAX_DELAY, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_confirmed_busy_queue_does_not_self_heal_into_ours_active() {
+        // Without this, the 2 s ended-trust window would dissolve the queue on
+        // its first backoff round and "poll once a minute forever" would never
+        // happen. Two agreeing probes are stronger evidence than a stale
+        // `ended_at`; only renewed healthy media clears it.
+        let base = Instant::now();
+        let mut tracker = Tracker::default();
+        tracker.observe(Signal::UnexpectedTeardown, at(base, 0));
+        assert!(
+            !tracker.we_hold_session(false, at(base, 1_000)),
+            "inside the ended-trust window the session is not ours"
+        );
+        assert!(
+            tracker.we_hold_session(false, at(base, 3_000)),
+            "without a confirmed busy queue the stale conclusion self-heals (Q32)"
+        );
+        let (note, confirmation) = confirm_busy(&mut tracker, at(base, 0));
+        assert_eq!(note.action, ProbeAction::Requeue);
+        assert!(tracker.queueing());
+        assert!(!tracker.we_hold_session(false, confirmation));
+        assert!(
+            !tracker.we_hold_session(false, confirmation + Duration::from_secs(3_600)),
+            "an hour into the queue the receiver is still another sender's"
+        );
+        assert!(
+            tracker.we_hold_session(true, confirmation + Duration::from_secs(3_600)),
+            "renewed healthy media proves the session is ours again"
+        );
+        // A Free verdict ends the busy run and restores the normal derivation.
+        tracker.note_result(&free(), confirmation);
+        assert!(!tracker.queueing());
+    }
+
+    #[test]
+    fn a_non_busy_verdict_resets_the_queue_backoff() {
         let base = Instant::now();
         let mut tracker = Tracker::default();
         let (first, confirmation) = confirm_busy(&mut tracker, at(base, 0));
         assert_eq!(first.action, ProbeAction::Requeue);
-        let (second, confirmation) = confirm_busy(&mut tracker, confirmation + REPROBE_DELAY);
+        let (second, confirmation) = confirm_busy(&mut tracker, confirmation + requeue_delay(0));
         assert_eq!(second.action, ProbeAction::Requeue);
-        // Our own session appears: no queue, and the run is broken.
+        // Our own session appears: no queue, and the backoff run is broken.
         assert_eq!(
-            tracker.note_result(&Ok(report(ProbeOutcome::OursActive)), confirmation).action,
+            tracker
+                .note_result(&Ok(report(ProbeOutcome::OursActive)), confirmation)
+                .action,
             ProbeAction::FallThrough
         );
-        // A fresh busy run starts from one again, so it cannot inherit a stale
-        // near-limit count from minutes ago.
-        let (next, _) = confirm_busy(&mut tracker, confirmation + Duration::from_secs(10));
+        // A fresh busy run starts again at the 3 s interval; it must not inherit
+        // the second step from minutes ago.
+        let (next, next_confirmation) =
+            confirm_busy(&mut tracker, confirmation + Duration::from_secs(10));
         assert_eq!(next.action, ProbeAction::Requeue);
-        assert!(!next.busy_exhausted);
+        assert_eq!(
+            tracker.scheduled(),
+            Some(next_confirmation + requeue_delay(0))
+        );
     }
 
     #[test]
@@ -1199,14 +1624,14 @@ mod tests {
         assert_eq!(note.action, ProbeAction::Requeue);
         assert_eq!(
             tracker.scheduled(),
-            Some(confirmation + REPROBE_DELAY),
+            Some(confirmation + requeue_delay(0)),
             "busy is a queue, not a retry storm"
         );
-        assert!(!tracker.due(confirmation + REPROBE_DELAY - Duration::from_millis(1)));
-        assert!(tracker.due(confirmation + REPROBE_DELAY));
+        assert!(!tracker.due(confirmation + requeue_delay(0) - Duration::from_millis(1)));
+        assert!(tracker.due(confirmation + requeue_delay(0)));
         // A repeated busy verdict does not change the log line, so it stays
         // quiet, but it is still confirmed before it is queued.
-        let repeated = tracker.note_result(&busy(), confirmation + REPROBE_DELAY);
+        let repeated = tracker.note_result(&busy(), confirmation + requeue_delay(0));
         assert!(!repeated.log_changed);
         assert_eq!(
             repeated.action,
@@ -1216,13 +1641,64 @@ mod tests {
         // Fresh evidence while queued must not cut the interval short.
         tracker.observe(
             Signal::ConnectionClose,
-            confirmation + REPROBE_DELAY + Duration::from_millis(500),
+            confirmation + requeue_delay(0) + Duration::from_millis(500),
         );
         assert_eq!(
             tracker.scheduled(),
-            Some(confirmation + REPROBE_DELAY + CONFIRM_DELAY),
+            Some(confirmation + requeue_delay(0) + CONFIRM_DELAY),
             "a signal while a confirmation is pending must not reschedule it"
         );
+    }
+
+    #[test]
+    fn yielding_is_terminal_and_only_an_explicit_trigger_revives_it() {
+        // Q34: `yielding` is not a timer. When the takeover limit is hit the
+        // tracker drops every queued probe; nothing is ever due again until an
+        // explicit external trigger (the user pressing play) asks for one.
+        let base = Instant::now();
+        let mut tracker = Tracker::default();
+        tracker.observe(Signal::UnexpectedTeardown, at(base, 0));
+        // Queue once first, so a stale requeue really exists at yield time.
+        let (note, confirmation) = confirm_busy(&mut tracker, at(base, 0));
+        assert_eq!(note.action, ProbeAction::Requeue);
+        assert!(tracker.scheduled().is_some());
+
+        tracker.suspend();
+        assert!(tracker.suspended());
+        assert_eq!(
+            tracker.scheduled(),
+            None,
+            "yielding must drop the queued probe"
+        );
+        // A long simulated interval: nothing is due, ever. One hour, one day,
+        // one year — the tracker is terminal, not on a long timer.
+        for elapsed in [1u64, 60, 3_600, 86_400, 31_536_000] {
+            assert!(
+                !tracker.due(base + Duration::from_secs(elapsed)),
+                "a yielded tracker must never self-arm after {elapsed}s"
+            );
+        }
+        // New control-plane evidence must not re-arm it either.
+        tracker.observe(
+            Signal::UnexpectedTeardown,
+            base + Duration::from_secs(3_600),
+        );
+        assert_eq!(tracker.scheduled(), None);
+        assert!(!tracker.due(base + Duration::from_secs(3_601)));
+        // Only the explicit trigger (user pressed play) revives it.
+        let trigger = base + Duration::from_secs(86_400);
+        assert!(tracker.trigger(trigger));
+        assert!(!tracker.suspended());
+        assert_eq!(tracker.scheduled(), Some(trigger));
+        assert!(tracker.due(trigger));
+        // Triggering a live tracker is a no-op, not a second probe.
+        assert!(!tracker.trigger(trigger + Duration::from_secs(1)));
+        assert_eq!(
+            tracker.scheduled(),
+            Some(trigger),
+            "the already scheduled probe is not rescheduled"
+        );
+        let _ = confirmation;
     }
 
     #[test]
@@ -1289,28 +1765,51 @@ mod tests {
     fn the_first_takeover_counts_as_one_and_reclaims() {
         let base = Instant::now();
         let mut counter = TakeoverCounter::default();
+        // No successful reclaim yet: the first takeover starts a new run at 1.
         assert_eq!(
-            counter.record(at(base, 0)),
+            counter.takeover(at(base, 0)),
             TakeoverVerdict::Reclaim { consecutive: 1 }
         );
         assert_eq!(counter.consecutive(), 1);
     }
 
     #[test]
-    fn takeovers_inside_the_window_increment_in_a_row() {
+    fn a_takeover_without_a_successful_reclaim_is_never_a_cycle() {
+        // "each within <n>s of a reclaim": without a reclaim in between, two
+        // quick takeovers are not two turns of the same run. Repeated probes of
+        // one displacement cannot build up to a yield.
         let base = Instant::now();
         let mut counter = TakeoverCounter::default();
         assert_eq!(
-            counter.record(at(base, 0)),
+            counter.takeover(at(base, 0)),
             TakeoverVerdict::Reclaim { consecutive: 1 }
         );
+        for step in 1..=5 {
+            assert_eq!(
+                counter.takeover(at(base, step * 100)),
+                TakeoverVerdict::Reclaim { consecutive: 1 }
+            );
+        }
+        assert_eq!(counter.consecutive(), 1);
+    }
+
+    #[test]
+    fn takeovers_after_successful_reclaims_increment_in_a_row() {
+        let base = Instant::now();
+        let mut counter = TakeoverCounter::default();
         assert_eq!(
-            counter.record(at(base, 1_000)),
+            counter.takeover(at(base, 0)),
+            TakeoverVerdict::Reclaim { consecutive: 1 }
+        );
+        counter.reclaim_succeeded(at(base, 1_000));
+        assert_eq!(
+            counter.takeover(at(base, 2_000)),
             TakeoverVerdict::Reclaim { consecutive: 2 }
         );
-        // Exactly on the boundary is still "within the window".
+        // Exactly on the boundary is still "within the window" of the reclaim.
+        counter.reclaim_succeeded(at(base, 3_000));
         assert_eq!(
-            counter.record(at(base, 1_000) + TAKEOVER_WINDOW),
+            counter.takeover(at(base, 3_000) + TAKEOVER_WINDOW),
             TakeoverVerdict::Yield { consecutive: 3 }
         );
     }
@@ -1319,10 +1818,15 @@ mod tests {
     fn a_takeover_after_the_window_resets_the_count_to_one() {
         let base = Instant::now();
         let mut counter = TakeoverCounter::default();
-        counter.record(at(base, 0));
-        counter.record(at(base, 1_000));
+        counter.takeover(at(base, 0));
+        counter.reclaim_succeeded(at(base, 1_000));
+        counter.takeover(at(base, 2_000));
+        assert_eq!(counter.consecutive(), 2);
+        // The next takeover is outside the window of the last successful
+        // reclaim: a new run, not another cycle.
+        counter.reclaim_succeeded(at(base, 3_000));
         assert_eq!(
-            counter.record(at(base, 1_000) + TAKEOVER_WINDOW + Duration::from_millis(1)),
+            counter.takeover(at(base, 3_000) + TAKEOVER_WINDOW + Duration::from_millis(1)),
             TakeoverVerdict::Reclaim { consecutive: 1 }
         );
     }
@@ -1331,16 +1835,21 @@ mod tests {
     fn hitting_the_limit_yields_and_a_later_takeover_starts_over() {
         let base = Instant::now();
         let mut counter = TakeoverCounter::default();
-        counter.record(at(base, 0));
-        counter.record(at(base, 100));
+        counter.takeover(at(base, 0));
+        counter.reclaim_succeeded(at(base, 100));
+        counter.takeover(at(base, 200));
+        counter.reclaim_succeeded(at(base, 300));
         assert_eq!(
-            counter.record(at(base, 200)),
+            counter.takeover(at(base, 400)),
             TakeoverVerdict::Yield {
                 consecutive: TAKEOVER_LIMIT
             }
         );
+        // Even after a yield a much later takeover starts a new run at 1 (the
+        // runtime never gets here: `yielding` is terminal for automatic retries).
+        counter.reclaim_succeeded(at(base, 400));
         assert_eq!(
-            counter.record(at(base, 200) + TAKEOVER_WINDOW + Duration::from_millis(1)),
+            counter.takeover(at(base, 400) + TAKEOVER_WINDOW + Duration::from_millis(1)),
             TakeoverVerdict::Reclaim { consecutive: 1 }
         );
     }
@@ -1352,15 +1861,46 @@ mod tests {
         let left: IpAddr = "192.0.2.10".parse().unwrap();
         let right: IpAddr = "192.0.2.11".parse().unwrap();
         assert_eq!(
-            counters.record(left, at(base, 0)),
+            counters.takeover(left, at(base, 0)),
             TakeoverVerdict::Reclaim { consecutive: 1 }
         );
         assert_eq!(
-            counters.record(right, at(base, 0)),
+            counters.takeover(right, at(base, 0)),
             TakeoverVerdict::Reclaim { consecutive: 1 }
         );
-        assert_eq!(counters.consecutive(left), 1);
-        assert_eq!(counters.consecutive(right), 1);
+        counters.reclaimed(left, at(base, 1_000));
+        assert_eq!(
+            counters.takeover(left, at(base, 2_000)),
+            TakeoverVerdict::Reclaim { consecutive: 2 }
+        );
+        assert_eq!(
+            counters.consecutive(right),
+            1,
+            "the other member's count is untouched"
+        );
+    }
+
+    #[test]
+    fn a_reclaim_cycle_only_counts_when_the_reclaim_succeeded() {
+        // Q34's correction: `BUSY_LIMIT` counted how long a sender queued; the
+        // reference counter counts reclaim → takeover cycles. The `busy` path
+        // never feeds a takeover, and a takeover needs an armed successful
+        // reclaim to continue a run.
+        let base = Instant::now();
+        let mut counter = TakeoverCounter::default();
+        counter.reclaim_succeeded(at(base, 0));
+        // Armed by a successful reclaim but no takeover happened: the first
+        // takeover is still 1.
+        assert_eq!(
+            counter.takeover(at(base, 1_000)),
+            TakeoverVerdict::Reclaim { consecutive: 1 }
+        );
+        // The marker is consumed: a second takeover with no new successful
+        // reclaim does not count as another cycle.
+        assert_eq!(
+            counter.takeover(at(base, 2_000)),
+            TakeoverVerdict::Reclaim { consecutive: 1 }
+        );
     }
 
     #[test]

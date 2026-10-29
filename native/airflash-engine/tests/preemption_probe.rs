@@ -1,9 +1,9 @@
-//! Live `statusFlags` probe contract against a localhost `/info` server.
-//! No real receiver and no HomePod.
+//! Live `statusFlags` probe and TCP liveness contract against localhost
+//! listeners. No real receiver and no HomePod.
 use airflash_engine::{
     preemption::{
-        self, action_for, action_for_result, ProbeAction, ProbeOutcome, PASSWORD_REQUIRED,
-        RECEIVER_SESSION_ACTIVE, STEREO_PARTNER_UNREACHABLE,
+        self, action_for, action_for_result, ProbeAction, ProbeOutcome, ReceiverLiveness,
+        PASSWORD_REQUIRED, RECEIVER_SESSION_ACTIVE, STEREO_PARTNER_UNREACHABLE,
     },
     rtsp::{Cancellation, Connection},
 };
@@ -219,4 +219,76 @@ fn probe_errors_time_out_and_fail_open() {
     assert!(timeout.is_err(), "a silent receiver must time out");
     assert_eq!(action_for_result(&timeout), ProbeAction::Reclaim);
     server.join().unwrap();
+}
+
+#[test]
+fn the_liveness_probe_is_a_bare_tcp_connect_to_the_control_port() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    assert_eq!(
+        preemption::receiver_liveness(address.ip(), address.port(), preemption::LIVENESS_TIMEOUT),
+        ReceiverLiveness::Alive,
+        "a listening control port is the reference sender's TCP reachable"
+    );
+    // Consume the probe connection, then take the port away.
+    let (socket, _) = listener.accept().unwrap();
+    drop(socket);
+    drop(listener);
+    assert_eq!(
+        preemption::receiver_liveness(address.ip(), address.port(), preemption::LIVENESS_TIMEOUT),
+        ReceiverLiveness::Dead,
+        "a refused connect means the device is gone"
+    );
+}
+
+#[test]
+fn dead_liveness_reclaims_with_healthy_media_and_is_never_busy() {
+    // Q34's combine table, with the liveness value a real refused connect
+    // produced (not a hand-written enum).
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let liveness =
+        preemption::receiver_liveness(address.ip(), address.port(), preemption::LIVENESS_TIMEOUT);
+    assert_eq!(liveness, ReceiverLiveness::Dead);
+    // Even with statusFlags claiming an active session, a dead receiver while
+    // our media is healthy is a reclaim — not another sender's session.
+    for hold in [false, true] {
+        let outcome = preemption::combine(true, liveness, Some(RECEIVER_SESSION_ACTIVE), hold);
+        assert_eq!(outcome, ProbeOutcome::Gone);
+        assert_eq!(action_for(outcome), ProbeAction::Reclaim);
+        assert_ne!(outcome, ProbeOutcome::BusyElsewhere);
+        assert_ne!(action_for(outcome), ProbeAction::Requeue);
+    }
+}
+
+#[test]
+fn unknown_liveness_with_healthy_media_is_still_our_active_session() {
+    // The conservative row: a probe that errored without proving death does not
+    // disturb a session whose media is flowing.
+    for flags in [Some(0), Some(RECEIVER_SESSION_ACTIVE), None] {
+        assert_eq!(
+            preemption::combine(true, ReceiverLiveness::Unknown, flags, false),
+            ProbeOutcome::OursActive
+        );
+        assert_eq!(
+            action_for(preemption::combine(
+                true,
+                ReceiverLiveness::Unknown,
+                flags,
+                false
+            )),
+            ProbeAction::FallThrough
+        );
+    }
+    // With unhealthy media the same unknown liveness falls back to the old
+    // statusFlags classification / fail-open.
+    assert_eq!(
+        preemption::combine(false, ReceiverLiveness::Unknown, Some(0), false),
+        ProbeOutcome::Free
+    );
+    assert_eq!(
+        preemption::combine(false, ReceiverLiveness::Unknown, None, false),
+        ProbeOutcome::Unknown
+    );
 }

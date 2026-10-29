@@ -349,7 +349,7 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   `select_timing`（单成员 `TimingPlan`），但输入不变，所以 IPC 里
   `selected_timing` 的取值与改造前完全一致。
 
-## P3-3 抢占识别（WAC 模型 + `statusFlags` 位定义 + Q32 死锁修复，已完成）
+## P3-3 抢占识别（WAC 模型 + `statusFlags` 位定义 + Q32 死锁修复 + Q34 busy/存活，已完成）
 
 `native/airflash-engine/src/preemption.rs`（重写）、`rtsp.rs`、`transport.rs`、
 `session.rs`、桌面状态与文案
@@ -376,13 +376,40 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   完整参与判定，不再把高位值当 `Free`/`Unknown`。bit14 和 bit7 **不参与判定**：
   单测把两位与 bit17 交叉组合，断言判决不变；bit14 只在 probe 日志里作为遥测
   （`stereo_partner_unreachable`）出现。
-- **三分类**（`classify(status_flags, we_hold_session)`）：
+- **三分类（RTP 不健康时的回退）**（`classify(status_flags, we_hold_session)`）：
   | `statusFlags & 0x20000` | `we_hold_session` | 判定 | 动作 |
   | --- | --- | --- | --- |
   | 0 | 任意 | `Free` | 二次确认后回收 |
   | 置位 | `true` | `OursActive` | **不回收**：`FallThrough`，走原来的非抢占路径 |
-  | 置位 | `false` | `BusyElsewhere` | 二次确认后 3 s 再探；连续上限后强制回收 |
+  | 置位 | `false` | `BusyElsewhere` | 二次确认后进入退避队列（3/6/12/24/60 s，封顶 60 s），**永不放弃** |
   | 缺字段/类型错 | 任意 | `Unknown` | 立即回收（fail-open） |
+- **Q34 的第四维：TCP 存活探测**：`statusFlags` 只说明「接收器上有没有会话」，
+  不说明「那台设备还在不在」。新增 `ReceiverLiveness { Alive, Unknown, Dead }`，
+  由 `receiver_liveness(ip, port, 2s)` 对**控制端口**做一次裸
+  `TcpStream::connect_timeout`：接通即 `Alive`（拿到 socket 立刻丢弃，不发任何
+  RTSP 请求）；连接被拒或超时 ⇒ `Dead`；其他错误 ⇒ `Unknown`。`combine` 把它和
+  媒体健康组合：
+  | `media_healthy` | `ReceiverLiveness` | 判定 | 动作 |
+  | --- | --- | --- | --- |
+  | `true` | `Alive` | `OursActive` | `FallThrough` |
+  | `true` | `Unknown` | `OursActive` | `FallThrough`（保守，不打扰仍在播的会话） |
+  | `true` | `Dead` | `Gone` | 立即回收；`Dead` **永远不会**判成 `BusyElsewhere` |
+  | `false` | `Dead` | `Gone` | 立即回收 |
+  | `false` | `Alive`/`Unknown` | 回退 `classify` | 同上面的三分类 |
+  探测行和证据行都新增 `tcp_reachable`（bool，只有 `Alive` 为 `true`）与
+  `tcp_liveness`（`alive`/`unknown`/`dead`）；媒体健康时不再因为 `/info` 报错
+  就 fail-open 回收——那会把我们自己正在播的会话打断。
+- **busy 队列永不放弃（Q34 §四）**：删掉了 `BUSY_LIMIT`、
+  `ProbeAction::ReclaimBusyExhausted` 和 `busy_exhausted` warning。确认的
+  `BusyElsewhere` 只做一件事：按下一次退避间隔排探测
+  （`requeue_delay`：3 s → 6 s → 12 s → 24 s → 60 s，之后一直 60 s），
+  不重建会话、不累计 takeover、不强制回收。任何非 busy 判决（`Free`/
+  `OursActive`/fail-open）都会把队列重置。因此「另一台控制器合法地占着接收器
+  一小时」的结果是：每分钟一次 `/info`，永远不 `preempted`。为了让队列真能跨过
+  Q32 的 2 s `ended_at` 自愈，`Tracker::we_hold_session` 在**已确认的 busy 队列
+  期间**固定返回 `false`（两次一致的探测是比过期 `ended_at` 更硬的证据），
+  只有媒体恢复健康才能把它扳回 `OursActive`；队列本身仍由 `Free` 或媒体健康
+  结束，不会 latch。
 - **Q32 死锁与三处修复**：旧实现把「未预期 `TEARDOWN` 或 `403`」永久记为
   `session_ended`。`403` 的真实原因通常是认证/权限变化（HomePod 固件更新后
   要求密码、macOS 关闭访问控制等），会话其实仍属于我们；但 `session_ended`
@@ -404,14 +431,16 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
      `/info` 探测。SETUP 阶段（媒体开始前）的 `401`/`403`/`454` 仍走终结性的
      `authentication_failed`，这条 Q16 边界没有变。真正表示「会话已结束」的
      控制面信号只剩未预期的 `TEARDOWN`；`Connection: close` 仍只是证据。
-  3. **busy 队列有上限**：连续确认的 `BusyElsewhere` 达到 `BUSY_LIMIT=3` 次后，
-     `ProbeAction::ReclaimBusyExhausted` 强制回收并打印 `busy_exhausted`
-     warning，队列不可能无限循环；随后的回收仍要过 `TakeoverCounter`，所以
-     反复强制回收最终会以 `preempted(limit)` 让步。
-  `ENDED_TRUST_WINDOW`、`BUSY_LIMIT` 都是**我们选的值**：Q32 只要求「可自愈」
-  和「有上限」，没有给出 WAC 的运行时参数；2 s 与引擎自己的
-  `MEDIA_HEALTH_WINDOW` 及 WAC 的 `2 s gap window` 对齐，3 次与
-  `TAKEOVER_LIMIT` 对齐。
+  3. **busy 队列不再有上限**（Q34 返工）：旧实现连续确认 `BusyElsewhere` 到
+     `BUSY_LIMIT=3` 就强制回收，把「别人合法占着接收器」当成了「我们在抢」，
+     还会把强制回收算进连续计数。现在确认的 busy 只排指数退避探测
+     （3/6/12/24/60 s，封顶 60 s，永远继续），`BUSY_LIMIT` 与
+     `busy_exhausted` 已删除；队列期间不回收、不计 takeover、不写 `ended_at`，
+     任何非 busy 判决都会重置退避。Q34 §四的完整状态机见上。
+  `ENDED_TRUST_WINDOW` 仍是**我们选的值**：Q32 只要求「可自愈」，没有给出 WAC
+  的运行时参数；2 s 与引擎自己的 `MEDIA_HEALTH_WINDOW` 及 WAC 的 `2 s gap
+  window` 对齐。busy 队列期间对 2 s 自愈的例外也只覆盖「已两次确认 busy」这一
+  状态，媒体恢复健康或接收器变 `Free` 都会立即退出。
 - **二次确认（Q32 第 3 问）**：`Free` 和 `BusyElsewhere` 都会改变状态，第一次
   probe 只排一次确认探测（`CONFIRM_DELAY=500ms`，**我们选的值**，Q32 未恢复
   WAC 的间隔），两次一致才执行；不一致时取非破坏性的结果 —— 任一为
@@ -437,27 +466,37 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   连续计数，照常走 `health.check()` / `check_control(media_healthy)` 这些原有的
   非抢占路径；会话结束时仍然正常回发 `TEARDOWN`。
 - **判决表**（`action_for` / `action_for_result` 的纯函数部分；状态机会在其上
-  再套二次确认和 busy 上限）：
+  再套二次确认和 busy 退避队列）：
   | 探测结果 | 首次动作 | 确认后 |
   | --- | --- | --- |
-  | `Free` | 只排 500 ms 确认，不回收 | 两次一致才回收 |
+  | `Free` | 只排 500 ms 确认，不回收 | 两次一致才回收（算一次 takeover） |
   | `OursActive` | 不回收，`FallThrough` 到原非抢占路径 | 不做二次确认（不改变状态） |
-  | `BusyElsewhere` | 只排 500 ms 确认，不排队 | 两次一致才 3 s 后再探；连续 `BUSY_LIMIT` 次确认后强制回收 |
+  | `BusyElsewhere` | 只排 500 ms 确认 | 两次一致才按 3/6/12/24/60 s 退避再探；永不强制回收 |
+  | `Gone`（存活探测判定 `Dead`） | 立即回收 | 不做二次确认；不算 busy、不计 takeover |
   | `Unknown` / `Err` / 超时 | 立即回收（fail-open） | 不做二次确认 |
-- **连续计数 + 时间窗 + yielding**：`TakeoverCounter` 按接收器（IP）计数，
-  每个 live 播放进程跨 reclaim 复用。`TAKEOVER_LIMIT=3`、
-  `TAKEOVER_WINDOW=30s`、`REPROBE_DELAY=3s`、`PROBE_TIMEOUT=2s` 都是**我们选的
-  值**，不是从 WAC 静态恢复的常数，注释里已标明（Q31 答复建议 re-probe 取
-  3–5 s，这里取了下限）。窗口内再次 takeover 计数
-  +1；超过窗口重置为 **1**（不是 0）；达到上限不再回收，返回不可重试的
-  `preempted` fault，`reason="limit"`，warning 也是 `reason="limit"`。单次
-  正常接管走 `reason="takeover"`；两种 reason 同时出现在 warning、fault 和
-  桌面文案里，用户能区分「被接管」与「反复被接管后让步」。
+- **连续计数只数「真接管周期」+ 时间窗 + yielding（Q34 §四）**：
+  `TakeoverCounter` 按接收器（IP）计数，每个 live 播放进程跨 reclaim 复用。
+  `TAKEOVER_LIMIT=3`、`TAKEOVER_WINDOW=30s`、`PROBE_TIMEOUT=2s`、
+  `LIVENESS_TIMEOUT=2s` 和退避序列都是**我们选的值**，不是从 WAC 静态恢复的
+  常数。一次「回收→接管」周期只有在**回收真的建立成功后**才开始：`run_stream`
+  在新会话 SETUP/RECORD 完成、开始发包前调用 `reclaim_succeeded(now)`，随后的
+  确认 `Free` 才调用 `takeover(now)`，只有落在这 30 s 窗口内才 +1，否则（包括
+  从未成功回收过的第一次接管）重置为 **1**，不是 2。因此
+  「接收器忙 ⇒ 确认 busy ⇒ 排队」这条路径永远不经过计数器；旧实现里「排队到
+  上限强制回收、再让计数器背锅」的假周期不复存在。达到上限不再回收：返回不可
+  重试的 `preempted` fault，`reason="limit"`，同时 `Tracker::suspend()`，之后
+  `due()` 恒为 `false`、`scheduled()` 恒为 `None`——**yielding 之后不会再排任何
+  探测**，桌面也不会自动重连。唯一复活方式是一次显式触发
+  `Tracker::trigger(now)`（给用户点播放、或未来低频 `Free` 轮询预留的钩子；
+  当前桌面在用户重新点播放时启动的是新进程/新 tracker，效果相同）。单次正常
+  接管仍走 `reason="takeover"`；两种 reason 同时出现在 warning、fault 和桌面
+  文案里，用户能区分「被接管」与「反复被接管后让步」。
 - **回收在引擎内部完成**：live 循环捕获专用的 `preemption::Reclaim` 错误，
   **不把它当故障上报**；旧 `Member` 被丢弃，`run_live` 用新连接重新
-  `run_stream`，`TakeoverCounters` 跨轮保留。有限时长探测没有 live 循环，
-  捕获 `Reclaim` 后转成终态 `PREEMPTED(takeover)`。这样桌面不需要新增自动
-  重连逻辑，正常会话行为也不变。
+  `run_stream`，`TakeoverCounters` 跨轮保留，并把「刚回收的 IP」带进下一轮
+  （只有新会话建立成功才记为一次成功的 reclaim，供 30 s 周期窗口使用）。
+  有限时长探测没有 live 循环，捕获 `Reclaim` 后转成终态
+  `PREEMPTED(takeover)`。这样桌面不需要新增自动重连逻辑，正常会话行为也不变。
 - **旧连接必须中毒**：回收前 `Connection::poison()`，之后任何 `write` /
   `finish_session` 都返回 `WireError::Poisoned`，不会把 TEARDOWN 或新请求
   发回已被接管的会话；回收只能走新连接（与 Q16 的「加密 RTSP 不能中途
@@ -469,42 +508,48 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   可重试的 `feedback_rejected` 降级路径（Q34）；`preempted` 的
   `Member::close()` 仍不回发 TEARDOWN。
 - **不会形成无限循环/重连风暴**：一个 live 循环里每个探测周期最多回收一次；
-  busy 时只排下一次探测，不重建会话，连续 `BUSY_LIMIT` 次确认后强制回收；
-  `OursActive` 不排队，等下一个控制面信号再探；连续计数到上限立即让步。
-  正常会话不探测，只有控制面出现证据后才发 `/info`；会改变状态的判决最多多
-  一次 500 ms 的确认探测。
+  busy 时只按指数退避排下一次探测（3/6/12/24/60 s），不重建会话、不回收，
+  队列无限长但不产生任何重连；`OursActive` 不排队，等下一个控制面信号再探；
+  连续计数只在「成功回收后 30 s 内再次被接管」时才递增，到上限立即让步并
+  停止一切探测。正常会话不探测，只有控制面出现证据后才发 `/info`；会改变状态
+  的判决最多多一次 500 ms 的确认探测；存活探测是每次探测前的一条裸 TCP
+  connect，不写任何字节。
 - **可观测性**：`preemption_evidence` 行保留 WAC 的三项上下文
   （`policy`/`rtp_healthy`/`packets_prepared`）；`preemption_probe` 行现在也带
-  这三项，并新增 `we_hold_session`、完整 64 位 `status_flags`（`0x%016x`）和
-  `stereo_partner_unreachable` 遥测位（只上报，不参与判定）。另外两个独立
-  warning code 让状态机不会静默循环：`preemption_probe_disagreement` 记录两次
-  探测不一致（带 `first`/`second` 两个 outcome），`busy_exhausted` 记录 busy
-  队列撞上限后强制回收（带 `attempts`）。
-- 测试：
-  - `preemption.rs` 表驱动单测：三分类表（无会话位时即使 bit14/bit7 置位、
-    `we_hold_session` 两种取值都是 `Free`；置位 + 持有是 `OursActive` 且动作
-    不是回收；置位 + 不持有是 `BusyElsewhere`）、bit14/bit7 不改变判决、
-    `u64` 高位（>`u32::MAX`）参与判定、缺字段/字符串/负数都是 `Unknown`、
-    原始 64 位 flags 保留、`Err` fail-open、首 takeover 计 1、窗口内递增、
-    窗口外重置为 1、到上限 yielding、按 IP 独立计数。
-  - **钉死 Q32 死锁的测试**（`preemption.rs`）：
-    `a_403_cannot_wedge_the_probe`（403 已不进入 tracker；就算有控制面信号把
-    会话记为结束，`we_hold_session` 也会在 2 s 边界自行恢复）、
-    `healthy_rtp_always_wins_over_an_ended_control_state`（RTP 健康时 TEARDOWN
-    也不能把它变成 false）、`busy_elsewhere_never_loops_forever`（连续确认
-    Busy 到 `BUSY_LIMIT` 必转 `ReclaimBusyExhausted`，且不留下一次探测）、
-    `a_single_free_busy_disagreement_does_not_reclaim`（Free/Busy 任一方向
-    不一致都不回收；任一方 OursActive 则 FallThrough）、
-    `a_state_changing_verdict_is_confirmed_before_it_is_acted_on`（首次只排
-    500 ms 确认，两次一致才回收）、
-    `a_non_busy_verdict_resets_the_consecutive_busy_run`（计数不跨非 busy
-    判决累积）、
-    `ours_active_and_fail_open_verdicts_are_not_delayed_by_a_confirmation`。
+  这三项，并新增 `we_hold_session`、完整 64 位 `status_flags`（`0x%016x`）、
+  `stereo_partner_unreachable` 遥测位（只上报，不参与判定），以及 Q34 的
+  `tcp_reachable`（bool）和 `tcp_liveness`（`alive`/`unknown`/`dead`）——
+  证据行和探测行都写，方便把「设备不在」与「设备在但被别人占着」分开。
+  另外两个独立 warning code 让状态机不会静默循环：`preemption_probe_disagreement`
+  记录两次探测不一致（带 `first`/`second` 两个 outcome），`preempted`
+  （`reason="limit"`）记录让步；`busy_exhausted` 已随强制回收一起删除，
+  不存在「排队撞上限」这个事件了。
+- 测试（Rust 共 253 passed / 2 ignored：`--lib` 213 passed + 1 ignored、
+  `main` 2、集成 38）：
+  - `preemption.rs` 表驱动单测：`combine` 的整张表（`media_healthy` ×
+    `Alive`/`Unknown`/`Dead`，含 `statusFlags` 缺省/0/活跃位变体）——
+    `Dead` 永远是 `Gone`/回收且**不是** `BusyElsewhere`，健康媒体 + `Alive`/
+    `Unknown` 是 `OursActive`，不健康才回退三分类；`ReceiverLiveness` 的
+    `name()`/`reachable()`（只有 `Alive` 为 true）；真实
+    `TcpStream::connect_timeout` 的 `Alive`/`Dead` 判定；
+    `requeue_delay_is_the_exact_backoff_sequence`（3/6/12/24/60/60…）；
+    `queueing_backs_off_forever_and_never_forces_a_reclaim`（一直 busy 也永远
+    不 `Reclaim`）；`a_non_busy_verdict_resets_the_queue_backoff`；
+    `a_confirmed_busy_queue_does_not_self_heal_into_ours_active`；
+    `yielding_is_terminal_and_only_an_explicit_trigger_revives_it`
+    （`suspend()` 后 `due()`/`scheduled()` 恒空，`trigger()` 才重新排探测）；
+    takeover 周期：没有成功 reclaim 的接管永远是 1、成功 reclaim 后的接管才
+    递增、超 30 s 重置为 1、到上限 yield 后重新从 1 开始、按 IP 独立；
+    `a_dead_receiver_or_a_fail_open_probe_is_a_reclaim_but_not_a_takeover`。
+    原有的三分类位定义、`u64` 高位、缺字段 `Unknown`、fail-open、二次确认、
+    `a_403_cannot_wedge_the_probe` 等测试全部保留并通过。
   - `tests/preemption_probe.rs`：localhost `/info` 服务器，验证两次探测各开
     一条新连接；同一置位位图在 `we_hold_session` 两种取值下分别是
     `OursActive` / `BusyElsewhere`；bit14+bit7 与 `1<<40` 高位不影响 `Free`；
-    高位 + bit17 仍能识别会话；缺 `statusFlags` 为 `Unknown`；连接拒绝/静默
-    超时为 `Err` 且判决为回收。
+    缺 `statusFlags` 为 `Unknown`；连接拒绝/静默超时为 `Err` 且判决为回收；
+    新增 Q34 集成测试：监听端口 ⇒ `Alive`、关闭端口 ⇒ `Dead`；
+    `Dead` + 健康媒体 ⇒ `Gone`/回收且任何 `statusFlags` 下都不是 busy；
+    `Unknown` + 健康媒体 ⇒ `OursActive`，不健康 ⇒ 回退 `Free`/`Unknown`。
   - `tests/continuity.rs`：运行中 `/feedback` 返回 401/403/454 时只把控制通道
     记为可重试的 `feedback_rejected`（不是 `authentication_failed` /
     `session_rejected`），`health.check()` 仍为 Ok、RTP 继续发包、只发一条
@@ -513,20 +558,26 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
     的 401/403/454 仍是不可重试的 `authentication_failed`。
   - `tests/rtsp_contract.rs`：中毒连接不写出任何请求，`finish_session` 也
     不写 TEARDOWN。
-  - `session.rs`：TEARDOWN + 两次 Free 时第一次返回 `Waiting`（排确认），
-    确认后走 `PreemptionPoll::Reclaimed`，断言 `preempted`、旧连接中毒、
-    warning `reason=takeover`、证据行带 `policy`/`rtp_healthy`/
-    `packets_prepared`、probe 行带 `we_hold_session`/`status_flags`/
-    `stereo_partner_unreachable`、没有回发 TEARDOWN；
-    **`healthy_rtp_beats_a_receiver_teardown_signal`**：bit17 置位 + RTP 健康 +
-    TEARDOWN ⇒ `None`（`ours_active`），不中毒、不计数、关闭时仍正常发
-    TEARDOWN；**`ended_session_with_unhealthy_rtp_is_busy_elsewhere`**：bit17
-    置位 + RTP 不健康 + TEARDOWN ⇒ 两次确认后 `Waiting`（`busy_elsewhere`），
-    不回收；`busy_exhausted_is_a_distinct_logged_outcome` 校验新 warning
-    code/`attempts`。另有缺字段、探测失败、连续上限（现在需要两次 Free 才会
-    走到 reclaim）三条路径。
+  - `session.rs`：TEARDOWN + 两次 Free（媒体已停）时第一次返回 `Waiting`
+    （排确认），确认后走 `PreemptionPoll::Reclaimed`，断言 `preempted`、旧连接
+    中毒、warning `reason=takeover`、证据行带 `policy`/`rtp_healthy`/
+    `packets_prepared`/`tcp_reachable`/`tcp_liveness`、probe 行带
+    `we_hold_session`/`status_flags`/`stereo_partner_unreachable`、没有回发
+    TEARDOWN；**`healthy_rtp_with_a_reachable_receiver_ignores_a_free_status_flags`**
+    和 **`healthy_rtp_beats_a_receiver_teardown_signal`**：健康媒体 + `Alive`
+    永远是 `None`（`ours_active`），不中毒、不计数、关闭时仍正常发 TEARDOWN；
+    **`ended_session_with_unhealthy_rtp_is_busy_elsewhere`**：两次确认后
+    `Waiting`（busy），调度时间 = 确认时刻 + `requeue_delay(0)`，不回收、
+    不出现 `busy_exhausted`/`preempted`；**`a_queueing_busy_receiver_never_reaches_the_yield`**：
+    24 轮确认 busy（跨过 2 s 自愈窗）仍不 yield、不中毒、计数器为 0；
+    **`a_dead_control_port_reclaims_instead_of_a_generic_fault`**：TCP 被拒 ⇒
+    `gone`/回收、`tcp_reachable=false`、不计 takeover、无 `preempted`；
+    缺字段（媒体不健康）⇒ fail-open 回收；`hitting_the_consecutive_limit_yields_with_reason_limit`
+    用新计数 API 播种两个「成功回收后接管」周期，第 3 次触顶后断言
+    `reason="limit"`、`suspended()`、`scheduled()=None`，且 1 s/60 s/1 h/24 h
+    后都 `due()==false`——证明 yielding 之后不会再排任何探测。
   - 桌面 `IpcFailureTests`：`reason=limit` 使用「反复接管后让步」文案，且
-    仍是 `PlaybackState.Preempted`、不自动重连。
+    仍是 `PlaybackState.Preempted`、不自动重连（Q34 未改桌面状态机）。
 - **没做/没验证**：
   - 真机 `statusFlags` 仍未取样（Q32/Q34）：HomePod 在我们自己播放、空闲、
     被接管三种状态下 bit17 是否分别置位/清零、接管瞬间 `/info` 是否仍可读、
@@ -538,12 +589,22 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   - RTP 健康与真接管：按 Q32 的无条件规则，UDP 发送仍「成功」时 bit17 会被判成
     `OursActive` 而不回收。真接管时 ICMP/端口关闭能否在多长时间内让
     `media_healthy` 变假、从而进入 busy 路径，未实测，见 Q34。
-  - `ENDED_TRUST_WINDOW=2s`、`CONFIRM_DELAY=500ms`、`BUSY_LIMIT=3` 都是**我们
-    选的值**：2 s 与 WAC 的 gap window / 引擎 `MEDIA_HEALTH_WINDOW` 对齐，
-    另两个没有 WAC 依据（Q34）。
-  - busy 上限的副作用：若另一台控制器合法地长时间占用接收器，约 9 s（3 次
-    3 s 排队）后我们会强制回收；连续三次强制回收后会 `preempted(limit)` 让步。
-    这个时机是否过于激进未在真机验证，见 Q34。
+  - TCP 存活探测的真机错误码（Q42，待答复）：Q34 只规定「被拒/超时 ⇒ `Dead`，
+    其他错误 ⇒ `Unknown`」。Windows 对同一子网内已关机/拔电的 HomePod 经常返回
+    `HostUnreachable`/`NetworkUnreachable`（10065/10051）而不是 refused/timeout；
+    按当前实现会落到 `Unknown`（保守 ⇒ `OursActive`），于是「设备关机」不会
+    回收，只能等媒体窗口自己过期。真机返回哪种错误、是否应把 host/network
+    unreachable 也算 `Dead`，未实测。
+  - `ENDED_TRUST_WINDOW=2s`、`CONFIRM_DELAY=500ms`、退避 3/6/12/24/60 s、
+    `TAKEOVER_LIMIT=3`、`TAKEOVER_WINDOW=30s`、`LIVENESS_TIMEOUT=2s` 都是
+    **我们选的值**：2 s 与 WAC 的 gap window / 引擎 `MEDIA_HEALTH_WINDOW` 对齐，
+    其余没有 WAC 依据（Q34 只规定「永不放弃」和「只数真周期」）。
+  - busy 队列无限长的代价：另一台控制器合法地占着接收器时，我们会一直每 60 s
+    探一次 `/info`（外加一条裸 TCP connect），直到它空出来；这是 Q34 要求的
+    行为，但真机上 60 s 一次的探测开销和「什么时候该放弃」未实测。
+  - 存活探测只证明「控制端口还在监听」：HomePod 在开机但 RTSP 服务异常、
+    或中间防火墙只挡 UDP 时，`Alive` 仍可能把已失效的会话判成 `OursActive`。
+    这种情况仍靠 `MEDIA_HEALTH_WINDOW` 兜底，未在真机验证。
   - 没有抓包验证 HomePod 被接管时 `/info` 响应是否仍可读、是否要求认证、
     `statusFlags` 是否在接管瞬间变化。
   - 立体声对中一个成员在探测时最多阻塞 2 s；本地测试未覆盖两台接收器同时
