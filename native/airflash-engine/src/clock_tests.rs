@@ -227,10 +227,9 @@ fn packet_validation_explains_rejections_without_relaxing_identity_checks() {
 
 #[test]
 fn loop_retries_dropped_subscription_and_answers_pdelay_while_following() {
-    // A distinct loopback address avoids the existing session simulation's ports.
-    let peer: IpAddr = "127.0.0.10".parse().unwrap();
-    let remote_event = UdpSocket::bind((peer, 319)).unwrap();
-    let remote_general = UdpSocket::bind((peer, 320)).unwrap();
+    // Protocol-fixed PTP ports on a fresh loopback address: parallel suites
+    // cannot collide, and the sender still targets the real receiver ports.
+    let (peer, remote_event, remote_general) = crate::test_net::ptp_receiver_sockets();
     remote_event.set_nonblocking(true).unwrap();
     remote_general.set_nonblocking(true).unwrap();
     let event = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -290,9 +289,7 @@ fn loop_retries_dropped_subscription_and_answers_pdelay_while_following() {
 
 #[test]
 fn localhost_follower_locks_after_receiver_drops_the_first_subscription() {
-    let peer: IpAddr = "127.0.0.11".parse().unwrap();
-    let remote_event = UdpSocket::bind((peer, 319)).unwrap();
-    let remote_general = UdpSocket::bind((peer, 320)).unwrap();
+    let (peer, remote_event, remote_general) = crate::test_net::ptp_receiver_sockets();
     remote_event.set_nonblocking(true).unwrap();
     remote_general.set_nonblocking(true).unwrap();
     let event = UdpSocket::bind("127.0.0.1:0").unwrap();
