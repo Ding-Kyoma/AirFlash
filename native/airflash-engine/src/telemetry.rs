@@ -287,12 +287,18 @@ impl TimelineResets {
 /// internal invariant, not as a product capability.
 pub const LEAD_SHIFT_RESET_US: u64 = 5_000;
 
-/// The rate-ratio inputs for one successful re-anchor (Q44 §一).
+/// The retransmit-fraction inputs for one successful re-anchor (Q44 §一, Q47).
 ///
 /// A binary "did anything move" test turns one incidental Wi-Fi loss into a
 /// transport fault. Comparing against the sender's own steady state instead makes
 /// a link that always loses a couple of packets per second normal for that link,
 /// and only a spike above it a fault.
+///
+/// The comparison is a **retransmit fraction**, `rtx / packets_sent`, not a rate
+/// ratio (Q47 §二). `rtx/s ÷ rtx/s` throws away the send volume: 3 retransmits
+/// out of 3 packets (100 % loss) and 3 out of 3000 (0.1 %) score identically. A
+/// fraction is volume- and bitrate-independent, so a low-bitrate stream is not
+/// judged by how few packets it sends per second.
 ///
 /// Retransmit requests are a weaker signal than underruns: a retransmitted packet
 /// was lost but probably recovered, while an underrun means the playout buffer ran
@@ -300,10 +306,24 @@ pub const LEAD_SHIFT_RESET_US: u64 = 5_000;
 /// retransmits also need an absolute minimum.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RtpBaseline {
-    /// Steady-state retransmit-request rate over the long window, events/second.
-    pub steady_rtx_per_s: f64,
-    /// Steady-state concealed-underflow rate over the long window, events/second.
-    pub steady_underrun_per_s: f64,
+    /// The span the steady window actually covers: from its oldest sample to the
+    /// pre-stall baseline sample. Never assumed to be
+    /// [`STEADY_WINDOW`](RtpEvidence::STEADY_WINDOW). A session younger than the
+    /// window, or a re-anchor that skipped samples, covers less than 30 s; dividing
+    /// by the nominal 30 s then makes the steady fraction too small and
+    /// *overestimates* the ratio, i.e. biases toward the transport-fault side
+    /// (Q47 §一).
+    pub baseline_span: Duration,
+    /// Packets sent over the steady window; zero means the denominator has no
+    /// volume to normalise by, so the relative test is skipped.
+    pub steady_packets_sent: u64,
+    /// Retransmit requests over the steady window.
+    pub steady_rtx: u32,
+    /// Concealed underruns over the steady window.
+    pub steady_underrun: u32,
+    /// Packets sent inside the pre-stall window; zero means the window carried no
+    /// audio at all.
+    pub pre_stall_packets_sent: u64,
     /// Actual retransmit-request increment inside the pre-stall window.
     pub pre_stall_rtx: u32,
     /// Actual concealed-underflow increment inside the pre-stall window.
@@ -317,32 +337,93 @@ impl RtpBaseline {
     /// enough session-summary rows, calibrate it from the observed distribution
     /// (Q44 §一).
     pub const RATIO_THRESHOLD: f64 = 3.0;
-    /// Floor for the denominator, in events/second. A clean link has a steady rate
-    /// of zero; without the floor one lost packet would divide by zero and look
-    /// like an infinite spike.
-    pub const RATE_FLOOR_PER_S: f64 = 0.05;
+    /// Shortest trustworthy baseline. 250 ms carries ~90 packets and 1 s ~350 at
+    /// 44.1 kHz ALAC; 10 s carries ~3500, which is the first length where the
+    /// loss fraction is stable enough to compare against (Q47 §二).
+    pub const MIN_BASELINE: Duration = Duration::from_secs(10);
     /// Minimum retransmit requests in the pre-stall window. Together with the
     /// ratio this stops a single incidental loss on an otherwise clean link from
     /// filling the bucket.
     pub const MIN_RTX: u32 = 3;
     /// One concealed underrun is already audible, so its absolute minimum is one.
     pub const MIN_UNDERRUN: u32 = 1;
+    /// Absolute retransmit threshold for when there is no relative baseline.
+    /// 30 requests inside one second is a lot at any bitrate, so this replaces
+    /// the deleted `0.05` rate floor (Q47 §二).
+    pub const ABS_RTX_BAD: u32 = 30;
 
-    pub fn rtx_ratio(&self) -> f64 {
-        f64::from(self.pre_stall_rtx) / self.steady_rtx_per_s.max(Self::RATE_FLOOR_PER_S)
+    /// Retransmit requests per packet sent inside the pre-stall window.
+    pub fn rtx_fraction(&self) -> f64 {
+        f64::from(self.pre_stall_rtx) / self.pre_stall_packets_sent.max(1) as f64
     }
 
-    pub fn underrun_ratio(&self) -> f64 {
-        f64::from(self.pre_stall_underrun) / self.steady_underrun_per_s.max(Self::RATE_FLOOR_PER_S)
+    /// Retransmit requests per packet sent over the steady window.
+    pub fn steady_rtx_fraction(&self) -> f64 {
+        f64::from(self.steady_rtx) / self.steady_packets_sent.max(1) as f64
+    }
+
+    /// Concealed underruns per packet sent inside the pre-stall window.
+    pub fn underrun_fraction(&self) -> f64 {
+        f64::from(self.pre_stall_underrun) / self.pre_stall_packets_sent.max(1) as f64
+    }
+
+    /// Concealed underruns per packet sent over the steady window.
+    pub fn steady_underrun_fraction(&self) -> f64 {
+        f64::from(self.steady_underrun) / self.steady_packets_sent.max(1) as f64
+    }
+
+    /// Whether the baseline is long enough and carried any packets at all.
+    fn long_enough_baseline(&self) -> bool {
+        self.baseline_span >= Self::MIN_BASELINE && self.steady_packets_sent > 0
+    }
+
+    /// Whether the retransmit side can be judged relatively. A baseline with zero
+    /// retransmits has no denominator: `pre > 0 * 3` is true for any single
+    /// request, which is the same hidden amplifier the deleted `0.05` floor was.
+    pub fn relative_rtx(&self) -> bool {
+        self.long_enough_baseline() && self.steady_rtx > 0
+    }
+
+    /// Whether the underrun side can be judged relatively. A link that never
+    /// concealed keeps the absolute rule: one underrun is already audible.
+    pub fn relative_underrun(&self) -> bool {
+        self.long_enough_baseline() && self.steady_underrun > 0
     }
 
     /// Whether the RTP side degraded enough to call the stall a transport fault.
-    /// Underruns have their own line because one is enough to be audible.
+    ///
+    /// With a trustworthy baseline the test is relative, so a link's normal loss
+    /// is not a fault. Without one it is an absolute count: a relative test would
+    /// divide by a fraction measured over too little traffic. There is no rate
+    /// floor in either branch (Q47 §二).
     pub fn transport_bad(&self) -> bool {
-        (self.rtx_ratio() > Self::RATIO_THRESHOLD && self.pre_stall_rtx >= Self::MIN_RTX)
-            || (self.underrun_ratio() > Self::RATIO_THRESHOLD
-                && self.pre_stall_underrun >= Self::MIN_UNDERRUN)
+        let rtx_bad = if self.relative_rtx() {
+            self.pre_stall_rtx >= Self::MIN_RTX
+                && self.rtx_fraction()
+                    > self.steady_rtx_fraction() * Self::RATIO_THRESHOLD
+        } else {
+            self.pre_stall_rtx >= Self::ABS_RTX_BAD
+        };
+        let underrun_bad = if self.relative_underrun() {
+            self.pre_stall_underrun >= Self::MIN_UNDERRUN
+                && self.underrun_fraction()
+                    > self.steady_underrun_fraction() * Self::RATIO_THRESHOLD
+        } else {
+            // One concealed underrun is audible whatever the baseline says.
+            self.pre_stall_underrun >= Self::MIN_UNDERRUN
+        };
+        rtx_bad || underrun_bad
     }
+}
+
+/// One cumulative-counter sample. `packets_sent` is the denominator of the
+/// retransmit fraction, so it is sampled together with the events (Q47 §二).
+#[derive(Clone, Copy, Debug)]
+struct RtpSample {
+    at: Instant,
+    rtx_req: u64,
+    underruns: u64,
+    packets_sent: u64,
 }
 
 /// RTP-side evidence used to separate a transport failure from a local sender
@@ -358,10 +439,13 @@ impl RtpBaseline {
 /// The send loop samples the cumulative counters at most once per
 /// [`SAMPLE_INTERVAL`](Self::SAMPLE_INTERVAL). At a re-anchor the oldest sample
 /// still inside [`WINDOW`](Self::WINDOW) is the pre-stall baseline, and the oldest
-/// sample still inside the steady window is the long baseline. The steady rate is
-/// measured up to the start of the pre-stall window, not up to now: a spike must
-/// not be diluted by its own baseline (3x over the last second of a 30 s window
-/// would otherwise read as 2.8x).
+/// sample still inside the steady window is the long baseline. The steady
+/// *fraction* is measured up to the start of the pre-stall window, not up to now:
+/// a spike must not be diluted by its own baseline, or the detector gets least
+/// sensitive exactly when the link is worst (in-sample contamination, Q47 §一).
+///
+/// The denominator is the measured span between those two samples and the packets
+/// sent between them, never a nominal 30 s and never a rate floor.
 ///
 /// Why "before": retransmit requests are only drained when the send loop runs, so
 /// requests that arrive *during* the stall are counted after it ends. They are not
@@ -379,7 +463,7 @@ impl RtpBaseline {
 #[derive(Debug, Default)]
 pub struct RtpEvidence {
     /// Cumulative-counter samples, oldest first.
-    samples: VecDeque<(Instant, u64, u64)>,
+    samples: VecDeque<RtpSample>,
     /// Start of the current pre-stall window; `None` before the first re-anchor.
     pre_stall_since: Option<Instant>,
 }
@@ -396,15 +480,18 @@ impl RtpEvidence {
     const MAX_SAMPLES: usize = 121;
 
     /// Record the cumulative counters, throttled to `SAMPLE_INTERVAL`.
-    pub fn sample(&mut self, now: Instant, rtx_req: u64, underruns: u64) {
-        if self
-            .samples
-            .back()
-            .is_some_and(|(at, _, _)| now.saturating_duration_since(*at) < Self::SAMPLE_INTERVAL)
-        {
+    pub fn sample(&mut self, now: Instant, rtx_req: u64, underruns: u64, packets_sent: u64) {
+        if self.samples.back().is_some_and(|sample| {
+            now.saturating_duration_since(sample.at) < Self::SAMPLE_INTERVAL
+        }) {
             return;
         }
-        self.samples.push_back((now, rtx_req, underruns));
+        self.samples.push_back(RtpSample {
+            at: now,
+            rtx_req,
+            underruns,
+            packets_sent,
+        });
         while self.samples.len() > Self::MAX_SAMPLES {
             self.samples.pop_front();
         }
@@ -414,32 +501,44 @@ impl RtpEvidence {
     /// no sample inside the pre-stall window: a stall longer than the window, or
     /// the very first loop iteration. The caller then falls back to
     /// [`TimelineResetReason::SenderStall`].
-    pub fn baseline(&self, now: Instant, rtx_req: u64, underruns: u64) -> Option<RtpBaseline> {
-        let pre = self.samples.iter().find(|(at, _, _)| {
-            self.pre_stall_since.is_none_or(|since| *at > since)
-                && now.saturating_duration_since(*at) <= Self::WINDOW
+    pub fn baseline(
+        &self,
+        now: Instant,
+        rtx_req: u64,
+        underruns: u64,
+        packets_sent: u64,
+    ) -> Option<RtpBaseline> {
+        let pre = self.samples.iter().find(|sample| {
+            self.pre_stall_since.is_none_or(|since| sample.at > since)
+                && now.saturating_duration_since(sample.at) <= Self::WINDOW
         })?;
         let steady = self
             .samples
             .iter()
-            .find(|(at, _, _)| now.saturating_duration_since(*at) <= Self::STEADY_WINDOW)?;
-        let steady_seconds = pre
-            .0
-            .saturating_duration_since(steady.0)
-            .as_secs_f64()
-            .max(0.001);
+            .find(|sample| now.saturating_duration_since(sample.at) <= Self::STEADY_WINDOW)?;
+        let count = |now: u64, then: u64| u32::try_from(now.saturating_sub(then)).unwrap_or(u32::MAX);
         Some(RtpBaseline {
-            steady_rtx_per_s: pre.1.saturating_sub(steady.1) as f64 / steady_seconds,
-            steady_underrun_per_s: pre.2.saturating_sub(steady.2) as f64 / steady_seconds,
-            pre_stall_rtx: u32::try_from(rtx_req.saturating_sub(pre.1)).unwrap_or(u32::MAX),
-            pre_stall_underrun: u32::try_from(underruns.saturating_sub(pre.2))
-                .unwrap_or(u32::MAX),
+            // Measured, not assumed: a re-anchor can skip samples, and a session
+            // younger than the steady window covers less than 30 s.
+            baseline_span: pre.at.saturating_duration_since(steady.at),
+            steady_packets_sent: pre.packets_sent.saturating_sub(steady.packets_sent),
+            steady_rtx: count(pre.rtx_req, steady.rtx_req),
+            steady_underrun: count(pre.underruns, steady.underruns),
+            pre_stall_packets_sent: packets_sent.saturating_sub(pre.packets_sent),
+            pre_stall_rtx: count(rtx_req, pre.rtx_req),
+            pre_stall_underrun: count(underruns, pre.underruns),
         })
     }
 
     /// The bucket a successful re-anchor belongs to (Q43 §三, Q44 §一).
-    pub fn reset_reason(&self, now: Instant, rtx_req: u64, underruns: u64) -> TimelineResetReason {
-        match self.baseline(now, rtx_req, underruns) {
+    pub fn reset_reason(
+        &self,
+        now: Instant,
+        rtx_req: u64,
+        underruns: u64,
+        packets_sent: u64,
+    ) -> TimelineResetReason {
+        match self.baseline(now, rtx_req, underruns, packets_sent) {
             Some(baseline) if baseline.transport_bad() => {
                 TimelineResetReason::ConfirmedTransportFailure
             }
@@ -463,6 +562,87 @@ impl RtpEvidence {
     }
 }
 
+/// How loud one stall was (Q47 §三).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StallDrain {
+    /// Retransmit requests drained inside the window.
+    pub drained: u32,
+    /// `true` when `drained` is a **lower bound** rather than an exact count: the
+    /// 250 ms window closed while requests were still being served, or a second
+    /// re-anchor closed it early. A capped value must not enter a distribution;
+    /// it is counted as an "undrainable stall" instead.
+    pub capped: bool,
+}
+
+/// The fixed 250 ms window that measures one stall's drain (Q47 §三).
+///
+/// `service_retransmits` accepts at most 16 requests per send-loop iteration, so
+/// the drain seen on the single iteration after a re-anchor saturates at 16: a
+/// 50 ms hiccup and a 2 s stall both read 16, and the field stops measuring
+/// severity exactly when severity matters. Accumulating over 250 ms lets roughly
+/// 80 iterations × 16 requests through, far more than any realistic backlog (a
+/// 2 s stall at 350 packets/s queues ~700), so `drained` becomes a measurement.
+///
+/// A second re-anchor inside the window does not merge the two stalls: the older
+/// window closes early as `capped` and the newer one starts fresh. "Known lower
+/// bound" and "a saturated value mistaken for exact" are different facts, and
+/// only the first one is usable.
+#[derive(Clone, Copy, Debug)]
+pub struct StallDrainWindow {
+    opened: Instant,
+    base: u64,
+    last: u64,
+}
+
+impl StallDrainWindow {
+    /// Long enough for ~80 send-loop iterations at the 350 packets/s media rate,
+    /// short enough that two independent stalls are rarely inside one window.
+    pub const WINDOW: Duration = Duration::from_millis(250);
+
+    /// Open a window at `now`, with the cumulative retransmit counter as it stands
+    /// before the first drain that follows the re-anchor.
+    pub fn open(now: Instant, total: u64) -> Self {
+        Self {
+            opened: now,
+            base: total,
+            last: total,
+        }
+    }
+
+    /// Feed the cumulative counter after a `service_retransmits` call. Returns
+    /// `Some` exactly once, when `WINDOW` has elapsed; the caller then drops the
+    /// window. Requests still being served on the final iteration mean the queue
+    /// may not be empty, so that drain is reported capped.
+    pub fn observe(&mut self, now: Instant, total: u64) -> Option<StallDrain> {
+        if now.saturating_duration_since(self.opened) < Self::WINDOW {
+            self.last = total;
+            return None;
+        }
+        Some(self.finish(total, total > self.last))
+    }
+
+    /// Close early because another re-anchor happened inside the window. Two
+    /// stalls must never be merged into one number, so the older one is reported
+    /// as a lower bound.
+    pub fn close_early(self, total: u64) -> StallDrain {
+        self.finish(total, true)
+    }
+
+    /// Close because the session ended before the window elapsed. Same rule as
+    /// the deadline: requests still being served on the last iteration mean the
+    /// count is a lower bound.
+    pub fn close(self, total: u64) -> StallDrain {
+        self.finish(total, total > self.last)
+    }
+
+    fn finish(self, total: u64, capped: bool) -> StallDrain {
+        StallDrain {
+            drained: u32::try_from(total.saturating_sub(self.base)).unwrap_or(u32::MAX),
+            capped,
+        }
+    }
+}
+
 /// One counter block per streaming session. Owned by the send loop; readers build
 /// a JSON snapshot through [`SessionTelemetry::snapshot`].
 #[derive(Default)]
@@ -479,13 +659,23 @@ pub struct SessionTelemetry {
     pub reanchored: u64,
     /// Signed shift applied by the most recent re-anchor (positive = timeline advanced).
     pub reanchor_shift_us: i64,
-    /// Retransmit requests drained on the first send-loop iteration after a
-    /// stall: how loud the stalls were, not how many there were. A high
-    /// `sender_stall` with a near-zero drained count means the receiver's buffer
-    /// absorbed them and nothing was audible (Q44 §一).
+    /// Retransmit requests drained after stalls: how loud they were, not how many
+    /// there were. A high `sender_stall` with a near-zero drained count means the
+    /// receiver's buffer absorbed them and nothing was audible (Q44 §一).
+    ///
+    /// Each stall contributes its [`StallDrain::drained`], measured over a fixed
+    /// [`StallDrainWindow::WINDOW`](StallDrainWindow::WINDOW) rather than the first
+    /// drain call (Q47 §三).
     pub stall_rtx_drained: u64,
-    /// Largest single-stall [`stall_rtx_drained`](Self::stall_rtx_drained).
+    /// Largest single-stall drain that was **not** capped, i.e. a value the window
+    /// proved exact. Capped lower bounds stay out of this maximum so a
+    /// distribution over it is meaningful.
     pub stall_rtx_drained_max: u64,
+    /// Stalls whose drain window closed capped: the receiver's backlog was still
+    /// being served at the 250 ms deadline, or a second re-anchor closed the
+    /// window early. Counts "stalls that could not be drained", which is more
+    /// telling than any average (Q47 §三).
+    pub stall_rtx_drained_capped: u64,
     /// Timeline expiries that still require a fresh session (should stay near zero).
     pub expired: u64,
     /// Underruns while real media was playing; these are audible without concealment.
@@ -565,15 +755,26 @@ impl SessionTelemetry {
             self.record_timeline_reset(TimelineResetReason::LatencyChange);
         }
     }
-    /// Account for the retransmit drain a stall caused (Q44 §一).
+    /// Account for the retransmit drain a stall caused (Q44 §一, Q47 §三).
     ///
-    /// `drained` is the increment the first `service_retransmits` call after the
-    /// re-anchor observed. A zero drain is healthy: the receiver's buffer covered
-    /// the gap. The per-stall maximum is kept separately because "fifty stalls of
-    /// one packet" and "two stalls of five hundred" are different problems.
-    pub fn record_stall_drain(&mut self, drained: u64) {
-        self.stall_rtx_drained = self.stall_rtx_drained.saturating_add(drained);
-        self.stall_rtx_drained_max = self.stall_rtx_drained_max.max(drained);
+    /// A zero drain is healthy: the receiver's buffer covered the gap. The
+    /// per-stall maximum is kept separately because "fifty stalls of one packet"
+    /// and "two stalls of five hundred" are different problems. Only uncapped
+    /// drains enter that maximum — a capped drain is a lower bound, and mixing
+    /// lower bounds into a distribution hides how bad the worst stall was. Capped
+    /// drains are counted instead, so "how many stalls could not be drained" stays
+    /// visible.
+    pub fn record_stall_drain(&mut self, drain: StallDrain) {
+        self.stall_rtx_drained = self
+            .stall_rtx_drained
+            .saturating_add(u64::from(drain.drained));
+        if drain.capped {
+            self.stall_rtx_drained_capped = self.stall_rtx_drained_capped.saturating_add(1);
+        } else {
+            self.stall_rtx_drained_max = self
+                .stall_rtx_drained_max
+                .max(u64::from(drain.drained));
+        }
     }
     pub fn snapshot(&self) -> Value {
         json!({
@@ -586,6 +787,7 @@ impl SessionTelemetry {
             "timeline_reanchor_shift_us": self.reanchor_shift_us,
             "stall_rtx_drained": self.stall_rtx_drained,
             "stall_rtx_drained_max": self.stall_rtx_drained_max,
+            "stall_rtx_drained_capped": self.stall_rtx_drained_capped,
             "timeline_expired": self.expired,
             "underruns_active": self.underruns_active,
             "underruns_idle": self.underruns_idle,
@@ -628,15 +830,16 @@ pub fn next_session_epoch() -> u64 {
 /// `timeline_resets_<reason>` columns are flat so a spreadsheet `SUM` keeps per
 /// cause, and `last_timeline_reset_reason` records the most recent one.
 ///
-/// Layout (33 columns): the 21 scalar fields, then the eleven reset buckets in
+/// Layout (34 columns): the 22 scalar fields, then the eleven reset buckets in
 /// [`TimelineResetReason::ALL`] declaration order, then the last-reason label.
 /// The two lead-shift fields sit next to `applied_lead_ms` because they describe
 /// the same adaptive ladder; they are counters, not reset buckets, and every
 /// shift moves them while only a >= 5 ms shift (the splice ramp) increments
-/// `timeline_resets_latency_change`. The two stall-severity fields sit next to
+/// `timeline_resets_latency_change`. The three stall-severity fields sit next to
 /// `reanchored` for the same reason: `reanchored` says how often the sender
-/// stalled, they say how loud each stall was.
-pub const SUMMARY_COLUMNS: [&str; 33] = [
+/// stalled, they say how loud each stall was and how many drains were so large
+/// that the 250 ms window could not prove them complete.
+pub const SUMMARY_COLUMNS: [&str; 34] = [
     "session_id",
     "topology",
     "codec",
@@ -652,6 +855,7 @@ pub const SUMMARY_COLUMNS: [&str; 33] = [
     "reanchored",
     "stall_rtx_drained",
     "stall_rtx_drained_max",
+    "stall_rtx_drained_capped",
     "servo_engagements",
     "baseline_resets",
     "mean_lateness_ms",
@@ -699,8 +903,10 @@ pub struct SessionSummary {
     pub reanchored: u64,
     /// Retransmit requests drained after stalls: how loud they were.
     pub stall_rtx_drained: u64,
-    /// Largest single-stall drain.
+    /// Largest single-stall drain the window proved exact.
     pub stall_rtx_drained_max: u64,
+    /// Stalls whose drain window closed capped (a lower bound, not an exact count).
+    pub stall_rtx_drained_capped: u64,
     pub servo_engagements: u64,
     pub baseline_resets: u64,
     pub mean_lateness_ms: f64,
@@ -739,6 +945,7 @@ impl SessionSummary {
             "reanchored": self.reanchored,
             "stall_rtx_drained": self.stall_rtx_drained,
             "stall_rtx_drained_max": self.stall_rtx_drained_max,
+            "stall_rtx_drained_capped": self.stall_rtx_drained_capped,
             "servo_engagements": self.servo_engagements,
             "baseline_resets": self.baseline_resets,
             "mean_lateness_ms": self.mean_lateness_ms,
@@ -776,6 +983,7 @@ impl SessionSummary {
             self.reanchored.to_string(),
             self.stall_rtx_drained.to_string(),
             self.stall_rtx_drained_max.to_string(),
+            self.stall_rtx_drained_capped.to_string(),
             self.servo_engagements.to_string(),
             self.baseline_resets.to_string(),
             format!("{:.3}", self.mean_lateness_ms),
@@ -1069,6 +1277,7 @@ mod tests {
             reanchored: 3,
             stall_rtx_drained: 12,
             stall_rtx_drained_max: 7,
+            stall_rtx_drained_capped: 5,
             servo_engagements: 4,
             baseline_resets: 1,
             mean_lateness_ms: 1.234,
@@ -1155,62 +1364,91 @@ mod tests {
         );
     }
 
-    /// Feed `seconds` of a steady rate at the sampling interval. One counter tick
-    /// per `ticks_per_second` is spread over the four samples of each second.
-    fn feed_steady(evidence: &mut RtpEvidence, t0: Instant, seconds: u64, per_second: u64) {
+    /// Feed `seconds` of a steady rate, one sample every 250 ms. Returns the
+    /// cumulative `(retransmit requests, packets sent)` after the last sample.
+    fn feed_steady(
+        evidence: &mut RtpEvidence,
+        t0: Instant,
+        seconds: u64,
+        rtx_per_s: u64,
+        packets_per_s: u64,
+    ) -> (u64, u64) {
+        let mut totals = (0, 0);
         for i in 0..=seconds * 4 {
-            evidence.sample(
-                t0 + Duration::from_millis(250 * i),
-                i * per_second / 4,
-                0,
-            );
+            totals = (i * rtx_per_s / 4, i * packets_per_s / 4);
+            evidence.sample(t0 + Duration::from_millis(250 * i), totals.0, 0, totals.1);
+        }
+        totals
+    }
+
+    /// A baseline with explicit counts. The formula tests do not need a sample
+    /// ring to say what `transport_bad` must answer.
+    fn baseline(
+        span: Duration,
+        steady_rtx: u32,
+        steady_packets: u64,
+        pre_rtx: u32,
+        pre_packets: u64,
+    ) -> RtpBaseline {
+        RtpBaseline {
+            baseline_span: span,
+            steady_packets_sent: steady_packets,
+            steady_rtx,
+            steady_underrun: 0,
+            pre_stall_packets_sent: pre_packets,
+            pre_stall_rtx: pre_rtx,
+            pre_stall_underrun: 0,
         }
     }
 
     #[test]
     fn a_steady_baseline_absorbs_a_small_pre_stall_increment() {
         let t0 = Instant::now();
-        // 2 rtx/s for 30 s is this link's normal loss; a binary "did anything
-        // move" test would have called the next stall a transport failure.
+        // 2 requests/s at 350 packets/s for 30 s is this link's normal loss; a
+        // binary "did anything move" test would have called the next stall a
+        // transport failure.
         let mut evidence = RtpEvidence::default();
-        feed_steady(&mut evidence, t0, 30, 2);
+        let (rtx, sent) = feed_steady(&mut evidence, t0, 30, 2, 350);
         let now = t0 + Duration::from_millis(30_500);
-        evidence.sample(now, 63, 0);
-        let baseline = evidence.baseline(now, 63, 0).expect("window exists");
+        evidence.sample(now, rtx + 2, 0, sent + 350);
+        let baseline = evidence
+            .baseline(now, rtx + 2, 0, sent + 350)
+            .expect("window exists");
         assert!(
             baseline.pre_stall_rtx >= 1,
             "the old binary test would have fired: {baseline:?}"
         );
         assert!(
-            (baseline.steady_rtx_per_s - 2.0).abs() < 0.2,
-            "steady rate must describe the link, got {baseline:?}"
-        );
-        assert!(
-            baseline.rtx_ratio() <= RtpBaseline::RATIO_THRESHOLD,
-            "a normal increment must stay inside the ratio: {baseline:?}"
+            (baseline.steady_rtx_fraction() * 350.0 - 2.0).abs() < 0.1,
+            "the steady fraction must describe the link's 2 requests/s: {baseline:?}"
         );
         assert!(!baseline.transport_bad(), "{baseline:?}");
         assert_eq!(
-            evidence.reset_reason(now, 63, 0),
+            evidence.reset_reason(now, rtx + 2, 0, sent + 350),
             TimelineResetReason::SenderStall
         );
     }
 
     #[test]
-    fn a_clear_spike_above_the_steady_rate_is_a_transport_failure() {
+    fn a_clear_spike_above_the_steady_fraction_is_a_transport_failure() {
         let t0 = Instant::now();
         let mut evidence = RtpEvidence::default();
-        feed_steady(&mut evidence, t0, 30, 1);
+        let (rtx, sent) = feed_steady(&mut evidence, t0, 30, 1, 350);
         let now = t0 + Duration::from_millis(30_750);
         // Eleven requests in the pre-stall window against a 1/s steady rate.
-        evidence.sample(now, 40, 0);
-        let baseline = evidence.baseline(now, 40, 0).expect("window exists");
-        assert_eq!(baseline.pre_stall_rtx, 11);
-        assert!(baseline.steady_rtx_per_s < 1.5, "{baseline:?}");
-        assert!(baseline.rtx_ratio() > RtpBaseline::RATIO_THRESHOLD);
+        evidence.sample(now, rtx + 10, 0, sent + 350);
+        let baseline = evidence
+            .baseline(now, rtx + 10, 0, sent + 350)
+            .expect("window exists");
+        assert!(baseline.pre_stall_rtx >= 11, "{baseline:?}");
+        assert!(
+            baseline.rtx_fraction()
+                > baseline.steady_rtx_fraction() * RtpBaseline::RATIO_THRESHOLD,
+            "{baseline:?}"
+        );
         assert!(baseline.transport_bad(), "{baseline:?}");
         assert_eq!(
-            evidence.reset_reason(now, 40, 0),
+            evidence.reset_reason(now, rtx + 10, 0, sent + 350),
             TimelineResetReason::ConfirmedTransportFailure
         );
     }
@@ -1218,35 +1456,34 @@ mod tests {
     #[test]
     fn one_underrun_is_transport_evidence_while_one_rtx_is_not() {
         let t0 = Instant::now();
-        // A clean link: the denominator is zero, so the ratio floor applies and
-        // the absolute minimums decide.
+        // A link that never concealed has no relative underrun baseline, so the
+        // absolute rule decides: one concealed underrun is already audible.
         let mut underruns = RtpEvidence::default();
-        feed_steady(&mut underruns, t0, 30, 0);
+        let (_, sent) = feed_steady(&mut underruns, t0, 30, 0, 350);
         let now = t0 + Duration::from_millis(30_250);
-        underruns.sample(now, 0, 1);
-        let baseline = underruns.baseline(now, 0, 1).expect("window exists");
+        underruns.sample(now, 0, 1, sent + 350);
+        let baseline = underruns
+            .baseline(now, 0, 1, sent + 350)
+            .expect("window exists");
         assert_eq!(baseline.pre_stall_rtx, 0);
         assert_eq!(baseline.pre_stall_underrun, 1);
-        assert!(
-            baseline.underrun_ratio() > RtpBaseline::RATIO_THRESHOLD,
-            "{baseline:?}"
-        );
+        assert!(!baseline.relative_underrun(), "{baseline:?}");
         assert!(baseline.transport_bad(), "{baseline:?}");
         assert_eq!(
-            underruns.reset_reason(now, 0, 1),
+            underruns.reset_reason(now, 0, 1, sent + 350),
             TimelineResetReason::ConfirmedTransportFailure
         );
-        // The same single event on the retransmit side is only a lost packet:
-        // rtx needs an absolute minimum of three as well as the ratio.
+        // A single retransmit request on a clean link is only a lost packet: on
+        // the absolute path the count needs 30.
         let mut rtx = RtpEvidence::default();
-        feed_steady(&mut rtx, t0, 30, 0);
-        rtx.sample(now, 1, 0);
-        let baseline = rtx.baseline(now, 1, 0).expect("window exists");
+        let (_, sent) = feed_steady(&mut rtx, t0, 30, 0, 350);
+        rtx.sample(now, 1, 0, sent + 350);
+        let baseline = rtx.baseline(now, 1, 0, sent + 350).expect("window exists");
         assert_eq!(baseline.pre_stall_rtx, 1);
-        assert!(baseline.rtx_ratio() > RtpBaseline::RATIO_THRESHOLD);
+        assert!(!baseline.relative_rtx(), "{baseline:?}");
         assert!(!baseline.transport_bad(), "{baseline:?}");
         assert_eq!(
-            rtx.reset_reason(now, 1, 0),
+            rtx.reset_reason(now, 1, 0, sent + 350),
             TimelineResetReason::SenderStall
         );
     }
@@ -1257,15 +1494,15 @@ mod tests {
         let mut evidence = RtpEvidence::default();
         // No sample at all: the conservative answer is a local stall.
         assert_eq!(
-            evidence.reset_reason(t0, 9, 9),
+            evidence.reset_reason(t0, 9, 9, 900),
             TimelineResetReason::SenderStall
         );
-        feed_steady(&mut evidence, t0, 30, 1);
+        let (rtx, sent) = feed_steady(&mut evidence, t0, 30, 1, 350);
         // A stall longer than the pre-stall window leaves no baseline.
         let far = t0 + Duration::from_millis(31_600);
-        assert!(evidence.baseline(far, 40, 0).is_none());
+        assert!(evidence.baseline(far, rtx + 10, 0, sent + 350).is_none());
         assert_eq!(
-            evidence.reset_reason(far, 40, 0),
+            evidence.reset_reason(far, rtx + 10, 0, sent + 350),
             TimelineResetReason::SenderStall
         );
         // A re-anchor starts a new pre-stall window: samples at or before it are
@@ -1274,34 +1511,265 @@ mod tests {
         evidence.reset(now);
         assert!(
             evidence
-                .baseline(now + Duration::from_millis(100), 31, 0)
+                .baseline(now + Duration::from_millis(100), rtx + 1, 0, sent + 1)
                 .is_none()
         );
         // The long steady samples survive the re-anchor: once a post-reset sample
-        // exists, the link's normal rate is still known.
+        // exists, the link's normal loss fraction is still known.
         let later = t0 + Duration::from_millis(30_500);
-        evidence.sample(later, 31, 0);
-        let baseline = evidence.baseline(later, 31, 0).expect("window exists");
+        evidence.sample(later, rtx + 1, 0, sent + 1);
+        let baseline = evidence
+            .baseline(later, rtx + 1, 0, sent + 1)
+            .expect("window exists");
         assert!(
-            (baseline.steady_rtx_per_s - 1.0).abs() < 0.2,
+            (baseline.steady_rtx_fraction() * 350.0 - 1.0).abs() < 0.1,
             "{baseline:?}"
+        );
+        assert!(
+            baseline.baseline_span >= Duration::from_secs(29),
+            "the baseline still covers the samples from before the re-anchor: {baseline:?}"
         );
     }
 
     #[test]
-    fn stall_severity_counts_the_total_and_the_worst_single_stall() {
+    fn the_fraction_distinguishes_three_out_of_three_from_three_out_of_three_thousand() {
+        // Same steady state (0.5 requests/s at 350 packets/s) and the same three
+        // pre-stall requests. The old rate ratio scores both 6x, because it only
+        // ever looked at requests per second; the fraction scores 100 % loss and
+        // 0.1 % loss.
+        let all_lost = baseline(Duration::from_secs(30), 15, 10_500, 3, 3);
+        let background = baseline(Duration::from_secs(30), 15, 10_500, 3, 3000);
+        let rate_ratio = |b: &RtpBaseline| {
+            let per_s = f64::from(b.steady_rtx) / b.baseline_span.as_secs_f64();
+            f64::from(b.pre_stall_rtx) / per_s
+        };
+        assert_eq!(
+            rate_ratio(&all_lost),
+            rate_ratio(&background),
+            "the volume-blind rate ratio cannot tell the two apart"
+        );
+        assert_eq!(all_lost.rtx_fraction(), 1.0);
+        assert!((background.rtx_fraction() - 0.001).abs() < 1e-12);
+        assert_ne!(all_lost.rtx_fraction(), background.rtx_fraction());
+        assert!(all_lost.transport_bad(), "{all_lost:?}");
+        assert!(!background.transport_bad(), "{background:?}");
+    }
+
+    #[test]
+    fn a_low_volume_stream_is_not_misjudged_by_its_packet_rate() {
+        let t0 = Instant::now();
+        // A low-bitrate stream: 5 packets/s, 150 packets over a clean 30 s
+        // baseline. The old rate ratio divided three requests by the 0.05/s floor
+        // and called this 60x; the fraction has no such amplifier, and a baseline
+        // with zero requests is compared by the absolute count instead.
+        let mut evidence = RtpEvidence::default();
+        let (rtx, sent) = feed_steady(&mut evidence, t0, 30, 0, 5);
+        assert_eq!(rtx, 0);
+        let now = t0 + Duration::from_millis(30_500);
+        // Half a second at 5 packets/s after the last steady sample: the pre-stall
+        // window then covers exactly one second, i.e. five packets.
+        evidence.sample(now, 3, 0, sent + 2);
+        let baseline = evidence
+            .baseline(now, 3, 0, sent + 2)
+            .expect("window exists");
+        assert_eq!(baseline.pre_stall_packets_sent, 5);
+        assert_eq!(baseline.pre_stall_rtx, 3);
+        assert_eq!(baseline.steady_rtx, 0, "the baseline carried no requests");
+        assert!(!baseline.relative_rtx(), "{baseline:?}");
+        assert!(
+            !baseline.transport_bad(),
+            "three requests is below the absolute minimum, whatever the packet rate: {baseline:?}"
+        );
+        assert_eq!(
+            evidence.reset_reason(now, 3, 0, sent + 2),
+            TimelineResetReason::SenderStall
+        );
+        // The absolute rule still fires at 30 requests, at any bitrate.
+        assert!(
+            evidence
+                .baseline(now, 30, 0, sent + 2)
+                .expect("window exists")
+                .transport_bad()
+        );
+    }
+
+    #[test]
+    fn a_baseline_shorter_than_ten_seconds_uses_the_absolute_count() {
+        // 5 s is too short to estimate a loss fraction (Q47 §二): the relative
+        // test would fire, but it must not be used.
+        let mut short = baseline(Duration::from_secs(5), 2, 1750, 3, 350);
+        assert!(
+            short.rtx_fraction()
+                > short.steady_rtx_fraction() * RtpBaseline::RATIO_THRESHOLD,
+            "the relative test would have fired: {short:?}"
+        );
+        assert!(!short.relative_rtx(), "{short:?}");
+        assert!(
+            !short.transport_bad(),
+            "3 requests is below the absolute minimum: {short:?}"
+        );
+        // 30 requests inside one window is a lot regardless of bitrate.
+        short.pre_stall_rtx = RtpBaseline::ABS_RTX_BAD;
+        assert!(short.transport_bad(), "{short:?}");
+        // A 10 s baseline is long enough again, and the same counts are judged
+        // relatively.
+        let long = baseline(Duration::from_secs(10), 2, 3500, 3, 350);
+        assert!(long.relative_rtx(), "{long:?}");
+        assert!(long.transport_bad(), "{long:?}");
+    }
+
+    #[test]
+    fn the_steady_fraction_uses_the_measured_span_not_a_nominal_thirty_seconds() {
+        let t0 = Instant::now();
+        let mut evidence = RtpEvidence::default();
+        // Only 12 s of history: the steady window is younger than its 30 s
+        // nominal length. 1 request/s at 350 packets/s is the link's normal loss.
+        let (rtx, sent) = feed_steady(&mut evidence, t0, 12, 1, 350);
+        let now = t0 + Duration::from_millis(12_750);
+        evidence.sample(now, rtx + 2, 0, sent + 350);
+        let baseline = evidence
+            .baseline(now, rtx + 2, 0, sent + 350)
+            .expect("window exists");
+        assert_eq!(baseline.pre_stall_rtx, 3);
+        assert!(
+            (baseline.baseline_span.as_secs_f64() - 11.75).abs() < 0.01,
+            "the divisor is the measured span, not the 30 s window: {baseline:?}"
+        );
+        // 3 requests over 438 packets against 11 over 4112 is 2.56x: a normal
+        // fluctuation. Dividing the same counts by a nominal 30 s would make the
+        // steady fraction 2.5x too small and turn it into a 6.5x "spike" — a
+        // false transport failure, the one direction that must not happen.
+        assert!(!baseline.transport_bad(), "{baseline:?}");
+        let packets_per_s =
+            baseline.steady_packets_sent as f64 / baseline.baseline_span.as_secs_f64();
+        let assumed_fraction = f64::from(baseline.steady_rtx) / (packets_per_s * 30.0);
+        assert!(
+            baseline.rtx_fraction() > assumed_fraction * RtpBaseline::RATIO_THRESHOLD,
+            "the assumed 30 s denominator would have been a false positive: {baseline:?}"
+        );
+    }
+
+    #[test]
+    fn stall_severity_counts_the_total_and_the_worst_uncapped_stall() {
         let mut telemetry = SessionTelemetry::new();
         assert_eq!(telemetry.stall_rtx_drained, 0);
         assert_eq!(telemetry.stall_rtx_drained_max, 0);
-        telemetry.record_stall_drain(3);
-        telemetry.record_stall_drain(9);
+        assert_eq!(telemetry.stall_rtx_drained_capped, 0);
+        telemetry.record_stall_drain(StallDrain {
+            drained: 3,
+            capped: false,
+        });
+        telemetry.record_stall_drain(StallDrain {
+            drained: 9,
+            capped: false,
+        });
         // A stall the receiver's buffer absorbed adds nothing but a count.
-        telemetry.record_stall_drain(0);
+        telemetry.record_stall_drain(StallDrain {
+            drained: 0,
+            capped: false,
+        });
         assert_eq!(telemetry.stall_rtx_drained, 12);
         assert_eq!(telemetry.stall_rtx_drained_max, 9);
+        // A capped drain is a lower bound: it counts towards the total and the
+        // "undrainable" tally, but must not enter the exact maximum.
+        telemetry.record_stall_drain(StallDrain {
+            drained: 40,
+            capped: true,
+        });
+        assert_eq!(telemetry.stall_rtx_drained, 52);
+        assert_eq!(telemetry.stall_rtx_drained_max, 9);
+        assert_eq!(telemetry.stall_rtx_drained_capped, 1);
         let snapshot = telemetry.snapshot();
-        assert_eq!(snapshot["stall_rtx_drained"], json!(12));
+        assert_eq!(snapshot["stall_rtx_drained"], json!(52));
         assert_eq!(snapshot["stall_rtx_drained_max"], json!(9));
+        assert_eq!(snapshot["stall_rtx_drained_capped"], json!(1));
+    }
+
+    #[test]
+    fn a_long_stall_drains_past_sixteen_requests_within_the_window() {
+        let start = Instant::now();
+        let mut window = StallDrainWindow::open(start, 1_000);
+        // A 2 s stall at ~350 packets/s leaves ~700 requests queued. At the 16
+        // requests `service_retransmits` accepts per iteration that is 44
+        // iterations, far inside the 250 ms window. The old first-drain field
+        // reported 16 here, i.e. 2 % of the real backlog.
+        let mut total = 1_000;
+        let mut closed = None;
+        for i in 1..=250 {
+            total += if i <= 44 { 16 } else { 0 };
+            if let Some(drain) = window.observe(start + Duration::from_millis(i), total) {
+                closed = Some((i, drain));
+                break;
+            }
+        }
+        let (iteration, drain) = closed.expect("the 250 ms window must close");
+        assert_eq!(iteration, 250, "the window is a fixed 250 ms");
+        assert_eq!(drain.drained, 704, "{drain:?}");
+        assert!(drain.drained > 16, "the old ceiling saturated at 16");
+        assert!(
+            !drain.capped,
+            "the queue was empty before the deadline, so the count is exact"
+        );
+    }
+
+    #[test]
+    fn a_stall_still_draining_at_the_deadline_is_reported_capped() {
+        let start = Instant::now();
+        let mut window = StallDrainWindow::open(start, 0);
+        let mut total = 0;
+        let mut drain = None;
+        for i in 1..=250 {
+            total += 16;
+            if let Some(closed) = window.observe(start + Duration::from_millis(i), total) {
+                drain = Some(closed);
+                break;
+            }
+        }
+        let drain = drain.expect("the 250 ms window must close");
+        assert_eq!(drain.drained, 4_000, "{drain:?}");
+        assert!(
+            drain.capped,
+            "requests were still being served at the deadline, so the count is a lower bound"
+        );
+    }
+
+    #[test]
+    fn a_second_reanchor_closes_the_window_capped_instead_of_merging() {
+        let start = Instant::now();
+        let mut first = StallDrainWindow::open(start, 0);
+        assert!(
+            first
+                .observe(start + Duration::from_millis(10), 500)
+                .is_none()
+        );
+        // Another re-anchor at 100 ms: the first stall closes early as a lower
+        // bound instead of running into the next stall's window.
+        let first_drain = first.close_early(500);
+        assert_eq!(
+            first_drain,
+            StallDrain {
+                drained: 500,
+                capped: true
+            }
+        );
+        // The second window starts from the counter as it stands, so the first
+        // stall's drain is not counted twice and the two windows never merge.
+        let mut second = StallDrainWindow::open(start + Duration::from_millis(100), 500);
+        let mut total = 500;
+        let mut second_drain = None;
+        for i in 1..=250 {
+            total += 8;
+            if let Some(closed) =
+                second.observe(start + Duration::from_millis(100 + i), total)
+            {
+                second_drain = Some(closed);
+                break;
+            }
+        }
+        let second_drain = second_drain.expect("the second window must close");
+        // 250 iterations × 8 requests, starting from the 500 the first stall had
+        // already served: the two stalls never merge into one number.
+        assert_eq!(second_drain.drained, 2_000, "{second_drain:?}");
     }
 
     #[test]
@@ -1352,6 +1820,7 @@ mod tests {
                         | "lead_shift_total_us"
                         | "stall_rtx_drained"
                         | "stall_rtx_drained_max"
+                        | "stall_rtx_drained_capped"
                 )
             {
                 assert_eq!(*value, "0", "{column} must be zero");
@@ -1448,6 +1917,7 @@ mod tests {
                 "reanchored" => assert_eq!(fields[index], "3"),
                 "stall_rtx_drained" => assert_eq!(fields[index], "12"),
                 "stall_rtx_drained_max" => assert_eq!(fields[index], "7"),
+                "stall_rtx_drained_capped" => assert_eq!(fields[index], "5"),
                 "servo_engagements" => assert_eq!(fields[index], "4"),
                 "baseline_resets" => assert_eq!(fields[index], "1"),
                 "mean_lateness_ms" => assert_eq!(fields[index], "1.234"),

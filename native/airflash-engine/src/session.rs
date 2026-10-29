@@ -1836,6 +1836,20 @@ fn run_stream(
     outcome
 }
 
+/// Cumulative RTP totals across the group: retransmit requests and packets sent.
+///
+/// The retransmit fraction (Q47 §二) needs both sides of the ratio, and the group
+/// is one logical stream, so the members are summed just like the IPC metrics
+/// already do.
+fn rtp_totals(members: &[Member]) -> (u64, u64) {
+    members.iter().fold((0, 0), |(rtx, sent), member| {
+        (
+            rtx.saturating_add(member.media.metrics.retransmit_requests),
+            sent.saturating_add(member.media.metrics.packets_sent),
+        )
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn send_packets(
     options: &ProbeOptions,
@@ -1937,10 +1951,11 @@ fn send_packets(
     // Q44). The pre-stall window is compared against the sender's own steady
     // state, so a link with constant background loss is not a fault.
     let mut rtp_evidence = crate::telemetry::RtpEvidence::default();
-    // Retransmit counter when the current stall was re-anchored. The requests
-    // that arrived during the stall are drained on the same iteration, so the
-    // delta after `service_retransmits` is the stall's severity (Q44 §一).
-    let mut stall_rtx_base: Option<u64> = None;
+    // The busy time of the most recent stall: a fixed 250 ms window that
+    // accumulates the retransmit requests the stall left queued (Q44 §一,
+    // Q47 §三). A second re-anchor closes it early as capped instead of merging
+    // two stalls into one number.
+    let mut stall_drain: Option<crate::telemetry::StallDrainWindow> = None;
     let mut last_marker = 0u64;
     let mut next_sync = start;
     let mut silence_packets = 0u64;
@@ -2152,15 +2167,11 @@ fn send_packets(
             let now = Instant::now();
             // Sample the cumulative RTP counters for the re-anchor evidence
             // window. `sample` throttles itself; this runs once per packet at
-            // most, and never during a stall (the loop is not running).
-            rtp_evidence.sample(
-                now,
-                members
-                    .iter()
-                    .map(|member| member.media.metrics.retransmit_requests)
-                    .sum(),
-                telemetry.underruns_active,
-            );
+            // most, and never during a stall (the loop is not running). Packets
+            // sent is sampled with the counters because the discriminator is a
+            // retransmit *fraction*, not a rate (Q47 §二).
+            let (rtx_total, sent_total) = rtp_totals(members);
+            rtp_evidence.sample(now, rtx_total, telemetry.underruns_active, sent_total);
             if now < deadline {
                 thread::sleep((deadline - now).min(Duration::from_millis(2)));
                 continue;
@@ -2245,21 +2256,27 @@ fn send_packets(
                             // stall. The heuristic is documented on `RtpEvidence`;
                             // the fallback is deliberately the conservative
                             // `sender_stall`.
-                            let rtp_req: u64 = members
-                                .iter()
-                                .map(|member| member.media.metrics.retransmit_requests)
-                                .sum();
+                            let (rtp_req, packets_sent) = rtp_totals(members);
                             let reason = rtp_evidence.reset_reason(
                                 now,
                                 rtp_req,
                                 telemetry.underruns_active,
+                                packets_sent,
                             );
                             // Start a new pre-stall window: the RTCP requests that
                             // arrived during this stall are drained after it, and
                             // must not be counted against the next re-anchor. The
                             // long steady baseline is kept.
                             rtp_evidence.reset(now);
-                            stall_rtx_base = Some(rtp_req);
+                            // A window still open here belongs to an *earlier*
+                            // stall: close it capped (a lower bound) instead of
+                            // letting this re-anchor merge two stalls (Q47 §三).
+                            if let Some(window) = stall_drain.take() {
+                                telemetry.record_stall_drain(window.close_early(rtp_req));
+                            }
+                            stall_drain = Some(crate::telemetry::StallDrainWindow::open(
+                                now, rtp_req,
+                            ));
                             telemetry.record_timeline_reset(reason);
                             recovery_left = 0;
                             if let Some(source) = &live {
@@ -2401,17 +2418,16 @@ fn send_packets(
             for member in members.iter_mut() {
                 member.media.service_retransmits();
             }
-            // Q44 §一: the first drain call after a stall is the backlog that
-            // stall created, i.e. how loud it was. A backlog larger than the
-            // per-call budget spills into later iterations and is not attributed
-            // to this stall, so the count is a lower bound.
-            if let Some(base) = stall_rtx_base.take() {
-                let drained = members
-                    .iter()
-                    .map(|member| member.media.metrics.retransmit_requests)
-                    .sum::<u64>()
-                    .saturating_sub(base);
-                telemetry.record_stall_drain(drained);
+            // Q44 §一, Q47 §三: accumulate the backlog a stall left queued over a
+            // fixed 250 ms window. One `service_retransmits` call accepts at most
+            // 16 requests, so measuring only the first drain after the re-anchor
+            // saturates at 16 and stops saying anything about severity.
+            if let Some(window) = stall_drain.as_mut() {
+                let drained = window.observe(Instant::now(), rtp_totals(members).0);
+                if let Some(drain) = drained {
+                    telemetry.record_stall_drain(drain);
+                    stall_drain = None;
+                }
             }
             schedule.sent();
             packets += 1;
@@ -2422,6 +2438,11 @@ fn send_packets(
         }
         Ok(StreamEnd::Finished)
     })();
+    // A stall in the last 250 ms of the session never reaches its own deadline.
+    // Report what the window saw rather than dropping the stall from the summary.
+    if let Some(window) = stall_drain.take() {
+        telemetry.record_stall_drain(window.close(rtp_totals(members).0));
+    }
     // Stop/reconfiguration shares one faded final packet and drains its render
     // deadline on every member before tearing down the common session.
     //
@@ -2587,11 +2608,14 @@ fn session_summary(
         underruns: telemetry.underruns_active,
         gap_filled: telemetry.gap_filled,
         reanchored: telemetry.reanchored,
-        // Q44 §一: severity, not just count. `reanchored` says how often the
-        // sender stalled; these say how loud the stalls were. A high stall count
-        // with a near-zero drain is healthy (the buffer absorbed it).
+        // Q44 §一, Q47 §三: severity, not just count. `reanchored` says how often
+        // the sender stalled; these say how loud the stalls were. A high stall
+        // count with a near-zero drain is healthy (the buffer absorbed it).
         stall_rtx_drained: telemetry.stall_rtx_drained,
         stall_rtx_drained_max: telemetry.stall_rtx_drained_max,
+        // Stalls whose 250 ms window closed capped: the drain is a lower bound,
+        // so it stays out of `_max` and is counted here instead.
+        stall_rtx_drained_capped: telemetry.stall_rtx_drained_capped,
         servo_engagements: telemetry.servo_engagements,
         // Servo "steps" is the existing full-loop reset after a discontinuity
         // (filter, correction and engagement cleared). It is the closest counter
@@ -4647,6 +4671,7 @@ mod tests {
         // No stall happened, so the severity counters stay at zero (Q44 §一).
         assert_eq!(summaries[0]["stall_rtx_drained"], json!(0));
         assert_eq!(summaries[0]["stall_rtx_drained_max"], json!(0));
+        assert_eq!(summaries[0]["stall_rtx_drained_capped"], json!(0));
         assert!(summaries[0].get("rebuild_count").is_none());
         drop(members);
         server.join().unwrap();
@@ -4728,6 +4753,9 @@ mod tests {
         // Q44 §一: stall severity is copied verbatim, separately from the count.
         telemetry.stall_rtx_drained = 12;
         telemetry.stall_rtx_drained_max = 7;
+        // Q47 §三: drains the 250 ms window could not prove exact are counted
+        // separately so a distribution over `_max` never mixes in lower bounds.
+        telemetry.stall_rtx_drained_capped = 2;
         telemetry.underruns_active = 4;
         telemetry.underruns_idle = 9;
         telemetry.servo_engagements = 3;
@@ -4769,6 +4797,7 @@ mod tests {
         assert_eq!(summary.reanchored, 2);
         assert_eq!(summary.stall_rtx_drained, 12);
         assert_eq!(summary.stall_rtx_drained_max, 7);
+        assert_eq!(summary.stall_rtx_drained_capped, 2);
         assert_eq!(summary.servo_engagements, 3);
         assert_eq!(summary.baseline_resets, 6);
         assert_eq!(summary.mean_lateness_ms, 2.0);
@@ -4788,6 +4817,7 @@ mod tests {
         assert!(event.get("rebuild_count").is_none());
         assert_eq!(event["stall_rtx_drained"], json!(12));
         assert_eq!(event["stall_rtx_drained_max"], json!(7));
+        assert_eq!(event["stall_rtx_drained_capped"], json!(2));
         assert_eq!(
             event["timeline_resets"]["confirmed_transport_failure"],
             json!(1)
