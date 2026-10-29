@@ -937,8 +937,8 @@ Q24（同上）。
   引擎 `start` 使用的 session id 一致（引擎行再加 `-<epoch>` 后缀）、写文件
   失败不影响会话；telemetry 侧覆盖 JSON 字段/redact 形状、CSV 列序与无身份
   字段、追加时只写一次表头；桌面侧覆盖表头/转义/不可写路径。
-- **验证**：Rust lib 214 passed + 1 ignored、main 2、集成 35 passed + 1 ignored，
-  合计 251 passed / 2 ignored；clippy `-D warnings` 无告警；
+- **验证**：Rust lib 225 passed + 1 ignored、main 2、集成 38 passed + 1 ignored，
+  合计 265 passed / 2 ignored；clippy `-D warnings` 无告警；
   `build-native.ps1 -Check` 通过；.NET 553 通过；pytest 141 通过；ruff 无问题。
   .NET 首次全量运行时 `EngineStandbyReleasesMuteAndMetricsCannotOverrideState`
   偶发一次事件时序空引用，单跑与全量重跑均通过（历史记录）。
