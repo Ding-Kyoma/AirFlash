@@ -1170,6 +1170,14 @@ enum StreamEnd {
     SourceEnded,
 }
 
+/// A capture source that ended is reopened with a brand-new timeline. This is
+/// deliberately not `start`: the reference implementation's `start` means
+/// "session start", which AirFlash never counts because the first timeline of a
+/// row is its baseline (Q43 §四). `source_restart` keeps the two meanings apart.
+fn source_restart_reason() -> TimelineResetReason {
+    TimelineResetReason::SourceRestart
+}
+
 fn run_live(
     options: ProbeOptions,
     cancel: Cancellation,
@@ -1219,9 +1227,9 @@ fn run_live(
             source = None;
             paused = None;
             // The capture source ended outside a transport end; the next loop
-            // reopens it and starts playback again. This is a fresh start, not a
-            // reconnect after a fault.
-            reset_before = Some(TimelineResetReason::Start);
+            // reopens it and starts playback again. That is a source restart, not
+            // a session start and not a reconnect after a fault (Q43 §四).
+            reset_before = Some(source_restart_reason());
         }
         if source.is_none() && options.source == "loopback" {
             // The capture thread repairs an endpoint in place. Reaching this
@@ -1345,10 +1353,9 @@ fn run_live(
             StreamEnd::SourceEnded => {
                 source = None;
                 paused = None;
-                // A new capture source starts a new playback timeline. There is
-                // no "source restart" reason in the nine; `start` is the closest
-                // fit and is flagged in QUESTIONS Q43.
-                reset_before = Some(TimelineResetReason::Start);
+                // A new capture source starts a new playback timeline, but the
+                // session itself did not start: its own bucket, never `start`.
+                reset_before = Some(source_restart_reason());
             }
             StreamEnd::Silence(at) => {
                 paused = Some(at);
@@ -1703,7 +1710,13 @@ fn send_packets(
     )
     .ok();
     let mut next_metrics = start + Duration::from_secs(1);
-    let mut applied_lead = 0i64;
+    // Applied lead in microseconds: the IPC request is whole milliseconds today,
+    // but keeping the accumulator exact means a future finer-grained request (and
+    // the 1 ms reset threshold below) does not lose a remainder.
+    let mut applied_lead_us = 0i64;
+    // RTP-side evidence for distinguishing a transport failure from a local
+    // sender stall when a successful re-anchor absorbs a missed deadline (Q43).
+    let mut rtp_evidence = crate::telemetry::RtpEvidence::default();
     let mut last_marker = 0u64;
     let mut next_sync = start;
     let mut silence_packets = 0u64;
@@ -1847,21 +1860,34 @@ fn send_packets(
             // exactly what makes the receiver jump a segment).
             let ceiling = lead_ceiling(members);
             let wanted = requested_lead().min(ceiling);
-            if wanted != applied_lead {
-                let applied = schedule.add_shift(wanted - applied_lead);
-                if applied != 0 {
-                    applied_lead += applied;
-                    telemetry.lead_extra_ms = applied_lead as f64;
+            let wanted_us = wanted * 1_000;
+            if wanted_us != applied_lead_us {
+                let applied_us = schedule.add_shift_us(wanted_us - applied_lead_us);
+                if applied_us != 0 {
+                    applied_lead_us += applied_us;
+                    telemetry.lead_extra_ms = applied_lead_us as f64 / 1_000.0;
                     // The timeline anchor moved because *we* asked for a different
-                    // playout lead, not because delivery failed. Keeping this in
-                    // its own bucket is what stops the adaptive ladder from
-                    // masquerading as drift (Q40).
-                    telemetry.record_timeline_reset(TimelineResetReason::LatencyChange);
-                    emit(json!({"event":"lead_changed","channel":"scheduler","host":null,"requested_ms":wanted,"applied_ms":applied_lead,"ceiling_ms":ceiling,"shift_ms":round3(schedule.shift.as_secs_f64() * 1000.0)}));
+                    // playout lead, not because delivery failed. Every shift moves
+                    // the lead counters, but only a >= 1 ms shift is a timeline
+                    // reset: otherwise the adaptive ladder's micro-adjustments
+                    // would drown every fault signal (Q43 §二).
+                    telemetry.record_lead_shift(applied_us);
+                    emit(json!({"event":"lead_changed","channel":"scheduler","host":null,"requested_ms":wanted,"applied_ms":applied_lead_us / 1_000,"shift_us":applied_us,"ceiling_ms":ceiling,"shift_ms":round3(schedule.shift.as_secs_f64() * 1000.0)}));
                 }
             }
             let deadline = schedule.deadline();
             let now = Instant::now();
+            // Sample the cumulative RTP counters for the re-anchor evidence
+            // window. `sample` throttles itself; this runs once per packet at
+            // most, and never during a stall (the loop is not running).
+            rtp_evidence.sample(
+                now,
+                members
+                    .iter()
+                    .map(|member| member.media.metrics.retransmit_requests)
+                    .sum(),
+                telemetry.underruns_active,
+            );
             if now < deadline {
                 thread::sleep((deadline - now).min(Duration::from_millis(2)));
                 continue;
@@ -1936,23 +1962,36 @@ fn send_packets(
                         telemetry.reanchored = schedule.reanchored;
                         telemetry.reanchor_shift_us = schedule.reanchor_shift_us;
                         if !shift.is_zero() {
-                            // Q40 mapping: AirFlash has no "sender stall" reason of
-                            // its own. The deadline was missed beyond silence
-                            // coverage, so delivery of the timeline has factually
-                            // failed; `confirmed_transport_failure` is the closest
-                            // of the nine and the only drift-signalling bucket.
-                            // Flagged in QUESTIONS Q43. A no-op re-anchor
-                            // (`shift == 0`) moved nothing and is not counted.
-                            telemetry.record_timeline_reset(
-                                TimelineResetReason::ConfirmedTransportFailure,
+                            // Q43 §三: a successful re-anchor is not automatically
+                            // a transport failure. A missed deadline can be the
+                            // local scheduler (GC, CPU contention, disk), which
+                            // must not pollute the only drift signal. Only RTP
+                            // movement in the window leading into the stall is
+                            // transport evidence; clean counters mean a sender
+                            // stall. The heuristic is documented on
+                            // `RtpEvidence`; the fallback is deliberately the
+                            // conservative `sender_stall`.
+                            let rtp_req: u64 = members
+                                .iter()
+                                .map(|member| member.media.metrics.retransmit_requests)
+                                .sum();
+                            let reason = rtp_evidence.reset_reason(
+                                now,
+                                rtp_req,
+                                telemetry.underruns_active,
                             );
+                            // Drop the pre-stall baseline: the RTCP requests that
+                            // arrive during this stall are only drained after it,
+                            // and must not be counted against the next re-anchor.
+                            rtp_evidence.reset();
+                            telemetry.record_timeline_reset(reason);
                             recovery_left = 0;
                             if let Some(source) = &live {
                                 // Everything queued is older than the new deadline.
                                 source.discard_stale();
                             }
                             emit(
-                                json!({"event":"warning","code":"timeline_reanchored","channel":"scheduler","host":null,"recovered":true,"late_ms":round3(late.as_secs_f64() * 1000.0),"shift_ms":round3(shift.as_secs_f64() * 1000.0),"lead_ms":round3(schedule.shift.as_secs_f64() * 1000.0),"reanchored":schedule.reanchored,"message":"Sender thread fell behind its catch-up budget; re-anchored the deadline one frame ahead"}),
+                                json!({"event":"warning","code":"timeline_reanchored","channel":"scheduler","host":null,"recovered":true,"late_ms":round3(late.as_secs_f64() * 1000.0),"shift_ms":round3(shift.as_secs_f64() * 1000.0),"lead_ms":round3(schedule.shift.as_secs_f64() * 1000.0),"reanchored":schedule.reanchored,"reset_reason":reason.name(),"message":"Sender thread fell behind its catch-up budget; re-anchored the deadline one frame ahead"}),
                             );
                         }
                     }
@@ -1963,7 +2002,7 @@ fn send_packets(
             // unwind of an already-counted re-anchor, not a new timeline reset:
             // counting it would turn one stall into a stream of `latency_change`
             // events that nobody caused.
-            if applied_lead == 0 {
+            if applied_lead_us == 0 {
                 schedule.relax(now, late);
             }
             if now >= next_sync {
@@ -2189,7 +2228,13 @@ fn send_packets(
     // Roadmap §12.3: exactly one summary per stream attempt. A normal stop, an
     // in-loop fault and the teardown above all reach this single call site with
     // `outcome` already decided, so no path can emit a second record.
-    let summary = session_summary(options, members, &telemetry, applied_lead, start.elapsed());
+    let summary = session_summary(
+        options,
+        members,
+        &telemetry,
+        applied_lead_us / 1_000,
+        start.elapsed(),
+    );
     let path = (!options.report_session_id.is_empty()).then(crate::telemetry::summary_path);
     emit_session_summary(&summary, path.as_deref(), emit);
     drop(volume_workers);
@@ -2234,6 +2279,10 @@ fn session_summary(
         codec: first.map_or("pcm", |member| member.compat.codec_name()),
         timing: first.map_or("ntp", |member| member.compat.timing_name()),
         applied_lead_ms,
+        // Q43 §二: the adaptive ladder's twitching lives here, not in the reset
+        // buckets. Every applied shift counts; only >= 1 ms shifts are resets.
+        lead_shift_count: telemetry.lead_shift_count,
+        lead_shift_total_us: telemetry.lead_shift_total_us,
         // One scheduler tick per media packet; `packets` is the existing
         // per-member counter that `transport_metrics` already publishes.
         packets: telemetry.packets,
@@ -3870,6 +3919,8 @@ mod tests {
         // but it is no longer a summary column: only the reason buckets are.
         telemetry.expired = 1;
         telemetry.lead_extra_ms = 45.0;
+        telemetry.lead_shift_count = 2;
+        telemetry.lead_shift_total_us = 3_000;
         telemetry.record_timeline_reset(TimelineResetReason::ConfirmedTransportFailure);
         telemetry.record_timeline_reset(TimelineResetReason::LatencyChange);
         telemetry.record_timeline_reset(TimelineResetReason::LatencyChange);
@@ -3889,6 +3940,9 @@ mod tests {
         assert_eq!(summary.codec, "pcm");
         assert_eq!(summary.timing, "ntp");
         assert_eq!(summary.applied_lead_ms, 45);
+        // Lead-shift counters are copied verbatim and stay outside the buckets.
+        assert_eq!(summary.lead_shift_count, 2);
+        assert_eq!(summary.lead_shift_total_us, 3_000);
         assert_eq!(summary.packets, 3);
         assert_eq!(summary.rtx_req, 7);
         assert_eq!(summary.rtx_resent, 5);
@@ -3965,6 +4019,78 @@ mod tests {
         );
         drop(members);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_capture_source_reopen_records_source_restart_not_start() {
+        // Q43 §四: the first timeline of a row is the baseline (never `start`),
+        // and a reopened capture source gets its own bucket.
+        assert_eq!(source_restart_reason(), TimelineResetReason::SourceRestart);
+        let options = summary_options("", "single", 40);
+        let (member, receiver, server) = local_member();
+        member
+            .media
+            .connect_audio(receiver.local_addr().unwrap())
+            .unwrap();
+        let gain = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0.0f32.to_bits()));
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let mut members = vec![member];
+        let mut takeovers = preemption::TakeoverCounters::default();
+        let outcome = send_packets(
+            &options,
+            &Cancellation::default(),
+            &gain,
+            crate::volume::Control::default(),
+            None,
+            &crate::standby::Control::default(),
+            &Clock::new(),
+            None,
+            &mut members,
+            None,
+            &mut takeovers,
+            &[],
+            Some(source_restart_reason()),
+            &|event| sink.lock().unwrap().push(event),
+        );
+        assert!(matches!(&outcome, Ok(StreamEnd::Finished)), "{outcome:?}");
+        let summaries = summary_events(&events);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0]["timeline_resets"]["source_restart"],
+            json!(1)
+        );
+        assert_eq!(
+            summaries[0]["timeline_resets"]["start"],
+            json!(0),
+            "a capture-source reopen must never be recorded as a session start"
+        );
+        assert_eq!(
+            summaries[0]["last_timeline_reset_reason"],
+            json!("source_restart")
+        );
+        drop(members);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn sub_millisecond_lead_shift_is_counted_without_a_latency_change_reset() {
+        let mut schedule = MediaSchedule::new(Instant::now(), 44_100);
+        let mut telemetry = crate::telemetry::SessionTelemetry::new();
+        let applied = schedule.add_shift_us(999);
+        assert_eq!(applied, 999, "a microsecond shift must survive exactly");
+        telemetry.record_lead_shift(applied);
+        assert_eq!(telemetry.lead_shift_count, 1);
+        assert_eq!(telemetry.lead_shift_total_us, 999);
+        assert_eq!(
+            telemetry.timeline_resets.latency_change, 0,
+            "sub-millisecond noise must not fill the reset bucket"
+        );
+        let applied = schedule.add_shift_us(1_000);
+        telemetry.record_lead_shift(applied);
+        assert_eq!(telemetry.timeline_resets.latency_change, 1);
+        assert_eq!(telemetry.lead_shift_count, 2);
+        assert_eq!(telemetry.lead_shift_total_us, 1_999);
     }
 
     #[test]

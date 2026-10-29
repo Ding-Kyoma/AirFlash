@@ -830,7 +830,7 @@ Q24（同上）。
   `ClaimsAirPlay2Outdated` 设备 SETUP 失败时仍落到引擎 detail/网络/密码分类；
   是否需要独立门禁文案、组规则是否要把它算作 classic，见 Q39。
 
-## §12.3 会话摘要（已完成，Q40 修订）
+## §12.3 会话摘要（已完成，Q40/Q43 修订）
 
 `native/airflash-engine/src/telemetry.rs`、`src/session.rs`、`src/main.rs`、
 `desktop/AirFlash.Core/SessionController.cs`、`desktop/AirFlash.Core/DesktopSessionLog.cs`
@@ -840,63 +840,100 @@ Q24（同上）。
   `%APPDATA%\AirFlash\logs\session-summary.csv` 追加一行（文件不存在时先写表头）。
   位置就是 WPF 的 `AppPaths.LogDirectory`，引擎侧沿用 `credentials.rs` 的
   `APPDATA\AirFlash` 约定，没有另造目录。
-- **没有「重建次数」，只有「时间线因为什么被重置」**：Q40 的结论。WAC 的
-  `[TIMELINE] reset reason=<reason>` 枚举就是下面 9 个原因，AF 按同样的原因
-  **分桶，永不合并成单一数字**：
+- **没有「重建次数」，只有「时间线因为什么被重置」**：Q40 的结论，Q43 把
+  WAC 的 9 类扩成 **11 个桶**（WAC 的 9 个 + AF 自己的 `source_restart`、
+  `sender_stall`），按原因**分桶，永不合并成单一数字**：
   `start, track_change, user_seek, receiver_rejected_flush, session_restart,
-  confirmed_transport_failure, silence_resume, latency_change, flush`。
-  CSV 是 9 个扁平的 `timeline_resets_<reason>` 列（可直接 SUM），加一个
+  confirmed_transport_failure, silence_resume, latency_change, flush,
+  source_restart, sender_stall`。
+  CSV 是 11 个扁平的 `timeline_resets_<reason>` 列（可直接 SUM），加一个
   `last_timeline_reset_reason` 字符串（`none` = 本会话没有重置）；JSON 事件里
-  是 `timeline_resets` 对象加同一个字符串。完整 27 列：
-  `session_id, topology, codec, timing, applied_lead_ms, packets, rtx_req,
-  rtx_resent, underruns, gap_filled, reanchored, servo_engagements,
-  baseline_resets, mean_lateness_ms, p99_lateness_ms, max_lateness_ms,
-  duration_s, timeline_resets_start, timeline_resets_track_change,
-  timeline_resets_user_seek, timeline_resets_receiver_rejected_flush,
-  timeline_resets_session_restart, timeline_resets_confirmed_transport_failure,
+  是 `timeline_resets` 对象加同一个字符串。完整 31 列（顺序即
+  `telemetry::SUMMARY_COLUMNS` 的唯一声明）：
+  `session_id, topology, codec, timing, applied_lead_ms, lead_shift_count,
+  lead_shift_total_us, packets, rtx_req, rtx_resent, underruns, gap_filled,
+  reanchored, servo_engagements, baseline_resets, mean_lateness_ms,
+  p99_lateness_ms, max_lateness_ms, duration_s, timeline_resets_start,
+  timeline_resets_track_change, timeline_resets_user_seek,
+  timeline_resets_receiver_rejected_flush, timeline_resets_session_restart,
+  timeline_resets_confirmed_transport_failure,
   timeline_resets_silence_resume, timeline_resets_latency_change,
-  timeline_resets_flush, last_timeline_reset_reason`。`rebuild_count` 已删除。
+  timeline_resets_flush, timeline_resets_source_restart,
+  timeline_resets_sender_stall, last_timeline_reset_reason`。
+  `rebuild_count` 已删除。11 个桶按枚举声明顺序排在末尾的
+  `last_timeline_reset_reason` 之前；两个 lead 计数字段紧跟
+  `applied_lead_ms`，因为它们描述同一套自适应 lead，不是重置桶。
+  `track_change` / `user_seek` / `receiver_rejected_flush` / `flush` 在 AF
+  的实时采集链路里没有站点，恒为 0，**保留作 tripwire**（Q43 §五）；`start`
+  同样保留，但引擎不再产生它（见下）。
 - **只有 `confirmed_transport_failure` 是漂移信号**：`track_change` /
   `user_seek` / `flush` / `silence_resume` 是中性或用户动作，`latency_change`
-  是我们自己改 lead，`session_restart` 和 `receiver_rejected_flush` 是各自的
-  诊断。**`latency_change` 与 `silence_resume` 必须能区分**：前者来自
-  `schedule.add_shift` 真正应用了非零 lead 变化（「我们主动干的」），后者来自
+  是我们自己改 lead，`session_restart` / `receiver_rejected_flush` /
+  `source_restart` 是各自的诊断，`sender_stall` 是本机侧错过 deadline。
+  **`latency_change` 与 `silence_resume` 必须能区分**：前者来自
+  `schedule.add_shift` 真正应用了 lead 变化（「我们主动干的」），后者来自
   standby 暂停后恢复、整条时间线重建（「静音后恢复」）；两者都不增加
-  `confirmed_transport_failure`。重锚（`LateAction::Reanchor` 成功且 shift
-  非零）和 `timeline_expired` 归入 `confirmed_transport_failure`——前者是
-  发送线程错过 deadline、时间线只能前移，九类里最接近，映射在代码注释和
-  Q43 里标注。
+  `confirmed_transport_failure`。
+  **重锚不再无条件算传输故障**（Q43 §三）：`LateAction::Reanchor` 成功且
+  shift 非零时，发送线程错过 deadline 可能只是本机调度（GC/CPU 争用/磁盘
+  抖动），也可能是网络真的坏了。判据是重锚前同一窗口的 RTP 侧证据：
+  `rtx_req`（各成员 `retransmit_requests` 之和）或 `underruns_active` 相对
+  基线上涨 ⇒ `confirmed_transport_failure`；两者都干净 ⇒ `sender_stall`。
+  窗口取 **1 s**：发送循环每 250 ms 采样一次累计计数（`RtpEvidence`），
+  重锚时取窗口内最旧的样本作基线，覆盖卡顿前约 1 s。重锚后清空基线，
+  避免把本次卡顿期间积压、重锚后才被 `service_retransmits` 收走的 RTX
+  请求算到下一次重锚头上。`reanchor` 预算耗尽（`timeline_expired`）仍是
+  确定的 `confirmed_transport_failure`。**这是启发式而不是证明**：卡顿前
+  1 s 内的无关丢包会被算作传输证据，超过窗口的长卡顿则没有基线；无法
+  区分时一律保守归 `sender_stall`（宁可漏报一次传输故障，也不污染唯一
+  可信的漂移信号），限制写在代码注释和 Q44。
+  **`latency_change` 有 1 ms 门槛**（Q43 §二）：每次实际应用的 lead 变化都
+  累加 `lead_shift_count` / `lead_shift_total_us`（微秒、带符号），但只有
+  |shift| ≥ 1 ms 才记一次 `latency_change`。否则自适应 lead 的亚毫秒微调
+  会把这一桶刷成 CSV 里最大的数字，把 `confirmed_transport_failure` 淹掉。
 - **站点清单**（每一处都显式传 reason，不再有隐式计数）：
   - 会话首次 `MediaSchedule::new`：**不计**。它是这一行的基线，不是重置；
-    正常停止必须九桶全 0（「没有重置」就是全 0）。
-  - `schedule.add_shift` 实际应用非零：`latency_change`。
+    正常停止必须 11 桶全 0（「没有重置」就是全 0）。`start` 因此保留但
+    不产生，WAC 的「会话开始」语义由「这一行本身」表达。
+  - `schedule.add_shift` 实际应用：每次都进 `lead_shift_count` /
+    `lead_shift_total_us`；|shift| ≥ 1 ms 才记 `latency_change`。
   - `LateAction::Silence`（把错过的槽补成静音）：不计。seq/rtptime 仍线性，
     时间线没有重置。
-  - `LateAction::Reanchor` 成功且 shift 非零 / reanchor 预算耗尽：
-    `confirmed_transport_failure`。
+  - `LateAction::Reanchor` 成功且 shift 非零：按 1 s 窗口的 RTP 证据分到
+    `confirmed_transport_failure`（有移动）或 `sender_stall`（干净）；
+    reanchor 预算耗尽：`confirmed_transport_failure`。
   - `schedule.relax`：不计。它是重锚 surplus 的慢速回退，再计一次会把一次
     卡顿放大成一串事件。
   - standby 暂停后 `run_live` 恢复：`silence_resume`。
   - 抢占 reclaim 后重开：`session_restart`。
-  - 采集源结束/重建后重开：`start`（九类没有 source_restart，取最接近；
-    见 Q43）。
+  - 采集源结束/重建后重开：`source_restart`，**不是 `start`**（Q43 §四）。
+    发送循环里发现 `source.ended()`、以及 `StreamEnd::SourceEnded` 之后
+    重开采集，两处都走同一个 reason。
   - 正常停止的 faded drain：不计。它不是 FLUSH，接收器从未被要求丢弃已排队
     音频。
 - **桌面端 companion 记录**：引擎看不到桌面重连。桌面端复用既有的
   `SessionController` 重连路径，在每次 IPC 会话结束时向
   `%APPDATA%\AirFlash\logs\session-desktop.csv` 追加一行
-  `session_id,desktop_reconnects,desktop_reconnect_reason`：
+  `session_id,desktop_reconnects,transport_fault_first,transport_fault_count,transport_fault_seq`：
   - `session_id` = 发给引擎的 IPC session id（`Guid.NewGuid().ToString("N")`）；
   - `desktop_reconnects` = 这次 attempt 开始前，本次播放已经重连过几次（首次 0）；
-  - `desktop_reconnect_reason` = 最近一次重连的原因
-    `transport_fault:<引擎 code>`，首次为 `none`。
-  - **join key**：引擎行的 `session_id` 是 `<桌面 session_id>-<session_epoch>`
-    （同一 IPC 会话里 standby 唤醒/抢占会再开一个 attempt）。把引擎
-    `session_id` 按最后一个 `-` 切开，前缀等于桌面 `session_id` 即可 join；
-    引擎一个 attempt 一行、桌面一次 IPC 会话一行，因此是 1:N。两个文件同在
+  - `transport_fault_first` = 本次播放第一个导致重连的引擎 fault code，
+    首次为 `none`；
+  - `transport_fault_count` = 本次播放累计多少次重连故障（和
+    `desktop_reconnects` 同一来源，二者不会互相矛盾）；
+  - `transport_fault_seq` = 按发生顺序用 `;` 连接的 fault code，
+    **只保留前 5 个，后面加 `…`**，避免重连循环把行撑大；没有故障时也是
+    `none`。Q43 §五：旧的单值 `desktop_reconnect_reason` 只留第一条，
+    丢掉了「重连 5 次、每次不同原因」这个最需要的故事。
+  - **join key 不变**：引擎行的 `session_id` 是
+    `<桌面 session_id>-<session_epoch>`（同一 IPC 会话里 standby 唤醒/抢占会
+    再开一个 attempt）。把引擎 `session_id` 按最后一个 `-` 切开，前缀等于桌面
+    `session_id` 即可 join；引擎一个 attempt 一行、桌面一次 IPC 会话一行，
+    因此是 1:N。Q43 明确**不**为逐 attempt 对齐加 `session_epoch`：桌面端
+    本来就没有 per-attempt 的 fault 记录，加了也配不上。两个文件同在
     `%APPDATA%\AirFlash\logs\`。
-  - 只写不透明 session id 和固定 reason 标签，不含 host/MAC/路径；I/O 失败
-    被吞掉，不影响会话。
+  - 只写不透明 session id 和固定 fault code 标签，不含 host/MAC/路径；I/O
+    失败被吞掉，不影响会话。
 - **全部来自既有计数器，没有为摘要新增音频路径计数**：
   - `session_id` = IPC 请求的 `session_id` + 本次流式尝试的 `session_epoch`
     （standby 唤醒/重连会产生新尝试，必须可区分）；由 `main.rs` 填入，
@@ -912,34 +949,44 @@ Q24（同上）。
     `percentile_ms(1.0)`）。
   - `servo_engagements` = 采集伺服 engagement；`baseline_resets` 仍取
     `ServoCounters.steps`（断点后整环清零）——Q40 已确认这个映射正确，本轮
-    不改。它不是 9 个 reason 桶之一，不会与它们重复计数。
-  - `timeline_resets_*` = `SessionTelemetry.timeline_resets`，只由上面站点
-    清单里的显式 `record_timeline_reset` 增加；`last_timeline_reset_reason` =
-    最近一次的原因。`SessionTelemetry.expired` 仍是内部计数器
-    （`timeline_expired` 的症状），只是不再当列。
+    不改。它不是 11 个 reason 桶之一，不会与它们重复计数。
+  - `lead_shift_count` / `lead_shift_total_us` = `SessionTelemetry` 里新增的
+    两个 lead 变化计数（次数、带符号微秒和），每次 `add_shift` 实际应用都
+    增加；它们**不是**重置桶，只有 ≥ 1 ms 的那部分同时进
+    `timeline_resets_latency_change`。
+  - `timeline_resets_*` = `SessionTelemetry.timeline_resets`（11 桶），只由
+    上面站点清单里的显式 `record_timeline_reset` 增加；
+    `last_timeline_reset_reason` = 最近一次的原因。`SessionTelemetry.expired`
+    仍是内部计数器（`timeline_expired` 的症状），只是不再当列。
   - `duration_s` = 发送循环开始到写摘要的墙钟时长；`applied_lead_ms` = 调度器
-    实际应用的 lead。
+    实际应用的 lead（内部按微秒累计，写出时取整到毫秒）。
 - **脱敏与 best-effort**：JSON 先过 `telemetry::redact`（全是数字/枚举，形状
   不变）；CSV 只有数字、固定枚举和 `session_id`，不含 host/MAC/路径/密钥。
   写文件失败只 `eprintln!`（桌面端把引擎 stderr 收进日志），不返回错误，也不
   影响音频或控制路径；事件仍照发。桌面 companion 行同样只含不透明 id 和固定
-  reason 标签，写失败被吞掉。
+  fault code 标签（以及截断后的序列），写失败被吞掉。
 - **恰好一次**：摘要只有一个调用点——`send_packets` 的发送循环之后。故障从
   闭包返回后仍会走最终 metrics + 摘要，再做 TEARDOWN；最后一包的 drain 用
   闭包包住 `?`，避免它的错误跳过摘要。握手/建链阶段失败的尝试没有 session
   计数器，不产生摘要（这一行只描述真正开始流媒体的会话）。桌面行在每次 IPC
   会话结束的 `finally` 里写一次，重连决策发生在 `catch` 里，不会重复写。
-- **测试**：正常停止九桶全 0 且恰好一条、注入 `Health` 故障后仍恰好一条且
-  TEARDOWN 照常发生、已知计数逐字段对账（含 idle underrun 不计入）、每个
-  reason 只进自己的桶且不泄漏到别的桶、`latency_change` 与 `silence_resume`
-  都不增加 `confirmed_transport_failure`、standby 恢复的 attempt 记
-  `silence_resume`、CSV 9 个新列按声明顺序且无 `rebuild_count`、桌面记录与
-  引擎 `start` 使用的 session id 一致（引擎行再加 `-<epoch>` 后缀）、写文件
-  失败不影响会话；telemetry 侧覆盖 JSON 字段/redact 形状、CSV 列序与无身份
-  字段、追加时只写一次表头；桌面侧覆盖表头/转义/不可写路径。
-- **验证**：Rust lib 225 passed + 1 ignored、main 2、集成 38 passed + 1 ignored，
-  合计 265 passed / 2 ignored；clippy `-D warnings` 无告警；
-  `build-native.ps1 -Check` 通过；.NET 553 通过；pytest 141 通过；ruff 无问题。
+- **测试**：正常停止 11 桶全 0 且恰好一条、注入 `Health` 故障后仍恰好一条且
+  TEARDOWN 照常发生、已知计数逐字段对账（含 idle underrun 不计入）、11 个
+  reason 各自独立可寻址且不泄漏到别的桶、`latency_change` /
+  `silence_resume` / `source_restart` / `sender_stall` 都不增加
+  `confirmed_transport_failure`、standby 恢复的 attempt 记
+  `silence_resume`、采集源重开记 `source_restart` 且 `start` 保持 0、
+  成功重锚在 RTP 计数有移动时记 `confirmed_transport_failure`、干净时记
+  `sender_stall`（两种都构造）、亚毫秒 lead 变化只加
+  `lead_shift_count`/`lead_shift_total_us` 而 `latency_change` 保持 0、
+  ≥ 1 ms 的 shift 记 `latency_change`、CSV 31 列按声明顺序且无
+  `rebuild_count`、桌面记录与引擎 `start` 使用的 session id 一致（引擎行再加
+  `-<epoch>` 后缀）、桌面 fault 序列超过 5 条截断并保留计数、写文件失败不影响
+  会话；telemetry 侧覆盖 JSON 字段/redact 形状、CSV 列序与无身份字段、追加时
+  只写一次表头；桌面侧覆盖表头/转义/不可写路径。
+- **验证**：Rust lib 230 passed + 1 ignored、main 2、集成 38 passed + 1 ignored，
+  合计 270 passed / 2 ignored；clippy `-D warnings` 无告警；
+  `build-native.ps1 -Check` 通过；.NET 554 通过；pytest 141 通过；ruff 无问题。
   .NET 首次全量运行时 `EngineStandbyReleasesMuteAndMetricsCannotOverrideState`
   偶发一次事件时序空引用，单跑与全量重跑均通过（历史记录）。
 
@@ -984,9 +1031,9 @@ Q24（同上）。
   失败、同类型成功、单成员永远接受、只有 `ClaimsAirPlay2Outdated` 追加原因
   且不替换动作句、软件立体声对不豁免、历史混组解析为离线空成员、门禁兜底
   文案复用组合器；既有 `GateFailure`/能力测试全过。
-- **验证**：Rust 265 passed / 2 ignored（未改 native，数字与 main 一致）；
-  clippy `-D warnings` 无告警；`build-native.ps1 -Check` 通过；.NET 565
+- **验证**：Rust 270 passed / 2 ignored（未改 native，数字与 main 一致）；
+  clippy `-D warnings` 无告警；`build-native.ps1 -Check` 通过；.NET 566
   通过；pytest 141 通过；ruff 无问题。
 - **没验证 / 待确认**：没有真机，无法验证真实 HomePod/Apple TV 的 TXT 是否
   会在运行中改变能力；升级前遗留混组的修复策略、以及缺少 TXT 证据（设备
-  暂时离线）时严格布尔导致的提示语选择，见 Q44。
+  暂时离线）时严格布尔导致的提示语选择，见 Q45。
