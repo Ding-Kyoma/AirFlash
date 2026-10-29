@@ -5,9 +5,13 @@
 //! stutter": lateness distribution, capture age, retransmission gaps, an explicit
 //! underflow classification, timeline recovery counters and a session epoch.
 use serde_json::{Value, json};
-use std::sync::{
-    Mutex, OnceLock,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 /// Log-spaced buckets covering 0.05 ms .. 200 ms, which brackets everything a
@@ -224,6 +228,153 @@ pub fn next_session_epoch() -> u64 {
     EPOCH.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// The roadmap §12.3 field list, in order. The CSV header is generated from this
+/// array, so changing the order is a format change and must be deliberate.
+pub const SUMMARY_COLUMNS: [&str; 18] = [
+    "session_id",
+    "topology",
+    "codec",
+    "timing",
+    "applied_lead_ms",
+    "packets",
+    "rtx_req",
+    "rtx_resent",
+    "underruns",
+    "gap_filled",
+    "reanchored",
+    "servo_engagements",
+    "baseline_resets",
+    "mean_lateness_ms",
+    "p99_lateness_ms",
+    "max_lateness_ms",
+    "duration_s",
+    "rebuild_count",
+];
+
+/// One finished streaming session, in the shape roadmap §12.3 asks for.
+///
+/// Every value is copied from a counter that already existed before this struct:
+/// the scheduler telemetry, `MediaMetrics`, the servo counters and the negotiated
+/// `CompatProfile`. Nothing here is sampled on the audio path.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub topology: &'static str,
+    pub codec: &'static str,
+    pub timing: &'static str,
+    pub applied_lead_ms: i64,
+    pub packets: u64,
+    pub rtx_req: u64,
+    pub rtx_resent: u64,
+    pub underruns: u64,
+    pub gap_filled: u64,
+    pub reanchored: u64,
+    pub servo_engagements: u64,
+    pub baseline_resets: u64,
+    pub mean_lateness_ms: f64,
+    pub p99_lateness_ms: f64,
+    pub max_lateness_ms: f64,
+    pub duration_s: f64,
+    pub rebuild_count: u64,
+}
+impl SessionSummary {
+    /// The additive IPC event. Consumers of `transport_metrics`/`capture_metrics`
+    /// never see a changed shape; this is a new `event` value they can ignore.
+    pub fn event(&self) -> Value {
+        json!({
+            "event": "session_summary",
+            "session_id": self.session_id,
+            "topology": self.topology,
+            "codec": self.codec,
+            "timing": self.timing,
+            "applied_lead_ms": self.applied_lead_ms,
+            "packets": self.packets,
+            "rtx_req": self.rtx_req,
+            "rtx_resent": self.rtx_resent,
+            "underruns": self.underruns,
+            "gap_filled": self.gap_filled,
+            "reanchored": self.reanchored,
+            "servo_engagements": self.servo_engagements,
+            "baseline_resets": self.baseline_resets,
+            "mean_lateness_ms": self.mean_lateness_ms,
+            "p99_lateness_ms": self.p99_lateness_ms,
+            "max_lateness_ms": self.max_lateness_ms,
+            "duration_s": self.duration_s,
+            "rebuild_count": self.rebuild_count,
+        })
+    }
+    pub fn csv_header() -> String {
+        SUMMARY_COLUMNS.join(",")
+    }
+    /// One CSV row. Only the opaque `session_id` can ever need quoting; every
+    /// other field is a number or a fixed enum label.
+    pub fn csv_row(&self) -> String {
+        [
+            csv_field(&self.session_id),
+            csv_field(self.topology),
+            csv_field(self.codec),
+            csv_field(self.timing),
+            self.applied_lead_ms.to_string(),
+            self.packets.to_string(),
+            self.rtx_req.to_string(),
+            self.rtx_resent.to_string(),
+            self.underruns.to_string(),
+            self.gap_filled.to_string(),
+            self.reanchored.to_string(),
+            self.servo_engagements.to_string(),
+            self.baseline_resets.to_string(),
+            format!("{:.3}", self.mean_lateness_ms),
+            format!("{:.3}", self.p99_lateness_ms),
+            format!("{:.3}", self.max_lateness_ms),
+            format!("{:.3}", self.duration_s),
+            self.rebuild_count.to_string(),
+        ]
+        .join(",")
+    }
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+/// Where the per-user summary lives: next to the WPF logs, which is the same
+/// `%APPDATA%\AirFlash` root the engine already uses for credentials. This
+/// mirrors `AppPaths.LogDirectory` on the engine side instead of inventing a
+/// second location.
+pub fn summary_path() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join("AirFlash")
+        .join("logs")
+        .join("session-summary.csv")
+}
+
+/// Append one row, writing the header first when the file is new. Callers treat
+/// every error as a warning: a bad profile must never fail a session.
+pub fn append_summary_row(path: &Path, summary: &SessionSummary) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let mut line = String::new();
+    if file.metadata()?.len() == 0 {
+        line.push_str(&SessionSummary::csv_header());
+        line.push('\n');
+    }
+    line.push_str(&summary.csv_row());
+    line.push('\n');
+    file.write_all(line.as_bytes())?;
+    file.flush()
+}
+
 static LATEST: OnceLock<Mutex<Value>> = OnceLock::new();
 /// The most recent session snapshot, readable through the `diag_summary` command
 /// after (or while) a session runs.
@@ -435,5 +586,96 @@ mod tests {
     fn published_diagnostics_round_trip() {
         publish_diagnostics(json!({"session_epoch": 7}));
         assert_eq!(diagnostics()["session_epoch"], json!(7));
+    }
+
+    fn known_summary() -> SessionSummary {
+        SessionSummary {
+            session_id: "session-42".into(),
+            topology: "software_stereo",
+            codec: "alac",
+            timing: "ptp",
+            applied_lead_ms: 45,
+            packets: 1500,
+            rtx_req: 7,
+            rtx_resent: 5,
+            underruns: 2,
+            gap_filled: 11,
+            reanchored: 3,
+            servo_engagements: 4,
+            baseline_resets: 1,
+            mean_lateness_ms: 1.234,
+            p99_lateness_ms: 9.876,
+            max_lateness_ms: 12.345,
+            duration_s: 30.5,
+            rebuild_count: 0,
+        }
+    }
+
+    #[test]
+    fn summary_event_carries_the_declared_fields_and_redaction_keeps_its_shape() {
+        let summary = known_summary();
+        let event = summary.event();
+        assert_eq!(event["event"], json!("session_summary"));
+        for column in SUMMARY_COLUMNS {
+            assert!(event.get(column).is_some(), "missing field {column}");
+        }
+        // Only the event discriminator is extra; the declared list is complete.
+        assert_eq!(event.as_object().unwrap().len(), SUMMARY_COLUMNS.len() + 1);
+        // Redaction never changes the shape of an already identity-free record.
+        assert_eq!(redact(&event), event);
+    }
+
+    #[test]
+    fn summary_csv_uses_the_declared_column_order_and_hides_identities() {
+        let summary = known_summary();
+        assert_eq!(SessionSummary::csv_header(), SUMMARY_COLUMNS.join(","));
+        let row = summary.csv_row();
+        let fields: Vec<_> = row.split(',').collect();
+        assert_eq!(fields.len(), SUMMARY_COLUMNS.len(), "row: {row}");
+        for (index, column) in SUMMARY_COLUMNS.iter().enumerate() {
+            match *column {
+                "session_id" => assert_eq!(fields[index], "session-42"),
+                "topology" => assert_eq!(fields[index], "software_stereo"),
+                "codec" => assert_eq!(fields[index], "alac"),
+                "timing" => assert_eq!(fields[index], "ptp"),
+                "applied_lead_ms" => assert_eq!(fields[index], "45"),
+                "packets" => assert_eq!(fields[index], "1500"),
+                "rtx_req" => assert_eq!(fields[index], "7"),
+                "rtx_resent" => assert_eq!(fields[index], "5"),
+                "underruns" => assert_eq!(fields[index], "2"),
+                "gap_filled" => assert_eq!(fields[index], "11"),
+                "reanchored" => assert_eq!(fields[index], "3"),
+                "servo_engagements" => assert_eq!(fields[index], "4"),
+                "baseline_resets" => assert_eq!(fields[index], "1"),
+                "mean_lateness_ms" => assert_eq!(fields[index], "1.234"),
+                "p99_lateness_ms" => assert_eq!(fields[index], "9.876"),
+                "max_lateness_ms" => assert_eq!(fields[index], "12.345"),
+                "duration_s" => assert_eq!(fields[index], "30.500"),
+                "rebuild_count" => assert_eq!(fields[index], "0"),
+                other => panic!("unexpected column {other}"),
+            }
+        }
+        // No host, MAC, path or secret can survive the numeric/enumerated shape.
+        for forbidden in ["127.0.0.1", "192.168.", "C:\\", "/home/", "02:57:32", "secret"] {
+            assert!(!row.contains(forbidden), "CSV leaked {forbidden}: {row}");
+        }
+    }
+
+    #[test]
+    fn summary_csv_append_writes_one_header_and_one_row_per_session() {
+        let root = std::env::temp_dir().join(format!("airflash-summary-{}", uuid::Uuid::new_v4()));
+        let path = root.join("logs").join("session-summary.csv");
+        let first = known_summary();
+        append_summary_row(&path, &first).unwrap();
+        let mut second = first.clone();
+        second.session_id = "session-43".into();
+        append_summary_row(&path, &second).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "header plus one row per session: {text}");
+        assert_eq!(lines[0], SessionSummary::csv_header());
+        assert!(lines[1].starts_with("session-42,"));
+        assert!(lines[2].starts_with("session-43,"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }
