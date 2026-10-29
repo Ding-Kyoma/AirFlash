@@ -1,6 +1,7 @@
 //! Session health and bounded media recovery, shared by production and localhost tests.
 use crate::{
     crypto::derive,
+    preemption::{self, Evidence, Signal},
     rtp::{self, FRAMES, Packetizer, Retransmit},
     rtsp::{Cancellation, Connection, WireError},
 };
@@ -127,6 +128,11 @@ struct HealthState {
     degraded: Option<Fault>,
     notices: VecDeque<Value>,
     commands: crate::events::Inbox,
+    /// Control-plane evidence that another controller may have taken over.
+    preemption: Evidence,
+    /// The fault to use if the preemption window expires without corroboration.
+    /// It keeps today's classification (auth failure, peer closed, ...) intact.
+    preemption_fallback: Option<Fault>,
 }
 #[derive(Clone, Default)]
 pub struct Health(Arc<Mutex<HealthState>>);
@@ -182,6 +188,58 @@ impl Health {
     /// keeps running; only the verdict is cleared.
     pub fn clear_degraded(&self) {
         self.0.lock().unwrap().degraded = None;
+    }
+    /// Record one control-plane signal. Signals alone never end the session; they
+    /// are only half of the preemption verdict.
+    pub fn preemption_signal(&self, signal: Signal) {
+        self.0
+            .lock()
+            .unwrap()
+            .preemption
+            .record(signal, Instant::now());
+    }
+    /// The peer restarted its PTP association; `at` is when the change was seen,
+    /// so repeated polling cannot extend the evidence window.
+    pub fn preemption_association_changed(&self, at: Instant) {
+        self.0.lock().unwrap().preemption.association_changed(at);
+    }
+    /// Media stopped arriving (one healthy-to-unhealthy transition, not every poll
+    /// while it stays down).
+    pub fn preemption_media_stopped(&self, at: Instant) {
+        self.0.lock().unwrap().preemption.media_stopped(at);
+    }
+    pub fn preemption_verdict(&self, now: Instant) -> Option<preemption::Verdict> {
+        self.0
+            .lock()
+            .unwrap()
+            .preemption
+            .classify(now, preemption::WINDOW)
+    }
+    pub fn has_preemption_signal(&self, now: Instant) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .preemption
+            .has_fresh_signal(now, preemption::WINDOW)
+    }
+    /// Hold the generic fault until the preemption window closes. If corroboration
+    /// arrives first the session reports `preempted`; otherwise this exact fault is
+    /// returned, preserving the pre-existing classification.
+    pub fn defer_for_preemption(&self, fault: Fault) {
+        let mut state = self.0.lock().unwrap();
+        if state.preemption_fallback.is_none() {
+            state.preemption_fallback = Some(fault);
+        }
+    }
+    pub fn take_expired_preemption_fault(&self, now: Instant) -> Option<Fault> {
+        let mut state = self.0.lock().unwrap();
+        if state
+            .preemption
+            .has_fresh_signal(now, preemption::WINDOW)
+        {
+            return None;
+        }
+        state.preemption_fallback.take()
     }
     fn notice(&self, host: &str, channel: &str, code: &str, message: &str, recovered: bool) {
         let mut state = self.0.lock().unwrap();
@@ -314,7 +372,13 @@ impl FeedbackWorker {
                         if fault.code != "feedback_rejected" {
                             health.0.lock().unwrap().metrics.feedback_failures += 1;
                         }
-                        if matches!(fault.code.as_str(), "authentication_failed" | "session_rejected") {
+                        if health.has_preemption_signal(Instant::now()) {
+                            // A takeover signal is on record. Hold the generic fault
+                            // until the corroboration window closes so media stopping
+                            // or a PTP re-association can still turn this into
+                            // `preempted`.
+                            health.defer_for_preemption(fault);
+                        } else if matches!(fault.code.as_str(), "authentication_failed" | "session_rejected") {
                             health.fail(fault);
                         } else {
                             // Feedback is a health probe, not the audio path: keep
@@ -347,6 +411,9 @@ fn feedback_loop(
     let mut failures = 0;
     let mut next = Instant::now() + timing.interval;
     while !stop.is_cancelled() {
+        if let Some(fault) = drain_incoming(connection, host, health) {
+            return Err(fault.into());
+        }
         if Instant::now() < next {
             thread::sleep(POLL.min(next.saturating_duration_since(Instant::now())));
             continue;
@@ -387,13 +454,36 @@ fn feedback_loop(
             if let Some(response) =
                 connection.read_for(POLL.min(timing.hard - elapsed), Some(stop))?
             {
+                if let Some(method) = response.method() {
+                    if preemption::incoming_teardown(Some(method)).is_some() {
+                        health.preemption_signal(Signal::UnexpectedTeardown);
+                        return Err(Fault::new(
+                            host,
+                            "feedback",
+                            "peer_teardown",
+                            true,
+                            "Receiver ended the session with an unexpected TEARDOWN",
+                        )
+                        .into());
+                    }
+                    // Another receiver-initiated request; keep waiting for the
+                    // answer to the feedback probe.
+                    continue;
+                }
                 if !connection.stale_response(&response) {
                     break response;
                 }
             }
         };
+        let close_requested = connection.take_close_requested();
+        if close_requested {
+            health.preemption_signal(Signal::ConnectionClose);
+        }
         connection.validate_cseq(&response)?;
         let status = response.status()?;
+        if let Some(signal) = preemption::status_signal(status) {
+            health.preemption_signal(signal);
+        }
         if status == 200 {
             failures = 0;
             let recovered = {
@@ -451,10 +541,50 @@ fn feedback_loop(
             )
             .into());
         }
+        if close_requested {
+            return Err(Fault::new(
+                host,
+                "feedback",
+                "peer_closed",
+                true,
+                "Receiver asked to close the control connection",
+            )
+            .into());
+        }
         drop(connection);
         next = Instant::now() + timing.interval;
     }
     Ok(())
+}
+
+/// Receiver-initiated traffic can land on the shared control connection while a
+/// volume or metadata worker owns it. The request is stashed by `Connection`; it
+/// is inspected here rather than inside every request path.
+fn drain_incoming(connection: &Mutex<Connection>, host: &str, health: &Health) -> Option<Fault> {
+    let mut connection = connection.lock().unwrap();
+    for message in connection.take_unsolicited() {
+        if preemption::incoming_teardown(message.method()).is_some() {
+            health.preemption_signal(Signal::UnexpectedTeardown);
+            return Some(Fault::new(
+                host,
+                "feedback",
+                "peer_teardown",
+                true,
+                "Receiver ended the session with an unexpected TEARDOWN",
+            ));
+        }
+    }
+    if connection.take_close_requested() {
+        health.preemption_signal(Signal::ConnectionClose);
+        return Some(Fault::new(
+            host,
+            "feedback",
+            "peer_closed",
+            true,
+            "Receiver asked to close the control connection",
+        ));
+    }
+    None
 }
 impl Drop for FeedbackWorker {
     fn drop(&mut self) {
@@ -556,6 +686,12 @@ impl MediaTransport {
     }
     pub fn reset_watchdog(&mut self, now: Instant) {
         self.last_success = now;
+    }
+    /// Test hook: make the next health poll see stale media without waiting out
+    /// the production failure timeout.
+    #[cfg(test)]
+    pub(crate) fn expire_media(&mut self, now: Instant) {
+        self.last_success = now - Duration::from_secs(60);
     }
     pub fn metrics(&self) -> Value {
         let mut v = serde_json::to_value(&self.metrics).unwrap();

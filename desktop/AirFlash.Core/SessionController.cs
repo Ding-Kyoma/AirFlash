@@ -4,7 +4,7 @@ using System.Net.Sockets;
 using System.Text.Json;
 namespace AirFlash.Core;
 
-public enum PlaybackState { Idle, Connecting, Streaming, Standby, Pairing, Error }
+public enum PlaybackState { Idle, Connecting, Streaming, Standby, Pairing, Error, Preempted }
 public sealed record StreamMetrics(double? CaptureToSendP95 = null, double? MaxQueueAge = null, long? Underruns = null, long? DroppedFrames = null, int? InputRate = null);
 public sealed record SessionSnapshot(PlaybackState State, Receiver? Receiver = null, string Message = "", StreamMetrics? Metrics = null, int TargetLatency = 0, PlaybackDiagnostics? Diagnostics = null, int StreamRate = 0, DeviceVolumeState? DeviceVolume = null, IReadOnlyDictionary<string, DeviceVolumeState>? MemberVolumes = null)
 {
@@ -281,7 +281,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             }
             catch (PairCancelledException) { }
             catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
-            catch (Exception error) { if (RecordFailure(epoch, error) is { } notice) Publish(epoch, PlaybackState.Error, notice.Detail); }
+            catch (Exception error) { if (RecordFailure(epoch, error) is { } notice) Publish(epoch, FailureState(notice), FailureMessage(notice)); }
             finally { await RestoreAudioAsync().ConfigureAwait(false); }
         }, CancellationToken.None);
     }
@@ -692,8 +692,10 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                 if (startedAt != 0 && Stopwatch.GetElapsedTime(startedAt) >= TimeSpan.FromSeconds(10)) attempts = 0;
                 ++attempts;
                 if (RecordFailure(epoch, error) is not { } notice) return;
-                Publish(epoch, PlaybackState.Error, notice.Detail);
-                if (!(_settings.ForceReconnect || receiver.IsSoftwareGroup || notice.Code is "timeline_expired" or "clock_lost") || attempts > _settings.MaxReconnectAttempts || notice.Retryable == false || notice.Retryable is null && IsAuthenticationFailure(error.Message)) return;
+                Publish(epoch, FailureState(notice), FailureMessage(notice));
+                // A preempted receiver belongs to another controller now; retrying
+                // would fight it. The user gets an explicit reconnect action instead.
+                if (notice.Code == "preempted" || !(_settings.ForceReconnect || receiver.IsSoftwareGroup || notice.Code is "timeline_expired" or "clock_lost") || attempts > _settings.MaxReconnectAttempts || notice.Retryable == false || notice.Retryable is null && IsAuthenticationFailure(error.Message)) return;
             }
             var delay = TimeSpan.FromMilliseconds(Math.Min(_timing.Retry.TotalMilliseconds * Math.Pow(2, attempts - 1), 8000));
             log?.Invoke($"Session reconnect reason=transport_fault; code={_diagnostics.LastFault?.Code}; attempt={attempts}; delay_ms={delay.TotalMilliseconds}");
@@ -739,6 +741,8 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             finally { ClearConnection(connection); await RequestStopAsync(connection, session).ConfigureAwait(false); }
         }
     }
+    private static PlaybackState FailureState(EngineNotice notice) => notice.Code == "preempted" ? PlaybackState.Preempted : PlaybackState.Error;
+    private static string FailureMessage(EngineNotice notice) => notice.Code == "preempted" ? L.Get("Another device took over this AirPlay session. Reconnect to claim it back.") : notice.Detail;
     private EngineNotice? RecordFailure(long epoch, Exception error)
     {
         var notice = error is EngineFailure engineFailure ? engineFailure.Notice : new EngineNotice("host_error", "", "desktop", error.Message);

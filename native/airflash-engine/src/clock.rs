@@ -224,6 +224,12 @@ struct PeerState {
     /// Announces requested while deciding the clock role at SETUP.
     bmca_probes: u8,
     next_probe: Option<Instant>,
+    /// Clock identity from this peer's last Announce, tracked regardless of the
+    /// role we hold. A takeover commonly restarts the receiver's PTP association.
+    announced_clock_id: Option<u64>,
+    /// How many times the announced identity changed after the first sighting.
+    identity_changes: u64,
+    last_identity_change: Option<Instant>,
 }
 const SAMPLE_LIFETIME: Duration = Duration::from_secs(2);
 const MAX_PENDING_SYNCS: usize = 32;
@@ -330,6 +336,16 @@ impl PeerState {
     }
     fn startup_timeout(&self) -> Duration {
         (self.exchange_timeout() + Duration::from_secs(2)).max(Duration::from_secs(8))
+    }
+    /// When this peer last restarted its PTP association, if it ever did.
+    fn identity_change_at(&self) -> Option<Instant> {
+        self.last_identity_change
+    }
+    /// The last exchange time once the peer has been silent for longer than its
+    /// own advertised exchange timeout. `None` while it is still following.
+    fn stalled_at(&self, now: Instant) -> Option<Instant> {
+        let last = self.last?;
+        (now.saturating_duration_since(last) >= self.exchange_timeout()).then_some(last)
     }
     fn delay_offset(&self, now: Instant) -> Option<f64> {
         self.offset.filter(|_| {
@@ -595,6 +611,22 @@ fn packet_rejection(data: &[u8]) -> Option<&'static str> {
 fn correction(data: &[u8]) -> f64 {
     i64::from_be_bytes(data[8..16].try_into().unwrap()) as f64 / 65536.0
 }
+/// Track the clock identity announced by a peer, even when we are the master and
+/// do not follow it. A changed identity means the receiver restarted its PTP
+/// association, which is exactly what another controller taking over looks like.
+fn note_announce_identity(s: &mut PeerState, data: &[u8], now: Instant) {
+    if data.len() < 64 || data[0] & 15 != 11 {
+        return;
+    }
+    let id = u64::from_be_bytes(data[53..61].try_into().unwrap());
+    if let Some(previous) = s.announced_clock_id
+        && previous != id
+    {
+        s.identity_changes += 1;
+        s.last_identity_change = Some(now);
+    }
+    s.announced_clock_id = Some(id);
+}
 fn followed_packet(s: &mut PeerState, data: &[u8], local_ns: u64, now: Instant, own_id: u64) {
     if !valid_packet(data) {
         return;
@@ -609,6 +641,22 @@ fn followed_packet(s: &mut PeerState, data: &[u8], local_ns: u64, now: Instant, 
             || s.source_id != Some(source)
             || s.source_port != Some(source_port)
         {
+            let mut identity_changes = s.identity_changes;
+            let mut last_identity_change = s.last_identity_change;
+            // `note_announce_identity` runs for every Announce before this path
+            // and already counted a clock-identity change. Count a source-only
+            // restart here so callers that feed `followed_packet` directly still
+            // see one association change per restart.
+            let identity_changed = s.clock_id.is_some() && s.announced_clock_id != Some(id);
+            let source_changed = s.clock_id.is_some()
+                && s.source_id.is_some()
+                && (s.source_id != Some(source) || s.source_port != Some(source_port));
+            if identity_changed || source_changed {
+                if identity_changed {
+                    identity_changes += 1;
+                }
+                last_identity_change = Some(now);
+            }
             let subscriptions = if s.source_id.is_none() {
                 std::mem::take(&mut s.subscriptions)
             } else {
@@ -623,6 +671,9 @@ fn followed_packet(s: &mut PeerState, data: &[u8], local_ns: u64, now: Instant, 
                 source_id: Some(source),
                 source_port: Some(source_port),
                 subscriptions,
+                announced_clock_id: s.announced_clock_id.or(Some(id)),
+                identity_changes,
+                last_identity_change,
                 ..Default::default()
             };
         }
@@ -996,6 +1047,27 @@ impl PtpMaster {
             .get(&host)
             .and_then(|s| s.stale_for(now))
     }
+    /// When the peer last restarted its PTP association (new clock identity or
+    /// source), or `None` if it has not done so since the first Announce.
+    /// Session code pairs this with a control-plane signal, so the timestamp is
+    /// the actual change time rather than "still true" polling time.
+    pub fn association_changed_at(&self, host: IpAddr) -> Option<Instant> {
+        self.states
+            .lock()
+            .unwrap()
+            .get(&host)
+            .and_then(PeerState::identity_change_at)
+    }
+    /// When the peer's last PTP exchange happened, once it has been silent for
+    /// longer than its own advertised exchange timeout. This is the "peer stopped
+    /// following us" half of an association restart.
+    pub fn association_stalled_at(&self, host: IpAddr, now: Instant) -> Option<Instant> {
+        self.states
+            .lock()
+            .unwrap()
+            .get(&host)
+            .and_then(|s| s.stalled_at(now))
+    }
 }
 fn send_ptp(
     socket: &UdpSocket,
@@ -1243,6 +1315,9 @@ fn ptp_loop(
                 let request_seq = u16::from_be_bytes([buf[30], buf[31]]);
                 if !s.active {
                     continue;
+                }
+                if kind == 11 {
+                    note_announce_identity(s, &buf[..n], received_at);
                 }
                 if s.follow && [0, 8, 9, 11, 12].contains(&kind) {
                     followed_packet(s, &buf[..n], local_received, received_at, clock_id);

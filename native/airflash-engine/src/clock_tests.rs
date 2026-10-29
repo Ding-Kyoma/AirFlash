@@ -81,6 +81,57 @@ fn cache_handles_backlog_wrap_duplicates_expiry_and_identity_changes() {
 }
 
 #[test]
+fn a_changed_announce_identity_is_timestamped_once_per_restart() {
+    let start = Instant::now();
+    let mut state = follower(start);
+    // The first Announce established the identity and is not a change.
+    assert_eq!(state.identity_change_at(), None);
+    note_announce_identity(&mut state, &announce(9, 0, 0), start + Duration::from_secs(1));
+    followed_packet(
+        &mut state,
+        &announce(9, 0, 0),
+        0,
+        start + Duration::from_secs(1),
+        7,
+    );
+    assert_eq!(state.identity_change_at(), Some(start + Duration::from_secs(1)));
+    assert_eq!(state.identity_changes, 1);
+    // Repeating the same identity must not count again.
+    note_announce_identity(&mut state, &announce(9, 1, 0), start + Duration::from_secs(2));
+    followed_packet(
+        &mut state,
+        &announce(9, 1, 0),
+        0,
+        start + Duration::from_secs(2),
+        7,
+    );
+    assert_eq!(state.identity_change_at(), Some(start + Duration::from_secs(1)));
+    assert_eq!(state.identity_changes, 1);
+    // A second restart moves the timestamp.
+    note_announce_identity(&mut state, &announce(10, 0, 0), start + Duration::from_secs(3));
+    assert_eq!(state.identity_change_at(), Some(start + Duration::from_secs(3)));
+    assert_eq!(state.identity_changes, 2);
+}
+
+#[test]
+fn a_silent_peer_reports_when_its_association_stalled() {
+    let start = Instant::now();
+    let state = PeerState {
+        follow: true,
+        active: true,
+        last: Some(start),
+        exchange_interval: Some(Duration::from_secs(1)),
+        ..Default::default()
+    };
+    assert_eq!(state.stalled_at(start + Duration::from_millis(500)), None);
+    assert_eq!(
+        state.stalled_at(start + Duration::from_secs(3)),
+        Some(start),
+        "three missed 1 s exchanges is the same bounded timeout readiness uses"
+    );
+}
+
+#[test]
 fn new_unmatched_sync_cannot_refresh_an_expired_complete_sample() {
     let start = Instant::now();
     let mut state = follower(start);

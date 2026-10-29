@@ -296,6 +296,53 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   靠 60 秒限速兜底；没有改 RTP/RTSP/编码路径。进程退出靠 50 ms 轮询 + 250 ms
   退避发现，未做事件驱动的退出通知。
 
+## P3-3 抢占识别（已完成）
+
+`native/airflash-engine/src/preemption.rs`（新）、`rtsp.rs`、`transport.rs`、
+`clock.rs`、`session.rs`、桌面状态与文案
+
+- **信号只收集，不立刻下结论**：`preemption::Signal` 只有三种——未预期
+  `TEARDOWN`（接收器主动发来的请求；我们自己的 `TEARDOWN` 响应不算）、RTSP
+  `403`、响应头 `Connection: close`。`Connection` 把接收器主动发来的请求暂存到
+  `unsolicited`，由 feedback worker 在轮询间隙统一 `drain`，没有散落到
+  SETUP/音量请求的 `if` 里；SETUP 期间收到则按通用 setup 失败处理。
+- **结论必须有旁证**：`Evidence::classify(now, WINDOW=3s)` 要求至少一个新鲜信号
+  加一个旁证——媒体健康从好到坏的那一次跳变（`media_stopped`），或 PTP Announce
+  的 clock identity 改变 / 对端静默超过其协商的 exchange timeout
+  （`association_changed`）。时间按绝对间隔配对，媒体先停、403 后到也能配对；
+  信号重复只刷新时间，不延长窗口。
+- **只有信号时回退**：窗口内没有旁证就等窗口结束，返回原来的通用故障
+  （`peer_teardown`、`peer_closed` 或 `authentication_failed`，retryable 不变），
+  不会把一次网络抖动说成抢占。
+- **结束方式**：结论成立时发一条现有形状的 `warning`（`code=preempted`、
+  `channel=control`、`recovered=false`，并带 `signals`/`corroboration` 列出证据），
+  Fault 为 `preempted`、`retryable=false`，消息明确要求手动重连；`Member`
+  置 `preempted` 后 `close()` **不再回发 TEARDOWN**，引擎也不重试。
+- **桌面**：新增 `PlaybackState.Preempted`，状态标题「已被其他设备接管」，详情
+  走本地化文案，状态区出现「重新连接」按钮；自动重连在 `preempted` 上显式短路，
+  只有用户按按钮才重新 `StartAsync`。`warning` 仍进入现有诊断/日志管道。
+- 测试：`preemption.rs` 表驱动谓词（三种信号各自单独出现都不是抢占；信号 +
+  两种旁证分别成立；窗口外旁证不配对；403 在 SETUP 是通用故障；自己发起的
+  `TEARDOWN` 不算；重复信号不延窗）；`clock.rs` 的 identity 变化时间戳与静默
+  判定；`session.rs` 的 localhost 假接收器在 feedback 过程中主动发 `TEARDOWN`，
+  断言 `preempted`、`retryable=false`、warning 证据、没有回发 `TEARDOWN`；
+  桌面 IPC 测试断言 `PlaybackState.Preempted`、本地化文案与 `OpenCount==1`
+  （不自动重连）。
+- **没做/没验证**：
+  - 没有真实 HomePod/接收器，也没有抓包。三种信号里只有「未预期 TEARDOWN」
+    在 localhost 上真实跑通；`403` 与 `Connection: close` 只有解析器/谓词单测，
+    没有真实对端触发。
+  - Windows 上已连接的 UDP socket 在对端 socket 关闭后仍返回成功，localhost
+    无法自然制造「媒体停止」；集成测试在假接收器发 `TEARDOWN` 的同时直接记录
+    旁证，真正的「健康→不健康」跳变由 `MediaTransport` 单测覆盖，未做真实网络
+    丢包下的时序验证。
+  - PTP 旁证只在 `clock.rs` 单测层验证（Announce identity 改变 / 静默超时），
+    没有把「信号 + PTP 重启」放进完整会话端到端跑一遍。
+  - 3 秒窗口与「至少一个旁证」是按现有故障节奏推的；真实接管时接收器先发
+    TEARDOWN、回 403 还是直接断流，见 Q29。
+  - 正常路径的协议字节没有变化；SETUP 的 401/403/454 仍走原有非重试路径，
+    没有被抢占分类接管。
+
 ## 还没做
 
 | 项目 | 现状 | 备注 |
@@ -303,7 +350,6 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
 | P1-10 标定流程 | 未开始 | 需要真机测延迟/丢包，按报告是「用户自助标定」 |
 | P2-13 兼容 profile | 未开始 | 把散落的 if 收成 `CompatBehavior`，按 `srcvers`/`model` 指纹选择 |
 | P2-12 热加入 | 未做 | 目前只做组创建与成员重试，运行中增删成员未实现 |
-| P3-3 抢占检测 | 未开始 | 按 Q18 用「未预期 TEARDOWN + 随后重新 announce」组合特征 |
 | P3-4 MRP 隧道 | 未开始 | 大工程 |
 | P3-5 经典 RAOP / 初代 AirPlay | 未开始 | 大工程 |
 | P3-6 `bufferStream` | 未开始 | 报告建议暂缓：弱网才有收益，改造成本大 |
