@@ -98,16 +98,21 @@ public sealed class GateFailureTests
     [InlineData("mfi_required", "synthetic")]
     [InlineData("protocol_error", "Device requires MFi authentication (not implementable without Apple hardware)")]
     [InlineData("authentication_failed", "MFi coprocessor rejected the request")]
-    public void MfiEvidenceHasItsOwnGate(string code, string message)
+    public void MfiLookingTextIsOnlyADisplayHeuristic(string code, string message)
     {
-        Assert.Equal(GateFailureKind.MfiAuthentication, GateFailure.Classify(AirPlay2(), Notice(code, message: message)));
-        Assert.Equal(L.Get("This device requires MFi authentication, which AirFlash cannot perform without Apple hardware."), GateFailure.Message(AirPlay2(), Notice(code, message: message)));
+        var notice = Notice(code, message: message);
+        // The authoritative kind stays the general authentication gate: the
+        // desktop has no reliable MFi signal to act on (Q37).
+        Assert.Equal(GateFailureKind.PasswordOrPairing, GateFailure.Classify(AirPlay2(), notice));
+        Assert.Equal(L.Get("This device requires MFi authentication, which AirFlash cannot perform without Apple hardware."), GateFailure.Message(AirPlay2(), notice));
     }
 
     [Fact]
-    public void MfiEvidenceWinsOverAClassicFeatureBitmap()
+    public void MfiLookingTextStillWinsOverClassicEvidenceOnlyForDisplay()
     {
-        Assert.Equal(GateFailureKind.MfiAuthentication, GateFailure.Classify(Classic(), Notice("protocol_error", message: "Device requires MFi authentication")));
+        var notice = Notice("protocol_error", message: "Device requires MFi authentication");
+        Assert.Equal(GateFailureKind.PasswordOrPairing, GateFailure.Classify(Classic(), notice));
+        Assert.Equal(L.Get("This device requires MFi authentication, which AirFlash cannot perform without Apple hardware."), GateFailure.Message(Classic(), notice));
     }
 
     [Theory]

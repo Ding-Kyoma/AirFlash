@@ -360,6 +360,7 @@
   "AirPlay 2": "AirPlay 2",
   "Classic AirPlay only": "仅经典 AirPlay",
   "AirPlay 2 support unknown": "AirPlay 2 支持未知",
+  "AirPlay 2 claimed, firmware too old": "自称支持 AirPlay 2，固件过旧",
   "This device only supports classic AirPlay. AirFlash cannot stream to it yet.": "此设备仅支持经典 AirPlay，AirFlash 目前无法向其推流。",
   "This device requires a password or pairing that AirFlash could not complete. Pair it again in Receivers.": "此设备需要密码或配对，AirFlash 无法完成。请在“接收器”中重新配对。",
   "This device requires MFi authentication, which AirFlash cannot perform without Apple hardware.": "此设备要求 MFi 认证，AirFlash 无法在没有 Apple 硬件的情况下完成。",

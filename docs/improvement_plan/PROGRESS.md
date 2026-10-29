@@ -661,56 +661,75 @@ Q24（同上）。
 
 - **两段式证据**：按 Q18/Q29 的答复，AirPlay 2 只由 TXT 决定，PTP/NTP 仍由
   引擎的型号 + 拓扑决定；桌面这一层不碰引擎，也没有改 IPC。
+- **路由与标注分开（Q36）**：这是两个不同的问题，代码里也拆成两个判定：
+  - **路由**（`AirPlayRouting.SupportsAirPlay2`）严格照 WAC 的布尔：
+    `(features & (1 << 40)) != 0 && srcvers >= 354.54.6`。`NotAirPlay2` 和
+    `ClaimsAirPlay2Outdated` 都返回 `false`，都走 classic 路径，没有因为
+    「设备自称 AP2」而放宽。
+  - **标注**（`AirPlayCapabilityClassifier.Classify`）只回答「我们知道了
+    什么」，用四态。路由布尔会把「不支持」和「自称支持但固件过旧」压成同一个
+    `false`，而这两者的处置完全不同（换设备 vs 升级固件），所以不能共用一套
+    判定。
 - **TXT 解析**：`Receiver` 新增 `SourceVersion`（TXT `srcvers` 原文），`Features`
-  保持原有 `features`/`ft` 回退与两段 32 位字拼接。`SupportsAirPlay2` 与 WAC
-  的 `SupportsAirPlay2` 同构：
-  `(features & (1 << 40)) != 0 && srcvers >= 354.54.6`。
-- **版本比较**（`AirPlayCapability.TryParseVersion`）：点分十进制，至少两段；
+  保持原有 `features`/`ft` 回退与两段 32 位字拼接。双段形式 `"0x...,0x..."`
+  低字在前、高字在后，bit40（高字 `0x100`）现在有专门的测试钉住；只读第一段
+  会把真 AP2 设备误判成 `NotAirPlay2`，这是 Q36 §五 指出的隐藏风险。
+- **版本比较**（`AirPlayVersion.TryParse`）：点分十进制，至少两段；
   2–4 段按 `System.Version` 比较，第 5 段起忽略；每段允许前后空格；空串、单段、
   非数字、负号一律不满足。`354.54.6`/`354.54.7`/`366.0` 通过，
-  `354.54.5`/`354.54`/`220.68`/`354` 不通过。没有复用引擎的 Rust 版本比较，
-  这一层可以单独测试。
-- **列表标注**：单台物理接收器的 `Detail` 从「型号」改成「型号 · 能力」：
-  - `features` 有 bit40 且 `srcvers >= 354.54.6` → `AirPlay 2`；
-  - `features` 存在但 bit40 为 0，或 bit40 置位而 `srcvers` 可解析但低于
-    354.54.6 → `Classic AirPlay only`；
-  - `features` 缺失，或 bit40 置位但 `srcvers` 缺失/不可解析 →
-    `AirPlay 2 support unknown`。**没有 feature 证据时绝不显示 classic**；
-    手工添加的接收器同样显示 unknown，而不是 classic。
-  - 原生立体声组继续只显示 `HomePod stereo · n/2`，软件组继续只显示
-    `Software stereo · experimental`；组不叠加能力标注，只有单台物理接收器
-    带新标注。
+  `354.54.5`/`354.54`/`220.68`/`354` 不通过。路由与标注共用这份解析，但用不同
+  的判定逻辑。
+- **列表标注**：单台物理接收器的 `Detail` 从「型号」改成「型号 · 能力」，
+  四态一一对应：
+  | TXT 证据 | 状态 | 列表文案 |
+  | --- | --- | --- |
+  | `features` 缺失 | `Unknown` | `AirPlay 2 support unknown` |
+  | bit40 = 0 | `NotAirPlay2` | `Classic AirPlay only` |
+  | bit40 = 1，`srcvers` 不可解析 | `Unknown` | `AirPlay 2 support unknown` |
+  | bit40 = 1，`srcvers` < 354.54.6 | `ClaimsAirPlay2Outdated` | `AirPlay 2 claimed, firmware too old` |
+  | bit40 = 1，`srcvers` >= 354.54.6 | `AirPlay2` | `AirPlay 2` |
+  没有 feature 证据时绝不显示 classic；手工添加的接收器同样显示 unknown。
+  「自称 AP2 但固件过旧」有独立文案，不再和「仅经典 AirPlay」共用一条。
+  原生立体声组继续只显示 `HomePod stereo · n/2`，软件组继续只显示
+  `Software stereo · experimental`；组不叠加能力标注，只有单台物理接收器带
+  新标注。
 - **门禁分类**：`GateFailure.Classify` 复用现有 `EngineNotice` /
   `SessionController.FailureMessage`，没有新增 IPC 字段或第二条错误通道：
   | 证据 | 分类 | 用户文案 |
   | --- | --- | --- |
-  | 引擎 `authentication_failed`，或 `session_rejected` + TXT `pw=true` | 密码/配对 | 需要密码或配对 |
-  | 引擎 code `mfi_required` 或 message 含 `MFi` | MFi | 软件无法完成 |
-  | setup 通道 + TXT 证明 classic-only（组内任一成员 classic，按 WAC 的整组降级） | 仅经典 | AirFlash 暂不能推流 |
+  | 引擎 `authentication_failed`，或 `session_rejected` + TXT `pw=true`；或 MFi 文本（仅展示启发式） | 密码/配对（通用认证失败） | 需要密码或配对；MFi 文本换成 MFi 文案 |
+  | setup 通道 + TXT 证明 classic-only（组内任一成员 `NotAirPlay2`） | 仅经典 | AirFlash 暂不能推流 |
   | 桌面 `network_error`（DNS/`SocketException`）、`socket_error`、`connection_reset`、`read_timeout`、`write_failed`、`peer_closed`、`feedback_timeout` | 网络 | 检查设备与网络 |
   | 其他（含 `preempted`/`timeline_expired`/`clock_lost`） | 不分类 | 保留引擎的 `Detail` |
   桌面内部新增的 `network_error` 只用于 `EngineNotice`，不进入 IPC 契约。
   `read_timeout` 与 classic 同时出现时优先 classic（经典设备常常接受 TCP 但不回
   AirPlay 2 `/info`）；真正的连接失败/DNS 失败优先网络。setup 以外的 classic
   证据不改文案，避免运行中网络故障被误标成能力门禁。
-- **MFi 的边界**：全仓库（引擎与桌面）目前 `mfi` 零命中，引擎不会返回独立 MFi
-  code，TXT 中也没有已确认的 MFi 位。分类器只在错误消息/code 明确出现 MFi 时
-  生效，所以真实 MFi 设备今天仍会落到通用 fault；这需要引擎侧补证据，见 Q37。
-- **测试**：能力谓词真值表（bit40 置位/清零 × 缺失/低于/等于/高于 354.54.6）、
-  版本解析（missing/extra components）、`features`/`ft` 两段 32 位解析、TXT
-  `srcvers`、单机 AP2/classic/unknown 与组/软件组 `Detail`、门禁分类表
-  （classic、密码、MFi、网络、未知、组内 classic、非 setup 不误标），以及
-  3 条 `SessionController` 消息落地测试。
-- **验证**：本节提交在合并了 main（含 P3-3d）的树上跑过——Rust lib 198 passed
+- **MFi 降级为展示启发式（Q37）**：WAC 定义了 MFi 错误变体但从不检测它
+  （"not implementable without Apple hardware"），TXT 里也没有已确认的 MFi 位。
+  因此桌面不再保留独立的 MFi 门禁分类：消息含 `MFi`（或引擎 code
+  `mfi_required`，目前不会发出）只用于把文案换成友好的「需要 MFi 认证」，
+  权威分类仍是通用认证失败（`PasswordOrPairing`）。也没有给引擎加
+  `mfi_required`，因为它没有可靠触发条件，会变成死代码（Q37）。
+- **测试**：四态逐行（两个 `Unknown` 来源都覆盖）、路由布尔对
+  `Unknown`/`ClaimsAirPlay2Outdated` 保持 `false`、`features`/`ft` 两段 32 位
+  解析（真形状 `"0x4A7FCA00,0x100"` 的 bit40 在高字 → `AirPlay2`；高字无 bit40
+  与单段字符串各一条）、TXT `srcvers`、单机四态与组/软件组 `Detail`、门禁分类
+  表（classic、密码、网络、未知、组内 classic、非 setup 不误标）、MFi 文本
+  只换文案不改权威分类，以及 3 条 `SessionController` 消息落地测试。两段解析
+  现在由测试固定，不再只靠代码阅读确认。
+- **验证**：本节提交在基于 `cfa62a9` 的树上跑过——Rust lib 198 passed
   + 1 ignored、main 2、集成 34 passed + 1 ignored（soak），共 234 passed /
   2 ignored；clippy `-D warnings` 无告警；`build-native.ps1 -Check` 通过；
-  .NET 541 通过；pytest 141 通过；ruff 无问题。
+  .NET 547 通过；pytest 141 通过；ruff 无问题。
 - **P3-2 整体状态**：引擎半（`profile.rs::is_airplay2`、`ptp_expected`，见上文
   「P3-2 连接前预判」）此前已完成，本轮补完桌面半，因此 **P3-2 的引擎半和
   桌面半都已落地**。`还没做` 表里本来就没有 P3-2，不需要删除。
-- **没验证**：没有真机，无法确认 AirPort Express 的真实 TXT 是否就是
+- **没验证 / 待确认**：没有真机，无法确认 AirPort Express 的真实 TXT 是否就是
   `srcvers=220.68`、HomePod 是否就是 `srcvers=366.0`，也无法确认 classic 设备
   拒绝 AirPlay 2 SETUP 时实际落在 `setup/protocol_error` 还是
   `setup/read_timeout`；分类优先级是按协议语义和 WAC 的两段模型推出来的。
   `acl`（报告里的密码标志）也没有并入 `RequiresPassword`，因为缺少真实 TXT
-  样本，暂不改现有 `pw` 语义。
+  样本，暂不改现有 `pw` 语义。门禁只把 `NotAirPlay2` 当作 classic 证据，
+  `ClaimsAirPlay2Outdated` 设备 SETUP 失败时仍落到引擎 detail/网络/密码分类；
+  是否需要独立门禁文案、组规则是否要把它算作 classic，见 Q39。

@@ -2076,6 +2076,23 @@ PTP；97 行表里 `realtime: PCM_44, codec: auto` 行同样是 PTP。本次约�
 3. **如果采用，97 行表怎么处理**？是保持 97 行不变、只在表外追加
    「HomePod + PCM → NTP」断言，还是允许新增/修改表行（会改变「97 行」这个
    计数基线）？
+---
+
+### Q39. `ClaimsAirPlay2Outdated` 的设备 SETUP 失败时，门禁该说什么？ `[待答复]`
+
+P3-2b 按 Q36 把列表标注拆成四态，路由仍严格用 WAC 的布尔。`GateFailure` 目前
+只在 TXT 有「明确不是 AP2」的证据（bit40 = 0，即 `NotAirPlay2`）时，才把 setup
+失败解释成「仅经典 AirPlay」。对于 bit40 = 1 但 `srcvers < 354.54.6` 的设备，
+列表会显示「自称支持 AirPlay 2，固件过旧」，但同样的 setup 失败不会得到能力
+门禁文案，而是落到引擎 `Detail` 或网络/密码分类。
+
+需要确认：
+
+1. 这类设备 SETUP 失败时，是否也应有一条独立门禁文案（例如「固件过旧」），
+   还是保持现状——列表已经说明，失败只报引擎 detail？
+2. 组内只要有一个 `ClaimsAirPlay2Outdated` 成员，按路由布尔整组也会走 classic；
+   门禁的「组内任一成员 classic」规则是否要跟着包含这个状态，还是继续只认
+   `NotAirPlay2` 这种「有证据的否定」？
 
 ---
 
