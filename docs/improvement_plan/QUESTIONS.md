@@ -1586,6 +1586,36 @@ P2-13b 已把协商改成「先探测全组、再算一个 `TimingPlan`、最后
 > | 想要用户可见的组级提示 | 照 WAC 做 **PTP 偏移 sigma 诊断**，放在 `streaming` 之后 |
 > | AP1+AP2 混组整组 NTP | ✅ 你的读法成立；WAC 更进一步，连自适应 lead 都关掉 |
 
+> ### ⚠️ 更正（Q39 调查时发现，Q33 §五 说过头了）
+>
+> Q33 §五 我写「**整组降级到 Classic RAOP**，HomePod 是当经典 RAOP 设备被驱动的」—— **这句错了**。
+>
+> 复核后：`CreateTopologyPlan` 里那行 `Any(d => !d.SupportsAirPlay2)` **只在全员都不是 AP2 时才可能走到**，因为**三处独立守卫会先把混组挡掉**：
+>
+> | 位置 | 守卫 |
+> |---|---|
+> | `:4410` UI 层 | `selected.Select(d => d.SupportsAirPlay2).Distinct().Count() > 1` → 直接 `return` |
+> | `:8316` `AddMember` | `Members[0].SupportsAirPlay2 == device.SupportsAirPlay2` → 加不进成员表 |
+> | `:8404` 批量设置 | `item.SupportsAirPlay2 == flag.Value` → 逐个过滤 |
+>
+> 〔码〕`:4410`：
+> ```csharp
+> if (selected.Select(d => d.SupportsAirPlay2).Distinct().Count() > 1)
+> {
+>     DeviceStatusText.Text = Local("Calibration_MixedTransport",
+>         "AirPlay 2 与经典 RAOP 设备不能加入同一个测试组。请仅选择一种设备类型。");
+>     return;                       // ← 不是降级，是拒绝
+> }
+> ```
+> 〔串〕后端也会独立拒绝：`AirPlay 2 and classic RAOP cannot share one timing group`；UI 文案 `Device_MixedTimingGroupUnsupported`「…**Please connect them separately.**」
+>
+> ⇒ **正确结论**：`Any(...)` 的语义等价于 `All(...)`，它是「**全经典组**」这条路，**不是「混组降级」**。WAC 遇到混组的行为是**拒绝并提示分开连接**，不是静默降级。
+>
+> ⇒ **对 AirFlash 的含义也改了**：不要在一组里既有 AP2 又有非 AP2 时悄悄降级成 classic 把组跑起来 —— 静默降级会让 AP2 成员丢掉 PTP/多房间同步而用户毫不知情。**要拒绝，并明确提示「请分开连接」。**
+>
+> **原第 4 问的回答依旧成立**（AP1 设备那侧听不听，仍要真机验），但「整组 NTP 跑起来」这个前提是不存在的 —— 那种组根本不会开始。
+
+
 ---
 
 ### Q34. Q32 修复落地后的三个取值与真机行为 `[已确认]`
@@ -2214,7 +2244,7 @@ PTP；97 行表里 `realtime: PCM_44, codec: auto` 行同样是 PTP。本次约�
 
 ---
 
-### Q39. `ClaimsAirPlay2Outdated` 的设备 SETUP 失败时，门禁该说什么？ `[待答复]`
+### Q39. `ClaimsAirPlay2Outdated` 的设备 SETUP 失败时，门禁该说什么？ `[已确认]`
 
 P3-2b 按 Q36 把列表标注拆成四态，路由仍严格用 WAC 的布尔。`GateFailure` 目前
 只在 TXT 有「明确不是 AP2」的证据（bit40 = 0，即 `NotAirPlay2`）时，才把 setup
@@ -2229,6 +2259,122 @@ P3-2b 按 Q36 把列表标注拆成四态，路由仍严格用 WAC 的布尔。`
 2. 组内只要有一个 `ClaimsAirPlay2Outdated` 成员，按路由布尔整组也会走 classic；
    门禁的「组内任一成员 classic」规则是否要跟着包含这个状态，还是继续只认
    `NotAirPlay2` 这种「有证据的否定」？
+
+> **答复**：**第 1 问保持现状（不新增独立门禁文案）；第 2 问要改 —— 不是「跟着包含这个状态」，而是「这条规则本身该换成混组拒绝」。这是 Q39 调查里顺带发现的、Q33 的一处过度结论，已在 Q33 §五 追加更正。**
+>
+> ## 一、先纠正一个前提：WAC 里根本没有「混组降级」这回事
+>
+> 你 Q39.2 写「组内只要有一个 `ClaimsAirPlay2Outdated` 成员，按路由布尔整组也会走 classic」—— 这个「整组走 classic」在 WAC 里**不存在**。
+>
+> 〔码〕`:4410`，在建 plan **之前**就挡掉了：
+> ```csharp
+> if (selected.Select(d => d.SupportsAirPlay2).Distinct().Count() > 1)
+> {
+>     DeviceStatusText.Text = Local("Calibration_MixedTransport",
+>         "AirPlay 2 与经典 RAOP 设备不能加入同一个测试组。请仅选择一种设备类型。");
+>     return;
+> }
+> ```
+>
+> 另外两处守卫（`:8316` `AddMember`、`:8404` 批量设置）连**成员表**都不让混。⇒ `CreateTopologyPlan` 的 `Any(!SupportsAirPlay2)` 实际只覆盖「**全员非 AP2**」，语义等价于 `All`。
+>
+> 〔串〕后端独立再拒一次：`AirPlay 2 and classic RAOP cannot share one timing group`；对应 UI 文案 `Device_MixedTimingGroupUnsupported`「AirPlay 2 and classic AirPlay 1/RAOP devices cannot be grouped together. **Please connect them separately.**」
+>
+> ⇒ **WAC 对混组的行为是「拒绝 + 让用户分开连」，不是「降级」**（三个层次各拒一次，非常坚决）。
+>
+> ## 二、第 1 问：`ClaimsAirPlay2Outdated` 设备 SETUP 失败，要不要独立门禁文案 → **不要**
+>
+> ### 证据：WAC 的失败文案表里没有这一类
+>
+> 〔码〕`BackendFailureFormatter.Format`（`:24160`）是一张**纯字符串子串匹配表**，我把 12 个类别全列出来了：
+>
+> | 后端原话 | UI 文案 key |
+> |---|---|
+> | `No audio capture source is selected` | `Device_CaptureNotSelected` |
+> | `Audio capture source is not available` | `Device_CaptureUnavailable` |
+> | `AirPlay 1 devices are single-device only` | `Device_AirPlay1SingleOnly` |
+> | `AirPlay 2 receivers without PTP timing are single-device only` | `Device_SoloTimingOnly` |
+> | `AirPlay 2 devices cannot join an active AirPlay 1 session` | `Device_AirPlay2CannotJoinAirPlay1` |
+> | `Selected DNS-SD receiver instance is no longer available` | `Device_SelectedInstanceUnavailable` |
+> | `AirPlay group has no reachable physical audio member` | `Device_NoReachableMember` |
+> | `AirPlay 2 and classic RAOP cannot share one timing group` | `Device_MixedTimingGroupUnsupported` |
+> | `Authentication rejected` | `Device_AuthenticationRejected` |
+> | `Device does not advertise AirPlay 2 or RAOP audio` | `Device_NoAirPlayAdvertisement` |
+> | `Password-protected AirPlay 1 devices are not supported` | `Device_PasswordProtectedAirPlay1` |
+> | `Backend recovery exhausted` / `BACKEND_RECOVERY_FAILED` | `Device_BackendRecoveryExhausted` |
+> | `HomePod is playing from another AirPlay device` | `Device_TakenOver` |
+>
+> **没有「固件过旧」这一类，一条都没有。**
+>
+> 这不是疏漏 —— 上面每一条都对应**后端真的会说的一句话**。而「固件过旧」后端从来不会说：因为**路由根本没让这类设备走 AP2**，它压根没机会报 AP2 相关的错。
+>
+> ### 更重要的理由：归因需要证据，而列表态不是失败原因
+>
+> `ClaimsAirPlay2Outdated` 是**连接前**从 TXT 读到的一个事实。SETUP 失败的原因可能是：网络不通、密码错、设备被别人占用、设备忙、协议不兼容……
+>
+> **拿一个连接前的状态去解释连接失败，是猜测，不是归因。** 猜错了比不猜更糟 —— 用户会去升级固件，而真实原因是密码。
+>
+> ### 折中：不做独立门禁，做一个**诚实的前缀提示**
+>
+> 如果一定要让用户看到这条信息，正确的位置是**在已有 detail 后面追加一句条件提示**，而不是替换整个分类：
+>
+> ```rust
+> fn describe_failure(device: &Device, failure: &GateFailure) -> String {
+>     let base = match failure { /* 现有分类 */ };
+>     if device.capability == AirPlayCapability::ClaimsAirPlay2Outdated {
+>         // 只在 base 没有给出具体原因时才补，避免和真实原因打架
+>         if failure.detail.is_empty() {
+>             return format!("{base}（该设备自称支持 AirPlay 2，但固件版本低于 354.54.6，已按经典设备连接）");
+>         }
+>     }
+>     base
+> }
+> ```
+>
+> 关键是 `failure.detail.is_empty()` 这个条件：**有真实原因时绝不覆盖**。
+>
+> ## 三、第 2 问：门禁的「组内任一成员 classic」规则 → **换成「混组拒绝」**
+>
+> 你现在把它设成一道**适配门禁**（决定能不能连），但 WAC 的语义是**准入拒绝**（压根不让组存在）。两者差别很大：
+>
+> | | 你的现方案 | WAC 的做法 |
+> |---|---|---|
+> | 全非 AP2 组 | classic，允许 | classic，允许 |
+> | 混组 | 整组降级 classic，允许 | **拒绝**，提示分开连 |
+> | 用户知道吗 | 不知道（悄悄降级） | 知道（明确提示） |
+> | AP2 成员丢掉的 PTP/多房间同步 | 无声 | 有提示 |
+>
+> ⇒ **规则应该按「路由布尔是否同质」判定，而不是按「有没有证据的否定」判定：**
+>
+> ```rust
+> // 用路由布尔（== WAC 的 SupportsAirPlay2）做同质性检查
+> let ap2_flags: HashSet<bool> = members.iter().map(|d| d.routes_as_ap2()).collect();
+>
+> match ap2_flags.len() {
+>     1 => { /* 同质：全 AP2 或全经典，正常连接 */ }
+>     _ => return Err(GateFailure::MixedTransport {
+>         // 对齐 Device_MixedTimingGroupUnsupported 的语义
+>         message: "AirPlay 2 与经典 AirPlay 1/RAOP 设备不能加入同一个组，请分开连接",
+>     }),
+> }
+> ```
+>
+> **`ClaimsAirPlay2Outdated` 在这里应该算「不是 AP2」**（和 `routes_as_ap2()` 一致），但它触发的是**混组拒绝**，**不是**「仅经典 AirPlay」的逐设备门禁。这两条消息是不同的：
+>
+> - **混组拒绝**：「你和别的设备不能放一起」→ 用户动作：**分开连**
+> - **逐设备能力门禁**：「这台本身不行」→ 用户动作：**换设备/升级**
+>
+> 把 `ClaimsAirPlay2Outdated` 放进后者，会给用户错误的处置建议。
+>
+> ## 四、结论
+>
+> | 你的问题 | 结论 |
+> |---|---|
+> | 是否给 `ClaimsAirPlay2Outdated` 加独立门禁文案 | **不加**。WAC 的 13 类失败文案里没有「固件过旧」，且列表态不能当失败原因 |
+> | 那用户怎么知道 | 已在列表四态里显示；失败时若 `detail` 为空，**追加一句前缀提示**（有真实原因就不覆盖） |
+> | 组内任一成员 classic 的门禁规则 | **换成「路由布尔不同质 ⇒ 拒绝混组」**，对齐 `Device_MixedTimingGroupUnsupported` |
+> | `ClaimsAirPlay2Outdated` 算不算「classic」 | **算**（与 `routes_as_ap2` 一致），但触发的是**混组拒绝**，不是逐设备能力门禁 |
+> | 顺带 | Q33 §五「整组降级」的表述已在 Q33 末尾追加更正 —— 那是拒绝，不是降级 |
 
 ---
 
