@@ -377,6 +377,32 @@ enum PreemptionPoll {
     Yield(Fault),
 }
 
+/// One member's preemption evidence for a loop round, gathered **before** any
+/// decision so Q42's group-wide rule can see every member at once: deciding
+/// member by member would reclaim the first failing receiver before the second
+/// one's identical failure was even probed.
+struct PreemptionRound {
+    media_healthy: bool,
+    /// Signals drained from the feedback workers this round (evidence line).
+    signals: Vec<preemption::Signal>,
+    /// The control-port probe taken for the evidence line, when a signal
+    /// arrived but no verdict was due.
+    evidence: Option<preemption::ReceiverLiveness>,
+    /// The verdict half: present only when a probe was due this round.
+    probe: Option<RoundProbe>,
+}
+
+/// The status-probe half of a due round, already combined with the raw
+/// liveness. It is re-derived from the same `statusFlags` when the escalation
+/// or the group-wide rule settles on a different verdict.
+struct RoundProbe {
+    /// The raw control-port probe (the log keeps `refused` distinct from
+    /// `dead`, Q42).
+    liveness: preemption::ReceiverLiveness,
+    result: Result<preemption::ProbeReport>,
+    we_hold_session: bool,
+}
+
 /// One receiver's `/info` evidence, fetched before the group timing decision.
 ///
 /// The RTSP connection stays open between probing and SETUP; `fingerprint` is
@@ -697,11 +723,21 @@ impl Member {
     ///   the media loop alive. Queueing never gives up: a receiver that stays
     ///   busy for an hour is probed once a minute and is never reclaimed for
     ///   being busy (Q34).
-    /// - `Gone` (healthy media + a failed TCP liveness probe) reclaims: the
-    ///   device is gone, not taken over. `Unknown` / probe error / timeout with
-    ///   unhealthy media reclaim immediately (fail-open).
+    /// - `Gone` (healthy media + a refused or failed TCP liveness probe)
+    ///   reclaims: the device is gone or is not serving us, not taken over.
+    ///   `Unknown` / probe error / timeout with unhealthy media reclaim
+    ///   immediately (fail-open).
     /// - Only a confirmed `Free` is a genuine takeover cycle; the per-receiver
     ///   counter decides whether it is another cycle or the sender must yield.
+    ///
+    /// One round is split in two so Q42's group-wide rule can run in between:
+    /// [`Self::prepare_preemption`] gathers every member's evidence and probe
+    /// without deciding anything, the caller applies
+    /// [`preemption::local_network_suspected`] across the whole group, and
+    /// [`Self::apply_preemption`] turns each round into an action. This
+    /// single-member wrapper keeps one-receiver paths and direct-call tests
+    /// unchanged.
+    #[cfg(test)]
     fn poll_preemption(
         &mut self,
         cancel: &Cancellation,
@@ -709,6 +745,15 @@ impl Member {
         now: Instant,
         emit: &impl Fn(Json),
     ) -> (PreemptionPoll, bool) {
+        let round = self.prepare_preemption(cancel, now);
+        self.apply_preemption(round, takeovers, now, emit, false)
+    }
+
+    /// Phase 1 of one preemption round: drain the evidence, probe the control
+    /// port's liveness and — when a probe is due — the receiver's live
+    /// `statusFlags`. Nothing is decided here: Q42's group-wide rule needs the
+    /// whole group's liveness before any member may be called gone.
+    fn prepare_preemption(&mut self, cancel: &Cancellation, now: Instant) -> PreemptionRound {
         let media_healthy = self.media.media_healthy(now, MEDIA_HEALTH_WINDOW);
         let signals = self.health.take_preemption_signals();
         // The receiver-side liveness dimension Q34 recovered. It is probed once
@@ -719,21 +764,22 @@ impl Member {
             for signal in &signals {
                 self.preemption.observe(*signal, now);
             }
-            let probed = preemption::receiver_liveness(
+            liveness = Some(preemption::receiver_liveness(
                 self.peer.host,
                 self.peer.port,
                 preemption::LIVENESS_TIMEOUT,
-            );
-            liveness = Some(probed);
-            emit(preemption_evidence(self, &signals, media_healthy, probed));
+            ));
         }
-        if !self.preemption.due(now) {
-            return (PreemptionPoll::None, media_healthy);
+        if !self.preemption.due(now) || cancel.is_cancelled() {
+            // Evidence is still reported with the probe taken for it, but no
+            // verdict is due: nothing is fed to the escalation timer.
+            return PreemptionRound {
+                media_healthy,
+                signals,
+                evidence: liveness,
+                probe: None,
+            };
         }
-        if cancel.is_cancelled() {
-            return (PreemptionPoll::None, media_healthy);
-        }
-        let address = SocketAddr::new(self.peer.host, self.peer.port);
         let liveness = liveness.unwrap_or_else(|| {
             preemption::receiver_liveness(
                 self.peer.host,
@@ -746,52 +792,124 @@ impl Member {
         // healthy session would look like "a session is active and we are
         // reclaiming", i.e. a takeover of ourselves (Q31/Q32).
         let we_hold_session = self.preemption.we_hold_session(media_healthy, now);
-        // A dead device cannot answer `/info`; probing it would only burn the
-        // RTSP timeout after the TCP probe already proved it is gone. Q34's
-        // table turns that straight into `Gone` (a reclaim, never busy).
-        let probed = if liveness == preemption::ReceiverLiveness::Dead {
+        // A receiver that refused the connection or cannot be reached cannot
+        // answer `/info` either; probing it would only burn the RTSP timeout
+        // after the TCP probe already settled it. Q34's table turns that
+        // straight into `Gone` (a reclaim, never busy). Q42 keeps the two raw
+        // states apart in the log: refused is not dead.
+        let result = if matches!(
+            liveness,
+            preemption::ReceiverLiveness::Dead | preemption::ReceiverLiveness::Refused
+        ) {
             Ok(preemption::ProbeReport {
                 outcome: preemption::ProbeOutcome::Gone,
                 status_flags: None,
             })
         } else {
-            preemption::probe_report(
+            let address = SocketAddr::new(self.peer.host, self.peer.port);
+            match preemption::probe_report(
                 address,
                 cancel,
                 preemption::PROBE_TIMEOUT,
                 we_hold_session,
-            )
+            ) {
+                Ok(report) => Ok(preemption::ProbeReport {
+                    // Q34's combine table: healthy media with a reachable (or
+                    // unproven) receiver is our session, whatever `/info` says.
+                    outcome: preemption::combine(
+                        media_healthy,
+                        liveness,
+                        report.status_flags,
+                        we_hold_session,
+                    ),
+                    status_flags: report.status_flags,
+                }),
+                // Healthy media outranks an auxiliary probe failure: the control
+                // channel is not the media path (Q34: feedback failure is not
+                // media failure). With unhealthy media the fail-open reclaim
+                // below still applies.
+                Err(_) if media_healthy => Ok(preemption::ProbeReport {
+                    outcome: preemption::combine(media_healthy, liveness, None, we_hold_session),
+                    status_flags: None,
+                }),
+                Err(error) => Err(error),
+            }
         };
-        let result = match probed {
-            Ok(report) => Ok(preemption::ProbeReport {
-                // Q34's combine table: healthy media with a reachable (or
-                // unproven) receiver is our session, whatever `/info` says.
-                outcome: preemption::combine(
+        PreemptionRound {
+            media_healthy,
+            signals,
+            evidence: None,
+            probe: Some(RoundProbe {
+                liveness,
+                result,
+                we_hold_session,
+            }),
+        }
+    }
+
+    /// Phase 2: feed the round through Q42's escalation rule and act on the
+    /// verdict. `local_suspected` is the group-wide result: every receiver
+    /// failed at once, so the failure belongs to our own side, not to this
+    /// device.
+    fn apply_preemption(
+        &mut self,
+        round: PreemptionRound,
+        takeovers: &mut preemption::TakeoverCounters,
+        now: Instant,
+        emit: &impl Fn(Json),
+        local_suspected: bool,
+    ) -> (PreemptionPoll, bool) {
+        let media_healthy = round.media_healthy;
+        let Some(probe) = round.probe else {
+            // Evidence only: no probe was due this round.
+            if let Some(probed) = round.evidence {
+                emit(preemption_evidence(
+                    self,
+                    &round.signals,
                     media_healthy,
-                    liveness,
-                    report.status_flags,
-                    we_hold_session,
-                ),
-                status_flags: report.status_flags,
-            }),
-            // Healthy media outranks an auxiliary probe failure: the control
-            // channel is not the media path (Q34: feedback failure is not
-            // media failure). With unhealthy media the fail-open reclaim below
-            // still applies.
-            Err(_) if media_healthy => Ok(preemption::ProbeReport {
-                outcome: preemption::combine(media_healthy, liveness, None, we_hold_session),
-                status_flags: None,
-            }),
-            Err(error) => Err(error),
+                    probed,
+                    None,
+                    false,
+                ));
+            }
+            return (PreemptionPoll::None, media_healthy);
         };
+        let sample = if local_suspected {
+            preemption::LivenessSample::LocalSuspect
+        } else {
+            preemption::LivenessSample::Probe(probe.liveness)
+        };
+        let liveness = self.preemption.observe_liveness(sample, now);
+        let result = settle_liveness(
+            media_healthy,
+            probe.liveness,
+            liveness.verdict,
+            probe.result,
+            probe.we_hold_session,
+        );
+        if !round.signals.is_empty() {
+            emit(preemption_evidence(
+                self,
+                &round.signals,
+                media_healthy,
+                probe.liveness,
+                Some(liveness.verdict),
+                local_suspected,
+            ));
+        }
         let note = self.preemption.note_result(&result, now);
-        if note.log_changed {
+        if note.log_changed || liveness.log_changed {
             emit(preemption_probe(
                 self,
                 &result,
-                we_hold_session,
+                probe.we_hold_session,
                 media_healthy,
-                liveness,
+                ProbeLiveness {
+                    probed: probe.liveness,
+                    verdict: liveness.verdict,
+                    failures: self.preemption.liveness_failures(),
+                    local_suspected,
+                },
             ));
         }
         if let Some((first, second)) = note.disagreement {
@@ -807,7 +925,17 @@ impl Member {
             // The active session on the receiver is ours: the control-plane
             // symptom is something else, so take no preemption action and fall
             // through to the existing health checks below.
-            preemption::ProbeAction::FallThrough => (PreemptionPoll::None, media_healthy),
+            preemption::ProbeAction::FallThrough => {
+                // Q42's timer needs another sample while the verdict is still
+                // undecided. Without this the patience limit could never be
+                // reached: the feedback worker that produced the evidence is
+                // gone and would never schedule another probe. A local-suspect
+                // round is not this device's failure, so it is not re-probed.
+                if !local_suspected && liveness.verdict == preemption::Verdict::Unknown {
+                    self.preemption.await_liveness(now);
+                }
+                (PreemptionPoll::None, media_healthy)
+            }
             preemption::ProbeAction::Reclaim => {
                 // Confirmed (or fail-open). The old encrypted control connection
                 // belongs to the session the receiver already ended; the reclaim
@@ -1757,12 +1885,33 @@ fn send_packets(
                     emit(event);
                 }
             }
+            // Gather the whole round before deciding anything: Q42's group-wide
+            // rule needs every member's liveness at once, and a member-by-member
+            // decision would reclaim the first failing receiver before the
+            // second one's identical failure was even probed.
+            let mut rounds = Vec::with_capacity(members.len());
             for member in members.iter_mut() {
+                rounds.push(member.prepare_preemption(cancel, Instant::now()));
+            }
+            let probed: Vec<_> = rounds
+                .iter()
+                .filter_map(|round| round.probe.as_ref().map(|probe| probe.liveness))
+                .collect();
+            let local_suspected = preemption::local_network_suspected(&probed, members.len());
+            if local_suspected {
+                emit(preemption_local_network(members.len(), &probed));
+            }
+            for (member, round) in members.iter_mut().zip(rounds) {
                 for notice in member.health.notices() {
                     emit(notice);
                 }
-                let (preemption, media_healthy) =
-                    member.poll_preemption(cancel, takeovers, Instant::now(), emit);
+                let (preemption, media_healthy) = member.apply_preemption(
+                    round,
+                    takeovers,
+                    Instant::now(),
+                    emit,
+                    local_suspected,
+                );
                 let waiting = match preemption {
                     PreemptionPoll::None => false,
                     PreemptionPoll::Waiting => true,
@@ -2421,16 +2570,53 @@ fn preemption_takeover_fault(host: IpAddr, consecutive: u32) -> Fault {
     )
     .with_reason(preemption::ReclaimReason::Takeover.name())
 }
+/// Re-derive Q34's combine table for the verdict Q42's escalation rule or the
+/// group-wide cross-check settled on.
+///
+/// The raw `/info` half is reused — when the verdict differs from the raw probe
+/// (an `Unknown` chain escalated to `Dead`, or an all-failed round downgraded to
+/// `Unknown`) the already fetched `statusFlags` are combined again instead of
+/// probing the receiver a second time. A failed `/info` probe stays a failure:
+/// there is nothing better to combine, and the caller's fail-open path applies.
+fn settle_liveness(
+    media_healthy: bool,
+    probed: preemption::ReceiverLiveness,
+    verdict: preemption::Verdict,
+    result: Result<preemption::ProbeReport>,
+    we_hold_session: bool,
+) -> Result<preemption::ProbeReport> {
+    let effective = verdict.liveness();
+    if effective == probed {
+        return result;
+    }
+    match result {
+        Ok(report) => Ok(preemption::ProbeReport {
+            outcome: preemption::combine(
+                media_healthy,
+                effective,
+                report.status_flags,
+                we_hold_session,
+            ),
+            status_flags: report.status_flags,
+        }),
+        Err(error) => Err(error),
+    }
+}
 /// Control-plane symptoms are logged as evidence, never as a verdict. The three
 /// context fields are the ones Q30 recovers from the reference log; `policy` is
 /// our proxy for WAC's session policy (timing/codec family). Q34 adds the
-/// receiver-side liveness dimension as the first-class `tcp_reachable` field
-/// (`tcp_liveness` keeps the three-state distinction that a bool cannot).
+/// receiver-side liveness dimension as the first-class `tcp_reachable` field;
+/// `tcp_liveness` keeps the four-state distinction a bool cannot (`alive` /
+/// `refused` / `dead` / `unknown`, Q42) and `liveness_verdict` is what the
+/// escalation rule made of it. `local_network_suspected` marks the rounds where
+/// every receiver failed at once, i.e. the failure is ours, not the device's.
 fn preemption_evidence(
     member: &Member,
     signals: &[preemption::Signal],
     rtp_healthy: bool,
     liveness: preemption::ReceiverLiveness,
+    verdict: Option<preemption::Verdict>,
+    local_suspected: bool,
 ) -> Json {
     json!({
         "event": "warning",
@@ -2444,21 +2630,40 @@ fn preemption_evidence(
         "packets_prepared": member.media.metrics.packets_sent,
         "tcp_reachable": liveness.reachable(),
         "tcp_liveness": liveness.name(),
+        "liveness_verdict": verdict.map(preemption::Verdict::name),
+        "local_network_suspected": local_suspected,
         "message": "Control-plane takeover evidence; asking the receiver for its live statusFlags and TCP reachability",
     })
+}
+/// The liveness half of one diagnostic line (Q34/Q42): what the control-port
+/// probe said, what the escalation rule made of it, how many consecutive
+/// non-definitive samples there are, and whether the whole group failed at
+/// once.
+#[derive(Clone, Copy, Debug)]
+struct ProbeLiveness {
+    probed: preemption::ReceiverLiveness,
+    verdict: preemption::Verdict,
+    failures: u32,
+    local_suspected: bool,
 }
 /// One diagnostic line per probe change. It carries the same context fields as
 /// the evidence line (the reference implementation logs them next to the
 /// symptom) plus `we_hold_session`, the locally derived dimension the verdict
 /// uses, the raw 64-bit `statusFlags` value so the bits can be checked against a
-/// real receiver, and Q34's `tcp_reachable` liveness field.
+/// real receiver, and Q34/Q42's liveness fields.
 fn preemption_probe(
     member: &Member,
     result: &Result<preemption::ProbeReport>,
     we_hold_session: bool,
     rtp_healthy: bool,
-    liveness: preemption::ReceiverLiveness,
+    liveness: ProbeLiveness,
 ) -> Json {
+    let ProbeLiveness {
+        probed,
+        verdict,
+        failures,
+        local_suspected,
+    } = liveness;
     let mut event = json!({
         "event": "warning",
         "host": member.peer.host.to_string(),
@@ -2469,8 +2674,11 @@ fn preemption_probe(
         "rtp_healthy": rtp_healthy,
         "packets_prepared": member.media.metrics.packets_sent,
         "we_hold_session": we_hold_session,
-        "tcp_reachable": liveness.reachable(),
-        "tcp_liveness": liveness.name(),
+        "tcp_reachable": probed.reachable(),
+        "tcp_liveness": probed.name(),
+        "liveness_verdict": verdict.name(),
+        "liveness_failures": failures,
+        "local_network_suspected": local_suspected,
     });
     match result {
         Ok(report) => {
@@ -2482,12 +2690,27 @@ fn preemption_probe(
                 .status_flags
                 .is_some_and(|flags| flags & preemption::STEREO_PARTNER_UNREACHABLE != 0));
             event["message"] = json!(match (report.outcome, report.status_flags) {
+                // A group-wide failure is never reported as a dead device: the
+                // evidence belongs to our own side (Q42).
+                _ if local_suspected => {
+                    "Every receiver failed its liveness probe in the same round; treating it as a local network problem, not a dead device".to_string()
+                }
+                (preemption::ProbeOutcome::Gone, _)
+                    if probed == preemption::ReceiverLiveness::Refused =>
+                {
+                    "Receiver refused the control connection (the host is alive, it is just not serving AirPlay); reclaiming"
+                        .to_string()
+                }
                 (preemption::ProbeOutcome::Gone, _) => {
                     "Receiver control port is not reachable; the device is gone, reclaiming"
                         .to_string()
                 }
                 (_, Some(flags)) => {
                     format!("Receiver /info statusFlags=0x{flags:016x} ({flags})")
+                }
+                (preemption::ProbeOutcome::OursActive, None) => {
+                    "Receiver /info has no usable statusFlags; keeping our session (conservative)"
+                        .to_string()
                 }
                 (_, None) => "Receiver /info has no usable statusFlags; reclaiming".to_string(),
             });
@@ -2500,6 +2723,27 @@ fn preemption_probe(
         }
     }
     event
+}
+/// Q42's group-wide cross-check fired: every receiver failed its liveness probe
+/// in the same round. The common cause is our own side (routing table,
+/// interface, Wi-Fi), not several devices dying at once, so no device is marked
+/// dead and the media-health backstop keeps the decision.
+fn preemption_local_network(
+    receivers: usize,
+    probes: &[preemption::ReceiverLiveness],
+) -> Json {
+    json!({
+        "event": "warning",
+        "host": null,
+        "channel": "preemption",
+        "code": "preemption_local_network",
+        "recovered": false,
+        "receivers": receivers,
+        "probes": probes.iter().map(|probed| probed.name()).collect::<Vec<_>>(),
+        "message": format!(
+            "All {receivers} receiver liveness probes failed this round; suspecting the local network, keeping the session"
+        ),
+    })
 }
 /// The confirmation probe disagreed with the first verdict. Both raw outcomes
 /// are logged; the caller keeps the non-destructive verdict (never a reclaim),
@@ -3369,10 +3613,13 @@ mod tests {
         probe_server.join().unwrap();
     }
     #[test]
-    fn a_dead_control_port_reclaims_instead_of_a_generic_fault() {
+    fn an_unreachable_control_port_reclaims_instead_of_a_generic_fault() {
         // Bind and drop a listener to get a port with no receiver listening.
-        // The TCP liveness probe is refused, so Q34 classifies the device as
-        // gone: a reclaim, never busy and never a generic transport fault.
+        // The TCP liveness probe proves the receiver cannot serve us, so the
+        // verdict is gone: a reclaim, never busy and never a generic transport
+        // fault. Which raw state it is depends on the local stack (a returned
+        // RST is `refused`, a dropped SYN is `dead`); both are the same action
+        // and both are Q42's "not serving us".
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let dead = probe.local_addr().unwrap();
         drop(probe);
@@ -3394,29 +3641,261 @@ mod tests {
         );
         assert!(
             matches!(poll, PreemptionPoll::Reclaimed { consecutive: 1 }),
-            "a dead receiver must take the reclaim path, never the generic fault path"
+            "a receiver that cannot serve us must take the reclaim path, never the generic fault path"
         );
         assert_eq!(
             counters.consecutive(member.peer.host),
             0,
-            "a dead device is not a takeover cycle"
+            "a receiver that cannot serve us is not a takeover cycle"
         );
         let events = emitted.lock().unwrap();
         let probe = events
             .iter()
             .find(|event| event["code"] == "preemption_probe")
-            .expect("the dead receiver must be logged");
+            .expect("the unreachable receiver must be logged");
         assert_eq!(probe["outcome"], "gone");
         assert_eq!(probe["tcp_reachable"], false);
-        assert_eq!(probe["tcp_liveness"], "dead");
+        assert_eq!(probe["liveness_verdict"], "dead");
+        assert!(
+            matches!(probe["tcp_liveness"].as_str(), Some("dead" | "refused")),
+            "the raw probe state is logged, got {}",
+            probe["tcp_liveness"]
+        );
         assert!(probe["message"].as_str().unwrap().contains("not reachable"));
         assert!(
             events.iter().all(|event| event["code"] != "preempted"),
-            "a dead device is not reported as another controller's takeover"
+            "an unreachable device is not reported as another controller's takeover"
         );
         drop(events);
         drop(member);
         worker.join().unwrap();
+    }
+    /// One synthetic verdict round, so the escalation and group-wide rules can
+    /// be tested without depending on which errno the local stack returns.
+    fn synthetic_round(
+        media_healthy: bool,
+        liveness: preemption::ReceiverLiveness,
+        result: Result<preemption::ProbeReport>,
+        signals: Vec<preemption::Signal>,
+    ) -> PreemptionRound {
+        PreemptionRound {
+            media_healthy,
+            signals,
+            evidence: None,
+            probe: Some(RoundProbe {
+                liveness,
+                result,
+                we_hold_session: true,
+            }),
+        }
+    }
+    #[test]
+    fn a_refused_control_port_is_logged_as_refused_and_never_as_dead() {
+        // A returned RST is not a dead device (Q42): the host is alive, it just
+        // is not serving the control port. The action is the same fail-open
+        // reclaim; the reported state must not be.
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mut member, worker, _methods) =
+            local_member_with_health(receiver.local_addr().unwrap(), None, Health::default());
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = emitted.clone();
+        let mut counters = preemption::TakeoverCounters::default();
+        let round = synthetic_round(
+            true,
+            preemption::ReceiverLiveness::Refused,
+            Ok(preemption::ProbeReport {
+                outcome: preemption::ProbeOutcome::Gone,
+                status_flags: None,
+            }),
+            vec![preemption::Signal::ConnectionClose],
+        );
+        let (poll, _) = member.apply_preemption(
+            round,
+            &mut counters,
+            Instant::now(),
+            &|json| seen.lock().unwrap().push(json),
+            false,
+        );
+        assert!(matches!(poll, PreemptionPoll::Reclaimed { consecutive: 1 }));
+        assert_eq!(
+            counters.consecutive(member.peer.host),
+            0,
+            "refused is not a takeover cycle"
+        );
+        let events = emitted.lock().unwrap();
+        let probe = events
+            .iter()
+            .find(|event| event["code"] == "preemption_probe")
+            .expect("the refused receiver must be logged");
+        assert_eq!(probe["tcp_liveness"], "refused");
+        assert_eq!(probe["liveness_verdict"], "dead");
+        assert_eq!(probe["tcp_reachable"], false);
+        assert_eq!(probe["outcome"], "gone");
+        let message = probe["message"].as_str().unwrap();
+        assert!(message.contains("refused"), "{message}");
+        assert!(message.contains("alive"), "{message}");
+        assert!(
+            !message.contains("device is gone"),
+            "a refusal must never be labelled dead: {message}"
+        );
+        let evidence = events
+            .iter()
+            .find(|event| event["code"] == "preemption_evidence")
+            .expect("the evidence line keeps the same state");
+        assert_eq!(evidence["tcp_liveness"], "refused");
+        assert_eq!(evidence["liveness_verdict"], "dead");
+        assert_eq!(evidence["local_network_suspected"], false);
+        assert!(
+            events.iter().all(|event| event["code"] != "preempted"),
+            "refused is not reported as another controller's takeover"
+        );
+        drop(events);
+        drop(member);
+        worker.join().unwrap();
+    }
+    #[test]
+    fn an_escalating_unknown_liveness_reclaims_after_the_patience_limit() {
+        // Q42: `Unknown` is "temporarily unknown", not "mine forever". Media is
+        // healthy — the UDP sends keep succeeding even when the device is
+        // unreachable, which is exactly why MEDIA_HEALTH_WINDOW cannot decide
+        // this on its own and the escalation timer has to.
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mut member, worker, _methods) =
+            local_member_with_health(receiver.local_addr().unwrap(), None, Health::default());
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = emitted.clone();
+        let mut counters = preemption::TakeoverCounters::default();
+        let now = Instant::now();
+        let unknown_round = || {
+            synthetic_round(
+                true,
+                preemption::ReceiverLiveness::Unknown,
+                Ok(preemption::ProbeReport {
+                    outcome: preemption::ProbeOutcome::OursActive,
+                    status_flags: None,
+                }),
+                Vec::new(),
+            )
+        };
+        for step in 0..preemption::LIVENESS_PATIENCE - 1 {
+            let at = now + Duration::from_secs(u64::from(step) * 3);
+            let (poll, _) =
+                member.apply_preemption(unknown_round(), &mut counters, at, &|json| seen.lock().unwrap().push(json), false);
+            assert!(
+                matches!(poll, PreemptionPoll::None),
+                "unknown is not a death yet"
+            );
+            assert_eq!(member.preemption.liveness_failures(), step + 1);
+            assert_eq!(
+                member.preemption.scheduled(),
+                Some(at + preemption::LIVENESS_RETRY),
+                "another liveness sample is scheduled while the verdict is undecided"
+            );
+            assert!(!member.preempted);
+        }
+        let at = now + Duration::from_secs(u64::from(preemption::LIVENESS_PATIENCE) * 3);
+        let (poll, _) =
+            member.apply_preemption(unknown_round(), &mut counters, at, &|json| seen.lock().unwrap().push(json), false);
+        assert!(
+            matches!(poll, PreemptionPoll::Reclaimed { consecutive: 1 }),
+            "the third consecutive unknown escalates to a reclaim"
+        );
+        assert_eq!(
+            counters.consecutive(member.peer.host),
+            0,
+            "an escalated unknown is not a takeover cycle"
+        );
+        assert!(member.preempted);
+        let events = emitted.lock().unwrap();
+        let last = events.iter().rfind(|event| event["code"] == "preemption_probe")
+            .expect("the escalated probe is logged");
+        assert_eq!(last["tcp_liveness"], "unknown");
+        assert_eq!(last["liveness_verdict"], "dead");
+        assert_eq!(last["liveness_failures"], 3);
+        assert_eq!(last["outcome"], "gone");
+        drop(events);
+        drop(member);
+        worker.join().unwrap();
+    }
+    #[test]
+    fn a_group_wide_liveness_failure_does_not_mark_the_device_dead() {
+        // Every receiver failed at once, so the failure belongs to our own side
+        // (Q42). The dead verdict is downgraded to unknown and a healthy
+        // session keeps playing instead of being reclaimed.
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mut member, worker, _methods) =
+            local_member_with_health(receiver.local_addr().unwrap(), None, Health::default());
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = emitted.clone();
+        let mut counters = preemption::TakeoverCounters::default();
+        let round = synthetic_round(
+            true,
+            preemption::ReceiverLiveness::Dead,
+            Ok(preemption::ProbeReport {
+                outcome: preemption::ProbeOutcome::Gone,
+                status_flags: None,
+            }),
+            Vec::new(),
+        );
+        let (poll, media_healthy) = member.apply_preemption(
+            round,
+            &mut counters,
+            Instant::now(),
+            &|json| seen.lock().unwrap().push(json),
+            true,
+        );
+        assert!(
+            matches!(poll, PreemptionPoll::None),
+            "a group-wide failure must not reclaim any single device"
+        );
+        assert!(media_healthy);
+        assert!(!member.preempted);
+        assert!(!member.conn.lock().unwrap().is_poisoned());
+        assert_eq!(
+            member.preemption.liveness_failures(),
+            0,
+            "a local round is not evidence about this device"
+        );
+        assert_eq!(
+            member.preemption.scheduled(),
+            None,
+            "a local round schedules no escalation re-probe"
+        );
+        let events = emitted.lock().unwrap();
+        let probe = events
+            .iter()
+            .find(|event| event["code"] == "preemption_probe")
+            .expect("the local-suspect round is still logged");
+        assert_eq!(probe["tcp_liveness"], "dead", "the raw probe is kept");
+        assert_eq!(probe["liveness_verdict"], "unknown", "the verdict is local");
+        assert_eq!(probe["local_network_suspected"], true);
+        assert_eq!(probe["outcome"], "ours_active");
+        assert!(
+            probe["message"]
+                .as_str()
+                .unwrap()
+                .contains("local network"),
+            "the line must say it is a local problem, got {}",
+            probe["message"]
+        );
+        drop(events);
+        drop(member);
+        worker.join().unwrap();
+    }
+    #[test]
+    fn the_local_network_warning_names_every_failed_probe() {
+        let event = preemption_local_network(
+            2,
+            &[
+                preemption::ReceiverLiveness::Dead,
+                preemption::ReceiverLiveness::Unknown,
+            ],
+        );
+        assert_eq!(event["code"], "preemption_local_network");
+        assert_eq!(event["channel"], "preemption");
+        assert_eq!(event["receivers"], 2);
+        assert_eq!(event["probes"], json!(["dead", "unknown"]));
+        assert!(event["message"].as_str().unwrap().contains("local network"));
     }
     #[test]
     fn hitting_the_consecutive_limit_yields_with_reason_limit() {

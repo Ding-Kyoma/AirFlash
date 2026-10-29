@@ -193,11 +193,12 @@
                   <TextBlock Text="{loc:Text 'Group name'}" Style="{StaticResource Hint}"/>
                   <TextBox Text="{Binding Group.Name, UpdateSourceTrigger=PropertyChanged}" Margin="0,4,0,12"/>
                   <TextBlock Text="{loc:Text 'Left receiver'}" Style="{StaticResource Hint}"/>
-                  <ComboBox ItemsSource="{Binding Candidates}" DisplayMemberPath="Name" SelectedValuePath="Id" SelectedValue="{Binding Group.LeftId, Mode=TwoWay}" Margin="0,4,0,12"/>
+                  <ComboBox ItemsSource="{Binding Candidates}" DisplayMemberPath="Name" SelectedValuePath="Id" SelectedValue="{Binding LeftId, Mode=TwoWay}" Margin="0,4,0,12"/>
                   <TextBlock Text="{loc:Text 'Left offset / ms (−500 to +500)'}" Style="{StaticResource Hint}"/>
                   <TextBox Text="{Binding Group.LeftOffsetMs, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" Margin="0,4,0,12"/>
                   <TextBlock Text="{loc:Text 'Right receiver'}" Style="{StaticResource Hint}"/>
-                  <ComboBox ItemsSource="{Binding Candidates}" DisplayMemberPath="Name" SelectedValuePath="Id" SelectedValue="{Binding Group.RightId, Mode=TwoWay}" Margin="0,4,0,12"/>
+                  <ComboBox ItemsSource="{Binding Candidates}" DisplayMemberPath="Name" SelectedValuePath="Id" SelectedValue="{Binding RightId, Mode=TwoWay}" Margin="0,4,0,12"/>
+                  <TextBlock Text="{Binding MembershipError}" Foreground="{DynamicResource ErrorBrush}" TextWrapping="Wrap" Margin="0,0,0,12" Visibility="{Binding MembershipError, Converter={StaticResource NonEmpty}}"/>
                   <TextBlock Text="{loc:Text 'Right offset / ms (−500 to +500)'}" Style="{StaticResource Hint}"/>
                   <TextBox Text="{Binding Group.RightOffsetMs, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" Margin="0,4,0,12"/>
                   <TextBlock Text="{loc:Text 'Common sample rate'}" Style="{StaticResource Hint}"/>

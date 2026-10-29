@@ -77,7 +77,7 @@ public static class GateFailure
             GateFailureKind.ClassicOnly => L.Get("This device only supports classic AirPlay. AirFlash cannot stream to it yet."),
             GateFailureKind.PasswordOrPairing => L.Get("This device requires a password or pairing that AirFlash could not complete. Pair it again in Receivers."),
             GateFailureKind.Network => L.Get("Could not reach the receiver over the network. Check that it is powered on and on the same network as this PC."),
-            GateFailureKind.MixedTimingGroup => L.Get("AirPlay 2 and classic AirPlay 1/RAOP devices cannot be grouped together. Please connect them separately."),
+            GateFailureKind.MixedTimingGroup => MixedGroupMessage.For(receiver?.Peers ?? []),
             _ => null
         };
     }

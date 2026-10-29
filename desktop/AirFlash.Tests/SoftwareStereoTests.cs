@@ -27,7 +27,31 @@ public sealed class SoftwareStereoTests
         settings.CopyFrom(changed);
         Assert.Same(bound, settings.SoftwareGroups[0]); Assert.Equal("b", bound.LeftId); Assert.Equal("Office", bound.Name);
     }
-    private static Receiver Pod(string id, string ip) => new(id, id, ip) { DeviceId = id };
+    private static Receiver Pod(string id, string ip, ulong? features = null, string sourceVersion = "") => new(id, id, ip) { DeviceId = id, Features = features, SourceVersion = sourceVersion };
+    [Fact]
+    public void MixedSavedGroupResolvesOfflineInsteadOfMixed()
+    {
+        var settings = new AppSettings(); settings.SoftwareGroups.Add(new() { LeftId = "a", RightId = "b" });
+        var resolved = SoftwareStereo.Resolve([
+            Pod("a", "127.0.0.1", AirPlayRouting.AirPlay2Feature, "366.0"),
+            Pod("b", "127.0.0.2", 0UL, "220.68")], settings).Single();
+        // Session restore goes through the same invariant: a legacy mixed pair
+        // cannot come back as a mixed member list.
+        Assert.False(resolved.Online);
+        Assert.False(resolved.Complete);
+        Assert.Empty(resolved.Members);
+    }
+    [Fact]
+    public void HomogeneousSavedGroupStillResolvesWithBothMembers()
+    {
+        var settings = new AppSettings(); settings.SoftwareGroups.Add(new() { LeftId = "a", RightId = "b" });
+        var resolved = SoftwareStereo.Resolve([
+            Pod("a", "127.0.0.1", AirPlayRouting.AirPlay2Feature, "366.0"),
+            Pod("b", "127.0.0.2", AirPlayRouting.AirPlay2Feature, "366.0")], settings).Single();
+        Assert.True(resolved.Online);
+        Assert.True(resolved.Complete);
+        Assert.Equal(2, resolved.Members.Length);
+    }
     [Fact]
     public async Task SchemaThreeMigrationPreservesDeviceOptionsAndBacksUpOriginal()
     {

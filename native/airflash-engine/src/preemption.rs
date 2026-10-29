@@ -5,14 +5,34 @@
 //! does. An unexpected `TEARDOWN` or a `Connection: close` is logged with
 //! context (`policy`, `rtp_healthy`, `packets_prepared`, `tcp_reachable`) and
 //! then the receiver is asked directly: `GET /info` and read `statusFlags`. The
-//! live answer is combined with a TCP connect probe of the control port (Q34):
+//! live answer is combined with a TCP connect probe of the control port (Q34,
+//! corrected by Q42):
 //!
-//! | media healthy | TCP reachable | verdict |
+//! | media healthy | liveness | verdict |
 //! | --- | --- | --- |
 //! | yes | Alive | `OursActive` — our session is still being served |
+//! | yes | Refused | `Gone` — the host is alive but not serving us; reclaim |
 //! | yes | Dead | `Gone` — the device is gone, reclaim, never `BusyElsewhere` |
 //! | yes | Unknown | `OursActive` — conservative, a failed probe is not a death |
 //! | no | any | consult `statusFlags` (see [`classify`]) |
+//!
+//! Q42 corrects two things about that dimension:
+//!
+//! - **`ConnectionRefused` does not mean the device is dead.** A returned RST
+//!   proves the host is alive and its network stack answered; it simply is not
+//!   serving the control port. Action-wise it is still a fail-open reclaim (no
+//!   `statusFlags` can be read), but it stays a distinct state in the log, or
+//!   "judged gone" and "refused the connection" become indistinguishable.
+//! - **`Unknown` is "temporarily unknown", not "counts as mine forever".**
+//!   [`LivenessTracker`] escalates a chain of non-definitive probes to `Dead`
+//!   after [`LIVENESS_PATIENCE`] consecutive failures, instead of enumerating
+//!   platform error codes.
+//!
+//! A group-wide cross-check closes the last ambiguous case: when **every**
+//! receiver of a multi-receiver session fails its probe in the same round, the
+//! common cause is our own side (routing table, interface, Wi-Fi), not several
+//! devices dying at once, so no device is marked dead
+//! ([`local_network_suspected`]).
 //!
 //! The bit values are recovered from the reference implementation (Q31 answer):
 //! `ReceiverStatusFlags.ReceiverSessionActive = 131072 (0x20000, bit 17)`,
@@ -73,6 +93,39 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long the receiver-side TCP connect probe may take. It is the same budget
 /// as [`PROBE_TIMEOUT`]: both are one control-plane round trip to a LAN address.
 pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Q42's escalation timer: how many **consecutive** non-definitive liveness
+/// probes are tolerated before the receiver counts as gone. Three is our
+/// choice — Q42 only fixed the shape ("`Unknown` must have a patience limit"),
+/// not the number:
+///
+/// - one or two failures are exactly what a transient local hiccup looks like
+///   (a firewall refresh, `WSAENOBUFS`, a routing-table blip), and the whole
+///   point of not enumerating errno is to survive those;
+/// - three independent control-port probes with no success in between is no
+///   longer a hiccup, and with [`LIVENESS_RETRY`] it is reached in about 6 s —
+///   far quicker than waiting for the media-health backstop, which never fires
+///   while UDP sends keep "succeeding";
+/// - Q42's own sketch escalates at `>= 3`.
+pub const LIVENESS_PATIENCE: u32 = 3;
+
+/// The wall-clock half of Q42's escalation timer: a receiver that has not been
+/// proved alive for this long is treated as gone once a **second** consecutive
+/// non-definitive probe confirms it is not a one-off. Our choice: 60 s matches
+/// the longest busy-queue interval, so even a slow probe cadence cannot keep an
+/// undecided receiver alive forever. A single `Unknown` never escalates on this
+/// clause alone — one anomalous error after a long quiet period is precisely the
+/// transient case the rule must not punish.
+pub const LIVENESS_PATIENCE_WINDOW: Duration = Duration::from_secs(60);
+
+/// How long to wait before re-sampling a receiver whose liveness probe was
+/// non-definitive. Q42's timer needs repeated samples: without this, a single
+/// `Unknown` would be the only sample the tracker ever sees (the next probe is
+/// only scheduled by fresh control-plane evidence, and a dead feedback worker
+/// produces no more), so the patience limit could never be reached. It is the
+/// first busy-queue backoff step, and the loop is bounded — the third unknown
+/// escalates to `Dead` and reclaims.
+pub const LIVENESS_RETRY: Duration = Duration::from_secs(3);
 
 /// The queueing backoff for a confirmed `BusyElsewhere` verdict: 3 s, 6 s,
 /// 12 s, 24 s, then 60 s forever. This is a queue, never a failure retry: a
@@ -185,30 +238,73 @@ pub fn incoming_teardown(method: Option<&str>) -> Option<Signal> {
 
 /// The receiver-side liveness dimension Q34 recovered from the reference
 /// sender: one TCP connect to the control port, not an RTP feedback path.
+///
+/// Q42 splits what used to be `Dead` into two states. A refused connect is a
+/// *returned RST*: the host is up and answered, it just does not serve that
+/// port. Only a timeout or an explicitly unreachable host/network means the
+/// device is not there. The action is the same fail-open reclaim for both, but
+/// the states must not be collapsed: the log has to distinguish "the device is
+/// gone" from "the device refused the connection".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReceiverLiveness {
     /// `TcpStream::connect_timeout` succeeded: the receiver is alive.
     Alive,
-    /// The probe itself failed in a way that does not prove death (DNS, routing,
-    /// another OS error). Never treated as a death — conservative.
-    Unknown,
-    /// The connection was refused or timed out: the device is gone.
+    /// The connection was refused (a returned RST): the host is alive, its
+    /// stack answered, but the control port is not serving. No `statusFlags`
+    /// can be read, so this reclaims like `Dead` — it is simply never *called*
+    /// dead (Q42).
+    Refused,
+    /// The connect timed out, or the host/network was reported unreachable: the
+    /// device is not there.
     Dead,
+    /// The probe failed in a way that proves neither life nor death (a firewall
+    /// rule, a transient local socket error, IPv6 neighbour discovery, ...).
+    /// Never treated as a death on its own; [`LivenessTracker`] escalates a
+    /// chain of these instead.
+    Unknown,
 }
 
 impl ReceiverLiveness {
     pub fn name(self) -> &'static str {
         match self {
             Self::Alive => "alive",
-            Self::Unknown => "unknown",
+            Self::Refused => "refused",
             Self::Dead => "dead",
+            Self::Unknown => "unknown",
         }
     }
 
     /// The boolean the reference sender exposes as `tcp_reachable=<b>`. Only a
-    /// completed connect is `true`; `Unknown` did not prove reachability.
+    /// completed connect is `true`; `Unknown` did not prove reachability, and
+    /// `Refused` proves the *host* answered but not that it can serve us.
     pub fn reachable(self) -> bool {
         matches!(self, Self::Alive)
+    }
+
+    /// Whether the probe proved the host's network stack answered us at all. A
+    /// refused connect (RST) does; a timeout or an unreachable error does not.
+    /// This is the "did anything answer?" dimension Q42's group-wide
+    /// cross-check uses, and it is the reason `Refused` cannot be folded into
+    /// `Dead`.
+    pub fn host_answered(self) -> bool {
+        matches!(self, Self::Alive | Self::Refused)
+    }
+}
+
+/// Classify one failed control-port `connect` into the liveness dimension.
+///
+/// Q42 names exactly three "the host is not there" errors — timeout, host
+/// unreachable, network unreachable — and treats a returned RST as proof of
+/// life, not death. Everything else is [`ReceiverLiveness::Unknown`] and is
+/// left to the escalation timer: enumerating more platform codes would only
+/// move the next surprise to the next OS/version.
+pub fn liveness_from_error(error: &std::io::Error) -> ReceiverLiveness {
+    match error.kind() {
+        ErrorKind::ConnectionRefused => ReceiverLiveness::Refused,
+        ErrorKind::TimedOut | ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable => {
+            ReceiverLiveness::Dead
+        }
+        _ => ReceiverLiveness::Unknown,
     }
 }
 
@@ -216,22 +312,155 @@ impl ReceiverLiveness {
 ///
 /// This is the cheap "is the device still there?" dimension WAC uses after a
 /// feedback timeout. It talks no protocol — a bare `connect` on a port we
-/// already open RTSP on — and collapses to [`ReceiverLiveness`]:
-/// refused/timeout is `Dead`, any other error is `Unknown` so an odd local
-/// networking error can never fake a dead device.
+/// already open RTSP on — and collapses to [`ReceiverLiveness`]: a returned RST
+/// is `Refused` (the host is alive), a timeout or an unreachable error is
+/// `Dead`, any other error is `Unknown` so an odd local networking error can
+/// never fake a dead device on its own (Q42).
 pub fn receiver_liveness(ip: IpAddr, port: u16, timeout: Duration) -> ReceiverLiveness {
     match TcpStream::connect_timeout(&SocketAddr::new(ip, port), timeout) {
         Ok(_) => ReceiverLiveness::Alive,
-        Err(error)
-            if matches!(
-                error.kind(),
-                ErrorKind::ConnectionRefused | ErrorKind::TimedOut
-            ) =>
-        {
-            ReceiverLiveness::Dead
-        }
-        Err(_) => ReceiverLiveness::Unknown,
+        Err(error) => liveness_from_error(&error),
     }
+}
+
+/// The liveness verdict after Q42's escalation rule has been applied. It is
+/// what the combine table consumes; the raw [`ReceiverLiveness`] is kept for
+/// the diagnostic line, so a `Refused` still reads `refused` there while its
+/// action is the `Dead` one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Alive,
+    Dead,
+    Unknown,
+}
+
+impl Verdict {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Alive => "alive",
+            Self::Dead => "dead",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The liveness value the combine table should use. `Refused` and `Dead`
+    /// share the `Dead` action by design (Q42): both leave us unable to read
+    /// `statusFlags`.
+    pub fn liveness(self) -> ReceiverLiveness {
+        match self {
+            Self::Alive => ReceiverLiveness::Alive,
+            Self::Dead => ReceiverLiveness::Dead,
+            Self::Unknown => ReceiverLiveness::Unknown,
+        }
+    }
+}
+
+/// One receiver's liveness sample for a polling round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LivenessSample {
+    /// The control-port probe answered (or failed) on its own.
+    Probe(ReceiverLiveness),
+    /// Every receiver of the group failed in the same round, so the common cause
+    /// is far more likely local than N devices dying at once (Q42). This is not
+    /// evidence about this receiver: the verdict is `Unknown`, the escalation
+    /// counter is neither advanced nor reset, and no re-probe is scheduled.
+    LocalSuspect,
+}
+
+/// What one liveness sample settled on, plus whether the diagnostic line needs
+/// to be printed again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LivenessNote {
+    pub verdict: Verdict,
+    /// True when the liveness half of the diagnostic line changed (raw state,
+    /// verdict or consecutive-failure count).
+    pub log_changed: bool,
+}
+
+/// One receiver's liveness history — Q42's escalation timer.
+///
+/// `Unknown` is "temporarily unknown", never "mine forever":
+///
+/// ```text
+/// Ok                        -> consecutive_failures = 0, last_ok = now, Alive
+/// Refused                   -> Dead   (host alive, not serving => no statusFlags)
+/// Timeout | HostUnreachable
+///   | NetworkUnreachable    -> Dead
+/// anything else             -> Unknown, but consecutive_failures += 1;
+///                              at the patience limit (or after the patience
+///                              window from the second failure on) => Dead
+/// ```
+///
+/// One `Alive` resets the counter and the clock. The tracker never guesses a
+/// platform error code: it only counts "probes that proved nothing".
+#[derive(Clone, Copy, Debug)]
+pub struct LivenessTracker {
+    consecutive_failures: u32,
+    /// When the receiver was last proved alive. A tracker is created when the
+    /// session is established and completing the RTSP handshake is itself a
+    /// reachability proof, so a fresh tracker starts as if just confirmed.
+    last_ok: Instant,
+}
+
+impl LivenessTracker {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            consecutive_failures: 0,
+            last_ok: now,
+        }
+    }
+
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    pub fn last_ok(&self) -> Instant {
+        self.last_ok
+    }
+
+    /// Apply Q42's rule to one probe. See the type docs for the table.
+    pub fn observe(&mut self, liveness: ReceiverLiveness, now: Instant) -> Verdict {
+        match liveness {
+            ReceiverLiveness::Alive => {
+                self.consecutive_failures = 0;
+                self.last_ok = now;
+                Verdict::Alive
+            }
+            // A returned RST proves the host is alive, but it cannot serve the
+            // session any more than a timeout can: both are fail-open reclaims.
+            // The counter is not reset — "not serving" is not a success.
+            ReceiverLiveness::Refused | ReceiverLiveness::Dead => Verdict::Dead,
+            ReceiverLiveness::Unknown => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                let patient = self.consecutive_failures >= LIVENESS_PATIENCE;
+                let stale = self.consecutive_failures >= 2
+                    && now.saturating_duration_since(self.last_ok) >= LIVENESS_PATIENCE_WINDOW;
+                if patient || stale {
+                    Verdict::Dead
+                } else {
+                    Verdict::Unknown
+                }
+            }
+        }
+    }
+}
+
+/// Q42's group-wide cross-check: "in a multi-receiver session, all failing
+/// probes at once means the problem is local".
+///
+/// It is the one judgement that needs no errno knowledge — our own routing
+/// table, interface or Wi-Fi cannot be told apart from several devices dying at
+/// the same instant by looking at one receiver, but it can by looking at the
+/// whole round. The rule deliberately requires evidence about **every**
+/// receiver: a single receiver failing is that receiver's problem, and a member
+/// that was not probed this round leaves the round inconclusive (its own
+/// verdict then stands). A `Refused` probe proves the host answered, so an
+/// all-refused round is *not* a local network failure — the devices are alive
+/// and simply not serving.
+pub fn local_network_suspected(probes: &[ReceiverLiveness], receivers: usize) -> bool {
+    receivers > 1
+        && probes.len() == receivers
+        && probes.iter().all(|probed| !probed.host_answered())
 }
 
 /// What a live `GET /info` probe could tell us.
@@ -254,8 +483,11 @@ pub enum ProbeOutcome {
     /// (fail-open), exactly like a failed probe.
     Unknown,
     /// The receiver did not answer a TCP connect on its control port while our
-    /// media was still healthy (Q34). The device is gone, not taken over: this
-    /// reclaims and must never be classified as `BusyElsewhere`.
+    /// media was still healthy (Q34), or it refused the connection (Q42: the
+    /// host is alive but not serving, so `statusFlags` cannot be read either).
+    /// Either way this reclaims and must never be classified as
+    /// `BusyElsewhere`; the diagnostic line keeps the raw state (`dead` vs
+    /// `refused`).
     Gone,
 }
 
@@ -302,6 +534,7 @@ pub fn classify(status_flags: u64, we_hold_session: bool) -> ProbeOutcome {
 ///
 /// ```text
 /// (media healthy, Alive)   => OursActive
+/// (media healthy, Refused) => Gone       // alive, but not serving us
 /// (media healthy, Dead)    => Gone       // the device is gone, not taken over
 /// (media healthy, Unknown) => OursActive // conservative
 /// (!media healthy, _)      => consult statusFlags
@@ -309,9 +542,10 @@ pub fn classify(status_flags: u64, we_hold_session: bool) -> ProbeOutcome {
 ///
 /// The status-flags consultation is [`classify`] (and `Unknown` when the field
 /// is missing), i.e. the fail-open path is unchanged for an unhealthy media
-/// session. `Dead` wins over the flags in every case so it can never resolve to
-/// `BusyElsewhere`: a receiver that cannot accept a TCP connection is not
-/// "busy with another sender", it is unreachable.
+/// session. `Dead` and `Refused` win over the flags in every case so they can
+/// never resolve to `BusyElsewhere`: a receiver that cannot accept a TCP
+/// connection is not "busy with another sender". Q42 keeps them distinct as
+/// states (see [`ReceiverLiveness`]) while sharing this action.
 ///
 /// `now` is implicit on purpose: the media-health sample and the liveness probe
 /// both belong to the caller's current poll.
@@ -323,7 +557,7 @@ pub fn combine(
 ) -> ProbeOutcome {
     use ReceiverLiveness as L;
     match (media_healthy, liveness) {
-        (_, L::Dead) => ProbeOutcome::Gone,
+        (_, L::Dead | L::Refused) => ProbeOutcome::Gone,
         (true, L::Alive | L::Unknown) => ProbeOutcome::OursActive,
         (false, _) => match status_flags {
             Some(flags) => classify(flags, we_hold_session),
@@ -681,7 +915,7 @@ pub struct ProbeNote {
 
 /// Per-member evidence and probe scheduling. Only the session thread probes;
 /// feedback workers merely append [`Signal`]s to `Health`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Tracker {
     signals: Vec<Signal>,
     next_probe: Option<Instant>,
@@ -698,6 +932,32 @@ pub struct Tracker {
     /// Terminal `yielding` state (Q34): no automatic probe is scheduled, and
     /// signals cannot re-arm one. Only an explicit [`Self::trigger`] leaves it.
     suspended: bool,
+    /// Q42's liveness escalation timer: `Unknown` is tolerated only for
+    /// [`LIVENESS_PATIENCE`] consecutive samples.
+    liveness: LivenessTracker,
+    /// The last liveness half of the diagnostic line, so a repeated
+    /// non-definitive probe stays quiet while a change (including the failure
+    /// count) is printed.
+    last_liveness_log: Option<(Option<ReceiverLiveness>, Verdict, u32)>,
+}
+
+impl Default for Tracker {
+    fn default() -> Self {
+        Self {
+            signals: Vec::new(),
+            next_probe: None,
+            last_report: None,
+            ended_at: None,
+            pending: None,
+            requeues: 0,
+            suspended: false,
+            // A tracker is created when the session is established: the RTSP
+            // handshake just proved the receiver reachable, so the clock starts
+            // at "last seen alive" rather than at an arbitrary epoch.
+            liveness: LivenessTracker::new(Instant::now()),
+            last_liveness_log: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -763,6 +1023,44 @@ impl Tracker {
     /// that carries `policy`/`rtp_healthy`/`packets_prepared`/`tcp_reachable`.
     pub fn take_signals(&mut self) -> Vec<Signal> {
         std::mem::take(&mut self.signals)
+    }
+
+    /// Feed one liveness sample through Q42's escalation rule. The verdict is
+    /// what the combine table consumes; `log_changed` says whether the
+    /// diagnostic line's liveness half changed.
+    pub fn observe_liveness(&mut self, sample: LivenessSample, now: Instant) -> LivenessNote {
+        let (raw, verdict) = match sample {
+            LivenessSample::Probe(probed) => (Some(probed), self.liveness.observe(probed, now)),
+            // The group-wide rule says the failure belongs to our side, not to
+            // this device: no counter movement, no escalation, just "unknown".
+            LivenessSample::LocalSuspect => (None, Verdict::Unknown),
+        };
+        let key = (raw, verdict, self.liveness.consecutive_failures());
+        let log_changed = self.last_liveness_log != Some(key);
+        self.last_liveness_log = Some(key);
+        LivenessNote {
+            verdict,
+            log_changed,
+        }
+    }
+
+    /// Consecutive non-definitive liveness probes, for the diagnostic line.
+    pub fn liveness_failures(&self) -> u32 {
+        self.liveness.consecutive_failures()
+    }
+
+    /// Q42's timer needs repeated samples. After an undecided (`Unknown`) round
+    /// ask for the next liveness probe at [`LIVENESS_RETRY`]; otherwise a single
+    /// `Unknown` would be the only sample this tracker ever sees (the next probe
+    /// is otherwise only scheduled by fresh control-plane evidence, and a dead
+    /// feedback worker produces no more), so the patience limit could never be
+    /// reached. It never overrides a busy queue or the terminal yielded state,
+    /// and it is bounded: the third unknown escalates to `Dead`.
+    pub fn await_liveness(&mut self, now: Instant) {
+        if self.suspended || self.queueing() {
+            return;
+        }
+        self.next_probe = Some(now + LIVENESS_RETRY);
     }
 
     pub fn due(&self, now: Instant) -> bool {
@@ -1231,6 +1529,18 @@ mod tests {
                 );
             }
         }
+        // Q42: a refused connect is a different *state* but the same action —
+        // the host is alive, it just cannot give us statusFlags.
+        for flags in [0u64, active] {
+            for hold in [false, true] {
+                for media_healthy in [false, true] {
+                    assert_eq!(
+                        combine(media_healthy, L::Refused, Some(flags), hold),
+                        ProbeOutcome::Gone
+                    );
+                }
+            }
+        }
         // Unhealthy media: consult statusFlags exactly as before.
         assert_eq!(
             combine(false, L::Alive, Some(0), false),
@@ -1262,21 +1572,24 @@ mod tests {
     #[test]
     fn a_dead_receiver_reclaims_and_is_never_busy_elsewhere() {
         use ReceiverLiveness as L;
-        for media_healthy in [true, false] {
-            for hold in [false, true] {
-                let outcome = combine(
-                    media_healthy,
-                    L::Dead,
-                    Some(RECEIVER_SESSION_ACTIVE),
-                    hold,
-                );
-                assert_eq!(outcome, ProbeOutcome::Gone);
-                assert_eq!(action_for(outcome), ProbeAction::Reclaim);
-                assert_ne!(
-                    action_for(outcome),
-                    ProbeAction::Requeue,
-                    "a device that cannot accept TCP is gone, not another sender's"
-                );
+        // `Refused` is included on purpose: same action, distinct state (Q42).
+        for liveness in [L::Dead, L::Refused] {
+            for media_healthy in [true, false] {
+                for hold in [false, true] {
+                    let outcome = combine(
+                        media_healthy,
+                        liveness,
+                        Some(RECEIVER_SESSION_ACTIVE),
+                        hold,
+                    );
+                    assert_eq!(outcome, ProbeOutcome::Gone);
+                    assert_eq!(action_for(outcome), ProbeAction::Reclaim);
+                    assert_ne!(
+                        action_for(outcome),
+                        ProbeAction::Requeue,
+                        "a device that cannot accept TCP is gone, not another sender's"
+                    );
+                }
             }
         }
     }
@@ -1284,15 +1597,244 @@ mod tests {
     #[test]
     fn the_liveness_flag_is_only_true_for_a_completed_connect() {
         assert!(ReceiverLiveness::Alive.reachable());
+        assert!(!ReceiverLiveness::Refused.reachable());
         assert!(!ReceiverLiveness::Unknown.reachable());
         assert!(!ReceiverLiveness::Dead.reachable());
         assert_eq!(ReceiverLiveness::Alive.name(), "alive");
+        assert_eq!(ReceiverLiveness::Refused.name(), "refused");
         assert_eq!(ReceiverLiveness::Unknown.name(), "unknown");
         assert_eq!(ReceiverLiveness::Dead.name(), "dead");
+        // Q42: a returned RST proves the host answered; a timeout or an
+        // unreachable error does not. That is what keeps refused out of dead.
+        assert!(ReceiverLiveness::Alive.host_answered());
+        assert!(ReceiverLiveness::Refused.host_answered());
+        assert!(!ReceiverLiveness::Dead.host_answered());
+        assert!(!ReceiverLiveness::Unknown.host_answered());
     }
 
     #[test]
-    fn a_tcp_connect_probe_reports_alive_or_dead() {
+    fn only_the_q42_errors_are_dead_and_a_refusal_is_not_one_of_them() {
+        assert_eq!(
+            liveness_from_error(&std::io::Error::from(ErrorKind::ConnectionRefused)),
+            ReceiverLiveness::Refused,
+            "a returned RST means the host is alive and answered"
+        );
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkUnreachable,
+        ] {
+            assert_eq!(
+                liveness_from_error(&std::io::Error::from(kind)),
+                ReceiverLiveness::Dead,
+                "{kind:?} means the host is not there"
+            );
+        }
+        // Everything else proves neither life nor death and is left to the
+        // escalation timer — no errno enumeration (Q42).
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::NotConnected,
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(
+                liveness_from_error(&std::io::Error::from(kind)),
+                ReceiverLiveness::Unknown,
+                "{kind:?} proves neither life nor death"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_chain_escalates_to_dead_and_one_ok_resets_it() {
+        let base = Instant::now();
+        let mut liveness = LivenessTracker::new(base);
+        assert_eq!(
+            liveness.observe(ReceiverLiveness::Unknown, at(base, 1_000)),
+            Verdict::Unknown,
+            "one failed probe is still only 'temporarily unknown'"
+        );
+        assert_eq!(
+            liveness.observe(ReceiverLiveness::Unknown, at(base, 2_000)),
+            Verdict::Unknown
+        );
+        assert_eq!(liveness.consecutive_failures(), 2);
+        assert_eq!(
+            liveness.observe(ReceiverLiveness::Unknown, at(base, 3_000)),
+            Verdict::Dead,
+            "the patience limit is three consecutive unknowns"
+        );
+        assert_eq!(liveness.consecutive_failures(), LIVENESS_PATIENCE);
+        // One successful probe resets the counter and the clock...
+        assert_eq!(
+            liveness.observe(ReceiverLiveness::Alive, at(base, 4_000)),
+            Verdict::Alive
+        );
+        assert_eq!(liveness.consecutive_failures(), 0);
+        assert_eq!(liveness.last_ok(), at(base, 4_000));
+        // ...so the chain has to start over.
+        for elapsed in 5..7 {
+            assert_eq!(
+                liveness.observe(ReceiverLiveness::Unknown, at(base, elapsed * 1_000)),
+                Verdict::Unknown
+            );
+        }
+        assert_eq!(
+            liveness.observe(ReceiverLiveness::Unknown, at(base, 7_000)),
+            Verdict::Dead
+        );
+    }
+
+    #[test]
+    fn refused_and_dead_are_decided_without_waiting() {
+        let base = Instant::now();
+        let mut liveness = LivenessTracker::new(base);
+        assert_eq!(
+            liveness.observe(ReceiverLiveness::Refused, at(base, 1)),
+            Verdict::Dead,
+            "refused cannot read statusFlags either: fail-open reclaim"
+        );
+        assert_eq!(
+            liveness.observe(ReceiverLiveness::Dead, at(base, 2)),
+            Verdict::Dead
+        );
+        assert_eq!(
+            liveness.consecutive_failures(),
+            0,
+            "definitive states are not counted as unknown failures"
+        );
+        // A refusal is not a success: it must not refresh the alive clock.
+        assert_eq!(liveness.last_ok(), base);
+    }
+
+    #[test]
+    fn the_patience_window_only_escalates_after_a_second_failure() {
+        let base = Instant::now();
+        let mut liveness = LivenessTracker::new(base);
+        // One anomalous error after a long quiet period is exactly the
+        // transient case the rule must not punish.
+        assert_eq!(
+            liveness.observe(ReceiverLiveness::Unknown, at(base, 120_000)),
+            Verdict::Unknown
+        );
+        // A second one past the window is no longer a one-off.
+        assert_eq!(
+            liveness.observe(ReceiverLiveness::Unknown, at(base, 121_000)),
+            Verdict::Dead
+        );
+    }
+
+    #[test]
+    fn all_receivers_failing_in_one_round_is_a_local_problem() {
+        use ReceiverLiveness as L;
+        // Every receiver produced no evidence of life: the common cause is our
+        // own side, not several devices dying at once.
+        assert!(local_network_suspected(&[L::Dead, L::Unknown], 2));
+        assert!(local_network_suspected(&[L::Dead, L::Dead, L::Unknown], 3));
+        // One alive receiver proves the local network works: the failure
+        // belongs to the device that failed.
+        assert!(!local_network_suspected(&[L::Dead, L::Alive], 2));
+        // A returned RST proves the host answered, so an all-refused round is
+        // not a local routing failure.
+        assert!(!local_network_suspected(&[L::Refused, L::Refused], 2));
+        assert!(!local_network_suspected(&[L::Refused, L::Dead], 2));
+        // A single receiver can never be "all failed": that is its own problem.
+        assert!(!local_network_suspected(&[L::Dead], 1));
+        // A member that was not probed this round leaves the round inconclusive.
+        assert!(!local_network_suspected(&[L::Dead], 2));
+        assert!(!local_network_suspected(&[], 2));
+    }
+
+    #[test]
+    fn a_local_suspect_round_neither_counts_nor_resets_the_device_failures() {
+        let base = Instant::now();
+        let mut tracker = Tracker::default();
+        assert_eq!(
+            tracker
+                .observe_liveness(LivenessSample::Probe(ReceiverLiveness::Unknown), at(base, 0))
+                .verdict,
+            Verdict::Unknown
+        );
+        assert_eq!(tracker.liveness_failures(), 1);
+        // Every receiver failed at once: this is not evidence about this device.
+        let local = tracker.observe_liveness(LivenessSample::LocalSuspect, at(base, 1_000));
+        assert_eq!(local.verdict, Verdict::Unknown);
+        assert_eq!(
+            tracker.liveness_failures(),
+            1,
+            "a local round neither advances nor resets the device counter"
+        );
+        // The device's own chain still needs its two remaining failures.
+        assert_eq!(
+            tracker
+                .observe_liveness(LivenessSample::Probe(ReceiverLiveness::Unknown), at(base, 2_000))
+                .verdict,
+            Verdict::Unknown
+        );
+        assert_eq!(
+            tracker
+                .observe_liveness(LivenessSample::Probe(ReceiverLiveness::Unknown), at(base, 3_000))
+                .verdict,
+            Verdict::Dead
+        );
+    }
+
+    #[test]
+    fn an_undecided_round_schedules_another_sample() {
+        let base = Instant::now();
+        let mut tracker = Tracker::default();
+        tracker.observe(Signal::ConnectionClose, at(base, 0));
+        assert!(tracker.due(at(base, 0)));
+        let note = tracker.observe_liveness(
+            LivenessSample::Probe(ReceiverLiveness::Unknown),
+            at(base, 0),
+        );
+        assert_eq!(note.verdict, Verdict::Unknown);
+        assert!(note.log_changed, "the first unknown is printed");
+        // The session loop asks for another sample after an undecided verdict;
+        // without it a single unknown would be the only sample ever taken.
+        tracker.await_liveness(at(base, 0));
+        assert_eq!(tracker.scheduled(), Some(at(base, 0) + LIVENESS_RETRY));
+        assert!(!tracker.due(at(base, 0) + LIVENESS_RETRY - Duration::from_millis(1)));
+        assert!(tracker.due(at(base, 0) + LIVENESS_RETRY));
+        // An unchanged sample stays quiet; a reset does change the line.
+        let alive = tracker.observe_liveness(
+            LivenessSample::Probe(ReceiverLiveness::Alive),
+            at(base, 9_000),
+        );
+        assert_eq!(alive.verdict, Verdict::Alive);
+        assert!(alive.log_changed);
+        assert!(
+            !tracker
+                .observe_liveness(LivenessSample::Probe(ReceiverLiveness::Alive), at(base, 12_000))
+                .log_changed,
+            "a repeated alive sample must not re-print the line"
+        );
+    }
+
+    #[test]
+    fn the_liveness_timer_never_cuts_a_busy_queue_short() {
+        let base = Instant::now();
+        let mut tracker = Tracker::default();
+        tracker.observe(Signal::ConnectionClose, at(base, 0));
+        let (note, confirmation) = confirm_busy(&mut tracker, at(base, 0));
+        assert_eq!(note.action, ProbeAction::Requeue);
+        let scheduled = tracker.scheduled().unwrap();
+        tracker.await_liveness(confirmation + Duration::from_millis(1));
+        assert_eq!(
+            tracker.scheduled(),
+            Some(scheduled),
+            "the busy backoff interval owns the schedule"
+        );
+        // The terminal yielded state is not re-armed either.
+        tracker.suspend();
+        tracker.await_liveness(confirmation + Duration::from_secs(1));
+        assert_eq!(tracker.scheduled(), None);
+    }
+
+    #[test]
+    fn a_tcp_connect_probe_reports_alive_or_refused() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         assert_eq!(
@@ -1305,11 +1847,16 @@ mod tests {
         let (socket, _) = listener.accept().unwrap();
         drop(socket);
         drop(listener);
-        assert_eq!(
-            receiver_liveness(address.ip(), address.port(), PROBE_TIMEOUT),
-            ReceiverLiveness::Dead,
-            "a refused connection means the device is gone"
+        // A generous timeout: the point is the *state*, and a slow local stack
+        // must not turn the RST into a timeout. Both are the same action, but
+        // only one of them is "the device is gone" (Q42).
+        let probed = receiver_liveness(address.ip(), address.port(), Duration::from_secs(5));
+        assert_ne!(probed, ReceiverLiveness::Alive);
+        assert!(
+            matches!(probed, ReceiverLiveness::Refused | ReceiverLiveness::Dead),
+            "a closed control port is refused or unreachable, never alive: {probed:?}"
         );
+        assert!(!probed.reachable());
     }
 
     #[test]
