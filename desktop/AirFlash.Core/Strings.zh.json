@@ -366,5 +366,8 @@
   "This device requires MFi authentication, which AirFlash cannot perform without Apple hardware.": "此设备要求 MFi 认证，AirFlash 无法在没有 Apple 硬件的情况下完成。",
   "Could not reach the receiver over the network. Check that it is powered on and on the same network as this PC.": "无法通过网络连接接收器。请确认设备已开机，并与本机处于同一网络。",
   "AirPlay 2 and classic AirPlay 1/RAOP devices cannot be grouped together. Please connect them separately.": "AirPlay 2 与经典 AirPlay 1/RAOP 设备不能加入同一个组，请分开连接。",
-  "“{0}” claims AirPlay 2, but its firmware is older than 354.54.6, so it is treated as a classic device.": "「{0}」自称支持 AirPlay 2，但固件版本低于 354.54.6，已按经典设备处理。"
+  "“{0}” claims AirPlay 2, but its firmware is older than 354.54.6, so it is treated as a classic device.": "「{0}」自称支持 AirPlay 2，但固件版本低于 354.54.6，已按经典设备处理。",
+  "This stereo group is currently unusable.": "该软件立体声组当前无法使用。",
+  "Split into two independent receivers": "拆分为两个独立接收器",
+  "A member's AirPlay 2 capability is not known right now. The group can be saved, but the connection will be refused if the two members turn out to be incompatible.": "当前无法确认某个成员的 AirPlay 2 能力。仍可保存该组，但如果两个成员不兼容，连接会被拒绝。"
 }

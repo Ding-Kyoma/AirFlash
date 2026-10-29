@@ -101,15 +101,53 @@ public sealed class GroupMembershipTests
     }
 
     [Fact]
-    public void ClassicAndUnknownNeverAppendAReason()
+    public void ClassicNeverAppendsAReason()
     {
-        foreach (var receiver in new[] { Classic(), Unknown() })
-        {
-            var membership = new GroupMembership();
-            Assert.True(membership.TryAdd(AirPlay2(), out _));
-            Assert.False(membership.TryAdd(receiver, out var error));
-            Assert.Equal(Action, error);
-        }
+        var membership = new GroupMembership();
+        Assert.True(membership.TryAdd(AirPlay2(), out _));
+        Assert.False(membership.TryAdd(Classic(), out var error));
+        Assert.Equal(Action, error);
+    }
+
+    [Fact]
+    public void UnknownCapabilityReceiverIsAcceptedNotRejected()
+    {
+        // Q45: absence of evidence is not evidence of absence. An offline/unknown
+        // receiver may join; the contradiction is caught by Resolve once the TXT
+        // record arrives.
+        var membership = new GroupMembership();
+        Assert.True(membership.TryAdd(AirPlay2("Known"), out _));
+        var unknown = Unknown("Bedroom HomePod");
+        Assert.True(membership.TryAdd(unknown, out var error));
+        Assert.Null(error);
+        Assert.Equal(new[] { "ap2", "unknown" }, membership.Members.Select(member => member.Id));
+        Assert.False(GroupMembership.HasProvenConflict(membership.Members));
+    }
+
+    [Fact]
+    public void OutdatedClaimAndClassicAreBothRoutingFalseSoTheyCanGroup()
+    {
+        var membership = new GroupMembership();
+        Assert.True(membership.TryAdd(Outdated(), out _));
+        Assert.True(membership.TryAdd(Classic("AirPort Express"), out var error));
+        Assert.Null(error);
+        Assert.Equal(2, membership.Count);
+    }
+
+    [Fact]
+    public void ResolveCatchesContradictionOnlyWhenBothSidesHaveEvidence()
+    {
+        var settings = new AppSettings();
+        settings.SoftwareGroups.Add(new() { LeftId = "ap2", RightId = "unknown" });
+        // While the second receiver is unknown the saved pair is representable.
+        var before = SoftwareStereo.Resolve([AirPlay2(), Unknown() with { Address = "10.0.0.6" }], settings).Single();
+        Assert.True(before.Online);
+        Assert.Equal(2, before.Members.Length);
+        // Once its TXT proves classic, Resolve refuses without touching the config.
+        var after = SoftwareStereo.Resolve([AirPlay2(), Physical("unknown", "Bedroom", 0UL, "220.68", "10.0.0.6")], settings).Single();
+        Assert.False(after.Online);
+        Assert.Empty(after.Members);
+        Assert.Single(settings.SoftwareGroups);
     }
 
     [Fact]

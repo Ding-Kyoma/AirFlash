@@ -146,7 +146,7 @@ public sealed class SettingsTests
             Assert.Null(settings.ReadOptions("one").AutoConnect); Assert.True(settings.ReadOptions("two").AutoConnect);
             Assert.Equal("endpoint", settings.CaptureMode); Assert.Equal("Old device", settings.CaptureEndpoint); Assert.Equal(2000, settings.CustomBufferMs);
             Assert.Equal(old, File.ReadAllText(path)); store.Save(settings);
-            Assert.Equal(old, File.ReadAllText(path + ".pre-wpf.bak")); Assert.Equal(4, new SettingsStore(path).Load().SchemaVersion);
+            Assert.Equal(old, File.ReadAllText(path + ".pre-wpf.bak")); Assert.Equal(5, new SettingsStore(path).Load().SchemaVersion);
             Assert.True(settings.Extra!["show_equalizer"].GetBoolean());
         }
         finally { Directory.Delete(directory, true); }
@@ -252,7 +252,7 @@ public sealed class SettingsTests
             var original = "{\"schema_version\":" + version + ",\"stream_sample_rate\":\"48000\",\"future_option\":true,\"receivers\":{\"a\":{\"sample_rate\":null},\"b\":{\"sample_rate\":\"48000\"}},\"software_groups\":[{\"id\":\"software:g\",\"name\":\"G\",\"left_id\":\"a\",\"right_id\":\"b\",\"sample_rate\":\"48000\"}]}";
             File.WriteAllText(path, original);
             var store = new SettingsStore(path); var settings = store.Load();
-            Assert.Equal(4, settings.SchemaVersion); Assert.Null(settings.ReadOptions("a").SampleRate); Assert.Equal("48000", settings.ReadOptions("b").SampleRate);
+            Assert.Equal(5, settings.SchemaVersion); Assert.Null(settings.ReadOptions("a").SampleRate); Assert.Equal("48000", settings.ReadOptions("b").SampleRate);
             Assert.Equal("48000", settings.SoftwareGroups.Single().SampleRate); Assert.True(settings.Extra!["future_option"].GetBoolean());
             store.Save(settings); Assert.DoesNotContain("stream_sample_rate", File.ReadAllText(path)); Assert.Equal(original, File.ReadAllText(path + ".pre-v4.bak"));
         }

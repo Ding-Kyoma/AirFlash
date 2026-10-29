@@ -198,7 +198,9 @@
                   <TextBox Text="{Binding Group.LeftOffsetMs, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" Margin="0,4,0,12"/>
                   <TextBlock Text="{loc:Text 'Right receiver'}" Style="{StaticResource Hint}"/>
                   <ComboBox ItemsSource="{Binding Candidates}" DisplayMemberPath="Name" SelectedValuePath="Id" SelectedValue="{Binding RightId, Mode=TwoWay}" Margin="0,4,0,12"/>
+                  <TextBlock Text="{loc:Text 'This stereo group is currently unusable.'}" Foreground="{DynamicResource ErrorBrush}" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,4" Visibility="{Binding HasMembershipConflict, Converter={StaticResource BoolVisibility}}"/>
                   <TextBlock Text="{Binding MembershipError}" Foreground="{DynamicResource ErrorBrush}" TextWrapping="Wrap" Margin="0,0,0,12" Visibility="{Binding MembershipError, Converter={StaticResource NonEmpty}}"/>
+                  <TextBlock Text="{Binding MembershipWarning}" Style="{StaticResource Hint}" TextWrapping="Wrap" Margin="0,0,0,12" Visibility="{Binding MembershipWarning, Converter={StaticResource NonEmpty}}"/>
                   <TextBlock Text="{loc:Text 'Right offset / ms (−500 to +500)'}" Style="{StaticResource Hint}"/>
                   <TextBox Text="{Binding Group.RightOffsetMs, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" Margin="0,4,0,12"/>
                   <TextBlock Text="{loc:Text 'Common sample rate'}" Style="{StaticResource Hint}"/>
@@ -206,7 +208,8 @@
                   <TextBlock Text="{Binding RateStatus}" Style="{StaticResource Hint}" Margin="0,0,0,12"/>
                   <WrapPanel>
                     <Button Content="{loc:Text 'Swap left and right'}" Command="{Binding SwapCommand}" Margin="0,0,8,0"/>
-                    <Button Content="{loc:Text 'Split group'}" Command="{Binding RemoveCommand}"/>
+                    <Button Content="{loc:Text 'Split into two independent receivers'}" Command="{Binding RepairCommand}" Margin="0,0,8,0" Visibility="{Binding HasMembershipConflict, Converter={StaticResource BoolVisibility}}"/>
+                    <Button Content="{loc:Text 'Split group'}" Command="{Binding RemoveCommand}" Visibility="{Binding HasMembershipConflict, Converter={StaticResource InverseBoolVisibility}}"/>
                   </WrapPanel>
                 </StackPanel>
               </Border>
