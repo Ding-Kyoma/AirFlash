@@ -1178,10 +1178,9 @@ fn send_packets(
             if let Some(source) = &live {
                 telemetry.capture_age.observe(source.sample_age_ms());
             }
-            let due = (late.as_nanos() * u128::from(rate) / 1_000_000_000 / FRAMES as u128) as u64;
             if options.duration_ms > 0 {
                 schedule.recover(now, false)?;
-            } else if recovery_left == 0 && due >= 2 {
+            } else if recovery_left == 0 {
                 let earliest = members
                     .iter()
                     .map(|m| {
@@ -1191,19 +1190,60 @@ fn send_packets(
                     .into_iter()
                     .min()
                     .unwrap();
-                recovery_left = schedule.recovery_silence(now, earliest)?;
-                schedule.recoveries += 1;
-                if let Some(source) = &live {
-                    source.discard_stale();
+                match schedule.late_action(now, earliest) {
+                    crate::transport::LateAction::OnTime => {}
+                    crate::transport::LateAction::Silence(fill) => {
+                        recovery_left = fill;
+                        schedule.recoveries += 1;
+                        telemetry.gap_filled += fill;
+                        if let Some(source) = &live {
+                            source.discard_stale();
+                        }
+                        emit(
+                            json!({"event":"warning","code":"sender_late_recovered","channel":"scheduler","host":null,"recovered":true,"silence_packets":fill,"message":"Sender filled valid timeline slots with encoded silence"}),
+                        );
+                    }
+                    crate::transport::LateAction::Reanchor => {
+                        // Over budget: move the whole timeline forward instead of
+                        // tearing the session down. Sequence numbers and RTP
+                        // timestamps stay untouched; only the rtptime→networkTime
+                        // anchor moves, one frame of phase margin ahead of now.
+                        let Some(shift) = schedule.reanchor(now) else {
+                            telemetry.expired += 1;
+                            emit(
+                                json!({"event":"warning","code":"timeline_reanchor_exhausted","channel":"scheduler","host":null,"recovered":false,"message":"Sender stalled past the re-anchor budget; a fresh group timeline is required"}),
+                            );
+                            return Err(Fault::new(
+                                "",
+                                "scheduler",
+                                "timeline_expired",
+                                true,
+                                "expired audio requires a fresh group timeline",
+                            )
+                            .into());
+                        };
+                        telemetry.reanchored = schedule.reanchored;
+                        telemetry.reanchor_shift_us = schedule.reanchor_shift_us;
+                        if !shift.is_zero() {
+                            recovery_left = 0;
+                            if let Some(source) = &live {
+                                // Everything queued is older than the new deadline.
+                                source.discard_stale();
+                            }
+                            emit(
+                                json!({"event":"warning","code":"timeline_reanchored","channel":"scheduler","host":null,"recovered":true,"late_ms":round3(late.as_secs_f64() * 1000.0),"shift_ms":round3(shift.as_secs_f64() * 1000.0),"lead_ms":round3(schedule.shift.as_secs_f64() * 1000.0),"reanchored":schedule.reanchored,"message":"Sender thread fell behind its catch-up budget; re-anchored the deadline one frame ahead"}),
+                            );
+                        }
+                    }
                 }
-                emit(
-                    json!({"event":"warning","code":"sender_late_recovered","channel":"scheduler","host":null,"recovered":true,"silence_packets":due,"message":"Sender filled valid timeline slots with encoded silence"}),
-                );
             }
+            schedule.relax(now, late);
             if now >= next_sync {
                 for m in members.iter_mut() {
                     let local = offset_time(
-                        base_ns + schedule.frames * 1_000_000_000 / u64::from(rate),
+                        base_ns
+                            + schedule.anchor_shift_ns()
+                            + schedule.frames * 1_000_000_000 / u64::from(rate),
                         common_latency,
                         m.media.latency(),
                         m.peer.profile.sync_offset_ms,
@@ -1436,6 +1476,9 @@ fn transport_metrics(
     }
     snapshot
 }
+fn round3(value: f64) -> f64 {
+    (value * 1000.0).round() / 1000.0
+}
 fn offset_time(base: u64, common: Duration, own: Duration, offset_ms: i32) -> Result<u64> {
     Ok(u64::try_from(
         base as i128 + common.as_nanos() as i128 - own.as_nanos() as i128
@@ -1530,6 +1573,125 @@ mod tests {
         };
         (member, receiver, worker)
     }
+    #[test]
+    fn stalled_sender_reanchors_instead_of_rebuilding_and_keeps_seq_linear() {
+        // Protocol-level version of the roadmap acceptance check: after a 300 ms
+        // stall the sender must move its timeline, not tear the session down.
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let audio = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let control = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut media = MediaTransport::new(
+            Packetizer::new([7; 32], 100, 0, 1),
+            audio,
+            control,
+            receiver.local_addr().unwrap(),
+        )
+        .unwrap();
+        media
+            .connect_audio(receiver.local_addr().unwrap())
+            .unwrap();
+        media.configure_latency(Duration::from_millis(200), false);
+        let rate = 44_100u32;
+        let start = Instant::now();
+        let mut schedule = MediaSchedule::new(start, rate);
+        let pcm = vec![0u8; rtp::PCM_BYTES];
+        let mut sends = 0usize;
+        let mut pending_silence = 0u64;
+        let mut stalls = 0usize;
+        for step in 0..40 {
+            if step == 10 || step == 25 {
+                // Simulate the sender thread being descheduled.
+                thread::sleep(Duration::from_millis(300));
+                stalls += 1;
+            }
+            let now = Instant::now();
+            let earliest_render = schedule.deadline() + Duration::from_millis(200);
+            match schedule.late_action(now, earliest_render) {
+                crate::transport::LateAction::OnTime => {}
+                crate::transport::LateAction::Silence(fill) => {
+                    // Covering the gap in place is still the cheapest recovery.
+                    assert_eq!(
+                        schedule.recovery_silence(now, earliest_render).unwrap(),
+                        fill
+                    );
+                    schedule.recoveries += 1;
+                    pending_silence += fill;
+                }
+                crate::transport::LateAction::Reanchor => {
+                    // The pre-change code returned `timeline_expired` here.
+                    assert!(
+                        schedule.recovery_silence(now, earliest_render).is_err(),
+                        "a session-wide expiry is what this test avoids"
+                    );
+                    let shift = schedule.reanchor(now).expect("re-anchor budget");
+                    assert!(!shift.is_zero());
+                }
+            }
+            for _ in 0..pending_silence {
+                while Instant::now() < schedule.deadline() {
+                    thread::sleep(Duration::from_micros(200));
+                }
+                media
+                    .send(
+                        &pcm,
+                        false,
+                        Instant::now(),
+                        schedule.deadline(),
+                        &Health::default(),
+                    )
+                    .expect("concealment must not fail the session");
+                schedule.sent();
+                sends += 1;
+            }
+            pending_silence = 0;
+            while Instant::now() < schedule.deadline() {
+                thread::sleep(
+                    schedule
+                        .deadline()
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(1)),
+                );
+            }
+            media
+                .send(
+                    &pcm,
+                    step == 0,
+                    Instant::now(),
+                    schedule.deadline(),
+                    &Health::default(),
+                )
+                .expect("a stalled sender must recover without a fresh session");
+            schedule.sent();
+            sends += 1;
+        }
+        assert_eq!(stalls, 2);
+        assert!(
+            schedule.reanchored >= 1,
+            "the stall must have been absorbed by a re-anchor"
+        );
+        assert!(schedule.shift > Duration::ZERO);
+        // Every received packet is contiguous and steps exactly one frame block:
+        // re-anchoring moves the anchor, never the sequence.
+        let mut packets = Vec::new();
+        let mut buffer = [0u8; 1600];
+        while let Ok(n) = receiver.recv(&mut buffer) {
+            packets.push(buffer[..n].to_vec());
+        }
+        assert_eq!(packets.len(), sends);
+        for pair in packets.windows(2) {
+            let seq = u16::from_be_bytes([pair[0][2], pair[0][3]]);
+            let next = u16::from_be_bytes([pair[1][2], pair[1][3]]);
+            assert_eq!(next, seq.wrapping_add(1), "sequence must stay linear");
+            let rtp = u32::from_be_bytes(pair[0][4..8].try_into().unwrap());
+            let next_rtp = u32::from_be_bytes(pair[1][4..8].try_into().unwrap());
+            assert_eq!(next_rtp.wrapping_sub(rtp), rtp::FRAMES as u32);
+        }
+        assert_eq!(schedule.skipped_packets, 0, "no slots were dropped");
+    }
+
     #[test]
     fn silence_releases_both_members_and_activity_resumes_current_audio() {
         silence_release(false);

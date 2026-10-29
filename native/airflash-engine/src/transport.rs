@@ -643,6 +643,19 @@ impl MediaTransport {
     }
 }
 
+/// What the send loop should do about a packet that woke up late.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LateAction {
+    /// Not late enough to matter; send normally.
+    OnTime,
+    /// The gap still fits a playable buffer: fill this many slots with faded
+    /// silence so seq/rtptime stay linear.
+    Silence(u64),
+    /// The gap is beyond silence coverage: move the timeline forward instead of
+    /// tearing the session down.
+    Reanchor,
+}
+
 /// The timeline advances for intentionally dropped slots and sent packets alike.
 pub struct MediaSchedule {
     pub start: Instant,
@@ -650,8 +663,25 @@ pub struct MediaSchedule {
     pub recoveries: u64,
     pub skipped_packets: u64,
     pub max_lateness_us: u128,
+    /// Extra playout lead accumulated by re-anchoring. The sync anchor must be
+    /// shifted by the same amount, so `seq → rtptime → networkTime` stays linear.
+    pub shift: Duration,
+    /// Re-anchors are bounded so a permanently stalled sender still expires.
+    pub reanchored: u64,
+    pub reanchor_shift_us: i64,
+    reanchors: VecDeque<Instant>,
+    next_relax: Option<Instant>,
     rate: u32,
 }
+/// Beyond eight packets of silence (≈64 ms at 44.1 kHz) the receiver's buffer is
+/// already exhausted, so covering the gap in place no longer helps.
+const MAX_SILENCE_PACKETS: u64 = 8;
+const REANCHOR_LIMIT: usize = 3;
+const REANCHOR_WINDOW: Duration = Duration::from_secs(10);
+/// A re-anchor buys lead; past this the receiver's declared buffer is exceeded and
+/// a fresh session is the honest answer.
+const MAX_SHIFT: Duration = Duration::from_millis(2000);
+const RELAX_INTERVAL: Duration = Duration::from_secs(1);
 impl MediaSchedule {
     pub fn new(start: Instant, rate: u32) -> Self {
         Self {
@@ -660,11 +690,24 @@ impl MediaSchedule {
             recoveries: 0,
             skipped_packets: 0,
             max_lateness_us: 0,
+            shift: Duration::ZERO,
+            reanchored: 0,
+            reanchor_shift_us: 0,
+            reanchors: VecDeque::new(),
+            next_relax: None,
             rate,
         }
     }
+    fn frame_duration(&self) -> Duration {
+        Duration::from_nanos(FRAMES as u64 * 1_000_000_000 / self.rate as u64)
+    }
     pub fn deadline(&self) -> Instant {
-        self.start + Duration::from_nanos(self.frames * 1_000_000_000 / self.rate as u64)
+        self.start + self.shift + Duration::from_nanos(self.frames * 1_000_000_000 / self.rate as u64)
+    }
+    /// The sync anchor moves with the timeline: callers add this to the session's
+    /// base network time before publishing `networkTime`.
+    pub fn anchor_shift_ns(&self) -> u64 {
+        self.shift.as_nanos() as u64
     }
     pub fn recover(&mut self, now: Instant, live: bool) -> Result<u64> {
         let late = now.saturating_duration_since(self.deadline());
@@ -693,26 +736,85 @@ impl MediaSchedule {
     pub fn sent(&mut self) {
         self.frames += FRAMES as u64;
     }
+    /// Classify a late wake-up. `earliest_render` is the receiver's playout
+    /// deadline; padding silence past it would be heard as a stall.
+    pub fn late_action(&self, now: Instant, earliest_render: Instant) -> LateAction {
+        let due = self.due_packets(now);
+        if due < 2 {
+            return LateAction::OnTime;
+        }
+        if due > MAX_SILENCE_PACKETS || now + Duration::from_millis(2) >= earliest_render {
+            return LateAction::Reanchor;
+        }
+        LateAction::Silence(due)
+    }
+    /// How many whole packet slots we are behind the plan.
+    pub fn due_packets(&self, now: Instant) -> u64 {
+        (now.saturating_duration_since(self.deadline()).as_nanos() * u128::from(self.rate)
+            / 1_000_000_000
+            / FRAMES as u128) as u64
+    }
     /// Keep the original sample timeline: fill only a bounded, still playable gap.
     pub fn recovery_silence(&self, now: Instant, earliest_render: Instant) -> Result<u64> {
-        let due = (now.saturating_duration_since(self.deadline()).as_nanos()
-            * u128::from(self.rate)
-            / 1_000_000_000
-            / FRAMES as u128) as u64;
-        if due < 2 {
-            return Ok(0);
-        }
-        if due > 8 || now + Duration::from_millis(2) >= earliest_render {
-            return Err(Fault::new(
+        match self.late_action(now, earliest_render) {
+            LateAction::OnTime => Ok(0),
+            LateAction::Silence(due) => Ok(due),
+            LateAction::Reanchor => Err(Fault::new(
                 "",
                 "scheduler",
                 "timeline_expired",
                 true,
                 "expired audio requires a fresh group timeline",
             )
-            .into());
+            .into()),
         }
-        Ok(due)
+    }
+    /// Move the whole timeline forward so the next packet is due one frame after
+    /// `now`, and report the applied shift.
+    ///
+    /// Crucially this does **not** advance `frames`: seq and rtptime stay exactly
+    /// as the receiver expects, and only the `rtptime → networkTime` anchor moves.
+    /// Returns `None` when the re-anchor budget or the lead ceiling is reached,
+    /// which is the only remaining path to a session rebuild.
+    pub fn reanchor(&mut self, now: Instant) -> Option<Duration> {
+        while self
+            .reanchors
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= REANCHOR_WINDOW)
+        {
+            self.reanchors.pop_front();
+        }
+        if self.reanchors.len() >= REANCHOR_LIMIT {
+            return None;
+        }
+        let frame = self.frame_duration();
+        let deadline = self.deadline();
+        let target = now + frame;
+        if target <= deadline {
+            // Sending already caught the timeline up; nothing to re-anchor.
+            return Some(Duration::ZERO);
+        }
+        let apply = target - deadline;
+        if self.shift.saturating_add(apply) > MAX_SHIFT {
+            return None;
+        }
+        self.shift += apply;
+        self.reanchored += 1;
+        self.reanchor_shift_us = apply.as_micros() as i64;
+        self.reanchors.push_back(now);
+        Some(apply)
+    }
+    /// Slew the extra lead back to zero one frame per second whenever the sender
+    /// is comfortably on time, so a re-anchor does not raise latency forever.
+    pub fn relax(&mut self, now: Instant, late: Duration) {
+        if self.shift.is_zero() || late >= self.frame_duration() {
+            return;
+        }
+        if self.next_relax.is_some_and(|at| now < at) {
+            return;
+        }
+        self.shift = self.shift.saturating_sub(self.frame_duration());
+        self.next_relax = Some(now + RELAX_INTERVAL);
     }
 }
 
@@ -816,5 +918,127 @@ mod schedule_tests {
         assert_eq!(skipped, due / FRAMES as u64);
         assert_eq!(s.frames, skipped * FRAMES as u64);
         assert_eq!(s.skipped_packets, skipped);
+    }
+    #[test]
+    fn late_wake_up_escalates_from_silence_to_reanchor() {
+        let start = Instant::now();
+        let s = MediaSchedule::new(start, 44_100);
+        // 2..=8 packets of lateness still fits a playable buffer.
+        let small = start + Duration::from_millis(30);
+        assert_eq!(
+            s.late_action(small, start + Duration::from_secs(1)),
+            LateAction::Silence(s.due_packets(small))
+        );
+        // Ten packets late is past silence coverage.
+        let large = start + Duration::from_millis(100);
+        assert_eq!(
+            s.late_action(large, start + Duration::from_secs(1)),
+            LateAction::Reanchor
+        );
+        // Reaching the receiver's playout deadline also escalates, even when the
+        // packet count alone would still be coverable.
+        assert_eq!(
+            s.late_action(small, small + Duration::from_millis(1)),
+            LateAction::Reanchor
+        );
+    }
+    #[test]
+    fn reanchor_moves_the_whole_timeline_without_touching_the_sequence() {
+        let start = Instant::now();
+        for rate in [44_100, 48_000] {
+            let mut s = MediaSchedule::new(start, rate);
+            for _ in 0..10 {
+                s.sent();
+            }
+            let frames = s.frames;
+            let now = start + Duration::from_millis(300);
+            let shift = s.reanchor(now).unwrap();
+            assert!(shift > Duration::ZERO);
+            assert_eq!(s.frames, frames, "seq/rtptime must not skip");
+            assert_eq!(s.reanchored, 1);
+            assert_eq!(s.anchor_shift_ns(), shift.as_nanos() as u64);
+            let frame = Duration::from_nanos(FRAMES as u64 * 1_000_000_000 / u64::from(rate));
+            assert_eq!(s.deadline(), now + frame, "one frame of phase margin");
+            assert_eq!(s.due_packets(now), 0, "the schedule is on time again");
+        }
+    }
+    #[test]
+    fn reanchor_budget_expires_a_stalled_sender() {
+        let start = Instant::now();
+        let mut s = MediaSchedule::new(start, 44_100);
+        let mut now;
+        for i in 0..REANCHOR_LIMIT {
+            now = s.deadline() + Duration::from_millis(120);
+            assert!(s.reanchor(now).is_some(), "re-anchor {i} within budget");
+        }
+        // The fourth stall in the same window must expire the session instead of
+        // re-anchoring forever.
+        now = s.deadline() + Duration::from_millis(120);
+        assert!(s.reanchor(now).is_none());
+        assert_eq!(s.reanchored as usize, REANCHOR_LIMIT);
+        // Once the window has rolled over the budget is available again; advance
+        // the plan so the sender is genuinely behind by the same amount.
+        let later = now + REANCHOR_WINDOW;
+        while s.deadline() < later {
+            s.sent();
+        }
+        assert!(s.reanchor(later + Duration::from_millis(120)).is_some());
+    }
+    #[test]
+    fn reanchor_lead_is_bounded_so_buffer_overflow_still_expires() {
+        let start = Instant::now();
+        let mut s = MediaSchedule::new(start, 44_100);
+        // Walk the window forward so the count budget never trips.
+        let mut now = start;
+        let mut applied = false;
+        for _ in 0..40 {
+            now += REANCHOR_WINDOW;
+            let late_by = 400; // fewer than MAX_SHIFT ms per step
+            match s.reanchor(now + Duration::from_millis(late_by)) {
+                Some(_) => applied = true,
+                None => {
+                    assert!(s.shift <= MAX_SHIFT);
+                    return;
+                }
+            }
+        }
+        assert!(applied);
+        panic!("lead must never grow without a ceiling");
+    }
+    #[test]
+    fn reanchor_does_not_count_a_no_op() {
+        let start = Instant::now();
+        let mut s = MediaSchedule::new(start, 44_100);
+        for _ in 0..8 {
+            s.sent();
+        }
+        // Sending is already ahead of the clock; re-anchoring has nothing to add.
+        assert_eq!(s.reanchor(start), Some(Duration::ZERO));
+        assert_eq!(s.reanchored, 0);
+        assert_eq!(s.shift, Duration::ZERO);
+        assert_eq!(s.frames, 8 * FRAMES as u64);
+    }
+    #[test]
+    fn extra_lead_slews_back_to_zero_when_the_sender_is_on_time() {
+        let start = Instant::now();
+        let mut s = MediaSchedule::new(start, 44_100);
+        let frame = Duration::from_nanos(FRAMES as u64 * 1_000_000_000 / 44_100);
+        s.reanchor(start + Duration::from_millis(300)).unwrap();
+        let raised = s.shift;
+        assert!(raised > frame);
+        // Late by a frame or more: do not relax, the sender has no slack.
+        s.relax(start + Duration::from_secs(5), frame);
+        assert_eq!(s.shift, raised);
+        // Comfortably on time: one frame comes off, then at most once a second.
+        s.relax(start + Duration::from_secs(10), Duration::ZERO);
+        assert_eq!(s.shift, raised - frame);
+        s.relax(start + Duration::from_secs(10), Duration::ZERO);
+        assert_eq!(s.shift, raised - frame, "relaxation is rate limited");
+        s.relax(start + Duration::from_secs(12), Duration::ZERO);
+        assert!(s.shift < raised - frame);
+        for second in 14..120 {
+            s.relax(start + Duration::from_secs(second), Duration::ZERO);
+        }
+        assert_eq!(s.shift, Duration::ZERO);
     }
 }
