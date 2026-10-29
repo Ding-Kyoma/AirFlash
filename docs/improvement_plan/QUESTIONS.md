@@ -964,12 +964,13 @@ bit40，预判会把它的 `selected_timing` 算成 `ntp`，实际会话却按 `
 > ```
 >
 > **4. 一个必须注意的差异**：WAC 第一段是 **`Any(!SupportsAirPlay2)` 全局降级**。如果你的立体声对/组里只有一台缺 bit40，WAC 会把**整个组**降成 Classic RAOP/NTP。这条比"预判取值变了"严重得多 —— 值得对照检查你现在是不是按成员逐台判的。
+---
 
 ---
 
 ## 十一、抢占识别（P3-3）
 
-### Q30. 真实接收器被接管时，最先出现的是哪种信号？ `[待答复]`
+### Q30. 真实接收器被接管时，最先出现的是哪种信号？ `[已确认]`
 
 P3-3 现在把「未预期 TEARDOWN / RTSP 403 / `Connection: close`」都只当信号，
 必须再配上「媒体在 3 秒内停流」或「PTP Announce 的 clock identity 改变 / 对端
@@ -979,6 +980,121 @@ P3-3 现在把「未预期 TEARDOWN / RTSP 403 / `Connection: close`」都只当
 TEARDOWN、回 403、直接断流，还是先改 PTP announce，也测不出这些动作之间的真实
 间隔；3 秒窗口和「至少一个旁证」由本地模拟加现有故障节奏推出。是否应放宽到
 5 秒，或把「随后重新 announce」单独视为充分条件？
+
+> **答复**：**WAC 不靠 TEARDOWN/403/close 判抢占 —— 它的权威判据是 `statusFlags`；探测失败反而「照样回收」。你现在的「信号 + 旁证」结构方向反了。**
+>
+> ## 一、WAC 的三层，先看第一层
+>
+> 〔串〕`session/lifecycle.rs:205/215` —— **回收前先做一次 live status probe**：
+> ```
+> HomePod <ip> is free (live statusFlags=<n>); reclaiming
+> HomePod <ip> is playing another sender's session (statusFlags=0x<n>); checking again in <n>s
+> HomePod <ip> status probe failed (<err>); reclaiming
+> HomePod <ip> status probe timed out; reclaiming
+> ```
+>
+> 这四条把判据说得很清楚：
+>
+> | 探测结果 | 动作 |
+> |---|---|
+> | `statusFlags` 表明空闲 | **立刻回收** |
+> | `statusFlags` 表明「另一个 sender 在播」 | **不做判定，等 `<n>s` 后再探**（不是失败，是排队） |
+> | 探测**失败** | **照样回收**（fail-open） |
+> | 探测**超时** | **照样回收**（fail-open） |
+>
+> ⇒ **探测不成功 ≠ 放弃回收**。这一点和 AF 现在「拿不到旁证就退回通用故障」正好相反。
+>
+> ## 二、第二层：控制面症状只是线索，且带完整上下文
+>
+> 〔串〕`session/tick.rs`
+> ```
+> Encrypted control EOF observed for <ip> (policy=<x>, rtp_healthy=<b>, packets_prepared=<n>)
+> HomePod control poisoned by preemption with active audio
+> HomePod <ip> preempted while audio active (takeover <n>); reclaiming it once no other sender is playing
+> ```
+>
+> 注意 `control EOF` 那条带了三个上下文：`policy` / `rtp_healthy` / `packets_prepared`。**它不是判定，是留证据** —— 判定发生在后面的 `statusFlags`。
+>
+> 另外 `control poisoned by preemption with active audio` 说明 WAC 会**把这条控制连接标记为中毒不可复用**，而不是重连同一根。
+>
+> ## 三、第三层：连续计数 + 时间窗 → 才认输
+>
+> 〔串〕
+> ```
+> HomePod <ip> taken over <n> times in a row, each within <n>s of a reclaim;
+>   it is in use from another device, yielding
+> ```
+>
+> 这是**整个答案的核心**：
+> - 数的是 **`in a row`（连续）**，不是累计；
+> - 每次都要求 **距上次 reclaim 在 `<n>s` 以内** —— 超过窗口就清零；
+> - 达到阈值就 **`yielding`**：放弃，判定「这台真被别的设备在用」。
+>
+> 对应 [`Status] PREEMPTED` 的两个 reason（`events.rs:215` 邻域）：
+> ```
+> [Status] FAILED <…>
+> PREEMPTED
+> [Status] PREEMPTED <reason>      ← reason ∈ { takeover, limit }
+> takeover
+> limit
+> ```
+> `takeover` = 被接管；`limit` = 撞到连续上限。**两个都要报给用户**，因为处置完全不同。
+>
+> ## 四、直接回答你的两个问题
+>
+> ### 「3 秒要不要放宽到 5 秒？」→ **不要。这个维度选错了。**
+> WAC 里根本没有「媒体在 N 秒内停流」这条规则。它用的是 **`statusFlags` 轮询 + `checking again in <n>s`**。
+> 两者的差别很重要：
+> - 「媒体停流 N 秒」是**间接症状**，正常换歌、暂停、切歌都会触发；
+> - 「`statusFlags` 显示另一 sender 在播」是**直接事实**，不会误判。
+>
+> ⇒ 别调窗口，**换成查 `statusFlags`**。窗口参数只保留一个用途：连续计数的时间窗（见下）。
+>
+> ### 「随后重新 announce 算不算充分条件？」→ **不算，而且这是最危险的一条。**
+> 重新 announce 只证明「对端还活着」，**不证明「它空闲」**。被接管后对端当然还在 announce —— 它正在为**新的** sender 服务。
+> 若把 re-announce 当充分条件，AF 会**在被占用时反复抢**，正是 WAC 用 `taken over in a row` 计数器要避免的拉锯。
+>
+> ## 五、给 AirFlash 的改造建议
+>
+> ### 1. 把判定换成 `statusFlags`（这是唯一需要新增的能力）
+> AirPlay 的 `statusFlags` 在 `/info` 和 mDNS TXT 里都有。WAC 还额外打 `Receiver /info statusFlags changed since discovery for '<ip>': mDNS=0x<a>, live=0x<b>` —— **它明确知道两边可能不一致，并选择信 live 的那份**。
+> ⇒ AF 也应该：**信 live 探测，不信 mDNS 缓存**。
+>
+> ### 2. 加连续计数 + 时间窗 + yielding
+> ```rust
+> struct TakeoverState { consecutive: u32, last_reclaim: Instant }
+> const LIMIT: u32 = 3;            // 具体值需实测；WAC 的这个数我没静态拿到
+> const WINDOW: Duration = Duration::from_secs(30);
+> ```
+> 语义严格照抄：
+> - 每次 reclaim 后，若**在 `WINDOW` 内**又发生 takeover ⇒ `consecutive += 1`；
+> - 超过 `WINDOW` 才再次 takeover ⇒ `consecutive = 1`（**重置，不是清零后不加**）；
+> - `consecutive >= LIMIT` ⇒ `yielding`，**停止抢占**并报 `PREEMPTED(limit)`。
+>
+> ### 3. 清理掉「只有信号就退回通用故障」
+> 改成：
+> ```rust
+> match probe_status(ip) {
+>     Ok(sf) if free(sf)          => reclaim(),
+>     Ok(sf) /* busy, other sender */ => schedule_retry(AFTER),   // 不是失败
+>     Err(_) | Timeout            => reclaim(),                    // fail-open
+> }
+> ```
+> **`Err`/`Timeout` 走 reclaim** 是关键 —— 别让它掉进通用故障分支。
+>
+> ### 4. 控制连接标记中毒，别重连同一根
+> `control poisoned by preemption with active audio` ⇒ 抢占后这条 RTSP 连接**不可复用**，必须新建（这也和 Q16 的 `Encrypted RTSP cannot be re-keyed mid-session` 一致）。
+>
+> ## 六、没拿到的东西（† 静态不可判定）
+>
+> | 项 | 状态 | 怎么定死 |
+> |---|---|---|
+> | 连续上限的具体数值（`taken over <n> times`） | † 运行时参数，未定位到常数池 | 反汇编 xref 到该格式串，或抓日志看阈值 |
+> | 时间窗的具体秒数 | 同上 | 同上 |
+> | `checking again in <n>s` 的间隔 | 同上 | 同上 |
+> | `statusFlags` 的位定义（哪个 bit = 正在播放） | † 二进制里没有位名表 | 抓 HomePod 空闲/播放中的 `/info` 对比 |
+>
+> 但这四个数**都不影响结论**：结构是「statusFlags 判定 + 连续计数限流 + fail-open 回收」，参数只是标定。
 
 ---
 
@@ -1011,3 +1127,5 @@ TEARDOWN、回 403、直接断流，还是先改 PTP announce，也测不出这�
 1. **伺服增益链路把两件事对上了**：`correction_ppb = filtered_ns / 20`，夹 **±50 ppm**。而 AF 现成的重采样环量程是 **±500 ppm** —— 你们的环路**量程绰绰有余，缺的只是"死区 + 增益"**。P0-3 的改造量比报告估计的更小。
 2. **`deadline` 是唯一权威源**，WAC 因此只需要改一处；AF 的 `base_ns` 是局部变量（`session.rs:1041`），这是所有"映射跳变"类问题的**同一根因**。
 3. **`ComputeRecommendation` 是一次算三方案，不升档**：所以"自适应阶梯"整套是 AF 的净增能力，不必也不该去对齐 WAC 的候选表（那张表里有 30/40 这种**永远用不到**的值）。
+
+---
