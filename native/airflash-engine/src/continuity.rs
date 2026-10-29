@@ -67,6 +67,12 @@ pub struct Splice {
     missing: bool,
     silent_frames: u32,
     rate: u32,
+    /// Exponential decay applied when the capture queue runs dry. A hard cut to
+    /// zero leaves a click at the gap edge; a short natural tail reads as the
+    /// music stopping rather than the speaker being unplugged.
+    conceal: u32,
+    conceal_length: u32,
+    conceal_from: [f32; 2],
     pub transitions: u64,
     gain_initialized: bool,
 }
@@ -84,6 +90,9 @@ impl Splice {
             missing: false,
             silent_frames: 0,
             rate,
+            conceal: 0,
+            conceal_length: (rate / 100).max(1),
+            conceal_from: [0.0; 2],
             transitions: 1,
             gain_initialized: false,
         }
@@ -103,6 +112,12 @@ impl Splice {
         if missing != self.missing {
             self.boundary();
             self.missing = missing;
+            if missing {
+                self.conceal = self.conceal_length;
+                self.conceal_from = self.last;
+            } else {
+                self.conceal = 0;
+            }
         }
         let silent = input.iter().all(|s| *s == 0.0);
         if !silent && self.silent_frames >= self.rate {
@@ -127,6 +142,15 @@ impl Splice {
             self.gain = self.gain_target;
         }
         let mut out = input.map(|s| (s * self.gain).clamp(-1.0, 1.0));
+        if self.conceal > 0 {
+            // About -52 dB at the end of the tail, then exact silence takes over.
+            let elapsed = (self.conceal_length - self.conceal) as f32 + 1.0;
+            let level = (-6.0 * elapsed / self.conceal_length as f32).exp();
+            for (i, sample) in out.iter_mut().enumerate() {
+                *sample = self.conceal_from[i] * level;
+            }
+            self.conceal -= 1;
+        }
         if self.remaining > 0 {
             let t = 1.0 - self.remaining as f32 / self.length as f32;
             let w = 0.5 - 0.5 * (std::f32::consts::PI * t).cos();
@@ -213,6 +237,33 @@ mod tests {
             }
             assert_eq!(s.frame([0.8; 2], 1.0, false), [0.0; 2]);
         }
+    }
+    #[test]
+    fn capture_gaps_decay_instead_of_cutting_to_silence() {
+        let rate = 48_000;
+        let mut s = Splice::new(rate);
+        for _ in 0..rate / 200 + 2 {
+            s.frame([0.5; 2], 1.0, false);
+        }
+        let mut previous = 1.0f32;
+        let mut samples = 0;
+        for _ in 0..(rate / 100 + 2) {
+            let out = s.frame([0.0; 2], 1.0, true);
+            assert!(
+                out[0].abs() <= previous + 1e-6,
+                "the tail must never rise: {} after {previous}",
+                out[0]
+            );
+            previous = out[0].abs();
+            samples += 1;
+        }
+        assert!(samples >= rate / 100, "the tail must span the conceal window");
+        assert!(previous < 0.01, "tail reaches silence, got {previous}");
+        assert_eq!(
+            s.frame([0.0; 2], 1.0, true),
+            [0.0; 2],
+            "after the tail, silence is exact"
+        );
     }
     #[test]
     fn gain_changes_ramp_without_resetting_music() {

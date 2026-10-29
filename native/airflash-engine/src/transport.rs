@@ -474,6 +474,8 @@ pub struct MediaMetrics {
     pub retransmit_send_errors: u64,
     pub retransmit_queue_drops: u64,
     pub invalid_requests: u64,
+    /// Whether the socket accepted the DSCP EF mark (diagnostic only).
+    pub qos_marked: bool,
 }
 pub struct MediaTransport {
     buffered: Option<crate::buffered::Sender>,
@@ -497,10 +499,11 @@ impl MediaTransport {
     ) -> Result<Self> {
         audio.set_nonblocking(true)?;
         control.set_nonblocking(true)?;
+        let qos_marked = crate::qos::mark_audio_socket(&audio);
         Ok(Self {
             buffered: None,
             packetizer,
-            metrics: MediaMetrics::default(),
+            metrics: MediaMetrics { qos_marked, ..Default::default() },
             audio,
             control,
             remote,
