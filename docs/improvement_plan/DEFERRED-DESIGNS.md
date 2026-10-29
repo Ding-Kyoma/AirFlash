@@ -7,9 +7,9 @@
 > 预期结果。
 >
 > 为什么这么处理：这三项的核心输入分别是「真实接收器的容忍度数据」、「MRP 的
-> 消息编号与加密封装」和「FairPlay 的密钥调度」。缺了输入就写实现，产出会编译、
-> 会跑、会打日志，但**不可能在真机上成立**——它把「没做」藏进了日志里，比明确
-> 不做更糟。所以本轮只交付设计，代码等输入。
+> 消息编号与加密封装」和「经典 RAOP 的真机与抓包（仅 RSA 路径）」。缺了输入就
+> 写实现，产出会编译、会跑、会打日志，但**不可能在真机上成立**——它把「没做」
+> 藏进了日志里，比明确不做更糟。所以本轮只交付设计，代码等输入。
 
 读法标记：
 
@@ -30,7 +30,7 @@
 | --- | --- | --- |
 | P1-10 延迟标定 | 未实现，待硬件/抓包 | 至少一台单机接收器与一对同型立体声对（各记录型号/固件）+ 可复现的会话遥测；判据阈值和推荐值必须在真机上标定，本文件不给默认数 |
 | P3-4 MRP 隧道 | 未实现，待硬件/抓包 | 一份**能解出明文**的 MRP 数据流抓包（含会话密钥或发送端明文 dump）+ 一台 Apple TV/HomePod；被动 pcap 只能看到密文 |
-| P3-5 经典 RAOP | 未实现，待硬件/抓包 | 一台 AirPort Express（或 AirPlay 1 第三方设备）+ 一份 ANNOUNCE/SETUP/RECORD 抓包；FairPlay 路径另需强制 `fpaeskey` 的目标设备与许可评估 |
+| P3-5 经典 RAOP | 未实现，待 AirPort Express 2 + 抓包（仅 RSA 路径） | 一台 AirPort Express 2 与一台 AirPlay 1 第三方设备 + 一份 ANNOUNCE/SETUP/RECORD 抓包；只实现 RSA 路径，要求 FairPlay 的设备在建链时拒绝 `raop_fairplay_required` |
 
 **一句话边界**（先看这张，再看每节）：
 
@@ -38,7 +38,7 @@
 | --- | --- | --- |
 | P1-10 | 仪器：试听音、按阶梯套候选、逐段取遥测快照、存 profile、状态机 | 结论：什么算「紧」、推荐几毫秒、归因规则、可重复性 |
 | P3-4 | 通道结构、密钥字段名、角色名、11+3 个字段名、生命周期、失败隔离 | protobuf 的消息号/字段号、帧封装、DataStream `type` 与 `/info` 端点、加密封装 |
-| P3-5 | RTSP/RAOP 控制面、SDP、ALAC 帧格式、RSA-OAEP 包装的 AES 密钥、AES-CBC、DACP 形状 | FairPlay `fp-setup`（SAP）、`fpaeskey`、目标设备是否强制 FairPlay |
+| P3-5 | RTSP/RAOP 控制面、SDP、ALAC 帧格式、RSA-OAEP 包装的 AES 密钥、AES-CBC、DACP 形状 | FairPlay `fp-setup`（SAP）与 `fpaeskey`——**永久不做**；设备要求 FairPlay 时拒绝，不再是待定未知 |
 
 三项共同的实现纪律（写实现时先读这一段）：
 
@@ -382,9 +382,22 @@ Apple TV 和 HomePod 的屏幕上出现正在播放的歌名、歌手、专辑�
 歌手（走 DACP）。用户感到的是「这台老设备也能用」，而不是「列表里看得见、点下去
 连不上」。
 
-### 2. 阻塞边界：控制面公开，FairPlay 黑盒
+### 2. 阻塞边界：RSA 路径可做，FairPlay 路径只拒绝
 
-这一项最容易被笼统地说成「被 FairPlay 阻塞」。按公开资料拆开看，边界是这样的：
+这一项过去被笼统写成「被 FairPlay 阻塞」。按 Q49 的决定，边界要拆成两条**没有
+共同前置条件**的路径——这是本节的主线，不是脚注：
+
+- **RSA 路径**：公开、可实现，是 P3-5 的**全部范围**；缺的只有真机与抓包。
+- **FairPlay 路径**：没有规范、永久不做；它不是要满足的门槛，而是要在建链时
+  **拒绝**的边界。
+
+#### 2.1 RSA 路径——可实现（P3-5 的全部范围）
+
+ANNOUNCE SDP 里 `a=rsaaeskey` 是用接收端 RSA 公钥做 OAEP 包装的 128-bit AES
+密钥（AirPort Express 的私钥 2011 年已公开，公钥可用于发送端），`a=aesiv` 是
+IV，音频走 AES-CBC；RTSP/RAOP 控制面（`ANNOUNCE` / `SETUP` / `RECORD` /
+`SET_PARAMETER` / `FLUSH` / `TEARDOWN`）、`Apple-Challenge`、ALAC 帧格式都有
+公开规范或公开实现可对照。逐项：
 
 | 部分 | 状态 | 说明 |
 | --- | --- | --- |
@@ -396,16 +409,46 @@ Apple TV 和 HomePod 的屏幕上出现正在播放的歌名、歌手、专辑�
 | 控制通道上的 sync / retransmit | 〔公开〕 | 与 AirPlay 2 的 RTP 内嵌 sync 不同；具体包类型实现时对照公开源码，**本文件不凭记忆写数值** |
 | DACP / DMAP：`_dacp._tcp` 注册、`DACP-ID`+`Active-Remote`、`minm/asar/asal` | 〔部分公开〕 | 形状可写；老设备实际发哪些请求、多久拉一次〔需真机〕 |
 | ALAC 编码 | 〔公开/已有〕 | 现有 `alac_encoder` + `FRAMES=352` 可复用，不需要新编码器 |
-| FairPlay `fp-setup`（SAP）与 `a=fpaeskey` | 〔未知〕 | 没有规范；只有逆向实现，**不能当规范用**，也不能内置其 white-box 表 |
-| 目标设备是否强制 FairPlay | 〔需真机〕 | 决定「只做 RSA 路径」是否够；见 `QUESTIONS.md` Q49 |
-| `et` 的取值与「SDP 里怎么选 FairPlay」 | 〔需抓包〕 | 不从记忆填数值 |
+| `et` 的取值 | 〔需抓包〕 | `_raop._tcp` TXT 的加密类型；取值表到实现时对照公开说明与抓包核对，不从记忆填 |
 
-结论：**RSA 路径公开、FairPlay 黑盒。** P3-5 的「不可重建」只对后者成立；是否
-只需要 RSA，取决于目标设备——而这必须先拿到设备看它的 ANNOUNCE/SDP 与响应。
-这也是它与 MRP 不同的地方：MRP 缺的是**全部**消息语义，RAOP 缺的只是一段
-（虽然关键）密钥交换。
+结论：**RSA 路径没有 FairPlay 前置条件。** 它缺的是一次真机 + 抓包对照，而不是
+一段黑盒密钥交换；这也是它与 MRP 不同的地方：MRP 缺的是**全部**消息语义，RAOP
+的 RSA 路径缺的只是验证。
+
+#### 2.2 FairPlay 路径——永久不做（拒绝边界）
+
+`fp-setup`（SAP）的模式选择、密钥调度、white-box 表、`a=fpaeskey` 属于 FairPlay
+路径：没有规范，只有逆向实现，**不能当规范用**，也不能内置其 white-box 表。
+它不在 P3-5 的范围内，也**不是 P3-5 的前置条件**。
+
+它是一条**要在建链时拒绝的边界**：设备要求 FairPlay 时，返回已决定的接口错误
+`raop_fairplay_required`（Q49），带可翻译的原因，不挂起、不重试、不静默失败。
+拒绝放在建链时而不是发现阶段——发现阶段的能力证据可能还没齐。
+`raop_fairplay_required` 是 P3-5 唯一**已决定**的接口名，其余名字与形状仍是占位。
+
+留一句给后来人：**FairPlay 路径未实现。** 若将来有强制 FairPlay 的目标设备且
+愿意接受逆向风险，这是**独立的一项**，不是本项的遗留——防止把「RSA 做完了」
+误读成「RAOP 做完了」。
+
+#### 2.3 依据：WinAirCast 2.3.11 binary string-pool evidence
+
+| 探针 | 命中 | 位置/说明 |
+| --- | --- | --- |
+| `rsaaeskey` | **1** | 紧邻 `crates\airplay-rtsp\src\sdp.rs` |
+| `a=aesiv:` | **1** | |
+| `a=min-latency:` | **1** | |
+| `a=aeskey`（明文密钥属性） | **0** | 只有 `rsaaeskey`，没有 FairPlay 风格的对侧属性 |
+| `Apple-Challenge` | **1** | |
+| `fpaeskey` | **0** | |
+| `fp-setup` | **0** | |
+
+结论：WinAirCast 的经典 RAOP 就是 RSA 路径，FairPlay 从未实现。只做 RSA 不是
+妥协，而是**扎实做过、并且把它发出去的人得出的结论**。
 
 ### 3. 接口占位（全部未实现）
+
+`raop_fairplay_required` 是唯一**已决定**的接口名（Q49）——拒绝边界必须用它；
+除此之外，本节的名字、字段与形状全部是占位，不是现有行为。
 
 **模块**：`native/airflash-engine/src/raop.rs`（新增）+ `raop_crypto.rs`（新增）。
 
@@ -417,7 +460,7 @@ Apple TV 和 HomePod 的屏幕上出现正在播放的歌名、歌手、专辑�
 | 控制通道 sync / retransmit | 独立于 RTP 的一条 UDP；具体包类型对照公开实现核对 |
 | NTP 计时 | 经典 RAOP 没有 PTP、没有 `SETPEERS`；timing 走 NTP，方向与端口在实现时对照公开实现核对 |
 | DACP | 引擎监听 HTTP、回 DMAP TLV、复用 `metadata.rs` 的编码器；mDNS 注册由桌面完成（见下） |
-| FairPlay 占位 | trait 返回 `Unsupported`，**永不**被默认路径调用 |
+| FairPlay 拒绝 | 建链时返回 `raop_fairplay_required`（已决定）；不做 `fp-setup`/white-box，也不进入默认路径 |
 
 DACP 的 mDNS 注册是一个容易漏掉的工程量：现有
 `desktop/AirFlash.App/Services/WindowsDnsSdApi.cs` 只有 `Browse` / `Resolve`，
@@ -437,7 +480,7 @@ DACP 的 mDNS 注册是一个容易漏掉的工程量：现有
 | --- | --- | --- |
 | `Peer.profile.transport` | 追加 `"raop"` | 现有取值不变；`Profile` 是 `deny_unknown_fields`，旧版本引擎收到 `raop` 会拒绝，所以只在两端一起升级的版本里启用 |
 | `start` / `probe` | 参数不变 | 不需要新命令；RAOP 是同一 `start` 的另一种传输 |
-| 错误码（新） | `raop_fairplay_required`、`raop_unsupported_receiver`、`raop_key_exchange_failed` | 一律带 `host` 与 `channel:"raop"`，可重试性为 false 或 true 要分开 |
+| 错误码（新） | `raop_fairplay_required`（已决定）、`raop_unsupported_receiver`、`raop_key_exchange_failed`（后两个仍为占位） | 一律带 `host` 与 `channel:"raop"`，可重试性为 false 或 true 要分开 |
 | `hello.capabilities` | 实现后才加 `classic_raop` | 未实现不报告 |
 
 **发现层**：`desktop/AirFlash.Core/Receiver.cs` 现在只从 `_raop._tcp` 读 `cn`
@@ -453,7 +496,7 @@ DACP 的 mDNS 注册是一个容易漏掉的工程量：现有
 | `setup` | SETUP 200，拿到 data/control/timing 端口 | `recorded` |
 | `recorded` | RECORD 200 | `streaming` |
 | `streaming` | 首包发出 | `flushed`（FLUSH）/ `stopped`（TEARDOWN） |
-| `unsupported` | 设备要求 FairPlay、或公钥缺失 | 终止，报 `raop_fairplay_required` / `raop_unsupported_receiver` |
+| `unsupported` | 建链时设备要求 FairPlay、或公钥缺失 | 终止，报 `raop_fairplay_required` / `raop_unsupported_receiver` |
 | `failed` | 任一步非 200 或超时 | 终止，错误码区分「设备拒绝」与「网络」 |
 
 RAOP 没有 PTP、没有 buffered（type 103）、没有 `SETPEERS`；不要在 RAOP 会话里
@@ -461,18 +504,23 @@ RAOP 没有 PTP、没有 buffered（type 103）、没有 `SETPEERS`；不要在 
 
 ### 4. 真机验收（开始动工的门槛）
 
-1. **出声**：AirPort Express 2 上能听到 5 s / 440 Hz / 幅度 0.05 / gain 0.1 的
-   测试音（沿用 AGENTS.md 的电平上限），重复 3 次都出声，`underruns` 为 0。
-   注意 `scripts/e2e_stream.py` 现在只走 AirPlay 2，让它能对 RAOP 发测试音本身
-   就是实现的一部分，不是现成工具。
+1. **出声（两台）**：AirPort Express 2 **和**一台 AirPlay 1 第三方设备上都能
+   听到 5 s / 440 Hz / 幅度 0.05 / gain 0.1 的测试音（沿用 AGENTS.md 的电平
+   上限），各重复 3 次都出声，`underruns` 为 0。只测 Express 2 不够：它是最
+   宽容的接收端之一，第三方设备才能验证互操作性。注意 `scripts/e2e_stream.py`
+   现在只走 AirPlay 2，让它能对 RAOP 发测试音本身就是实现的一部分，不是现成
+   工具。
 2. **控制**：暂停 / 恢复 / 停止 / 音量 各一次，设备行为与命令一致；停止后
    没有残留连接（TEARDOWN 后端口可再连）。
 3. **音量与进度**：`SET_PARAMETER volume:` 与 `progress:` 在老设备上生效
    （这是 RAOP 的文本参数格式，不是 AirPlay 2 的 plist）。
 4. **元数据**：设备屏幕显示 title/artist（DACP 拉取），停止后清空；不显示时
    日志能指出是「没注册 DACP」还是「设备没来拉」。
-5. **明确拒绝**：强制 FairPlay 的设备在 1 s 内返回 `raop_fairplay_required`，
-   不挂起、不重试、不影响其他会话。
+5. **明确拒绝（验收项本身）**：强制 FairPlay 的设备必须得到
+   `raop_fairplay_required` 这个明确错误，而不是通用失败或超时；错误带可翻译
+   的原因，1 s 内返回，不挂起、不重试、不影响其他会话。**「正确地拒绝」和
+   「出声」同级**——否则会做出一个对 DRM 设备静默失败的实现，在用户看来和
+   「不支持我的音箱」没有区别，但后者至少是可查的。
 6. **抓包证据**：ANNOUNCE 的 SDP 含 `rsaaeskey`/`aesiv`；SETUP/RECORD 成功；
    RTP 能用我们持有的 key 以 AES-CBC 解出，且解出的 PCM 与发送端一致。
 7. **不回归**：同一台 HomePod 仍走现有 AirPlay 2 路径；混组门禁仍拒绝
@@ -484,9 +532,8 @@ RAOP 没有 PTP、没有 buffered（type 103）、没有 `SETPEERS`；不要在 
       2011 年公开的那把要先确认适用）。
 - [ ] 一份 iTunes/Music（macOS）或 iOS 向该设备发送的 ANNOUNCE/SETUP/RECORD 抓包，
       用来对照 SDP 与 timing 参数；没有这份对照，SDP 只能靠公开示例猜版本差异。
-- [ ] 一台 AirPlay 1 第三方设备（可选），用来验证不是只为 Apple 一家适配。
-- [ ] 一台强制 FairPlay 的设备（只有要走 FairPlay 才需要）；需要先做许可/法务
-      评估，逆向实现不是规范。
+- [ ] 一台 AirPlay 1 第三方设备（与 Express 2 一起构成验收目标），用来验证
+      互操作性——只测 Express 2 有盲区，它太宽容。
 - [ ] 目标设备的 `_raop._tcp` TXT 原文（含 `et`/`cn`/`md`），以及它是否广播
       `_airplay._tcp`。
 - [ ] 测试音合规：只用 `scripts/e2e_stream.py`，≤5 s，gain ≤0.1；AirPort Express
@@ -496,8 +543,8 @@ RAOP 没有 PTP、没有 buffered（type 103）、没有 `SETPEERS`；不要在 
       可翻译（现有 L 机制），不能是英文异常串。
 
 拿到设备后的第一步：先用 macOS/iOS 向目标设备发一次并抓包，确认它走的是
-`rsaaeskey` 还是 `fpaeskey`；这一步决定整项是「可做」还是「被 FairPlay 挡住」，
-比写任何代码都先。
+`rsaaeskey`。若某台设备实测要求 `fpaeskey`，那不是整项被挡住，而是走 Q49 的
+拒绝路径——Express 2 与验收用的第三方设备都应走 RSA。
 
 ---
 
