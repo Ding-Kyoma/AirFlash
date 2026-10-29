@@ -796,21 +796,44 @@ fn run_live(
         .zip(options.capture_process_started_at);
     let mut next_metrics = Instant::now();
     while !cancel.is_cancelled() {
+        if let Some(live) = &source {
+            emit_capture_warnings(live, &emit);
+        }
         if source.as_ref().is_some_and(crate::live::Loopback::ended) {
             source = None;
             paused = None;
         }
+        if source.is_none() && options.source == "loopback" {
+            // The capture thread repairs an endpoint in place. Reaching this
+            // branch means its rebind budget was exhausted, so reopen the
+            // requested (or current default) endpoint and try again.
+            source = Some(crate::live::Loopback::start(
+                options.capture_endpoint.clone(),
+                options.sample_rate,
+                equalizer.clone(),
+            )?);
+            paused = None;
+            reason = "";
+        }
         if source.is_none() {
-            let candidates = crate::applications::matching(
-                options
-                    .capture_application_path
-                    .as_deref()
-                    .unwrap_or_default(),
-            )?;
-            let selected = crate::applications::select(&candidates, hint);
-            if let Some(application) = selected {
+            let path = options
+                .capture_application_path
+                .as_deref()
+                .unwrap_or_default();
+            let candidates = crate::applications::matching(path)?;
+            let plan = crate::applications::bind_plan(
+                path,
+                &candidates,
+                hint,
+                crate::applications::MAX_CAPTURE_INSTANCES,
+            );
+            if let Some(application) = plan.first().cloned() {
+                let pinned = hint.is_some_and(|(pid, started_at)| {
+                    application.process_id == pid && application.started_at == started_at
+                });
                 match crate::live::Loopback::start_application(
                     application.clone(),
+                    pinned,
                     options.sample_rate,
                     equalizer.clone(),
                 ) {
@@ -1166,6 +1189,7 @@ fn send_packets(
     let outcome = (|| -> Result<StreamEnd> {
         while (options.duration_ms == 0 || start.elapsed() < duration) && !cancel.is_cancelled() {
             if let Some(source) = live {
+                emit_capture_warnings(source, emit);
                 if source.ended() {
                     return Ok(StreamEnd::SourceEnded);
                 }
@@ -1577,6 +1601,19 @@ fn send_packets(
         m.close();
     }
     outcome
+}
+
+fn emit_capture_warnings(source: &crate::live::Loopback, emit: &impl Fn(Json)) {
+    for warning in source.take_warnings() {
+        emit(json!({
+            "event": "warning",
+            "code": warning.code,
+            "channel": "capture",
+            "host": null,
+            "recovered": warning.recovered,
+            "message": warning.message,
+        }));
+    }
 }
 
 fn sample_capture(

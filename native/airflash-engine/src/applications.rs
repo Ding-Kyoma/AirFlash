@@ -33,6 +33,9 @@ pub struct Application {
     pub process_id: u32,
     pub started_at: u64,
 }
+/// Upper bound on application instances captured at once. The sender sums them
+/// before the resampler, so the cost is one loopback client per instance.
+pub const MAX_CAPTURE_INSTANCES: usize = 4;
 pub struct Process(pub HANDLE);
 impl Drop for Process {
     fn drop(&mut self) {
@@ -165,6 +168,45 @@ pub fn matching(path: &str) -> Result<Vec<Application>> {
         .filter_map(|pid| items.get(&pid).cloned())
         .collect())
 }
+/// Which running instances one application target should capture.
+///
+/// The executable path is authoritative: a candidate with a different path is
+/// never attached. A pinned `(pid, started_at)` wins only while that exact
+/// process is still alive, but once it has exited all live roots of the same
+/// executable are candidates again (bounded by `cap`). A candidate that reuses
+/// the pinned PID with a different creation time is not mistaken for it.
+pub fn bind_plan(
+    path: &str,
+    candidates: &[Application],
+    pinned: Option<(u32, u64)>,
+    cap: usize,
+) -> Vec<Application> {
+    let candidates: Vec<_> = candidates
+        .iter()
+        .filter(|p| p.path.eq_ignore_ascii_case(path))
+        .collect();
+    if let Some((pid, started_at)) = pinned {
+        if let Some(exact) = candidates
+            .iter()
+            .find(|p| p.process_id == pid && p.started_at == started_at)
+        {
+            return vec![(*exact).clone()];
+        }
+        // The pinned instance is gone. Keep the PID-reuse guard: a new process
+        // that happens to own the old PID is not a continuation of it.
+        let mut rest: Vec<_> = candidates
+            .into_iter()
+            .filter(|p| !(p.process_id == pid && p.started_at != started_at))
+            .cloned()
+            .collect();
+        rest.sort_by_key(|p| (p.started_at, p.process_id));
+        return rest.into_iter().take(cap).collect();
+    }
+    let mut instances: Vec<_> = candidates.into_iter().cloned().collect();
+    instances.sort_by_key(|p| (p.started_at, p.process_id));
+    instances.into_iter().take(cap).collect()
+}
+
 /// A stale identity may follow one replacement, but must never choose among
 /// independent instances solely because Windows reused the old process ID.
 pub fn select(candidates: &[Application], instance: Option<(u32, u64)>) -> Option<Application> {
@@ -391,6 +433,73 @@ mod tests {
         assert_eq!(root(1, &items, &parents), 1);
     }
     #[test]
+    fn bind_plan_prefers_the_pinned_instance_and_captures_all_roots_otherwise() {
+        let path = "C:\\player.exe";
+        let instances: Vec<_> = [(11, 10), (12, 20), (13, 30)]
+            .into_iter()
+            .map(|(pid, at)| Application {
+                path: path.into(),
+                name: "player".into(),
+                process_id: pid,
+                started_at: at,
+            })
+            .collect();
+        // Pinned identity still alive: exactly one client, no matter how many
+        // independent instances share the executable.
+        let pinned = bind_plan(path, &instances, Some((12, 20)), 4);
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].process_id, 12);
+        // No pin: every root of the executable, deterministically ordered.
+        let all = bind_plan(path, &instances, None, 4);
+        let pids: Vec<_> = all.iter().map(|p| p.process_id).collect();
+        assert_eq!(pids, [11, 12, 13]);
+        // Cap applies to the path-wide plan.
+        let capped = bind_plan(path, &instances, None, 2);
+        assert_eq!(capped.len(), 2);
+    }
+
+    #[test]
+    fn bind_plan_releases_an_exited_pin_but_never_follows_a_reused_pid() {
+        let path = "C:\\player.exe";
+        let mut instances: Vec<_> = [(11, 10), (12, 20)]
+            .into_iter()
+            .map(|(pid, at)| Application {
+                path: path.into(),
+                name: "player".into(),
+                process_id: pid,
+                started_at: at,
+            })
+            .collect();
+        // The pinned process exited; an unrelated PID 12 was reused later.
+        let without_pin = bind_plan(path, &instances, Some((99, 5)), 4);
+        let pids: Vec<_> = without_pin.iter().map(|p| p.process_id).collect();
+        assert_eq!(pids, [11, 12]);
+
+        instances.push(Application {
+            path: path.into(),
+            name: "player".into(),
+            process_id: 99,
+            started_at: 40,
+        });
+        // Same PID, different creation time: not the process the request pinned.
+        let reused = bind_plan(path, &instances, Some((99, 5)), 4);
+        let pids: Vec<_> = reused.iter().map(|p| p.process_id).collect();
+        assert_eq!(pids, [11, 12]);
+
+        // Even unpinned, a different executable is never attached.
+        let mut others = instances.clone();
+        others.push(Application {
+            path: "C:\\other.exe".into(),
+            name: "other".into(),
+            process_id: 7,
+            started_at: 1,
+        });
+        let plan = bind_plan(path, &others, None, 4);
+        assert!(plan.iter().all(|p| p.path.eq_ignore_ascii_case(path)));
+        assert!(!plan.iter().any(|p| p.process_id == 7));
+    }
+
+    #[test]
     fn verifies_identity_and_rejects_reused_pid() {
         let pid = unsafe { GetCurrentProcessId() };
         let mut identity = Process::open(pid).unwrap().identity(pid).unwrap();
@@ -407,7 +516,8 @@ mod tests {
         let identity = Process::open(pid).unwrap().identity(pid).unwrap();
         let control =
             crate::equalizer::Control::new(crate::equalizer::Settings::default(), 44100).unwrap();
-        let capture = crate::live::Loopback::start_application(identity, 44100, control).unwrap();
+        let capture =
+            crate::live::Loopback::start_application(identity, true, 44100, control).unwrap();
         std::thread::sleep(Duration::from_millis(40));
         assert_eq!(capture.last_audio(), 0);
         capture.ready().unwrap();
