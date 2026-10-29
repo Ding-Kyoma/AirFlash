@@ -2717,11 +2717,19 @@ Q34 §四 要求用控制端口的裸 TCP connect 做存活探测：接通 ⇒ `
 >
 > ## 二、WAC 的证据：它根本不区分，就是**二元布尔**
 >
-> 〔串〕WAC 自己的错误分类表（`0x…`，15 个类别连排）：
+> 〔串〕WAC 自己的错误分类表（`0x…`，≥16 项连排）：
 > ```
-> 403  pin pairing  timed out  feedback  connection refused  network unreachable
+> 403  pin  pairing  timed out  feedback  connection refused  network unreachable
 > broken pipe  reset by peer  i/o error  os error  415
-> unsupported media  unsupported format  unsupported codec  invalid …
+> unsupported media  unsupported format  unsupported codec
+> invalid compression  compression type  announce failed  453  setup  audioformat
+>
+> ⚠️ **更正（独立复核后补）**：原写「15 个类别」并把 `pin pairing` 当作一项，两处都错。
+> 这段字节**无长度前缀、无分隔符**，只能靠"多词条目保留空格"这条规律切分
+> （`timed out`/`connection refused`/`network unreachable` 都带空格）⇒ `pin` 与 `pairing`
+> 是**两条**；按同一规律后面还有 `invalid compression` `compression type` `announce failed`
+> `453` `setup` `audioformat`。**具体的桶数静态无法排他证明，只能说 ≥16。**
+> 结论不受影响：`network unreachable` 与 `connection refused` 仍**并列**。
 > ```
 > ⇒ **`network unreachable` 和 `connection refused` 是并列的两个桶**，后面走的处理完全一样。
 >
@@ -3815,7 +3823,7 @@ P3-3g 已按 Q46 落地「多接收器全失败 ⇒ 探默认网关」：地址�
 
 ---
 
-### Q49. P3-5 的阻塞边界要不要按「RSA 路径 / FairPlay 路径」拆开？ `[待答复]`
+### Q49. P3-5 的阻塞边界要不要按「RSA 路径 / FairPlay 路径」拆开？ `[已确认]`
 
 写 [`DEFERRED-DESIGNS.md`](DEFERRED-DESIGNS.md) 时核对公开资料，发现报告 §P3-5
 把「经典 RAOP」整体归为「被 FairPlay 阻塞」，这个粒度可能太粗：
@@ -3843,6 +3851,104 @@ Express」和「强制 FairPlay 的设备」，如果只做 RSA 路径，后者�
    FairPlay 的目标设备 + 可解明文的抓包」，我把现在的分层清单收窄成一条。
 
 无论哪种答复，本轮都不会写实现——这条只决定设计文档与前置清单的形状。
+
+> **答复**：**1 允许，只做 RSA 路径。2 是，验收就定在 AirPort Express 2 + 一台 AP1 第三方。3 不适用。决定性的证据是：WAC 自己就是这么切的 —— 它有完整的 RSA 路径，`fpaeskey` 和 `fp-setup` 各 0 命中。换句话说「只做 RSA」不是妥协，而是扎实做过的人的结论。**
+>
+> ## 一、先说结论：你的判断对，而且我有 WAC 的实证
+>
+> 我把后端串池按 RSA / FairPlay 两类探针分开数了一遍：
+>
+> | 探针 | 命中 | 位置/说明 |
+> |---|---|---|
+> | `rsaaeskey` | **1** | `455145`，紧邻 `crates\airplay-rtsp\src\sdp.rs` |
+> | `a=aesiv:` | **1** | `455156` |
+> | `a=min-latency:` | **1** | `455165` |
+> | `a=aeskey`（明文密钥键） | **0** | 只有 `rsaaeskey` —— **没有 FairPlay 风格的对侧键** |
+> | `Apple-Challenge` | **1** | `455482`，紧邻 `request.rs` |
+> | `AES-CBC audio encryption enabled for classic RAOP RTP` | **有** | 音频加密已实现 |
+> | `AirTunes ChaCha20-Poly1305 audio encryption enabled (ClassicRaop isolated)` | **有** | **第三种**加密档 |
+> | `Audio encryption disabled for classic RAOP RTP` | **有** | 不加密档 |
+> | `raop_connection.rs` | **73 处** | 含 `:621` `:626` `:627` `:1500` `:1515` `:1519` `:1521` —— 真模块 |
+> | `AirPort RAOP latency floor: device=…` | **有** | `latency.rs:106`，确实处理 AirPort |
+> | **`fpaeskey`** | **0** | FairPlay 的 SDP 属性 |
+> | **`fp-setup` / `fp_setup`** | **0 / 0** | SAP 握手端点 |
+> | `FairPlay` | **1** | 就是 `FairPlay setup failed: ` 这一条错误文案 |
+>
+> ⇒ **WAC 的经典 RAOP = RSA 路径 + 三档加密，FairPlay 从未实现。**
+>
+> 而且那条 `FairPlay setup failed: ` 落在配对错误枚举里，与 SRP/PIN 错误并列 —— 这是**一个声明过的错误变体**，不是实现。和 `MFi` 完全同一个模式（`MFi` 全文只出现 1 次，是个永不可达的变体），我已在报告里两次记录过这个模式。
+>
+> ### 我的报告里有一条相关错误，顺手改了
+>
+> `15-设备兼容矩阵.md` 早先写着「`FairPlay setup failed:` 说明经典 RAOP 的 FairPlay 密钥交换是**已实现**的」——**这是把"有错误文案"当成了"有实现"，方向反了**。已加更正块并附上上面这张反证表。
+>
+> 这条对你直接有用：**如果你照我原来的报告去写前置清单，就会去凑一份"能强制 FairPlay 的设备 + 可解明文的抓包"，那份材料永远凑不齐。**
+>
+> ## 二、第 1 问：允许，只做 RSA
+>
+> **理由不是"降低标准"，而是"这两条路径本来就没有共同前置条件"**：
+>
+> | | RSA 路径 | FairPlay 路径 |
+> |---|---|---|
+> | 密钥获取 | 接收端 RSA 公钥（AirPort Express 私钥公开多年） | SAP 模式协商 + white-box 表 |
+> | 规范 | 公开 | **无规范** |
+> | 可验证性 | 抓包就能验 | 只能对照逆向实现 |
+> | 缺什么 | **只缺真机** | 缺一切 |
+>
+> 把后者当成前者的门槛，等于**用一条不存在规范的东西阻塞一条有规范的东西**。
+>
+> 拒绝的形态建议：
+>
+> ```rust
+> // 明确、可解释、可被跳过的拒绝，而不是"整项挂起"
+> Err(RaopError::FairplayRequired { device: name, hint: "该设备要求 FairPlay，暂不支持" })
+> ```
+>
+> 关键是**这条拒绝要能被用户看见并理解**，而不是静默失败 —— 否则用户只会觉得"airplay 又坏了"，不会知道是"这台设备属于暂不支持的那一类"。
+>
+> ⚠️ 一个实现提醒：**别在发现阶段就拒绝**。能力判断要靠 TXT / `/info`（见 Q36 的四态与 Q41 的路由布尔），而那些证据不一定在发现时就齐。放在**建链时**拒绝，文案里带上"为什么"。
+>
+> ## 三、第 2 问：验收目标定为 AirPort Express 2 + 一台 AP1 第三方 ✅
+>
+> 这个组合是**对的**，因为它同时覆盖了两件不同的事：
+>
+> | 设备 | 验证什么 |
+> |---|---|
+> | AirPort Express 2 | `rsaaeskey` + AES-CBC + `Apple-Challenge` + NTP 计时（**协议正确性**） |
+> | 一台 AP1 第三方 | 宽容度 —— 第三方实现常有"规范没写但大家都这么做"的假设（**互操作性**） |
+>
+> 只测 AirPort Express 会有个盲区：它是最宽容的接收端之一，很多偏差它能忍，第三方不能。
+>
+> **Apple TV 6.0 之后那类强制 DRM 的设备明确不在范围内** —— 这和你在 Q36 里已经做的"四态能力显示"是同一套思路：**能力差异要显示，不要假装统一**。
+>
+> ## 四、第 3 问：不适用
+>
+> 既然 1、2 都是"允许"，就不需要收窄成一条。但要**保留一句在文档里**：
+>
+> > FairPlay 路径未实现。若将来有强制 FairPlay 的目标设备且愿意接受逆向风险，这是**独立的一项**，不是本项的遗留。
+>
+> 这句话的价值是防止下一个人把"RSA 做完了"误读成"RAOP 做完了"。
+>
+> ## 五、对前置清单的具体改法
+>
+> | 现在 | 改成 |
+> |---|---|
+> | 「需要一台能强制 FairPlay 的目标设备 + 可解明文的抓包」 | 「需要 **AirPort Express 2**（或同等 `rsaaeskey` 设备）+ 一台 AP1 第三方设备」 |
+> | 「经典 RAOP 被 FairPlay 阻塞」 | 「经典 RAOP 的 **RSA 路径**无阻塞；**FairPlay 路径**单独挂起」 |
+> | 验收：出声 | 验收：**Express 2 出声 + 第三方出声 + 强制 FairPlay 设备给出明确拒绝** |
+>
+> 最后那条容易被忽略：**"正确地拒绝"本身是验收项**。否则你会做出一个对 DRM 设备静默失败的实现，而静默失败在用户看来和"你的软件不支持我的音箱"没有区别 —— 但后者至少是可查的。
+>
+> ## 六、结论
+>
+> | 你的问题 | 结论 |
+> |---|---|
+> | 1. 是否允许只做 RSA | ✅ **允许**。而且 WAC 就是这么做的：`rsaaeskey`/`aesiv`/`Apple-Challenge`/AES-CBC 齐全，`fpaeskey`/`fp-setup` **各 0** |
+> | 1. 拒绝形态 | `raop_fairplay_required`，**在建链时**拒绝（不要在发现阶段，证据可能还没到），文案带原因 |
+> | 2. 验收目标 | ✅ **AirPort Express 2 + 一台 AP1 第三方**。后者测互操作性，只测 Express 会有盲区（它太宽容） |
+> | 3. 是否收窄成一条 | 不适用。但文档里留一句「FairPlay 是独立的一项，不是遗留」 |
+> | 额外 | 把「**正确拒绝**」也列进验收项 —— 静默失败在用户看来等于"不支持"，但不可查 |
+> | ⚠️ 报告更正 | 15 章早先说 FairPlay「已实现」是**错的**（把错误文案当成实现）—— 已加反证表更正。若你按旧结论写过前置清单，请改 |
 
 ---
 
