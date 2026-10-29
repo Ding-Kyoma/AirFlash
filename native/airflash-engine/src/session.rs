@@ -212,6 +212,14 @@ impl ProbeOptions {
         );
         Ok(())
     }
+    /// WAC's topology plan takes one codec for the whole group. Software stereo
+    /// may request different profiles per member, but the codec does not change
+    /// the timing verdict, so the first member's request is the group's.
+    fn profile_codec(&self) -> crate::profile::Codec {
+        self.peers
+            .first()
+            .map_or(crate::profile::Codec::Auto, |peer| peer.profile.codec)
+    }
 }
 fn clock_status(timer: &PtpMaster, hosts: &[IpAddr], phase: &str) -> Json {
     let members: Vec<_> = timer
@@ -361,29 +369,59 @@ enum PreemptionPoll {
     Yield(Fault),
 }
 
+/// One receiver's `/info` evidence, fetched before the group timing decision.
+///
+/// The RTSP connection stays open between probing and SETUP; `fingerprint` is
+/// what the group plan reads, so every member is characterized before any member
+/// is configured.
+struct MemberProbe {
+    peer: Peer,
+    conn: Connection,
+    info: Value,
+    fingerprint: crate::profile::CompatFingerprint,
+}
+
+impl MemberProbe {
+    fn connect(peer: &Peer, cancel: Cancellation, emit: &dyn Fn(Json)) -> Result<Self> {
+        let mut conn = Connection::connect(SocketAddr::new(peer.host, peer.port), cancel)?;
+        emit(json!({"event":"phase","host":peer.host,"phase":"info"}));
+        let info = conn.request("GET", "/info", &[], &[])?.plist()?;
+        let fingerprint =
+            crate::profile::CompatFingerprint::from_info(&info, &peer.profile, &peer.codecs);
+        Ok(Self {
+            peer: peer.clone(),
+            conn,
+            info,
+            fingerprint,
+        })
+    }
+}
+
 impl Member {
     #[allow(clippy::too_many_arguments)]
     fn connect(
-        peer: &Peer,
+        probe: MemberProbe,
+        plan: crate::profile::TimingPlan,
         options: &ProbeOptions,
         ptp: &mut Option<PtpMaster>,
         clock: &Clock,
         ntp_port: u16,
         initial_rtp: u32,
-        cancel: Cancellation,
         emit: &dyn Fn(Json),
     ) -> Result<Self> {
-        let mut conn = Connection::connect(SocketAddr::new(peer.host, peer.port), cancel)?;
+        let MemberProbe {
+            peer,
+            mut conn,
+            info,
+            fingerprint,
+        } = probe;
         let local = conn.local_addr()?.ip();
         let ssrc = rand::random::<u32>();
         let uri = format!("rtsp://{local}/{ssrc}");
-        emit(json!({"event":"phase","host":peer.host,"phase":"info"}));
-        let info = conn.request("GET", "/info", &[], &[])?.plist()?;
         let capabilities = info.as_dictionary().context("info is not a dictionary")?;
-        let compat = crate::profile::CompatProfile::derive(
-            &info,
+        let compat = fingerprint.negotiate_planned(
+            plan,
             &peer.profile,
-            &peer.codecs,
             options.sample_rate,
             options.timing == "ptp",
         )?;
@@ -741,6 +779,133 @@ impl Drop for Member {
     }
 }
 
+/// Probe one member's `/info`, retrying a transient connection failure exactly
+/// like the old single-phase connect did.
+fn probe_member(
+    peer: &Peer,
+    cancel: &Cancellation,
+    emit: &dyn Fn(Json),
+) -> Result<MemberProbe> {
+    let mut attempt = 0;
+    loop {
+        match MemberProbe::connect(peer, cancel.clone(), emit) {
+            Ok(probe) => return Ok(probe),
+            Err(error) if attempt < MEMBER_SETUP_RETRIES => {
+                attempt += 1;
+                emit(json!({
+                    "event": "warning",
+                    "host": peer.host.to_string(),
+                    "channel": "setup",
+                    "code": "member_setup_retry",
+                    "recovered": false,
+                    "message": error.to_string(),
+                }));
+                std::thread::sleep(MEMBER_SETUP_RETRY_DELAY);
+            }
+            Err(error) => return Err(Fault::from_error(peer.host, "setup", &error).into()),
+        }
+    }
+}
+
+/// The single divergence warning for one group setup.
+///
+/// Members are one clock domain, so when their timing evidence (or an explicit
+/// NTP request) points different ways the plan forces a common decision. This
+/// names every member and the forced decision; it is emitted once, before any
+/// SETUP, and never per packet.
+fn group_timing_warning(
+    peers: &[Peer],
+    fingerprints: &[crate::profile::CompatFingerprint],
+    plan: crate::profile::TimingPlan,
+    codec: crate::profile::Codec,
+) -> Option<Json> {
+    use crate::profile::Timing;
+    if !plan.is_group() || peers.len() != fingerprints.len() {
+        return None;
+    }
+    let evidence: Vec<_> = fingerprints
+        .iter()
+        .map(crate::profile::CompatFingerprint::timing_evidence)
+        .collect();
+    let solos: Vec<_> = evidence
+        .iter()
+        .map(|evidence| evidence.solo_timing())
+        .collect();
+    let airplay2: Vec<_> = evidence.iter().map(|evidence| evidence.airplay2).collect();
+    let evidence_disagrees = airplay2.windows(2).any(|pair| pair[0] != pair[1])
+        || solos.windows(2).any(|pair| pair[0] != pair[1]);
+    let automatic = crate::profile::select_timing(&evidence, codec);
+    let settings_forced = automatic != plan.timing();
+    if !evidence_disagrees && !settings_forced {
+        return None;
+    }
+    let label = |peer: &Peer| {
+        if peer.receiver_id.is_empty() {
+            peer.host.to_string()
+        } else {
+            peer.receiver_id.clone()
+        }
+    };
+    let cause = peers
+        .iter()
+        .zip(&evidence)
+        .find(|(_, evidence)| !evidence.airplay2)
+        .map(|(peer, _)| peer)
+        .or_else(|| {
+            peers
+                .iter()
+                .zip(&solos)
+                .find(|(_, solo)| plan.timing() == Timing::Ntp && **solo == Timing::Ntp)
+                .map(|(peer, _)| peer)
+        })
+        .or_else(|| {
+            peers
+                .iter()
+                .find(|peer| peer.profile.timing == Timing::Ntp)
+        })
+        .or_else(|| peers.first());
+    let described: Vec<_> = peers
+        .iter()
+        .zip(&evidence)
+        .zip(&solos)
+        .map(|((peer, evidence), solo)| {
+            let requested = match peer.profile.timing {
+                Timing::Ntp => ", requested ntp",
+                Timing::Ptp => ", requested ptp",
+                _ => "",
+            };
+            format!(
+                "{}{} ({}, {}{})",
+                label(peer),
+                if peer.profile.follow_receiver_clock {
+                    " [follow]"
+                } else {
+                    ""
+                },
+                if evidence.airplay2 {
+                    "airplay2"
+                } else {
+                    "no airplay2"
+                },
+                if *solo == Timing::Ptp { "ptp" } else { "ntp" },
+                requested,
+            )
+        })
+        .collect();
+    Some(json!({
+        "event": "warning",
+        "code": "group_timing_divergence",
+        "channel": "setup",
+        "host": cause.map(|peer| peer.host.to_string()).unwrap_or_default(),
+        "recovered": true,
+        "message": format!(
+            "Group timing evidence disagreed: {}; forced {} for the whole group",
+            described.join(", "),
+            if plan.timing() == Timing::Ptp { "PTP" } else { "NTP" },
+        ),
+    }))
+}
+
 fn load_quiet_wav(options: &ProbeOptions) -> Result<Vec<i16>> {
     let rate = options.sample_rate;
     let mut reader = hound::WavReader::open(&options.wav_path).context("open probe WAV")?;
@@ -1081,21 +1246,59 @@ fn run_stream(
     let ntp = NtpServer::start(peers.clone(), clock.clone())?;
     let initial_rtp = rand::random::<u32>();
     let mut members = Vec::new();
+    // Phase one: characterize every member before any SETUP. The group timing
+    // decision needs every fingerprint, and no receiver may be configured before
+    // that one decision exists.
+    let mut probes = Vec::new();
     for peer in &options.peers {
         cancel.check()?;
+        probes.push(probe_member(peer, cancel, &emit)?);
+    }
+    let fingerprints: Vec<_> = probes
+        .iter()
+        .map(|probe| probe.fingerprint.clone())
+        .collect();
+    let codec = options.profile_codec();
+    let evidence: Vec<_> = fingerprints
+        .iter()
+        .map(crate::profile::CompatFingerprint::timing_evidence)
+        .collect();
+    let mut timing = crate::profile::select_timing(&evidence, codec);
+    // An explicit NTP request from any member is the conservative group choice:
+    // honouring it keeps the whole group in one clock domain.
+    if timing == crate::profile::Timing::Ptp
+        && options
+            .peers
+            .iter()
+            .any(|peer| peer.profile.timing == crate::profile::Timing::Ntp)
+    {
+        timing = crate::profile::Timing::Ntp;
+    }
+    let plan = crate::profile::TimingPlan::new(timing, probes.len());
+    if let Some(warning) = group_timing_warning(&options.peers, &fingerprints, plan, codec) {
+        emit(warning);
+    }
+    // Phase two: every member negotiates under the same timing decision.
+    for (index, probe) in probes.into_iter().enumerate() {
+        let peer = &options.peers[index];
         // A group joins as one unit: if a member cannot be brought up after one
         // retry, the members already built are dropped (their Drop sends TEARDOWN),
         // so the receiver never sees a half-configured stereo pair.
+        let mut probe = Some(probe);
         let mut attempt = 0;
         let member = loop {
+            let current = match probe.take() {
+                Some(current) => current,
+                None => probe_member(peer, cancel, &emit)?,
+            };
             match Member::connect(
-                peer,
+                current,
+                plan,
                 options,
                 &mut ptp,
                 &clock,
                 ntp.port,
                 initial_rtp,
-                cancel.clone(),
                 &emit,
             ) {
                 Ok(member) => break member,
