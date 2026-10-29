@@ -403,6 +403,91 @@ struct RoundProbe {
     we_hold_session: bool,
 }
 
+/// Q46's all-failed episode: the gateway reference discovered for the current
+/// run of all-failed full rounds, plus the suppression state.
+///
+/// Keeping the bookkeeping here (instead of four locals in the audio loop) lets
+/// the rule be exercised with fake time, a fake gateway and no stream: what the
+/// loop does is hand in each round's probed liveness and emit the one warning
+/// the episode returns. Discovery runs once per episode; `probe` runs on every
+/// full all-failed round, because a gateway that comes back has to end the
+/// suppression and, with no gateway at all, the fallback clock only advances
+/// here.
+struct AllFailedEpisode {
+    /// Start of the current all-failed episode; `None` between episodes.
+    since: Option<Instant>,
+    /// The default gateway discovered for this episode. `None` **inside** a
+    /// started episode means "no default route", which is what triggers
+    /// [`preemption::GATEWAY_FALLBACK_WINDOW`].
+    gateway: Option<IpAddr>,
+    /// Whether `gateway` was discovered for this episode (it may legitimately be
+    /// `None`).
+    discovered: bool,
+    /// Whether the previous full round was suppressed, so the warning is a state
+    /// change and not a line per outage round.
+    suppressing: bool,
+}
+
+impl AllFailedEpisode {
+    fn new() -> Self {
+        Self {
+            since: None,
+            gateway: None,
+            discovered: false,
+            suppressing: false,
+        }
+    }
+
+    /// Feed one polling round. `discover` is called at most once per episode,
+    /// `probe` once per full all-failed round. Returns whether the group-wide
+    /// rule suppresses this round, and the one warning to log when the
+    /// suppression state changed.
+    fn observe(
+        &mut self,
+        probes: &[preemption::ReceiverLiveness],
+        receivers: usize,
+        now: Instant,
+        discover: &dyn Fn() -> Option<IpAddr>,
+        probe: &dyn Fn(IpAddr) -> preemption::GatewayReachability,
+    ) -> (bool, Option<Json>) {
+        // A round that did not probe every member proves nothing about the
+        // group, and it must not reset the episode clock either.
+        if probes.len() != receivers {
+            return (false, None);
+        }
+        if !preemption::all_receivers_failed(probes, receivers) {
+            *self = Self::new();
+            return (false, None);
+        }
+        let since = *self.since.get_or_insert(now);
+        if !self.discovered {
+            self.gateway = discover();
+            self.discovered = true;
+        }
+        let reference = self.gateway.map(probe);
+        let held = now.saturating_duration_since(since);
+        let judgement =
+            preemption::judge_all_failed(probes, receivers, reference, Some(held));
+        let suppress = judgement.suppress();
+        let warning = if suppress && !self.suppressing {
+            Some(preemption_local_network(
+                receivers,
+                probes,
+                judgement,
+                reference,
+                held,
+            ))
+        } else {
+            None
+        };
+        // A round that stops suppressing (the fallback expired, or a receiver
+        // answered again) leaves the episode armed: the loop reclaims right
+        // away on the former, and the latter already reset `self` above.
+        self.suppressing = suppress;
+        (suppress, warning)
+    }
+}
+
 /// One receiver's `/info` evidence, fetched before the group timing decision.
 ///
 /// The RTSP connection stays open between probing and SETUP; `fingerprint` is
@@ -930,8 +1015,11 @@ impl Member {
                 // undecided. Without this the patience limit could never be
                 // reached: the feedback worker that produced the evidence is
                 // gone and would never schedule another probe. A local-suspect
-                // round is not this device's failure, so it is not re-probed.
-                if !local_suspected && liveness.verdict == preemption::Verdict::Unknown {
+                // round is not this device's failure and does not move its
+                // counter, but it is re-probed too: Q46's gateway reference has
+                // to be re-evaluated (a recovered gateway ends the suppression)
+                // and its fallback clock only advances on full rounds.
+                if liveness.verdict == preemption::Verdict::Unknown {
                     self.preemption.await_liveness(now);
                 }
                 (PreemptionPoll::None, media_healthy)
@@ -1862,6 +1950,11 @@ fn send_packets(
     );
     let mut pcm = vec![0; PCM_BYTES];
     let started_ns = crate::wasapi::qpc_ns();
+    // Q46's all-failed rule state. The gateway address is discovered once per
+    // all-failed episode (not per round: a routing-table lookup every 3 s of an
+    // outage would buy nothing) while its reachability is probed again on every
+    // full round, so a recovered reference ends the suppression.
+    let mut all_failed = AllFailedEpisode::new();
     let outcome = (|| -> Result<StreamEnd> {
         while (options.duration_ms == 0 || start.elapsed() < duration) && !cancel.is_cancelled() {
             if let Some(source) = live {
@@ -1897,9 +1990,31 @@ fn send_packets(
                 .iter()
                 .filter_map(|round| round.probe.as_ref().map(|probe| probe.liveness))
                 .collect();
-            let local_suspected = preemption::local_network_suspected(&probed, members.len());
-            if local_suspected {
-                emit(preemption_local_network(members.len(), &probed));
+            // Q46: "all receivers failed" is only a judgement when the round
+            // has a control group. Probe the default gateway, which shares our
+            // local path but not the receivers' power state:
+            //   gateway answered + all failed => the devices really are gone;
+            //   gateway silent     + all failed => our own network, mark nothing
+            //                                      dead;
+            //   no default route   + all failed => suppress, but only for
+            //                                      GATEWAY_FALLBACK_WINDOW.
+            // A judgement needs every member probed in the same round; a
+            // partial round leaves each receiver's own verdict standing.
+            let (local_suspected, warning) = all_failed.observe(
+                &probed,
+                members.len(),
+                Instant::now(),
+                &preemption::default_gateway,
+                &|address| {
+                    preemption::reference_reachability(
+                        address,
+                        &preemption::GATEWAY_PROBE_PORTS,
+                        preemption::GATEWAY_PROBE_TIMEOUT,
+                    )
+                },
+            );
+            if let Some(event) = warning {
+                emit(event);
             }
             for (member, round) in members.iter_mut().zip(rounds) {
                 for notice in member.health.notices() {
@@ -2724,14 +2839,31 @@ fn preemption_probe(
     }
     event
 }
-/// Q42's group-wide cross-check fired: every receiver failed its liveness probe
-/// in the same round. The common cause is our own side (routing table,
-/// interface, Wi-Fi), not several devices dying at once, so no device is marked
-/// dead and the media-health backstop keeps the decision.
+/// Q46's all-failed rule fired: every receiver failed its liveness probe in the
+/// same round and the gateway reference did not clear them. The common cause is
+/// our own side (routing table, interface, Wi-Fi), not several devices dying at
+/// once, so no device is marked dead and the media-health backstop keeps the
+/// decision. The event is emitted once per episode — the state change — not on
+/// every re-evaluation round; `verdict` separates "the gateway answered nothing"
+/// (`local_network`) from "there was no default route to ask"
+/// (`local_network_unproven`), and `all_failed_for_ms` is how long the episode
+/// has run (it matters only for the time-boxed fallback).
 fn preemption_local_network(
     receivers: usize,
     probes: &[preemption::ReceiverLiveness],
+    judgement: preemption::AllFailed,
+    gateway: Option<preemption::GatewayReachability>,
+    held: Duration,
 ) -> Json {
+    let message = match judgement {
+        preemption::AllFailed::LocalNetwork => format!(
+            "All {receivers} receiver liveness probes failed this round and the gateway did not answer; suspecting the local network, keeping the session"
+        ),
+        _ => format!(
+            "All {receivers} receiver liveness probes failed this round and no default gateway could be probed; suppressing for at most {} s, then reclaiming",
+            preemption::GATEWAY_FALLBACK_WINDOW.as_secs()
+        ),
+    };
     json!({
         "event": "warning",
         "host": null,
@@ -2740,9 +2872,11 @@ fn preemption_local_network(
         "recovered": false,
         "receivers": receivers,
         "probes": probes.iter().map(|probed| probed.name()).collect::<Vec<_>>(),
-        "message": format!(
-            "All {receivers} receiver liveness probes failed this round; suspecting the local network, keeping the session"
-        ),
+        "verdict": judgement.name(),
+        "gateway": gateway.map(preemption::GatewayReachability::name),
+        "gateway_probed": gateway.is_some(),
+        "all_failed_for_ms": held.as_millis() as u64,
+        "message": message,
     })
 }
 /// The confirmation probe disagreed with the first verdict. Both raw outcomes
@@ -3798,7 +3932,7 @@ mod tests {
             member.apply_preemption(unknown_round(), &mut counters, at, &|json| seen.lock().unwrap().push(json), false);
         assert!(
             matches!(poll, PreemptionPoll::Reclaimed { consecutive: 1 }),
-            "the third consecutive unknown escalates to a reclaim"
+            "the fifth consecutive unknown escalates to a reclaim"
         );
         assert_eq!(
             counters.consecutive(member.peer.host),
@@ -3811,7 +3945,7 @@ mod tests {
             .expect("the escalated probe is logged");
         assert_eq!(last["tcp_liveness"], "unknown");
         assert_eq!(last["liveness_verdict"], "dead");
-        assert_eq!(last["liveness_failures"], 3);
+        assert_eq!(last["liveness_failures"], preemption::LIVENESS_PATIENCE);
         assert_eq!(last["outcome"], "gone");
         drop(events);
         drop(member);
@@ -3819,9 +3953,10 @@ mod tests {
     }
     #[test]
     fn a_group_wide_liveness_failure_does_not_mark_the_device_dead() {
-        // Every receiver failed at once, so the failure belongs to our own side
-        // (Q42). The dead verdict is downgraded to unknown and a healthy
-        // session keeps playing instead of being reclaimed.
+        // Every receiver failed at once and the gateway reference did not clear
+        // them, so the failure belongs to our own side (Q42 + Q46). The dead
+        // verdict is downgraded to unknown and a healthy session keeps playing
+        // instead of being reclaimed.
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
         let (mut member, worker, _methods) =
             local_member_with_health(receiver.local_addr().unwrap(), None, Health::default());
@@ -3837,10 +3972,11 @@ mod tests {
             }),
             Vec::new(),
         );
+        let now = Instant::now();
         let (poll, media_healthy) = member.apply_preemption(
             round,
             &mut counters,
-            Instant::now(),
+            now,
             &|json| seen.lock().unwrap().push(json),
             true,
         );
@@ -3858,8 +3994,8 @@ mod tests {
         );
         assert_eq!(
             member.preemption.scheduled(),
-            None,
-            "a local round schedules no escalation re-probe"
+            Some(now + preemption::LIVENESS_RETRY),
+            "the reference is re-evaluated: a recovered gateway has to end the suppression"
         );
         let events = emitted.lock().unwrap();
         let probe = events
@@ -3883,19 +4019,185 @@ mod tests {
         worker.join().unwrap();
     }
     #[test]
-    fn the_local_network_warning_names_every_failed_probe() {
+    fn the_local_network_warning_names_every_failed_probe_and_the_reference() {
         let event = preemption_local_network(
             2,
             &[
                 preemption::ReceiverLiveness::Dead,
                 preemption::ReceiverLiveness::Unknown,
             ],
+            preemption::AllFailed::LocalNetwork,
+            Some(preemption::GatewayReachability::Silent),
+            Duration::from_secs(4),
         );
         assert_eq!(event["code"], "preemption_local_network");
         assert_eq!(event["channel"], "preemption");
         assert_eq!(event["receivers"], 2);
         assert_eq!(event["probes"], json!(["dead", "unknown"]));
+        assert_eq!(event["verdict"], "local_network");
+        assert_eq!(event["gateway"], "unreachable");
+        assert_eq!(event["gateway_probed"], true);
+        assert_eq!(event["all_failed_for_ms"], 4_000);
         assert!(event["message"].as_str().unwrap().contains("local network"));
+        // No default route at all: the fallback is time-boxed and the message
+        // says so instead of pretending a reference answered.
+        let unproven = preemption_local_network(
+            2,
+            &[
+                preemption::ReceiverLiveness::Dead,
+                preemption::ReceiverLiveness::Dead,
+            ],
+            preemption::AllFailed::LocalNetworkUnproven,
+            None,
+            Duration::from_secs(3),
+        );
+        assert_eq!(unproven["verdict"], "local_network_unproven");
+        assert_eq!(unproven["gateway"], json!(null));
+        assert_eq!(unproven["gateway_probed"], false);
+        assert!(
+            unproven["message"]
+                .as_str()
+                .unwrap()
+                .contains("no default gateway"),
+            "got {}",
+            unproven["message"]
+        );
+    }
+    #[test]
+    fn the_all_failed_episode_warns_once_and_re_arms_after_recovery() {
+        let base = Instant::now();
+        let mut episode = AllFailedEpisode::new();
+        let discover = || Some("10.0.0.1".parse().unwrap());
+        let silent = |_gateway| preemption::GatewayReachability::Silent;
+        let dead = [
+            preemption::ReceiverLiveness::Dead,
+            preemption::ReceiverLiveness::Dead,
+        ];
+        let alive = [
+            preemption::ReceiverLiveness::Alive,
+            preemption::ReceiverLiveness::Dead,
+        ];
+        let (suppress, warning) = episode.observe(&dead, 2, base, &discover, &silent);
+        assert!(suppress);
+        let event = warning.expect("the first suppressed round warns");
+        assert_eq!(event["verdict"], "local_network");
+        assert_eq!(event["gateway"], "unreachable");
+        assert_eq!(event["all_failed_for_ms"], 0);
+        // The same episode on a later round: still suppressed, no second line.
+        let (suppress, warning) =
+            episode.observe(&dead, 2, base + Duration::from_secs(3), &discover, &silent);
+        assert!(suppress);
+        assert!(
+            warning.is_none(),
+            "the warning is a state change, not a heartbeat"
+        );
+        // One receiver answers again: the episode ends.
+        let (suppress, warning) =
+            episode.observe(&alive, 2, base + Duration::from_secs(6), &discover, &silent);
+        assert!(!suppress);
+        assert!(warning.is_none());
+        // A later all-failed run is a new episode and warns again.
+        let (suppress, warning) =
+            episode.observe(&dead, 2, base + Duration::from_secs(9), &discover, &silent);
+        assert!(suppress);
+        assert_eq!(
+            warning.expect("a new episode warns again")["all_failed_for_ms"],
+            0
+        );
+    }
+    #[test]
+    fn a_partial_round_never_resets_the_all_failed_episode() {
+        let base = Instant::now();
+        let mut episode = AllFailedEpisode::new();
+        let discover = || Some("10.0.0.1".parse().unwrap());
+        let silent = |_gateway| preemption::GatewayReachability::Silent;
+        let dead = [
+            preemption::ReceiverLiveness::Dead,
+            preemption::ReceiverLiveness::Dead,
+        ];
+        assert!(
+            episode
+                .observe(&dead, 2, base, &discover, &silent)
+                .1
+                .is_some()
+        );
+        // Only one member was due this round: no group judgement, and the
+        // episode clock has to survive it.
+        let (suppress, warning) = episode.observe(
+            &dead[..1],
+            2,
+            base + Duration::from_secs(3),
+            &discover,
+            &silent,
+        );
+        assert!(!suppress);
+        assert!(warning.is_none());
+        assert_eq!(episode.since, Some(base), "the episode clock was not reset");
+        let (suppress, warning) =
+            episode.observe(&dead, 2, base + Duration::from_secs(9), &discover, &silent);
+        assert!(suppress);
+        assert!(warning.is_none());
+    }
+    #[test]
+    fn the_all_failed_fallback_expires_after_the_window_without_a_gateway() {
+        let base = Instant::now();
+        let mut episode = AllFailedEpisode::new();
+        // No default route at all: Q46's last resort applies.
+        let discover = || None;
+        let unanswered = |_gateway| preemption::GatewayReachability::Silent;
+        let dead = [
+            preemption::ReceiverLiveness::Dead,
+            preemption::ReceiverLiveness::Dead,
+        ];
+        let (suppress, warning) = episode.observe(&dead, 2, base, &discover, &unanswered);
+        assert!(suppress);
+        assert_eq!(
+            warning.expect("the unproven suppression warns")["verdict"],
+            "local_network_unproven"
+        );
+        let (suppress, _) = episode.observe(
+            &dead,
+            2,
+            base + preemption::GATEWAY_FALLBACK_WINDOW - Duration::from_millis(1),
+            &discover,
+            &unanswered,
+        );
+        assert!(suppress, "inside the window the failure is still suppressed");
+        let (suppress, warning) = episode.observe(
+            &dead,
+            2,
+            base + preemption::GATEWAY_FALLBACK_WINDOW,
+            &discover,
+            &unanswered,
+        );
+        assert!(
+            !suppress,
+            "the fallback window is a limit, not another guess"
+        );
+        assert!(warning.is_none());
+    }
+    #[test]
+    fn a_reachable_gateway_makes_the_episode_reclaim_instead_of_warning() {
+        let base = Instant::now();
+        let mut episode = AllFailedEpisode::new();
+        let discover = || Some("10.0.0.1".parse().unwrap());
+        let answered = |_gateway| preemption::GatewayReachability::Answered;
+        let dead = [
+            preemption::ReceiverLiveness::Dead,
+            preemption::ReceiverLiveness::Dead,
+        ];
+        let (suppress, warning) = episode.observe(&dead, 2, base, &discover, &answered);
+        assert!(!suppress, "the devices really are gone");
+        assert!(warning.is_none(), "no local-network warning");
+        // The per-device verdicts now stand, so the loop reclaims them.
+        for probe in dead {
+            let mut tracker = preemption::Tracker::default();
+            let note = tracker.observe_liveness(
+                preemption::LivenessSample::Probe(probe),
+                base,
+            );
+            assert_eq!(note.verdict, preemption::Verdict::Dead);
+        }
     }
     #[test]
     fn hitting_the_consecutive_limit_yields_with_reason_limit() {
