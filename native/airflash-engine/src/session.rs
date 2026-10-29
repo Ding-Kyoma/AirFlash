@@ -671,12 +671,31 @@ impl Member {
             return (PreemptionPoll::None, media_healthy);
         }
         let address = SocketAddr::new(self.peer.host, self.peer.port);
-        let result = preemption::probe_report(address, cancel, preemption::PROBE_TIMEOUT);
+        // The dimension the receiver's session bit cannot give us: our own media
+        // is still flowing and the receiver never ended this session. Without it
+        // our own healthy session would look like "a session is active and we
+        // are reclaiming", i.e. a takeover of ourselves (Q31).
+        let we_hold_session = self.preemption.we_hold_session(media_healthy);
+        let result = preemption::probe_report(
+            address,
+            cancel,
+            preemption::PROBE_TIMEOUT,
+            we_hold_session,
+        );
         if self.preemption.note_result(&result, now) {
-            emit(preemption_probe(self, &result));
+            emit(preemption_probe(
+                self,
+                &result,
+                we_hold_session,
+                media_healthy,
+            ));
         }
         match preemption::action_for_result(&result) {
             preemption::ProbeAction::Requeue => (PreemptionPoll::Waiting, media_healthy),
+            // The active session on the receiver is ours: the control-plane
+            // symptom is something else, so take no preemption action and fall
+            // through to the existing health checks below.
+            preemption::ProbeAction::FallThrough => (PreemptionPoll::None, media_healthy),
             preemption::ProbeAction::Reclaim => {
                 // Confirmed (or fail-open). The old encrypted control connection
                 // belongs to the session the receiver already ended; the reclaim
@@ -1825,22 +1844,39 @@ fn preemption_evidence(
         "message": "Control-plane takeover evidence; asking the receiver for its live statusFlags",
     })
 }
-/// One diagnostic line per probe change. The raw `statusFlags` value is logged
-/// so the bit map can be mapped from a real receiver (it is currently unknown).
-fn preemption_probe(member: &Member, result: &Result<preemption::ProbeReport>) -> Json {
+/// One diagnostic line per probe change. It carries the same three context
+/// fields as the evidence line (the reference implementation logs them next to
+/// the symptom) plus `we_hold_session`, the locally derived dimension the
+/// verdict uses, and the raw 64-bit `statusFlags` value so the bits can be
+/// checked against a real receiver.
+fn preemption_probe(
+    member: &Member,
+    result: &Result<preemption::ProbeReport>,
+    we_hold_session: bool,
+    rtp_healthy: bool,
+) -> Json {
     let mut event = json!({
         "event": "warning",
         "host": member.peer.host.to_string(),
         "channel": "preemption",
         "code": "preemption_probe",
         "recovered": true,
+        "policy": format!("{}/{}", member.compat.timing_label(), member.compat.codec_name()),
+        "rtp_healthy": rtp_healthy,
+        "packets_prepared": member.media.metrics.packets_sent,
+        "we_hold_session": we_hold_session,
     });
     match result {
         Ok(report) => {
             event["outcome"] = json!(report.outcome.name());
             event["status_flags"] = json!(report.status_flags);
+            // Telemetry only: bit 14 says the stereo partner is unreachable. It
+            // has no session-ownership meaning and never changes the verdict.
+            event["stereo_partner_unreachable"] = json!(report
+                .status_flags
+                .is_some_and(|flags| flags & preemption::STEREO_PARTNER_UNREACHABLE != 0));
             event["message"] = json!(match report.status_flags {
-                Some(flags) => format!("Receiver /info statusFlags=0x{flags:08x} ({flags})"),
+                Some(flags) => format!("Receiver /info statusFlags=0x{flags:016x} ({flags})"),
                 None => "Receiver /info has no usable statusFlags; reclaiming".to_string(),
             });
         }
@@ -2023,7 +2059,7 @@ mod tests {
     }
     // A minimal live-status probe target: one fresh TCP connection, one
     // `GET /info`, one binary plist. `status_flags = None` omits the field.
-    fn status_probe_server(status_flags: Option<u32>) -> (SocketAddr, JoinHandle<()>) {
+    fn status_probe_server(status_flags: Option<u64>) -> (SocketAddr, JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let worker = thread::spawn(move || {
@@ -2033,10 +2069,7 @@ mod tests {
             assert!(request.first.starts_with("GET /info"));
             let mut body = Dictionary::new();
             if let Some(flags) = status_flags {
-                body.insert(
-                    "statusFlags".into(),
-                    Value::Integer(u64::from(flags).into()),
-                );
+                body.insert("statusFlags".into(), Value::Integer(flags.into()));
             }
             let mut bytes = Vec::new();
             Value::Dictionary(body).to_writer_binary(&mut bytes).unwrap();
@@ -2263,6 +2296,12 @@ mod tests {
                 .expect("the raw statusFlags must be logged");
             assert_eq!(probe["outcome"], "free");
             assert_eq!(probe["status_flags"], 0);
+            // The receiver ended this session, so its RTP cannot be read as ours.
+            assert_eq!(probe["we_hold_session"], false);
+            assert!(probe["rtp_healthy"].is_boolean());
+            assert!(probe["policy"].is_string());
+            assert!(probe["packets_prepared"].is_number());
+            assert_eq!(probe["stereo_partner_unreachable"], false);
             let warning = events
                 .iter()
                 .find(|event| event["code"] == "preempted")
@@ -2276,6 +2315,113 @@ mod tests {
             !methods.lock().unwrap().iter().any(|m| m == "TEARDOWN"),
             "the displaced session must not send TEARDOWN down the old connection"
         );
+        probe_server.join().unwrap();
+    }
+    #[test]
+    fn our_own_active_session_is_never_classified_as_a_takeover() {
+        // Q31's hazard, end to end: the receiver reports an active session and
+        // that session is ours (healthy media, no TEARDOWN/403). A spurious
+        // `Connection: close` on the control channel must not reclaim it.
+        let (probe_addr, probe_server) =
+            status_probe_server(Some(preemption::RECEIVER_SESSION_ACTIVE));
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mut member, worker, methods) =
+            local_member_with_health(receiver.local_addr().unwrap(), None, Health::default());
+        member.peer.port = probe_addr.port();
+        member
+            .health
+            .preemption_signal(preemption::Signal::ConnectionClose);
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = emitted.clone();
+        let mut counters = preemption::TakeoverCounters::default();
+        let (poll, healthy) = member.poll_preemption(
+            &Cancellation::default(),
+            &mut counters,
+            Instant::now(),
+            &|json| seen.lock().unwrap().push(json),
+        );
+        assert!(healthy, "our own media is still flowing");
+        assert!(
+            matches!(poll, PreemptionPoll::None),
+            "our own session must fall through to the non-preemption path, not reclaim"
+        );
+        assert!(!member.preempted, "no takeover was detected");
+        assert!(
+            !member.conn.lock().unwrap().is_poisoned(),
+            "a healthy session's control connection must stay usable"
+        );
+        assert_eq!(counters.consecutive(member.peer.host), 0);
+        {
+            let events = emitted.lock().unwrap();
+            assert!(
+                !events.iter().any(|event| event["code"] == "preempted"),
+                "no preemption warning may be reported for our own session"
+            );
+            let probe = events
+                .iter()
+                .find(|event| event["code"] == "preemption_probe")
+                .expect("the probe must still be logged");
+            assert_eq!(probe["outcome"], "ours_active");
+            assert_eq!(probe["we_hold_session"], true);
+            assert_eq!(probe["status_flags"], preemption::RECEIVER_SESSION_ACTIVE);
+            assert_eq!(probe["rtp_healthy"], true);
+            assert_eq!(probe["stereo_partner_unreachable"], false);
+        }
+        drop(member);
+        worker.join().unwrap();
+        // The session was never displaced, so it still ends with a normal
+        // TEARDOWN instead of being abandoned.
+        assert_eq!(
+            methods.lock().unwrap().iter().filter(|m| *m == "TEARDOWN").count(),
+            1
+        );
+        probe_server.join().unwrap();
+    }
+    #[test]
+    fn a_receiver_that_ended_our_session_is_busy_even_while_rtp_still_sends() {
+        // After a real takeover UDP sends keep "succeeding", so media health
+        // alone would keep saying "ours". The receiver's own TEARDOWN is the
+        // sticky evidence that turns the same bitmap into a re-probe queue.
+        let (probe_addr, probe_server) = status_probe_server(Some(
+            preemption::RECEIVER_SESSION_ACTIVE | preemption::STEREO_PARTNER_UNREACHABLE,
+        ));
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mut member, worker, _methods) =
+            local_member_with_health(receiver.local_addr().unwrap(), None, Health::default());
+        member.peer.port = probe_addr.port();
+        member
+            .health
+            .preemption_signal(preemption::Signal::UnexpectedTeardown);
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = emitted.clone();
+        let mut counters = preemption::TakeoverCounters::default();
+        let (poll, healthy) = member.poll_preemption(
+            &Cancellation::default(),
+            &mut counters,
+            Instant::now(),
+            &|json| seen.lock().unwrap().push(json),
+        );
+        assert!(healthy);
+        assert!(
+            matches!(poll, PreemptionPoll::Waiting),
+            "another sender's session is a queue, never a reclaim"
+        );
+        assert!(!member.preempted);
+        assert!(!member.conn.lock().unwrap().is_poisoned());
+        {
+            let events = emitted.lock().unwrap();
+            let probe = events
+                .iter()
+                .find(|event| event["code"] == "preemption_probe")
+                .expect("the probe must be logged");
+            assert_eq!(probe["outcome"], "busy_elsewhere");
+            assert_eq!(probe["we_hold_session"], false);
+            // Bit 14 is telemetry only and must not change the verdict.
+            assert_eq!(probe["stereo_partner_unreachable"], true);
+            assert!(events.iter().all(|event| event["code"] != "preempted"));
+        }
+        drop(member);
+        worker.join().unwrap();
         probe_server.join().unwrap();
     }
     #[test]
