@@ -612,8 +612,8 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   `gateway_probed` 和 `all_failed_for_ms`；只在抑制状态变化时发一条）、
   `preempted`（`reason="limit"`）记录让步；`busy_exhausted` 已随强制回收一起删除，
   不存在「排队撞上限」这个事件了。
-- 测试（Rust 共 293 passed / 2 ignored：`--lib` 247 passed + 1 ignored、
-  `main` 2、集成 44）：
+- 测试（本分支合并 `main` 后 Rust 共 297 passed / 2 ignored：`--lib` 251 passed + 1
+  ignored、`main` 2、集成 44；P3-3 本轮新增/改写的用例见下）：
   - `preemption.rs` 表驱动单测：`combine` 的整张表（`media_healthy` ×
     `Alive`/`Refused`/`Unknown`/`Dead`，含 `statusFlags` 缺省/0/活跃位变体）——
     `Dead`/`Refused` 永远是 `Gone`/回收且**不是** `BusyElsewhere`，健康媒体 +
