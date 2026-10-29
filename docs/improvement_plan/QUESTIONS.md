@@ -1417,7 +1417,7 @@ P3-3 已按 Q31 的位定义实现三分类：`statusFlags & 0x20000 == 0` ⇒ `
 
 ---
 
-### Q33. 组内时钟域：Mixed Apple group 到底该 PTP 还是 NTP？ `[待答复]`
+### Q33. 组内时钟域：Mixed Apple group 到底该 PTP 还是 NTP？ `[已确认]`
 
 P2-13b 已把协商改成「先探测全组、再算一个 `TimingPlan`、最后逐个 SETUP」。
 实现采用的规则是：
@@ -1450,7 +1450,141 @@ P2-13b 已把协商改成「先探测全组、再算一个 `TimingPlan`、最后
    `Any(!SupportsAirPlay2) → Classic RAOP/NTP` 的整组降级；需要真机确认
    HomePod 在组里不会坚持自己的 PTP grandmaster，也不会因此静音。
 
-> **答复**：（待补充）
+> **答复**：**WAC 的规则比"保守取 NTP"更干脆 —— 所有多设备 AP2 组都是 PTP，没有例外。而且它的"一组一时钟域"比你更硬：它会把运行时 snapshot 和计划值做相等断言。第 3 问的答案是「WAC 根本没有这种告警，因为它不可能发生」。**
+>
+> ## 一、`CreateTopologyPlan` 的完整分支表（`:38404`，逐行确认）
+>
+> ```csharp
+> if (n == 0)                      return ("None",              "Unknown", {});
+> if (Any(!SupportsAirPlay2))      return ("Classic RAOP",      "NTP",     {});      // ← 整组降级
+>
+> bool isAppleTv  = Any(LooksLikeAppleTv(Model, Name));      // note: Any
+> bool allHomePod = All(LooksLikeHomePod(Model, Name));      // note: All
+> bool isPcm      = (codec == "PCM");
+>
+> if (n == 1 && isAppleTv)               return ("Apple TV solo",      "NTP", {100,80});
+> if (n == 1 && allHomePod && isPcm)     return ("HomePod solo (PCM)", "NTP", {60,45,30});
+> if (n == 1 && allHomePod)              return ("HomePod solo",       "PTP", {50,40,30});
+> if (n > 1  && allHomePod)              return ("HomePod group",      "PTP", {120,110,100,90});
+> if (n > 1  && isAppleTv)               return ("Mixed Apple group",  "PTP", {120,110,100});
+> if (n == 1)                            return ("AirPlay 2 receiver", "PTP", {100,80,60});
+>                                        return ("AirPlay 2 group",    "PTP", {180,160,140});
+> ```
+>
+> **提取出来的规律，可以直接背走**：
+>
+> | 场景 | 结果 |
+> |---|---|
+> | 任一成员缺 AP2 证据 | **整组 NTP**（Classic RAOP） |
+> | 单机 Apple TV | NTP |
+> | 单机 HomePod + PCM | NTP |
+> | 单机 HomePod（音乐） | PTP |
+> | **任何多设备 AP2 组**（HomePod 组 / Mixed Apple / 通用 AP2 组） | **PTP，无一例外** |
+>
+> ⇒ **「Apple TV 单机 NTP」和「Apple TV 在组里 PTP」并不矛盾** —— 那是两个不同分支，代码写得很清楚（`n == 1` vs `n > 1`）。
+>
+> ## 二、第 1 问：Mixed Apple group 该 PTP 还是保守 NTP → **跟 WAC 走 PTP**
+>
+> 你的 97 行表里「Apple TV 单机 = NTP」是对的，但它在 `n > 1 && isAppleTv` 分支里**根本不参与**：一旦进到多设备，`isAppleTv` 为真直接给 `Mixed Apple group → PTP`。
+>
+> **Apple TV 进 PTP 组后是否必须当 follower？→ 是，而且这是硬要求的。** 证据在 `GroupPtpDiagnosis`（`:36897`）：
+>
+> ```csharp
+> Diagnose(devices, delta)                       // 调用点 :7086
+>   ← Diagnose((plan?.Timing == "PTP") ? identities : null, d2)
+> 
+> if (devices == null || devices.Count <= 1) return NotApplicable;
+> foreach (var device in devices) {
+>     var ptpOffset = targetHealth.PtpOffset;
+>     if (!targetHealth.IsValid || ptpOffset == null ||
+>         ptpOffset.Metric != HistogramMetric.PtpClockOffsetProxy ||
+>         targetHealth.PtpOffsetCount < 30 || …)  return Insufficient();
+>     list.Add((device, ptpOffset.Sigma));
+> }
+> ```
+>
+> ⇒ **只要组是 PTP，诊断就对「每一个成员」要求 `PtpOffset` 直方图且 ≥30 个样本。**
+> 一个还在走 NTP 的 Apple TV 不可能产出这个量 → 整个诊断退化成 `InsufficientDate`。
+> **所以 Apple TV 进 PTP 组必须是 follower，没有"组内混用"这个选项。**
+>
+> ## 三、第 2 问：组内能不能每成员不同 timing → **不能，而且 WAC 会断言它一致**
+>
+> 〔码〕`CalibrationPlan` 整个记录只有**一个** `Timing` 字段（`:38121`）：
+> ```csharp
+> public sealed record CalibrationPlan(
+>     string Topology, string Timing, IReadOnlyList<int> CandidatesMs,
+>     bool SupportsLiveLatencyTuning, int MinLeadMs = 0);
+> ```
+>
+> 〔码〕更关键的是 `:7048` —— **它把运行时快照和计划值做相等比较**：
+> ```csharp
+> if (_before.Members != _devices.Count
+>     || snapshot.Members != _devices.Count
+>     || !string.Equals(snapshot.Timing, _plan?.Timing, StringComparison.OrdinalIgnoreCase))
+> {
+>     _delta = _delta with { Validity = _delta.Validity | TelemetryValidity.TargetSetChanged };
+> }
+> ```
+> ⇒ **只要实际 timing 和计划不一致，整份遥测就被判为无效**（`TargetSetChanged`）。
+> 这不是"最好一致"，是**一致才允许测量**。
+>
+> ⇒ **AF 的「一组一时钟域」不需要放宽 —— 它和 WAC 完全一致，而且 WAC 比它更硬。** 保持现状。
+>
+> ⚠️ 但要分清一件事：`timingProtocol` 在协议层是**每次 SETUP 的 plist 字段**（`session.rs` 的 `timing_port timing_protocol has_timing_peer_info`，值 `NTP` / `PTP`），所以**协议允许每成员不同，WAC 主动选择不用**。你的约束是**设计选择**，不是协议限制 —— 这个区别值得在代码注释里写清楚，否则以后有人会以为是被协议逼的。
+>
+> ## 四、第 3 问：`group_timing_divergence` 告警 → **WAC 里没有这个东西，因为结构上不可能发生**
+>
+> 后端全库 `diverge` / `Diverge` = **0 命中**。
+>
+> 原因很直白：**一组只有一个 plan，且被断言一致**（见 §三）。在这个模型里"组内 timing 分裂"不是需要告警的运行时风险，而是**计划计算出了 bug**。
+>
+> ⇒ 你现在这条告警的定位错了：
+>
+> | 现在 | 应该是 |
+> |---|---|
+> | 用户可见的 warning，SETUP 前发出 | **内部断言 / 日志**（它只在你自己算错时触发） |
+> | 被桌面端 `startedAt == 0` 过滤掉 | 不该走用户通道，所以"被过滤"其实是**正确的** |
+>
+> **WAC 真正给用户看的组级告警是另一类，而且都在 `streaming` 之后**（因为需要 ≥30 个 PTP 偏移样本）：
+>
+> ```
+> PtpDiagnosis_Normal            「传输侧时钟偏移波动较小；这不代表已测量实际播放同步。」
+> PtpDiagnosis_UnstableDevice    「「{0}」的传输侧时钟偏移波动明显高于其他设备。可检查 Wi-Fi 或 Mesh 节点连接；这不代表已测量实际播放同步。」
+> PtpDiagnosis_ElevatedGroup     「组内传输侧时钟偏移波动偏高，但没有可明确归因的单个异常设备。…」
+> PtpDiagnosis_InsufficientData  「对时信息有限或设备映射不明确，暂时无法判断…」
+> PtpDiagnosis_CheckNetwork      「建议检查设备的无线信号和路由节点连接，再重新测试。」
+> ```
+> 判据（`:36920`）：全员 `PtpOffset.Sigma < 0.3` → Normal；否则阈值 `max(0.5, 5 × min_sigma)`，超阈值的设备点名报 `UnstableDevice`，否则 `ElevatedGroup`。
+>
+> ⇒ **建议**：把 `group_timing_divergence` 降级为日志/内部断言；如果想要用户可见的组级提示，**照 WAC 做 PTP 偏移 sigma 诊断**，而且必须放在 `streaming` 之后（要等够 30 个样本）。这也顺带解决了你"`startedAt == 0` 被丢弃"的问题 —— 那条告警本来就不该在 SETUP 前发。
+>
+> ## 五、第 4 问：AP1 + AP2 混组，整组 NTP 时 HomePod 会不会听
+>
+> † 真机才能定死，但静态证据支持你的读法，而且比你说的更彻底：
+>
+> ```csharp
+> if (devices.Any(d => !d.SupportsAirPlay2))
+>     return new CalibrationPlan("Classic RAOP", "NTP", Array.Empty<int>(),
+>                                SupportsLiveLatencyTuning: false);   // ← 注意这里
+> ```
+>
+> 两个含义：
+> 1. **整组降级到 Classic RAOP**，不只是 timing 改 NTP —— 连 `CandidatesMs` 都清空、**`SupportsLiveLatencyTuning` 直接置 false**。WAC 不认为这种组还能做自适应 lead 调优。
+> 2. 既然整组走 Classic RAOP（RAOP/RTSP + NTP，`ANNOUNCE`/`SETUP`/`RECORD` 老路径），HomePod 是**当经典 RAOP 设备**被驱动，而不是"AP2 设备但用 NTP"。**它没有机会坚持自己是 PTP grandmaster** —— 因为整个 AP2 会话（含 PTP 协商、SETUP 里的 `timingProtocol=PTP`）都没建立。
+>
+> ⇒ 你的读法成立。真机上要验的其实只有一件事：**HomePod 在 Classic RAOP 模式下能不能正常出声**（这是老协议兼容性，不是时钟域冲突）。
+>
+> ## 六、结论速查
+>
+> | 你的问题 | 结论 |
+> |---|---|
+> | Mixed Apple group 该 PTP 还是 NTP | **PTP**（跟 WAC）。AF 现在"NTP 保守"与 WAC 不一致 |
+> | Apple TV 进 PTP 组要当 follower 吗 | **必须**。`GroupPtpDiagnosis` 对每个成员都要 `PtpOffset` ≥30 样本 |
+> | 组内每成员不同 timing | **不行**。`CalibrationPlan` 单 `Timing`；`:7048` 用相等断言，不一致即判遥测无效 |
+> | AF 的"一组一时钟域" | **保持**，与 WAC 一致且更宽松 |
+> | `group_timing_divergence` 该不该用户可见 | **不该** —— 它是内部 bug 指示器，不是运行时风险。降级为日志 |
+> | 想要用户可见的组级提示 | 照 WAC 做 **PTP 偏移 sigma 诊断**，放在 `streaming` 之后 |
+> | AP1+AP2 混组整组 NTP | ✅ 你的读法成立；WAC 更进一步，连自适应 lead 都关掉 |
 
 ---
 
