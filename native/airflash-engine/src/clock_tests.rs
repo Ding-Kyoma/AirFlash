@@ -102,7 +102,10 @@ fn new_unmatched_sync_cannot_refresh_an_expired_complete_sample() {
     response[44..52].copy_from_slice(&7u64.to_be_bytes());
     response[52..54].copy_from_slice(&0x8005u16.to_be_bytes());
     followed_packet(&mut state, &response, 3_000_400_000, later, 7);
-    assert_eq!(state.exchanges, 0);
+    // Only the first complete pair counts as an exchange; the later Sync has no
+    // matching Follow_Up and must not refresh or re-arm the sample.
+    assert_eq!(state.exchanges, 1);
+    assert_eq!(state.sync_pair.map(|sample| sample.received), Some(100_000));
     assert_eq!(
         state.packets.last_rejection,
         Some("delay_identity_or_stale_sample")
@@ -290,4 +293,38 @@ fn localhost_follower_locks_after_receiver_drops_the_first_subscription() {
     assert!(snapshot.exchanges >= 3);
     assert!(snapshot.offset_ns.is_some());
     assert_eq!(snapshot.phase, "ready");
+}
+
+#[test]
+fn follower_locks_from_sync_pairs_when_delay_responses_stay_unusable() {
+    // Receivers such as HomePod OS 27 answer the delay request with timestamps
+    // that contradict their own sync timestamps. The session must still obtain a
+    // usable timeline from the sync exchange instead of failing to start.
+    let start = Instant::now();
+    let mut state = follower(start);
+    let receiver_offset: i128 = 4_200_000_000;
+    for seq in 0..3u16 {
+        let at = start + Duration::from_millis(u64::from(seq) * 125);
+        let local = 1_000_000_000 + u64::from(seq) * 1_000_000_000;
+        let (sync, follow) = sync_pair(8, seq, (local as i128 + receiver_offset) as u64);
+        followed_packet(&mut state, &sync, local + 90_000, at, 7);
+        followed_packet(&mut state, &follow, local + 95_000, at, 7);
+        state.delay = Some((seq, local + 200_000));
+        state.delay_age = Some(at);
+        let mut response = header(9, 54, 8, seq, 0x0408, 0);
+        timestamp(&mut response[34..44], 17);
+        response[44..52].copy_from_slice(&7u64.to_be_bytes());
+        response[52..54].copy_from_slice(&0x8005u16.to_be_bytes());
+        followed_packet(&mut state, &response, local + 400_000, at, 7);
+        assert_eq!(state.packets.last_rejection, Some("round_trip"));
+    }
+    assert_eq!(state.exchanges, 3);
+    assert_eq!(state.packets.rejected, 3);
+    assert!(state.offset.is_none(), "no delay response was accepted");
+    assert_eq!(state.offset_source(), Some("sync"));
+    let negative_rtt = state.packets.last_round_trip_ns.expect("round trip recorded");
+    assert!(negative_rtt < 0.0, "contradictory timestamps");
+    let offset = state.effective_offset().expect("sync offset");
+    assert!((offset - receiver_offset as f64).abs() < 200_000.0);
+    assert!(state.ready(start + Duration::from_millis(250)));
 }

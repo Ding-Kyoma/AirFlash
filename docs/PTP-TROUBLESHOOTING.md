@@ -17,12 +17,26 @@ path. Do not include pairing files or credentials.
 | `rx_rejected` | Traffic arrived but failed source-port or packet validation. Inspect `packets.last_rejection`. |
 | `waiting_announce` | Receiver-clock mode has not identified the receiver's announced clock. Confirm the selected clock mode and receiver behavior. |
 | `waiting_sync_pair` | A fresh matching Sync/Follow_Up pair is missing. Inspect the packet types and rejection reason. |
-| `waiting_delay_response` | Receiver-clock mode still needs a matching delay response and a valid offset sample. |
+| `waiting_delay_response` | Receiver-clock mode has no offset sample at all. A complete Sync/Follow_Up pair normally supplies one, so this phase means the pair cache is empty as well. |
 | `waiting_exchanges` | More valid exchanges are needed, or earlier exchanges expired. Inspect exchange count, timeout and offset/RTT rejection reasons. |
 | `ready` | The required timing exchanges passed. This is not an acoustic latency measurement. |
 
 `received_by_type` uses the PTP message type as its index: Sync 0, Delay_Req 1,
 Pdelay_Req 2, Follow_Up 8, Delay_Resp 9, Announce 11 and Signaling 12.
+
+`offset_source` reports which exchange produced the receiver-to-local offset.
+`sync` means a complete Sync/Follow_Up pair supplied it; that estimate omits the
+path delay, which is sub-millisecond on a local network. `delay` means a matching
+delay response refined it by measuring the round trip. A receiver that answers
+the sync exchange but never supplies a consistent delay response therefore still
+reaches `ready` with `offset_source=sync`.
+
+A rejected delay response is recorded in `packets.last_rejection` with the
+computed round trip in `packets.last_round_trip_ns`. `round_trip` means the
+receiver's delay and sync timestamps disagree by more than 250 ms; the sample is
+discarded and the sync-derived offset stays in use. Report that number together
+with the receiver model when a `sync`-sourced offset behaves incorrectly.
+
 `network` counters include datagrams rejected before peer validation.
 An OS error code in `last_send_error` or `last_receive_error` identifies a local
 socket failure. Normal nonblocking polling is not logged as an error.

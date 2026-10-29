@@ -109,7 +109,11 @@ struct PeerState {
     pending_syncs: VecDeque<PendingSync>,
     sync_pair: Option<SyncSample>,
     delay: Option<(u16, u64)>,
+    /// Offset refined by a validated delay response. This removes the path
+    /// delay from the estimate but is not required to establish one.
     offset: Option<f64>,
+    /// Offset derived from complete Sync/Follow_Up pairs alone.
+    sync_offset: Option<f64>,
     delay_age: Option<Instant>,
     source_id: Option<u64>,
     source_port: Option<u16>,
@@ -171,6 +175,7 @@ pub struct PacketSnapshot {
     received_by_type: [u64; 16],
     rejected: u64,
     last_rejection: Option<&'static str>,
+    last_round_trip_ns: Option<f64>,
     send_errors: u64,
     last_send_error: Option<SocketFailure>,
     pdelay_responses: u64,
@@ -184,6 +189,9 @@ pub struct PeerSnapshot {
     pub last_exchange_age_ms: Option<u128>,
     pub clock_id: Option<u64>,
     pub offset_ns: Option<f64>,
+    /// `delay` when a validated delay response refined the offset, `sync` when
+    /// only complete Sync/Follow_Up pairs have supplied one.
+    pub offset_source: Option<&'static str>,
     pub grants: u64,
     pub received_grants: u64,
     pub active_subscriptions: usize,
@@ -217,6 +225,21 @@ impl PeerState {
     fn startup_timeout(&self) -> Duration {
         (self.exchange_timeout() + Duration::from_secs(2)).max(Duration::from_secs(8))
     }
+    /// Best available receiver-to-local offset. A validated delay response wins
+    /// because it also removes the path delay; the Sync pair estimate remains
+    /// usable when the receiver never supplies a matching delay response.
+    fn effective_offset(&self) -> Option<f64> {
+        self.offset.or(self.sync_offset)
+    }
+    fn offset_source(&self) -> Option<&'static str> {
+        if self.offset.is_some() {
+            Some("delay")
+        } else if self.sync_offset.is_some() {
+            Some("sync")
+        } else {
+            None
+        }
+    }
     fn phase(&self, now: Instant) -> &'static str {
         if !self.active {
             "waiting_session"
@@ -234,7 +257,7 @@ impl PeerState {
                 .is_none_or(|sample| now.duration_since(sample.at) >= SAMPLE_LIFETIME)
         {
             "waiting_sync_pair"
-        } else if self.follow && self.offset.is_none() {
+        } else if self.follow && self.effective_offset().is_none() {
             "waiting_delay_response"
         } else {
             "waiting_exchanges"
@@ -284,34 +307,60 @@ impl PeerState {
                 self.pending_syncs.len() - 1
             }
         };
-        let entry = &mut self.pending_syncs[index];
-        if entry.complete {
+        let complete = {
+            let entry = &mut self.pending_syncs[index];
+            if entry.complete {
+                return;
+            }
+            if kind == 0 && entry.sync.is_none() {
+                entry.sync = Some((local_ns, correction(data)));
+                if let Some(origin) = origin {
+                    entry.follow = Some((origin, 0.0));
+                }
+            } else if kind == 8 && entry.follow.is_none() {
+                entry.follow = Some((origin.unwrap(), correction(data)));
+            }
+            match (entry.sync, entry.follow) {
+                (Some((received, sync_correction)), Some((origin, follow_correction))) => {
+                    entry.complete = true;
+                    Some((
+                        origin,
+                        received,
+                        sync_correction + follow_correction,
+                        entry.at,
+                    ))
+                }
+                _ => None,
+            }
+        };
+        let Some((origin, received, correction_ns, at)) = complete else {
             return;
-        }
-        if kind == 0 && entry.sync.is_none() {
-            entry.sync = Some((local_ns, correction(data)));
-            if let Some(origin) = origin {
-                entry.follow = Some((origin, 0.0));
-            }
-        } else if kind == 8 && entry.follow.is_none() {
-            entry.follow = Some((origin.unwrap(), correction(data)));
-        }
-        if let (Some((received, sync_correction)), Some((origin, follow_correction))) =
-            (entry.sync, entry.follow)
+        };
+        // A late older pair must not replace the newest complete sample.
+        if self
+            .sync_pair
+            .is_none_or(|sample| received > sample.received)
         {
-            entry.complete = true;
-            // A late older pair must not replace the newest complete sample.
-            if self
-                .sync_pair
-                .is_none_or(|sample| received > sample.received)
-            {
-                self.sync_pair = Some(SyncSample {
-                    origin,
-                    received,
-                    correction: sync_correction + follow_correction,
-                    at: entry.at,
-                });
-            }
+            self.sync_pair = Some(SyncSample {
+                origin,
+                received,
+                correction: correction_ns,
+                at,
+            });
+        }
+        if self.follow {
+            // A complete pair already yields the receiver-to-local offset. The
+            // omitted path delay is sub-millisecond on a local network and far
+            // below any AirPlay latency in use, so a receiver that answers the
+            // sync exchange but never supplies a usable delay response can still
+            // provide a valid timeline. A validated response refines `offset`
+            // without being required for readiness.
+            let sample = (origin as i128 - received as i128) as f64 + correction_ns;
+            self.sync_offset = Some(
+                self.sync_offset
+                    .map_or(sample, |old| old * 0.875 + sample * 0.125),
+            );
+            self.exchanged(at);
         }
     }
     fn exchanged(&mut self, now: Instant) {
@@ -333,7 +382,7 @@ impl PeerState {
             && self
                 .last
                 .is_some_and(|last| now.duration_since(last) < self.exchange_timeout())
-            && (!self.follow || self.offset.is_some())
+            && (!self.follow || self.effective_offset().is_some())
     }
 }
 fn read_timestamp(data: &[u8]) -> Option<u64> {
@@ -470,7 +519,13 @@ fn followed_packet(s: &mut PeerState, data: &[u8], local_ns: u64, now: Instant, 
                 let inward = (remote_received as i128 - sent as i128) as f64 - correction(data);
                 let rtt = inward - outward;
                 if !(0.0..=250_000_000.0).contains(&rtt) {
+                    // Keep the number for diagnostics: a receiver whose delay
+                    // timestamps disagree with its sync timestamps is otherwise
+                    // indistinguishable from one that never answered.
+                    s.packets.last_round_trip_ns = Some(rtt);
                     s.reject("round_trip");
+                    s.delay = None;
+                    s.delay_age = None;
                     return;
                 }
                 let offset = (outward + inward) / 2.0;
@@ -486,7 +541,6 @@ fn followed_packet(s: &mut PeerState, data: &[u8], local_ns: u64, now: Instant, 
                     s.offset = Some(offset);
                 }
                 s.offset = Some(s.offset.map_or(offset, |old| old * 0.875 + offset * 0.125));
-                s.exchanged(now);
                 s.delay = None;
                 s.delay_age = None;
             } else {
@@ -679,7 +733,8 @@ impl PtpMaster {
                 ready: s.ready(now),
                 last_exchange_age_ms: s.last.map(|last| now.duration_since(last).as_millis()),
                 clock_id: s.clock_id,
-                offset_ns: s.offset,
+                offset_ns: s.effective_offset(),
+                offset_source: s.offset_source(),
                 grants: s.grants,
                 received_grants: s.received_grants,
                 active_subscriptions: s
@@ -713,7 +768,8 @@ impl PtpMaster {
             return Ok((self.clock_id, local_ns));
         }
         anyhow::ensure!(s.ready(Instant::now()), "receiver clock is not ready");
-        let mapped = local_ns as i128 + s.offset.unwrap().round() as i128;
+        let offset = s.effective_offset().context("missing clock offset")?;
+        let mapped = local_ns as i128 + offset.round() as i128;
         Ok((
             s.clock_id.context("missing receiver clock identity")?,
             u64::try_from(mapped)?,
