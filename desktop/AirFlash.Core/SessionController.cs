@@ -15,12 +15,15 @@ public sealed record SessionTiming(TimeSpan Connect, TimeSpan Read, TimeSpan Pin
 {
     public static SessionTiming Default { get; } = new(TimeSpan.FromSeconds(40), TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(120), TimeSpan.FromSeconds(1));
 }
-public sealed class SessionController(IEngineFactory factory, IAudioService audio, Action<string>? log = null, SessionTiming? timing = null) : IAsyncDisposable
+public sealed class SessionController(IEngineFactory factory, IAudioService audio, Action<string>? log = null, SessionTiming? timing = null, Action<DesktopSessionRecord>? sessionRecords = null) : IAsyncDisposable
 {
     private readonly SemaphoreSlim _serial = new(1, 1);
     private readonly SemaphoreSlim _audioWriter = new(1, 1);
     private readonly object _sync = new();
     private readonly SessionTiming _timing = timing ?? SessionTiming.Default;
+    // Q40: the companion record for the engine's session-summary.csv. Tests pass a
+    // collector; production appends beside the engine file.
+    private readonly Action<DesktopSessionRecord> _sessionRecords = sessionRecords ?? DesktopSessionLog.Append;
     private CancellationTokenSource? _lifetime;
     private Task? _work;
     private IEngineConnection? _connection;
@@ -526,6 +529,10 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private async Task RunStreamAsync(Receiver receiver, long epoch, CancellationToken cancellation)
     {
         var attempts = 0;
+        // Q40 companion record: how many reconnects this playback run had already
+        // done when the next attempt started, and why the latest one happened.
+        var reconnects = 0;
+        var reconnectReason = DesktopSessionLog.NoReconnect;
         while (!cancellation.IsCancellationRequested)
         {
             lock (_sync)
@@ -684,7 +691,16 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         }
                     }
                 }
-                finally { ClearConnection(connection); await RequestStopAsync(connection, session).ConfigureAwait(false); }
+                finally
+                {
+                    ClearConnection(connection);
+                    await RequestStopAsync(connection, session).ConfigureAwait(false);
+                    // One desktop row per IPC session, written before the catch
+                    // decides whether to reconnect: the engine's row for this
+                    // session already exists or is being written now. The join key
+                    // is this id; the engine appends "-<session_epoch>".
+                    _sessionRecords(new DesktopSessionRecord(session, reconnects, reconnectReason));
+                }
             }
             catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { return; }
             catch (Exception error)
@@ -698,6 +714,10 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                 // A preempted receiver belongs to another controller now; retrying
                 // would fight it. The user gets an explicit reconnect action instead.
                 if (notice.Code == "preempted" || !(_settings.ForceReconnect || receiver.IsSoftwareGroup || notice.Code is "timeline_expired" or "clock_lost") || attempts > _settings.MaxReconnectAttempts || notice.Retryable == false || notice.Retryable is null && IsAuthenticationFailure(error.Message)) return;
+                // This is the one reconnect notion the desktop already has; the
+                // companion record only reports it, it does not add a second one.
+                ++reconnects;
+                reconnectReason = $"transport_fault:{notice.Code}";
             }
             var delay = TimeSpan.FromMilliseconds(Math.Min(_timing.Retry.TotalMilliseconds * Math.Pow(2, attempts - 1), 8000));
             log?.Invoke($"Session reconnect reason=transport_fault; code={_diagnostics.LastFault?.Code}; attempt={attempts}; delay_ms={delay.TotalMilliseconds}");
