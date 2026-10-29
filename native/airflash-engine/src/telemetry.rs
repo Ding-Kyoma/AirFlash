@@ -7,12 +7,14 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
+    collections::VecDeque,
     io::Write,
     path::{Path, PathBuf},
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 /// Log-spaced buckets covering 0.05 ms .. 200 ms, which brackets everything a
@@ -132,14 +134,22 @@ pub enum UnderflowCause {
 /// Why the timeline was reset.
 ///
 /// The reference implementation logs `[TIMELINE] reset reason=<reason>` and
-/// exposes the last one as the `last_timeline_reset_reason` diagnostic field; the
-/// nine names below are its complete enum. They are also the CSV column suffixes,
-/// so renaming a variant is a format change.
+/// exposes the last one as the `last_timeline_reset_reason` diagnostic field; its
+/// nine names are the first nine below. AirFlash adds two of its own (Q43):
+/// `source_restart` for a reopened capture source and `sender_stall` for a local
+/// deadline miss that a successful re-anchor absorbed. They are also the CSV
+/// column suffixes, so renaming a variant is a format change.
 ///
 /// Only [`TimelineResetReason::ConfirmedTransportFailure`] is a drift signal.
 /// `track_change`, `user_seek`, `flush` and `silence_resume` are neutral or
 /// user-initiated, `latency_change` is our own lead adjustment, and
-/// `receiver_rejected_flush` / `session_restart` are their own diagnoses.
+/// `receiver_rejected_flush` / `session_restart` / `source_restart` are their own
+/// diagnoses. `sender_stall` is local (the sender thread missed a deadline), so it
+/// must never be folded into the confirmed bucket (Q43 §三).
+///
+/// `start` keeps the reference implementation's "session start" meaning and is
+/// deliberately never recorded: the first timeline of a row is its baseline, so a
+/// normal stop stays all-zero (Q43 §四). It stays in the enum as a tripwire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimelineResetReason {
@@ -155,11 +165,16 @@ pub enum TimelineResetReason {
     /// Our own adaptive lead adjustment; must stay distinguishable from a fault.
     LatencyChange,
     Flush,
+    /// A capture source ended and was reopened: a new timeline for the same run.
+    SourceRestart,
+    /// The sender thread missed its deadline with clean RTP counters; a local
+    /// scheduling problem, not proof that the network failed.
+    SenderStall,
 }
 
 impl TimelineResetReason {
     /// Declaration order, which is also the CSV column order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::Start,
         Self::TrackChange,
         Self::UserSeek,
@@ -169,6 +184,8 @@ impl TimelineResetReason {
         Self::SilenceResume,
         Self::LatencyChange,
         Self::Flush,
+        Self::SourceRestart,
+        Self::SenderStall,
     ];
 
     /// The wire/CSV label, identical to the reference enum's spelling.
@@ -183,6 +200,8 @@ impl TimelineResetReason {
             Self::SilenceResume => "silence_resume",
             Self::LatencyChange => "latency_change",
             Self::Flush => "flush",
+            Self::SourceRestart => "source_restart",
+            Self::SenderStall => "sender_stall",
         }
     }
 }
@@ -200,6 +219,8 @@ pub struct TimelineResets {
     pub silence_resume: u32,
     pub latency_change: u32,
     pub flush: u32,
+    pub source_restart: u32,
+    pub sender_stall: u32,
 }
 
 impl TimelineResets {
@@ -216,6 +237,8 @@ impl TimelineResets {
             TimelineResetReason::SilenceResume => &mut self.silence_resume,
             TimelineResetReason::LatencyChange => &mut self.latency_change,
             TimelineResetReason::Flush => &mut self.flush,
+            TimelineResetReason::SourceRestart => &mut self.source_restart,
+            TimelineResetReason::SenderStall => &mut self.sender_stall,
         };
         *slot = slot.saturating_add(1);
     }
@@ -231,6 +254,8 @@ impl TimelineResets {
             TimelineResetReason::SilenceResume => self.silence_resume,
             TimelineResetReason::LatencyChange => self.latency_change,
             TimelineResetReason::Flush => self.flush,
+            TimelineResetReason::SourceRestart => self.source_restart,
+            TimelineResetReason::SenderStall => self.sender_stall,
         }
     }
 
@@ -244,6 +269,93 @@ impl TimelineResets {
             + self.silence_resume
             + self.latency_change
             + self.flush
+            + self.source_restart
+            + self.sender_stall
+    }
+}
+
+/// A lead shift of at least this many microseconds is a timeline reset. Smaller
+/// adjustments only move the lead-shift counters (Q43 §二).
+pub const LEAD_SHIFT_RESET_US: u64 = 1_000;
+
+/// RTP-side evidence used to separate a transport failure from a local sender
+/// stall when a successful re-anchor absorbs a missed deadline (Q43 §三).
+///
+/// The send thread can miss a deadline because the network stalled or because
+/// the thread itself was descheduled. The cheap discriminator is whether the RTP
+/// counters moved in the window leading into the stall: retransmit requests
+/// (receivers asking for missing packets) and concealed capture underruns.
+///
+/// The send loop samples the cumulative counters at most once per
+/// [`SAMPLE_INTERVAL`](Self::SAMPLE_INTERVAL). At a re-anchor the oldest sample
+/// still inside [`WINDOW`](Self::WINDOW) is the baseline, so the comparison
+/// covers roughly the second before the stall.
+///
+/// Why "before": retransmit requests are only drained when the send loop runs, so
+/// requests that arrive *during* the stall are counted after it ends. They are not
+/// evidence for this re-anchor, and [`reset`](Self::reset) clears the ring after
+/// each re-anchor so they cannot be attributed to the next one either.
+///
+/// This is a heuristic, not a proof: loss up to a second before a purely local
+/// stall still looks like transport movement, and a stall longer than the window
+/// leaves no baseline at all. The fallback is [`TimelineResetReason::SenderStall`],
+/// the conservative direction — a missed transport failure costs one stall sample,
+/// while a false confirmed failure would poison the only drift signal.
+#[derive(Debug, Default)]
+pub struct RtpEvidence {
+    samples: VecDeque<(Instant, u64, u64)>,
+}
+
+impl RtpEvidence {
+    /// How far back a successful re-anchor looks for movement.
+    pub const WINDOW: Duration = Duration::from_secs(1);
+    /// Minimum spacing between samples; the send loop iterates every packet.
+    pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+    /// Two seconds of history at `SAMPLE_INTERVAL`.
+    const MAX_SAMPLES: usize = 8;
+
+    /// Record the cumulative counters, throttled to `SAMPLE_INTERVAL`.
+    pub fn sample(&mut self, now: Instant, rtx_req: u64, underruns: u64) {
+        if self
+            .samples
+            .back()
+            .is_some_and(|(at, _, _)| now.saturating_duration_since(*at) < Self::SAMPLE_INTERVAL)
+        {
+            return;
+        }
+        self.samples.push_back((now, rtx_req, underruns));
+        while self.samples.len() > Self::MAX_SAMPLES {
+            self.samples.pop_front();
+        }
+    }
+
+    /// Whether retransmit requests or concealed underruns rose between the oldest
+    /// sample inside the window and `now`.
+    pub fn moved(&self, now: Instant, rtx_req: u64, underruns: u64) -> bool {
+        let Some((_, base_rtx, base_underruns)) = self
+            .samples
+            .iter()
+            .find(|(at, _, _)| now.saturating_duration_since(*at) <= Self::WINDOW)
+        else {
+            return false;
+        };
+        rtx_req > *base_rtx || underruns > *base_underruns
+    }
+
+    /// The bucket a successful re-anchor belongs to (Q43 §三).
+    pub fn reset_reason(&self, now: Instant, rtx_req: u64, underruns: u64) -> TimelineResetReason {
+        if self.moved(now, rtx_req, underruns) {
+            TimelineResetReason::ConfirmedTransportFailure
+        } else {
+            TimelineResetReason::SenderStall
+        }
+    }
+
+    /// Forget the pre-stall baseline after a re-anchor, so the RTCP requests that
+    /// piled up during this stall cannot make the next re-anchor look like a
+    /// transport failure.
+    pub fn reset(&mut self) {
+        self.samples.clear();
     }
 }
 
@@ -284,6 +396,13 @@ pub struct SessionTelemetry {
     pub servo_filtered_ms: f64,
     pub servo_drift_ppb: f64,
     pub lead_extra_ms: f64,
+    /// Applied adaptive-lead adjustments, including the sub-millisecond ones.
+    /// These are deliberately *not* reset buckets: they describe the ladder
+    /// twitching, which is not a timeline reset (Q43 §二).
+    pub lead_shift_count: u64,
+    /// Signed sum of every applied lead shift, in microseconds. Positive means
+    /// the timeline was delayed (more lead held at the receiver).
+    pub lead_shift_total_us: i64,
     /// Timeline resets by cause; never collapsed into a single count.
     pub timeline_resets: TimelineResets,
     /// The most recent cause, `None` when the timeline was never reset.
@@ -315,10 +434,24 @@ impl SessionTelemetry {
         }
     }
     /// Record one timeline reset. Callers pass the cause explicitly; a site that
-    /// does not fit one of the nine reasons must not stay untagged.
+    /// does not fit one of the reasons must not stay untagged.
     pub fn record_timeline_reset(&mut self, reason: TimelineResetReason) {
         self.timeline_resets.record(reason);
         self.last_timeline_reset_reason = Some(reason);
+    }
+    /// Account for one applied adaptive-lead shift (Q43 §二).
+    ///
+    /// Every shift moves `lead_shift_count` / `lead_shift_total_us`, but only a
+    /// shift of at least [`LEAD_SHIFT_RESET_US`] is a `latency_change` reset. The
+    /// adaptive ladder nudges the lead by fractions of a millisecond; counting
+    /// those as resets would turn `latency_change` into the largest bucket and
+    /// drown `confirmed_transport_failure`.
+    pub fn record_lead_shift(&mut self, applied_us: i64) {
+        self.lead_shift_count = self.lead_shift_count.saturating_add(1);
+        self.lead_shift_total_us = self.lead_shift_total_us.saturating_add(applied_us);
+        if applied_us.unsigned_abs() >= LEAD_SHIFT_RESET_US {
+            self.record_timeline_reset(TimelineResetReason::LatencyChange);
+        }
     }
     pub fn snapshot(&self) -> Value {
         json!({
@@ -337,6 +470,8 @@ impl SessionTelemetry {
             "capture_glitches": self.capture_glitches,
             "events_dropped": self.events_dropped,
             "lead_extra_ms": round3(self.lead_extra_ms),
+            "lead_shift_count": self.lead_shift_count,
+            "lead_shift_total_us": self.lead_shift_total_us,
             "timeline_resets": self.timeline_resets,
             "last_timeline_reset_reason": self
                 .last_timeline_reset_reason
@@ -365,15 +500,24 @@ pub fn next_session_epoch() -> u64 {
 /// array, so changing the order is a format change and must be deliberate.
 ///
 /// `rebuild_count` is gone: it was a bare count that mixed user track changes and
-/// our own lead adjustments into what looked like drift. The nine
+/// our own lead adjustments into what looked like drift. The eleven
 /// `timeline_resets_<reason>` columns are flat so a spreadsheet `SUM` keeps per
 /// cause, and `last_timeline_reset_reason` records the most recent one.
-pub const SUMMARY_COLUMNS: [&str; 27] = [
+///
+/// Layout (31 columns): the 19 scalar fields, then the eleven reset buckets in
+/// [`TimelineResetReason::ALL`] declaration order, then the last-reason label.
+/// The two lead-shift fields sit next to `applied_lead_ms` because they describe
+/// the same adaptive ladder; they are counters, not reset buckets, and every
+/// shift moves them while only a >= 1 ms shift increments
+/// `timeline_resets_latency_change`.
+pub const SUMMARY_COLUMNS: [&str; 31] = [
     "session_id",
     "topology",
     "codec",
     "timing",
     "applied_lead_ms",
+    "lead_shift_count",
+    "lead_shift_total_us",
     "packets",
     "rtx_req",
     "rtx_resent",
@@ -395,6 +539,8 @@ pub const SUMMARY_COLUMNS: [&str; 27] = [
     "timeline_resets_silence_resume",
     "timeline_resets_latency_change",
     "timeline_resets_flush",
+    "timeline_resets_source_restart",
+    "timeline_resets_sender_stall",
     "last_timeline_reset_reason",
 ];
 
@@ -413,6 +559,10 @@ pub struct SessionSummary {
     pub codec: &'static str,
     pub timing: &'static str,
     pub applied_lead_ms: i64,
+    /// Applied lead adjustments of any size (the adaptive ladder's twitching).
+    pub lead_shift_count: u64,
+    /// Signed sum of those adjustments in microseconds.
+    pub lead_shift_total_us: i64,
     pub packets: u64,
     pub rtx_req: u64,
     pub rtx_resent: u64,
@@ -447,6 +597,8 @@ impl SessionSummary {
             "codec": self.codec,
             "timing": self.timing,
             "applied_lead_ms": self.applied_lead_ms,
+            "lead_shift_count": self.lead_shift_count,
+            "lead_shift_total_us": self.lead_shift_total_us,
             "packets": self.packets,
             "rtx_req": self.rtx_req,
             "rtx_resent": self.rtx_resent,
@@ -469,7 +621,7 @@ impl SessionSummary {
     /// One CSV row. Only the opaque `session_id` can ever need quoting; every
     /// other field is a number or a fixed enum label.
     ///
-    /// The nine reset counters are flat columns rather than one object because a
+    /// The eleven reset counters are flat columns rather than one object because a
     /// spreadsheet can then `SUM` a single cause across sessions without parsing
     /// JSON. `TimelineResetReason::ALL` and [`SUMMARY_COLUMNS`] must stay in the
     /// same declared order; the header test locks that down.
@@ -480,6 +632,8 @@ impl SessionSummary {
             csv_field(self.codec),
             csv_field(self.timing),
             self.applied_lead_ms.to_string(),
+            self.lead_shift_count.to_string(),
+            self.lead_shift_total_us.to_string(),
             self.packets.to_string(),
             self.rtx_req.to_string(),
             self.rtx_resent.to_string(),
@@ -761,12 +915,16 @@ mod tests {
         timeline_resets.record(TimelineResetReason::ConfirmedTransportFailure);
         timeline_resets.record(TimelineResetReason::ConfirmedTransportFailure);
         timeline_resets.record(TimelineResetReason::LatencyChange);
+        timeline_resets.record(TimelineResetReason::SourceRestart);
+        timeline_resets.record(TimelineResetReason::SenderStall);
         SessionSummary {
             session_id: "session-42".into(),
             topology: "software_stereo",
             codec: "alac",
             timing: "ptp",
             applied_lead_ms: 45,
+            lead_shift_count: 7,
+            lead_shift_total_us: -1500,
             packets: 1500,
             rtx_req: 7,
             rtx_resent: 5,
@@ -780,7 +938,7 @@ mod tests {
             max_lateness_ms: 12.345,
             duration_s: 30.5,
             timeline_resets,
-            last_timeline_reset_reason: TimelineResetReason::LatencyChange.name(),
+            last_timeline_reset_reason: TimelineResetReason::SenderStall.name(),
         }
     }
 
@@ -802,19 +960,27 @@ mod tests {
             }
             assert_eq!(resets.field(reason), 1);
         }
-        // Every reason once: nine, and each bucket holds exactly one.
+        // Every reason once: eleven, and each bucket holds exactly one.
+        assert_eq!(TimelineResetReason::ALL.len(), 11);
         let mut all = TimelineResets::default();
         for reason in TimelineResetReason::ALL {
             all.record(reason);
         }
-        assert_eq!(all.total(), 9);
+        assert_eq!(all.total(), 11);
         for reason in TimelineResetReason::ALL {
             assert_eq!(all.field(reason), 1, "{reason:?}");
         }
         // A repeated cause only grows its own bucket.
         all.record(TimelineResetReason::LatencyChange);
         assert_eq!(all.latency_change, 2);
-        assert_eq!(all.total(), 10);
+        assert_eq!(all.total(), 12);
+        // The two AirFlash-only buckets are their own reasons, not aliases for the
+        // confirmed transport failure (Q43 §三/§四).
+        assert_eq!(all.confirmed_transport_failure, 1);
+        assert_eq!(all.source_restart, 1);
+        assert_eq!(all.sender_stall, 1);
+        // `start` stays a declared tripwire and is never produced by the engine.
+        assert_eq!(all.start, 1, "the bucket is addressable even if unused");
     }
 
     #[test]
@@ -852,6 +1018,92 @@ mod tests {
     }
 
     #[test]
+    fn a_successful_reanchor_is_a_transport_failure_only_when_rtp_counters_moved() {
+        let t0 = Instant::now();
+        let at = t0 + Duration::from_millis(900);
+        // Clean RTP before the stall: the thread missed its own deadline.
+        let mut clean = RtpEvidence::default();
+        clean.sample(t0, 5, 1);
+        clean.sample(t0 + Duration::from_millis(500), 5, 1);
+        assert!(!clean.moved(at, 5, 1));
+        assert_eq!(clean.reset_reason(at, 5, 1), TimelineResetReason::SenderStall);
+        // Retransmit requests rose: the receiver was already missing packets.
+        let mut rtx = RtpEvidence::default();
+        rtx.sample(t0, 5, 1);
+        rtx.sample(t0 + Duration::from_millis(500), 7, 1);
+        assert_eq!(
+            rtx.reset_reason(at, 7, 1),
+            TimelineResetReason::ConfirmedTransportFailure
+        );
+        // Concealed capture underruns alone are also RTP-side evidence.
+        let mut underruns = RtpEvidence::default();
+        underruns.sample(t0, 5, 1);
+        underruns.sample(t0 + Duration::from_millis(500), 5, 4);
+        assert_eq!(
+            underruns.reset_reason(at, 5, 4),
+            TimelineResetReason::ConfirmedTransportFailure
+        );
+        // Neither bucket is the other.
+        assert_eq!(clean.reset_reason(at, 5, 1), TimelineResetReason::SenderStall);
+        assert_ne!(
+            clean.reset_reason(at, 5, 1),
+            TimelineResetReason::ConfirmedTransportFailure
+        );
+    }
+
+    #[test]
+    fn rtp_evidence_needs_a_fresh_baseline_and_is_cleared_after_a_reanchor() {
+        let t0 = Instant::now();
+        let mut evidence = RtpEvidence::default();
+        // No sample at all: the conservative answer is a local stall.
+        assert_eq!(
+            evidence.reset_reason(t0, 9, 9),
+            TimelineResetReason::SenderStall
+        );
+        evidence.sample(t0, 1, 0);
+        // Samples closer than SAMPLE_INTERVAL are throttled away, so the t0
+        // sample stays the baseline; unchanged counters report no movement.
+        evidence.sample(t0 + Duration::from_millis(100), 1, 0);
+        assert!(!evidence.moved(t0 + Duration::from_millis(100), 1, 0));
+        // A sample outside the window is not a baseline either.
+        assert!(!evidence.moved(t0 + Duration::from_millis(1500), 5, 5));
+        evidence.sample(t0 + Duration::from_millis(1500), 1, 0);
+        assert!(evidence.moved(t0 + Duration::from_millis(2000), 2, 0));
+        // The ring is cleared after a re-anchor, so requests that piled up during
+        // the stall cannot make the next re-anchor look like a transport failure.
+        evidence.reset();
+        assert_eq!(
+            evidence.reset_reason(t0 + Duration::from_millis(2100), 9, 9),
+            TimelineResetReason::SenderStall
+        );
+    }
+
+    #[test]
+    fn only_a_full_millisecond_lead_shift_is_a_latency_change_reset() {
+        let mut telemetry = SessionTelemetry::new();
+        telemetry.record_lead_shift(999);
+        telemetry.record_lead_shift(1);
+        assert_eq!(telemetry.lead_shift_count, 2);
+        assert_eq!(telemetry.lead_shift_total_us, 1_000);
+        assert_eq!(
+            telemetry.timeline_resets.latency_change, 0,
+            "sub-millisecond noise must not fill the reset bucket"
+        );
+        telemetry.record_lead_shift(1_000);
+        telemetry.record_lead_shift(-1_000);
+        assert_eq!(telemetry.lead_shift_count, 4);
+        assert_eq!(telemetry.lead_shift_total_us, 1_000);
+        assert_eq!(telemetry.timeline_resets.latency_change, 2);
+        assert_eq!(
+            telemetry.last_timeline_reset_reason,
+            Some(TimelineResetReason::LatencyChange)
+        );
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot["lead_shift_count"], json!(4));
+        assert_eq!(snapshot["lead_shift_total_us"], json!(1_000));
+    }
+
+    #[test]
     fn a_session_without_resets_is_all_zero_and_still_emits_one_summary() {
         let summary = SessionSummary {
             session_id: "session-clean".into(),
@@ -864,7 +1116,9 @@ mod tests {
         let fields: Vec<_> = row.split(',').collect();
         assert_eq!(fields.len(), SUMMARY_COLUMNS.len());
         for (column, value) in SUMMARY_COLUMNS.iter().zip(&fields) {
-            if column.starts_with("timeline_resets_") {
+            if column.starts_with("timeline_resets_")
+                || matches!(*column, "lead_shift_count" | "lead_shift_total_us")
+            {
                 assert_eq!(*value, "0", "{column} must be zero");
             }
         }
@@ -917,7 +1171,7 @@ mod tests {
         }
         assert_eq!(
             event["last_timeline_reset_reason"],
-            json!(TimelineResetReason::LatencyChange.name())
+            json!(TimelineResetReason::SenderStall.name())
         );
         // Redaction never changes the shape of an already identity-free record.
         assert_eq!(redact(&event), event);
@@ -949,6 +1203,8 @@ mod tests {
                 "codec" => assert_eq!(fields[index], "alac"),
                 "timing" => assert_eq!(fields[index], "ptp"),
                 "applied_lead_ms" => assert_eq!(fields[index], "45"),
+                "lead_shift_count" => assert_eq!(fields[index], "7"),
+                "lead_shift_total_us" => assert_eq!(fields[index], "-1500"),
                 "packets" => assert_eq!(fields[index], "1500"),
                 "rtx_req" => assert_eq!(fields[index], "7"),
                 "rtx_resent" => assert_eq!(fields[index], "5"),
@@ -972,7 +1228,9 @@ mod tests {
                 "timeline_resets_silence_resume" => assert_eq!(fields[index], "0"),
                 "timeline_resets_latency_change" => assert_eq!(fields[index], "1"),
                 "timeline_resets_flush" => assert_eq!(fields[index], "0"),
-                "last_timeline_reset_reason" => assert_eq!(fields[index], "latency_change"),
+                "timeline_resets_source_restart" => assert_eq!(fields[index], "1"),
+                "timeline_resets_sender_stall" => assert_eq!(fields[index], "1"),
+                "last_timeline_reset_reason" => assert_eq!(fields[index], "sender_stall"),
                 other => panic!("unexpected column {other}"),
             }
         }

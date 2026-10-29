@@ -1039,17 +1039,29 @@ impl MediaSchedule {
         self.shift = self.shift.saturating_sub(self.frame_duration());
         self.next_relax = Some(now + RELAX_INTERVAL);
     }
-    /// Apply an operator-requested lead change (adaptive latency ladder). Positive
-    /// values delay playout, which is what the receiver sees; the sync anchor moves
-    /// with the deadline so the timeline stays consistent. Returns the signed change
-    /// actually applied, in milliseconds, clamped to the same ceiling as a re-anchor.
+    /// Apply an operator-requested lead change (adaptive latency ladder) in whole
+    /// milliseconds. Kept for callers that think in the IPC unit; see
+    /// [`add_shift_us`](Self::add_shift_us) for the exact version.
     pub fn add_shift(&mut self, delta_ms: i64) -> i64 {
+        self.add_shift_us(delta_ms.saturating_mul(1_000)) / 1_000
+    }
+
+    /// Apply a lead change in microseconds. Positive values delay playout, which
+    /// is what the receiver sees; the sync anchor moves with the deadline so the
+    /// timeline stays consistent. Returns the signed change actually applied, in
+    /// microseconds, clamped to the same ceiling as a re-anchor.
+    ///
+    /// Microseconds (not milliseconds) are what let the session distinguish an
+    /// audible lead change from a sub-millisecond nudge: only the former is a
+    /// `latency_change` reset (Q43 §二).
+    pub fn add_shift_us(&mut self, delta_us: i64) -> i64 {
         let before = self.shift;
-        let target = if delta_ms >= 0 {
-            self.shift.saturating_add(Duration::from_millis(delta_ms as u64))
+        let target = if delta_us >= 0 {
+            self.shift
+                .saturating_add(Duration::from_micros(delta_us as u64))
         } else {
             self.shift
-                .saturating_sub(Duration::from_millis(delta_ms.unsigned_abs()))
+                .saturating_sub(Duration::from_micros(delta_us.unsigned_abs()))
         }
         .min(MAX_SHIFT);
         self.shift = target;
@@ -1057,9 +1069,9 @@ impl MediaSchedule {
         // immediately relaxed back.
         self.next_relax = None;
         if target >= before {
-            (target - before).as_millis() as i64
+            (target - before).as_micros() as i64
         } else {
-            -((before - target).as_millis() as i64)
+            -((before - target).as_micros() as i64)
         }
     }
 }
