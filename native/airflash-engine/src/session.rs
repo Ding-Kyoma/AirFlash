@@ -1273,7 +1273,7 @@ fn run_live(
                 paused = None;
                 // A new capture source starts a new playback timeline. There is
                 // no "source restart" reason in the nine; `start` is the closest
-                // fit and is flagged in QUESTIONS Q42.
+                // fit and is flagged in QUESTIONS Q43.
                 reset_before = Some(TimelineResetReason::Start);
             }
             StreamEnd::Silence(at) => {
@@ -1856,7 +1856,7 @@ fn send_packets(
                             // coverage, so delivery of the timeline has factually
                             // failed; `confirmed_transport_failure` is the closest
                             // of the nine and the only drift-signalling bucket.
-                            // Flagged in QUESTIONS Q42. A no-op re-anchor
+                            // Flagged in QUESTIONS Q43. A no-op re-anchor
                             // (`shift == 0`) moved nothing and is not counted.
                             telemetry.record_timeline_reset(
                                 TimelineResetReason::ConfirmedTransportFailure,
