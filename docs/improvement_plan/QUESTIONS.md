@@ -3815,6 +3815,37 @@ P3-3g 已按 Q46 落地「多接收器全失败 ⇒ 探默认网关」：地址�
 
 ---
 
+### Q49. P3-5 的阻塞边界要不要按「RSA 路径 / FairPlay 路径」拆开？ `[待答复]`
+
+写 [`DEFERRED-DESIGNS.md`](DEFERRED-DESIGNS.md) 时核对公开资料，发现报告 §P3-5
+把「经典 RAOP」整体归为「被 FairPlay 阻塞」，这个粒度可能太粗：
+
+- **RSA 路径是公开的**：ANNOUNCE 的 SDP 里 `a=rsaaeskey` 是用接收端 RSA 公钥
+  （AirPort Express 的私钥 2011 年已被公开）做 OAEP 包装的 128-bit AES 密钥，
+  `a=aesiv` 是 IV；音频用 AES-CBC。ANNOUNCE/SETUP/RECORD/SET_PARAMETER/FLUSH/
+  TEARDOWN、`Apple-Challenge`、ALAC 的 `fmtp:96 352 0 16 40 ...` 都有公开规范
+  或公开实现可对照。
+- **FairPlay 路径才是黑盒**：`fp-setup`（SAP）的模式选择、密钥调度和 white-box
+  表没有规范，只有逆向实现；`a=fpaeskey` 属于这条路径。
+
+所以「P3-5 完全不可做」只在目标设备**强制 FairPlay** 时成立；对只用
+`rsaaeskey` 的 AirPort Express 一类设备，控制面 + ALAC + AES-CBC 是可写设计的，
+缺的只是真机验证。这会影响前置清单的写法：现在这份清单同时列了「AirPort
+Express」和「强制 FairPlay 的设备」，如果只做 RSA 路径，后者就不该是门槛。
+
+**需要确认**：
+
+1. 将来恢复 P3-5 时，是否允许**只做 RSA 路径**（AirPort Express 等），对要求
+   FairPlay 的设备用明确的 `raop_fairplay_required` 拒绝，而不是整项继续挂起？
+2. 如果允许，验收目标是否就定在 AirPort Express 2（+ 一台 AirPlay 1 第三方
+   设备），Apple TV 6.0 之后那类强制 DRM 的设备不在范围内？
+3. 如果不允许（要么全支持、要么不做），那前置清单里应该直接写「需要一台能强制
+   FairPlay 的目标设备 + 可解明文的抓包」，我把现在的分层清单收窄成一条。
+
+无论哪种答复，本轮都不会写实现——这条只决定设计文档与前置清单的形状。
+
+---
+
 ## 答复区
 
 > 已在每条条目下方就地回填（`> **答复**`）。下面是需要**优先改代码**的 4 条，按影响排序。
