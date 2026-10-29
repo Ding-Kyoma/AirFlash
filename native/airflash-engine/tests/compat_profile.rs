@@ -7,7 +7,10 @@
 //! keep passing unchanged: it is the proof that collecting the scattered
 //! conditions into `CompatProfile` changed no outcome.
 
-use airflash_engine::profile::{Codec, CompatFingerprint, CompatProfile, Profile, Timing, Transport};
+use airflash_engine::profile::{
+    Codec, CompatFingerprint, CompatProfile, Profile, Timing, TimingEvidence, TimingPlan,
+    Transport, select_timing,
+};
 
 /// Feature bit 40: "AirPlay 2 (including buffered audio)".
 const BIT40: u64 = 1 << 40;
@@ -317,4 +320,101 @@ fn model_fingerprint_maps_to_its_timing_expectation() {
         let fingerprint = CompatFingerprint::from_info(&info, &Profile::default(), &[]);
         assert_eq!(fingerprint.ptp_expected(), expected, "{model:?}");
     }
+}
+
+/// The group rule from Q29: the whole group converges on one timing decision,
+/// while a single receiver keeps exactly the rows above.
+#[test]
+fn group_plans_converge_on_one_clock_domain() {
+    let homepod = TimingEvidence {
+        airplay2: true,
+        model: Some("AudioAccessory5,1"),
+        name: None,
+    };
+    let homepod_without_ap2 = TimingEvidence {
+        airplay2: false,
+        model: Some("AudioAccessory5,1"),
+        name: None,
+    };
+    let appletv = TimingEvidence {
+        airplay2: true,
+        model: Some("AppleTV6,2"),
+        name: None,
+    };
+    // All members advertise AirPlay 2: PTP, exactly as the table expects.
+    assert_eq!(
+        select_timing(&[homepod, homepod], Codec::Auto),
+        Timing::Ptp
+    );
+    // One member missing bit40 downgrades the entire group.
+    assert_eq!(
+        select_timing(&[homepod, homepod_without_ap2], Codec::Auto),
+        Timing::Ntp
+    );
+    // Inside the AirPlay 2 branch the conservative member wins.
+    assert_eq!(
+        select_timing(&[homepod, appletv], Codec::Auto),
+        Timing::Ntp
+    );
+    // A single receiver is unchanged: a HomePod without bit40 still runs PTP.
+    assert_eq!(
+        select_timing(&[homepod_without_ap2], Codec::Auto),
+        Timing::Ptp
+    );
+    assert_eq!(select_timing(&[appletv], Codec::Auto), Timing::Ntp);
+}
+
+#[test]
+fn every_group_member_negotiates_the_shared_timing_decision() {
+    let ap2_info = info(
+        Some("AudioAccessory5,1"),
+        Some(BIT40),
+        Some("366.0"),
+        Some(REALTIME),
+        Some(BUFFERED_ALAC),
+    );
+    let ap1_info = info(
+        Some("AudioAccessory5,1"),
+        None,
+        None,
+        Some(REALTIME),
+        Some(BUFFERED_ALAC),
+    );
+    let ap2 = CompatFingerprint::from_info(&ap2_info, &Profile::default(), &[]);
+    let ap1 = CompatFingerprint::from_info(&ap1_info, &Profile::default(), &[]);
+    let profile = Profile {
+        codec: Codec::Auto,
+        transport: Transport::Realtime,
+        timing: Timing::Auto,
+        ..Default::default()
+    };
+    // The bug fix: one member without bit40 makes every member NTP.
+    let plan = TimingPlan::select(&[ap2.timing_evidence(), ap1.timing_evidence()], Codec::Auto);
+    assert_eq!(plan.timing(), Timing::Ntp);
+    for fingerprint in [&ap2, &ap1] {
+        let compat = fingerprint
+            .negotiate_planned(plan, &profile, 44100, false)
+            .unwrap();
+        assert!(!compat.uses_ptp());
+        assert_eq!(compat.timing_name(), "ntp");
+    }
+    // All AirPlay 2: every member stays on PTP.
+    let plan = TimingPlan::select(&[ap2.timing_evidence(), ap2.timing_evidence()], Codec::Auto);
+    assert_eq!(plan.timing(), Timing::Ptp);
+    for fingerprint in [&ap2, &ap2] {
+        assert!(
+            fingerprint
+                .negotiate_planned(plan, &profile, 44100, false)
+                .unwrap()
+                .uses_ptp()
+        );
+    }
+    // A group of one member is the characterized single-receiver behaviour.
+    let single = TimingPlan::single(&ap1, Codec::Auto);
+    assert_eq!(single.timing(), Timing::Ptp);
+    assert!(
+        ap1.negotiate_planned(single, &profile, 44100, false)
+            .unwrap()
+            .uses_ptp()
+    );
 }

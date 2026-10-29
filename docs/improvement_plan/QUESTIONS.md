@@ -1417,6 +1417,43 @@ P3-3 已按 Q31 的位定义实现三分类：`statusFlags & 0x20000 == 0` ⇒ `
 
 ---
 
+### Q33. 组内时钟域：Mixed Apple group 到底该 PTP 还是 NTP？ `[待答复]`
+
+P2-13b 已把协商改成「先探测全组、再算一个 `TimingPlan`、最后逐个 SETUP」。
+实现采用的规则是：
+
+- 任一成员没有 AirPlay 2 证据（bit40 且 `srcvers >= 354.54.6`）→ 整组 NTP；
+- 都在 AP2 分支内 → 任一成员单独会选 NTP 就整组 NTP，否则整组 PTP
+  （即「组内取最保守」）；
+- 单成员完全维持 97 行表刻画的原有行为。
+
+这修掉了「一台有 bit40、一台没有 → 一个 PTP 一个 NTP」的分裂，但也和 WAC
+报告里的一条拓扑结论不一致，需要确认：
+
+1. **Mixed Apple group（HomePod + Apple TV，两台都有完整 AP2 证据）**：报告说
+   WAC 的第二阶段按型号/名称给出「Mixed Apple group → PTP」，而 AF 的 97 行表
+   里 Apple TV 单机是 NTP。AF 现在按「保守取 NTP」处理，整组会退到 NTP。
+   正确做法是跟随 WAC 的 PTP，还是保持保守 NTP？如果把 Apple TV 放进 PTP 组，
+   它是否必须作为 PTP follower 跟发送端时钟（即使它单机时走 NTP）？
+2. **组内是否允许每成员 timing 不同**：AF 现在坚持「一组一个时钟域」，
+   组计划 NTP 时显式 PTP 会被降级、显式 NTP 会被折进组计划，显式 buffered
+   或 `follow_receiver_clock` 在组 NTP 下直接报错。WAC 的 `CreateTopologyPlan`
+   之后，是否可能给不同成员下发不同的 `timingProtocol`（例如 HomePod 对 PTP、
+   Apple TV 对 NTP）？如果是，AF 的「一组一时钟域」需要放宽到什么程度？
+3. **告警可见性**：`group_timing_divergence` 在 SETUP 之前发出，而桌面端
+   `SessionController` 会丢弃 `startedAt == 0` 之前的 warning（`startedAt` 在
+   `streaming`/`standby` 时才置位）。这条告警在真实 UI 上是否应该可见？
+   应该改成 `streaming` 后补发，还是让桌面端对 `channel=setup` 的 warning
+   放宽过滤？WAC 有没有对应的用户可见提示或日志？
+4. **真机验证 AP1 + AP2 混组**：整组 NTP 时，那台本来单机走 PTP 的 AP2 成员
+   （HomePod）是否会接受 NTP 会话？AF 依据的是 WAC 第一阶段
+   `Any(!SupportsAirPlay2) → Classic RAOP/NTP` 的整组降级；需要真机确认
+   HomePod 在组里不会坚持自己的 PTP grandmaster，也不会因此静音。
+
+> **答复**：（待补充）
+
+---
+
 ## 答复区
 
 > 已在每条条目下方就地回填（`> **答复**`）。下面是需要**优先改代码**的 4 条，按影响排序。
