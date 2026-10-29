@@ -262,7 +262,7 @@ fn main() {
                 }
             }
             "probe" | "start" => {
-                let options: ProbeOptions = match serde_json::from_value(request.params) {
+                let mut options: ProbeOptions = match serde_json::from_value(request.params) {
                     Ok(o) => o,
                     Err(e) => {
                         send(
@@ -273,6 +273,9 @@ fn main() {
                         continue;
                     }
                 };
+                // Not a wire parameter: the end-of-session summary needs an id to
+                // correlate a CSV row with the desktop's session log.
+                options.report_session_id = request.session_id.clone();
                 if let Err(e) = if request.command == "start" {
                     options.validate_start()
                 } else {
