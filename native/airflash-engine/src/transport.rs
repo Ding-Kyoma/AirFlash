@@ -216,6 +216,12 @@ impl Health {
             state.failure = Some(fault);
         }
     }
+    /// Deterministic fault injection for the session tests: a media loop built on
+    /// this `Health` fails on its first health check, exactly like a worker fault.
+    #[cfg(test)]
+    pub(crate) fn fail_for_test(&self, fault: Fault) {
+        self.fail(fault);
+    }
     /// Record a control-plane fault without stopping the media stream.
     fn degrade(&self, fault: Fault) {
         let mut state = self.0.lock().unwrap();
