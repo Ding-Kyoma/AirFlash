@@ -917,7 +917,7 @@ Q24（同上）。
   `ClaimsAirPlay2Outdated` 设备 SETUP 失败时仍落到引擎 detail/网络/密码分类；
   是否需要独立门禁文案、组规则是否要把它算作 classic，见 Q39。
 
-## §12.3 会话摘要（已完成，Q40/Q43 修订）
+## §12.3 会话摘要（已完成，Q40/Q43/Q44 修订）
 
 `native/airflash-engine/src/telemetry.rs`、`src/session.rs`、`src/main.rs`、
 `desktop/AirFlash.Core/SessionController.cs`、`desktop/AirFlash.Core/DesktopSessionLog.cs`
@@ -935,21 +935,22 @@ Q24（同上）。
   source_restart, sender_stall`。
   CSV 是 11 个扁平的 `timeline_resets_<reason>` 列（可直接 SUM），加一个
   `last_timeline_reset_reason` 字符串（`none` = 本会话没有重置）；JSON 事件里
-  是 `timeline_resets` 对象加同一个字符串。完整 31 列（顺序即
+  是 `timeline_resets` 对象加同一个字符串。完整 33 列（顺序即
   `telemetry::SUMMARY_COLUMNS` 的唯一声明）：
   `session_id, topology, codec, timing, applied_lead_ms, lead_shift_count,
   lead_shift_total_us, packets, rtx_req, rtx_resent, underruns, gap_filled,
-  reanchored, servo_engagements, baseline_resets, mean_lateness_ms,
-  p99_lateness_ms, max_lateness_ms, duration_s, timeline_resets_start,
-  timeline_resets_track_change, timeline_resets_user_seek,
-  timeline_resets_receiver_rejected_flush, timeline_resets_session_restart,
-  timeline_resets_confirmed_transport_failure,
+  reanchored, stall_rtx_drained, stall_rtx_drained_max, servo_engagements,
+  baseline_resets, mean_lateness_ms, p99_lateness_ms, max_lateness_ms,
+  duration_s, timeline_resets_start, timeline_resets_track_change,
+  timeline_resets_user_seek, timeline_resets_receiver_rejected_flush,
+  timeline_resets_session_restart, timeline_resets_confirmed_transport_failure,
   timeline_resets_silence_resume, timeline_resets_latency_change,
   timeline_resets_flush, timeline_resets_source_restart,
   timeline_resets_sender_stall, last_timeline_reset_reason`。
   `rebuild_count` 已删除。11 个桶按枚举声明顺序排在末尾的
   `last_timeline_reset_reason` 之前；两个 lead 计数字段紧跟
-  `applied_lead_ms`，因为它们描述同一套自适应 lead，不是重置桶。
+  `applied_lead_ms`，因为它们描述同一套自适应 lead，不是重置桶；两个 stall
+  严重度字段紧跟 `reanchored`：前者说卡了几次，它们说每次卡得多响。
   `track_change` / `user_seek` / `receiver_rejected_flush` / `flush` 在 AF
   的实时采集链路里没有站点，恒为 0，**保留作 tripwire**（Q43 §五）；`start`
   同样保留，但引擎不再产生它（见下）。
@@ -961,34 +962,66 @@ Q24（同上）。
   `schedule.add_shift` 真正应用了 lead 变化（「我们主动干的」），后者来自
   standby 暂停后恢复、整条时间线重建（「静音后恢复」）；两者都不增加
   `confirmed_transport_failure`。
-  **重锚不再无条件算传输故障**（Q43 §三）：`LateAction::Reanchor` 成功且
-  shift 非零时，发送线程错过 deadline 可能只是本机调度（GC/CPU 争用/磁盘
-  抖动），也可能是网络真的坏了。判据是重锚前同一窗口的 RTP 侧证据：
-  `rtx_req`（各成员 `retransmit_requests` 之和）或 `underruns_active` 相对
-  基线上涨 ⇒ `confirmed_transport_failure`；两者都干净 ⇒ `sender_stall`。
-  窗口取 **1 s**：发送循环每 250 ms 采样一次累计计数（`RtpEvidence`），
-  重锚时取窗口内最旧的样本作基线，覆盖卡顿前约 1 s。重锚后清空基线，
-  避免把本次卡顿期间积压、重锚后才被 `service_retransmits` 收走的 RTX
-  请求算到下一次重锚头上。`reanchor` 预算耗尽（`timeline_expired`）仍是
-  确定的 `confirmed_transport_failure`。**这是启发式而不是证明**：卡顿前
-  1 s 内的无关丢包会被算作传输证据，超过窗口的长卡顿则没有基线；无法
-  区分时一律保守归 `sender_stall`（宁可漏报一次传输故障，也不污染唯一
-  可信的漂移信号），限制写在代码注释和 Q44。
-  **`latency_change` 有 1 ms 门槛**（Q43 §二）：每次实际应用的 lead 变化都
+  **重锚不再无条件算传输故障**（Q43 §三，Q44 §一）：`LateAction::Reanchor`
+  成功且 shift 非零时，发送线程错过 deadline 可能只是本机调度（GC/CPU 争用/
+  磁盘抖动），也可能是网络真的坏了。Q43 最初的判据是「卡顿前 1 s 窗口里
+  `rtx_req` 或 `underruns_active` **有任何上涨** ⇒ 传输故障」，但它太敏感：
+  1 s 内一次无关的偶发丢包（Wi-Fi 上是常态）就会把本机卡顿判成网络故障，
+  `confirmed_transport_failure` 会被噪声填满。现在的判据是**速率比**：
+  - 预卡顿窗口仍是 **1 s**：发送循环每 250 ms 采样一次累计的 `rtx_req`
+    （各成员 `retransmit_requests` 之和）与 `underruns_active`，重锚时取
+    窗口内最旧的样本作 pre-stall 基线（`RtpEvidence`）；
+  - 分母是该链路自己的**约 30 s 稳态速率**（同一份采样环扩到 30 s，从
+    30 s 窗口内最旧的样本量到 pre-stall 基线为止，不把尖峰本身算进分母，
+    否则 30 s 里的 1 s 尖峰会从 3× 被稀释成 2.8×）。一个一直丢 2 包/s 的
+    网络，卡顿前 1 s 丢 2 包是**正常**，不是故障；
+  - `transport_bad = (rtx_ratio > 3.0 && pre_stall_rtx >= 3) ||
+    (underrun_ratio > 3.0 && pre_stall_underrun >= 1)`，其中
+    `ratio = pre_stall / steady.max(0.05)`。0.05 是防除零的地板；3× 是
+    **起点而不是定值**，等有足够多行数据后按分布调；
+  - `underruns` 权重高于 `rtx_req`：rtx 只说明包丢了（大概率被重传救回来），
+    underrun 说明播放缓冲真的饿了、已经能听见，所以绝对下限是 1 对 3；
+  - 没有 pre-stall 基线（卡顿超过 1 s、第一次循环就卡住、或刚重锚完还在
+    下一个采样间隔内）一律保守归 `sender_stall`；
+  - 重锚只重置 pre-stall 窗口，**30 s 稳态样本保留**：一次卡顿不该丢掉
+    「这条链路正常长什么样」的基线。卡顿期间积压、重锚后才被
+    `service_retransmits` 收走的 RTX 请求因此不会算到下一次重锚头上。
+  `reanchor` 预算耗尽（`timeline_expired`）仍是确定的
+  `confirmed_transport_failure`。**这是启发式而不是证明**：卡顿前 1 s 内的
+  无关丢包仍可能被算作传输证据，超过窗口的长卡顿没有基线；限制写在代码注释
+  和 Q44/Q47。
+  **`latency_change` 有 5 ms 门槛**（Q44 §二）：每次实际应用的 lead 变化都
   累加 `lead_shift_count` / `lead_shift_total_us`（微秒、带符号），但只有
-  |shift| ≥ 1 ms 才记一次 `latency_change`。否则自适应 lead 的亚毫秒微调
-  会把这一桶刷成 CSV 里最大的数字，把 `confirmed_transport_failure` 淹掉。
+  |shift| ≥ 5 ms 才记一次 `latency_change`。5 ms 就是 `continuity.rs` 的
+  splice ramp 长度（`rate / 200` 帧，48 kHz 正好 5.0 ms、44.1 kHz 4.99 ms）：
+  ≤ ramp 的调整被淡入淡出完全吸收，用户听不到，也不构成时间线事件。
+  原来的 1 ms 门槛是错的——`set_lead` 只传整数毫秒，|shift| ≥ 1 ms **恒真**，
+  `lead_shift_count` 与 `latency_change` 永远相等，两个字段的信息量完全
+  重叠。现在前者回答「自适应环路调得多勤」，后者回答「有多少次调整大到
+  可能被听见」。微秒精度保留，但只是内部不变量，不是产品能力（Q44 明确
+  不做亚毫秒 lead）。
+- **`stall_rtx_drained` / `stall_rtx_drained_max`：把「卡了几次」变成「卡得
+  多响」**（Q44 §一）。每次成功重锚（即一次 stall）后，发送循环在同一个
+  迭代里执行 `service_retransmits`，把卡顿期间积压的 RTX 请求收走；重锚时
+  记下 `rtx_req`，drain 之后取增量累加到 `stall_rtx_drained`，并更新
+  `stall_rtx_drained_max`（单次最大）。于是 `sender_stall > 0` 但
+  drained ≈ 0 是**健康**的（接收端缓冲把卡顿吸收了）；少数几次卡顿但
+  drained 很大才是可听的。`reanchored` 是次数，这两个是严重度。计数是
+  下限：超过单次 `service_retransmits` 预算的积压会溢到后续迭代，不计入
+  这次卡顿。
 - **站点清单**（每一处都显式传 reason，不再有隐式计数）：
   - 会话首次 `MediaSchedule::new`：**不计**。它是这一行的基线，不是重置；
     正常停止必须 11 桶全 0（「没有重置」就是全 0）。`start` 因此保留但
     不产生，WAC 的「会话开始」语义由「这一行本身」表达。
   - `schedule.add_shift` 实际应用：每次都进 `lead_shift_count` /
-    `lead_shift_total_us`；|shift| ≥ 1 ms 才记 `latency_change`。
+    `lead_shift_total_us`；|shift| ≥ 5 ms 才记 `latency_change`。
   - `LateAction::Silence`（把错过的槽补成静音）：不计。seq/rtptime 仍线性，
     时间线没有重置。
-  - `LateAction::Reanchor` 成功且 shift 非零：按 1 s 窗口的 RTP 证据分到
-    `confirmed_transport_failure`（有移动）或 `sender_stall`（干净）；
-    reanchor 预算耗尽：`confirmed_transport_failure`。
+  - `LateAction::Reanchor` 成功且 shift 非零：按 1 s 预卡顿窗口相对 30 s
+    稳态的速率比分到 `confirmed_transport_failure`（明显尖峰）或
+    `sender_stall`（背景丢包/干净/无基线）；同一迭代 drain 之后记录这次
+    卡顿的 `stall_rtx_drained` / `_max`；reanchor 预算耗尽：
+    `confirmed_transport_failure`（不记 stall 严重度，会话已结束）。
   - `schedule.relax`：不计。它是重锚 surplus 的慢速回退，再计一次会把一次
     卡顿放大成一串事件。
   - standby 暂停后 `run_live` 恢复：`silence_resume`。
@@ -1039,8 +1072,11 @@ Q24（同上）。
     不改。它不是 11 个 reason 桶之一，不会与它们重复计数。
   - `lead_shift_count` / `lead_shift_total_us` = `SessionTelemetry` 里新增的
     两个 lead 变化计数（次数、带符号微秒和），每次 `add_shift` 实际应用都
-    增加；它们**不是**重置桶，只有 ≥ 1 ms 的那部分同时进
+    增加；它们**不是**重置桶，只有 ≥ 5 ms 的那部分同时进
     `timeline_resets_latency_change`。
+  - `stall_rtx_drained` / `stall_rtx_drained_max` = `SessionTelemetry` 的
+    stall 严重度计数（累计 drain 的 RTX 请求数、单次最大），只由成功重锚
+    站点更新；不是重置桶，也不会和 `reanchored` 重复计数。
   - `timeline_resets_*` = `SessionTelemetry.timeline_resets`（11 桶），只由
     上面站点清单里的显式 `record_timeline_reset` 增加；
     `last_timeline_reset_reason` = 最近一次的原因。`SessionTelemetry.expired`
@@ -1063,19 +1099,23 @@ Q24（同上）。
   `silence_resume` / `source_restart` / `sender_stall` 都不增加
   `confirmed_transport_failure`、standby 恢复的 attempt 记
   `silence_resume`、采集源重开记 `source_restart` 且 `start` 保持 0、
-  成功重锚在 RTP 计数有移动时记 `confirmed_transport_failure`、干净时记
-  `sender_stall`（两种都构造）、亚毫秒 lead 变化只加
-  `lead_shift_count`/`lead_shift_total_us` 而 `latency_change` 保持 0、
-  ≥ 1 ms 的 shift 记 `latency_change`、CSV 31 列按声明顺序且无
+  成功重锚按速率比分类（持续背景丢包 + 小幅增量 ⇒ `sender_stall`、明显
+  尖峰 ⇒ `confirmed_transport_failure`、只有 1 次 underrun 也 ⇒
+  `confirmed_transport_failure`、无基线 ⇒ `sender_stall`，四种都构造）、
+  3 ms 的 lead 变化只加 `lead_shift_count`/`lead_shift_total_us` 而
+  `latency_change` 保持 0、5 ms 与 7 ms 各记一次 `latency_change`、
+  stall 严重度按累计/单次对账且无卡顿时为 0、CSV 33 列按声明顺序且无
   `rebuild_count`、桌面记录与引擎 `start` 使用的 session id 一致（引擎行再加
   `-<epoch>` 后缀）、桌面 fault 序列超过 5 条截断并保留计数、写文件失败不影响
   会话；telemetry 侧覆盖 JSON 字段/redact 形状、CSV 列序与无身份字段、追加时
   只写一次表头；桌面侧覆盖表头/转义/不可写路径。
-- **验证**：Rust lib 230 passed + 1 ignored、main 2、集成 38 passed + 1 ignored，
-  合计 270 passed / 2 ignored；clippy `-D warnings` 无告警；
-  `build-native.ps1 -Check` 通过；.NET 554 通过；pytest 141 通过；ruff 无问题。
-  .NET 首次全量运行时 `EngineStandbyReleasesMuteAndMetricsCannotOverrideState`
-  偶发一次事件时序空引用，单跑与全量重跑均通过（历史记录）。
+- **验证**（合并 main 后重跑）：Rust lib 246 passed + 1 ignored、main 2、集成
+  40 passed + 1 ignored，合计 288 passed / 2 ignored；clippy `-D warnings`
+  无告警；`build-native.ps1 -Check` 通过；.NET 566 通过；pytest 141 通过；
+  ruff 无问题。本轮没有复现已知偶发（`session_simulation.rs` 的 `AddrInUse`
+  与 .NET standby 的事件时序空引用）；历史记录保留：
+  `EngineStandbyReleasesMuteAndMetricsCannotOverrideState` 曾在首次全量时
+  偶发一次事件时序空引用，单跑与全量重跑均通过。
 
 ## P3-2c 混组不可表示（桌面，已完成）
 

@@ -1840,11 +1840,19 @@ fn send_packets(
     let mut next_metrics = start + Duration::from_secs(1);
     // Applied lead in microseconds: the IPC request is whole milliseconds today,
     // but keeping the accumulator exact means a future finer-grained request (and
-    // the 1 ms reset threshold below) does not lose a remainder.
+    // the microsecond reset comparison below) does not lose a remainder. This is
+    // an internal invariant, not a promise of sub-millisecond lead control
+    // (Q44 §二).
     let mut applied_lead_us = 0i64;
     // RTP-side evidence for distinguishing a transport failure from a local
-    // sender stall when a successful re-anchor absorbs a missed deadline (Q43).
+    // sender stall when a successful re-anchor absorbs a missed deadline (Q43,
+    // Q44). The pre-stall window is compared against the sender's own steady
+    // state, so a link with constant background loss is not a fault.
     let mut rtp_evidence = crate::telemetry::RtpEvidence::default();
+    // Retransmit counter when the current stall was re-anchored. The requests
+    // that arrived during the stall are drained on the same iteration, so the
+    // delta after `service_retransmits` is the stall's severity (Q44 §一).
+    let mut stall_rtx_base: Option<u64> = None;
     let mut last_marker = 0u64;
     let mut next_sync = start;
     let mut silence_packets = 0u64;
@@ -2017,9 +2025,10 @@ fn send_packets(
                     telemetry.lead_extra_ms = applied_lead_us as f64 / 1_000.0;
                     // The timeline anchor moved because *we* asked for a different
                     // playout lead, not because delivery failed. Every shift moves
-                    // the lead counters, but only a >= 1 ms shift is a timeline
-                    // reset: otherwise the adaptive ladder's micro-adjustments
-                    // would drown every fault signal (Q43 §二).
+                    // the lead counters, but only a shift at least as long as the
+                    // splice ramp (5 ms) is a timeline reset: smaller adjustments
+                    // are inaudible and would make `latency_change` equal
+                    // `lead_shift_count` (Q44 §二).
                     telemetry.record_lead_shift(applied_us);
                     emit(json!({"event":"lead_changed","channel":"scheduler","host":null,"requested_ms":wanted,"applied_ms":applied_lead_us / 1_000,"shift_us":applied_us,"ceiling_ms":ceiling,"shift_ms":round3(schedule.shift.as_secs_f64() * 1000.0)}));
                 }
@@ -2111,15 +2120,16 @@ fn send_packets(
                         telemetry.reanchored = schedule.reanchored;
                         telemetry.reanchor_shift_us = schedule.reanchor_shift_us;
                         if !shift.is_zero() {
-                            // Q43 §三: a successful re-anchor is not automatically
-                            // a transport failure. A missed deadline can be the
-                            // local scheduler (GC, CPU contention, disk), which
-                            // must not pollute the only drift signal. Only RTP
-                            // movement in the window leading into the stall is
-                            // transport evidence; clean counters mean a sender
-                            // stall. The heuristic is documented on
-                            // `RtpEvidence`; the fallback is deliberately the
-                            // conservative `sender_stall`.
+                            // Q43 §三, Q44 §一: a successful re-anchor is not
+                            // automatically a transport failure. A missed deadline
+                            // can be the local scheduler (GC, CPU contention,
+                            // disk), which must not pollute the only drift signal.
+                            // Only an RTP spike above this link's own steady rate
+                            // in the window leading into the stall is transport
+                            // evidence; clean or steady counters mean a sender
+                            // stall. The heuristic is documented on `RtpEvidence`;
+                            // the fallback is deliberately the conservative
+                            // `sender_stall`.
                             let rtp_req: u64 = members
                                 .iter()
                                 .map(|member| member.media.metrics.retransmit_requests)
@@ -2129,10 +2139,12 @@ fn send_packets(
                                 rtp_req,
                                 telemetry.underruns_active,
                             );
-                            // Drop the pre-stall baseline: the RTCP requests that
-                            // arrive during this stall are only drained after it,
-                            // and must not be counted against the next re-anchor.
-                            rtp_evidence.reset();
+                            // Start a new pre-stall window: the RTCP requests that
+                            // arrived during this stall are drained after it, and
+                            // must not be counted against the next re-anchor. The
+                            // long steady baseline is kept.
+                            rtp_evidence.reset(now);
+                            stall_rtx_base = Some(rtp_req);
                             telemetry.record_timeline_reset(reason);
                             recovery_left = 0;
                             if let Some(source) = &live {
@@ -2273,6 +2285,18 @@ fn send_packets(
             }
             for member in members.iter_mut() {
                 member.media.service_retransmits();
+            }
+            // Q44 §一: the first drain call after a stall is the backlog that
+            // stall created, i.e. how loud it was. A backlog larger than the
+            // per-call budget spills into later iterations and is not attributed
+            // to this stall, so the count is a lower bound.
+            if let Some(base) = stall_rtx_base.take() {
+                let drained = members
+                    .iter()
+                    .map(|member| member.media.metrics.retransmit_requests)
+                    .sum::<u64>()
+                    .saturating_sub(base);
+                telemetry.record_stall_drain(drained);
             }
             schedule.sent();
             packets += 1;
@@ -2428,8 +2452,9 @@ fn session_summary(
         codec: first.map_or("pcm", |member| member.compat.codec_name()),
         timing: first.map_or("ntp", |member| member.compat.timing_name()),
         applied_lead_ms,
-        // Q43 §二: the adaptive ladder's twitching lives here, not in the reset
-        // buckets. Every applied shift counts; only >= 1 ms shifts are resets.
+        // Q44 §二: the adaptive ladder's twitching lives here, not in the reset
+        // buckets. Every applied shift counts; only shifts at least as long as
+        // the splice ramp (5 ms) are resets.
         lead_shift_count: telemetry.lead_shift_count,
         lead_shift_total_us: telemetry.lead_shift_total_us,
         // One scheduler tick per media packet; `packets` is the existing
@@ -2447,6 +2472,11 @@ fn session_summary(
         underruns: telemetry.underruns_active,
         gap_filled: telemetry.gap_filled,
         reanchored: telemetry.reanchored,
+        // Q44 §一: severity, not just count. `reanchored` says how often the
+        // sender stalled; these say how loud the stalls were. A high stall count
+        // with a near-zero drain is healthy (the buffer absorbed it).
+        stall_rtx_drained: telemetry.stall_rtx_drained,
+        stall_rtx_drained_max: telemetry.stall_rtx_drained_max,
         servo_engagements: telemetry.servo_engagements,
         // Servo "steps" is the existing full-loop reset after a discontinuity
         // (filter, correction and engagement cleared). It is the closest counter
@@ -4312,6 +4342,9 @@ mod tests {
             summaries[0]["last_timeline_reset_reason"],
             crate::telemetry::NO_TIMELINE_RESET
         );
+        // No stall happened, so the severity counters stay at zero (Q44 §一).
+        assert_eq!(summaries[0]["stall_rtx_drained"], json!(0));
+        assert_eq!(summaries[0]["stall_rtx_drained_max"], json!(0));
         assert!(summaries[0].get("rebuild_count").is_none());
         drop(members);
         server.join().unwrap();
@@ -4390,6 +4423,9 @@ mod tests {
         }
         telemetry.gap_filled = 11;
         telemetry.reanchored = 2;
+        // Q44 §一: stall severity is copied verbatim, separately from the count.
+        telemetry.stall_rtx_drained = 12;
+        telemetry.stall_rtx_drained_max = 7;
         telemetry.underruns_active = 4;
         telemetry.underruns_idle = 9;
         telemetry.servo_engagements = 3;
@@ -4429,6 +4465,8 @@ mod tests {
         assert_eq!(summary.underruns, 4);
         assert_eq!(summary.gap_filled, 11);
         assert_eq!(summary.reanchored, 2);
+        assert_eq!(summary.stall_rtx_drained, 12);
+        assert_eq!(summary.stall_rtx_drained_max, 7);
         assert_eq!(summary.servo_engagements, 3);
         assert_eq!(summary.baseline_resets, 6);
         assert_eq!(summary.mean_lateness_ms, 2.0);
@@ -4446,6 +4484,8 @@ mod tests {
         assert_eq!(summary.last_timeline_reset_reason, "latency_change");
         let event = summary.event();
         assert!(event.get("rebuild_count").is_none());
+        assert_eq!(event["stall_rtx_drained"], json!(12));
+        assert_eq!(event["stall_rtx_drained_max"], json!(7));
         assert_eq!(
             event["timeline_resets"]["confirmed_transport_failure"],
             json!(1)
@@ -4553,23 +4593,29 @@ mod tests {
     }
 
     #[test]
-    fn sub_millisecond_lead_shift_is_counted_without_a_latency_change_reset() {
+    fn a_lead_shift_below_the_splice_ramp_is_counted_without_a_latency_change_reset() {
         let mut schedule = MediaSchedule::new(Instant::now(), 44_100);
         let mut telemetry = crate::telemetry::SessionTelemetry::new();
-        let applied = schedule.add_shift_us(999);
-        assert_eq!(applied, 999, "a microsecond shift must survive exactly");
+        // 3 ms is shorter than the 5 ms continuity splice ramp: audible lead
+        // activity, not a timeline event.
+        let applied = schedule.add_shift_us(3_000);
+        assert_eq!(applied, 3_000, "a microsecond shift must survive exactly");
         telemetry.record_lead_shift(applied);
         assert_eq!(telemetry.lead_shift_count, 1);
-        assert_eq!(telemetry.lead_shift_total_us, 999);
+        assert_eq!(telemetry.lead_shift_total_us, 3_000);
         assert_eq!(
             telemetry.timeline_resets.latency_change, 0,
-            "sub-millisecond noise must not fill the reset bucket"
+            "a shift inside the splice ramp must not fill the reset bucket"
         );
-        let applied = schedule.add_shift_us(1_000);
+        // 5 ms is exactly the ramp length and 7 ms is past it; both are resets.
+        let applied = schedule.add_shift_us(5_000);
         telemetry.record_lead_shift(applied);
         assert_eq!(telemetry.timeline_resets.latency_change, 1);
-        assert_eq!(telemetry.lead_shift_count, 2);
-        assert_eq!(telemetry.lead_shift_total_us, 1_999);
+        let applied = schedule.add_shift_us(7_000);
+        telemetry.record_lead_shift(applied);
+        assert_eq!(telemetry.timeline_resets.latency_change, 2);
+        assert_eq!(telemetry.lead_shift_count, 3);
+        assert_eq!(telemetry.lead_shift_total_us, 15_000);
     }
 
     #[test]
