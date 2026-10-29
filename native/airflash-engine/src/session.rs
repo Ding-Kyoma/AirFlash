@@ -1103,6 +1103,7 @@ fn send_packets(
         vec![crate::volume::Worker::start(volume_peers, volume)?]
     };
     let mut next_metrics = start + Duration::from_secs(1);
+    let mut applied_lead = 0i64;
     let mut last_marker = 0u64;
     let mut next_sync = start;
     let mut silence_packets = 0u64;
@@ -1171,6 +1172,18 @@ fn send_packets(
                     .media
                     .service_buffered(Instant::now())
                     .map_err(|e| Fault::from_error(member.peer.host, "buffered", &e))?;
+            }
+            // Adaptive latency: the desktop side asks for more or less media held at
+            // the receiver; the shift is applied to the live timeline, so no session
+            // rebuild and no audible restart is needed.
+            let wanted = requested_lead();
+            if wanted != applied_lead {
+                let applied = schedule.add_shift(wanted - applied_lead);
+                if applied != 0 {
+                    applied_lead += applied;
+                    telemetry.lead_extra_ms = applied_lead as f64;
+                    emit(json!({"event":"lead_changed","channel":"scheduler","host":null,"requested_ms":wanted,"applied_ms":applied_lead,"shift_ms":round3(schedule.shift.as_secs_f64() * 1000.0)}));
+                }
             }
             let deadline = schedule.deadline();
             let now = Instant::now();
@@ -1245,7 +1258,11 @@ fn send_packets(
                     }
                 }
             }
-            schedule.relax(now, late);
+            // A deliberate lead change (adaptive latency ladder) keeps its value;
+            // only an automatic re-anchor surplus is slewed back.
+            if applied_lead == 0 {
+                schedule.relax(now, late);
+            }
             if now >= next_sync {
                 for m in members.iter_mut() {
                     let local = offset_time(
@@ -1507,6 +1524,24 @@ fn transport_metrics(
 }
 fn round3(value: f64) -> f64 {
     (value * 1000.0).round() / 1000.0
+}
+/// Extra media lead requested by the adaptive latency ladder, in milliseconds.
+///
+/// The engine runs one session at a time (the IPC front end serialises `start`),
+/// so a process-wide cell keeps `set_lead` from having to thread another parameter
+/// through six call sites. Zero means "whatever the timeline needs".
+static LEAD_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// Ceiling for an operator-requested lead. Two seconds matches the re-anchor cap:
+/// beyond that the receiver's own buffer is the limit, not ours.
+pub const MAX_LEAD_MS: i64 = 2000;
+pub fn request_lead(ms: i64) {
+    LEAD_MS.store(ms.clamp(0, MAX_LEAD_MS), std::sync::atomic::Ordering::Release);
+}
+pub fn requested_lead() -> i64 {
+    LEAD_MS.load(std::sync::atomic::Ordering::Acquire)
+}
+pub fn reset_lead() {
+    LEAD_MS.store(0, std::sync::atomic::Ordering::Release);
 }
 /// A receiver that has accepted RTP this recently is still listening, even if the
 /// control channel is unhappy.

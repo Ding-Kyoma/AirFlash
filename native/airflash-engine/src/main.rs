@@ -189,7 +189,7 @@ fn main() {
             "hello" => send(
                 &request.id,
                 &request.session_id,
-                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"experimental","live_loopback":true,"capabilities":capabilities(),"commands":["hello","get_receiver_capabilities","list_applications","start","probe","stop","set_gain","set_equalizer","set_standby","set_device_volume","pair","pair_pin"],"production_ready":false}),
+                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"experimental","live_loopback":true,"capabilities":capabilities(),"commands":["hello","get_receiver_capabilities","list_applications","start","probe","stop","set_gain","set_equalizer","set_standby","set_device_volume","set_lead","pair","pair_pin"],"production_ready":false}),
             ),
             "get_receiver_capabilities" => {
                 let result = (|| -> anyhow::Result<_> {
@@ -390,6 +390,29 @@ fn main() {
                             json!({"event":"error","message":"gain must be 0..1"}),
                         );
                     }
+                }
+            }
+            "set_lead" => {
+                // Adaptive latency: shift the live timeline instead of restarting.
+                let requested = request
+                    .params
+                    .get("ms")
+                    .or_else(|| request.params.get("lead_ms"))
+                    .and_then(Value::as_i64);
+                match requested {
+                    Some(ms) => {
+                        airflash_engine::session::request_lead(ms);
+                        send(
+                            &request.id,
+                            &request.session_id,
+                            json!({"event":"lead_requested","ms":airflash_engine::session::requested_lead()}),
+                        );
+                    }
+                    None => send(
+                        &request.id,
+                        &request.session_id,
+                        json!({"event":"error","message":"set_lead needs an integer ms"}),
+                    ),
                 }
             }
             "pair_pin" => {

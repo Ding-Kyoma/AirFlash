@@ -885,6 +885,29 @@ impl MediaSchedule {
         self.shift = self.shift.saturating_sub(self.frame_duration());
         self.next_relax = Some(now + RELAX_INTERVAL);
     }
+    /// Apply an operator-requested lead change (adaptive latency ladder). Positive
+    /// values delay playout, which is what the receiver sees; the sync anchor moves
+    /// with the deadline so the timeline stays consistent. Returns the signed change
+    /// actually applied, in milliseconds, clamped to the same ceiling as a re-anchor.
+    pub fn add_shift(&mut self, delta_ms: i64) -> i64 {
+        let before = self.shift;
+        let target = if delta_ms >= 0 {
+            self.shift.saturating_add(Duration::from_millis(delta_ms as u64))
+        } else {
+            self.shift
+                .saturating_sub(Duration::from_millis(delta_ms.unsigned_abs()))
+        }
+        .min(MAX_SHIFT);
+        self.shift = target;
+        // A deliberate lead change resets the settle timer so the new value is not
+        // immediately relaxed back.
+        self.next_relax = None;
+        if target >= before {
+            (target - before).as_millis() as i64
+        } else {
+            -((before - target).as_millis() as i64)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1108,6 +1131,24 @@ mod schedule_tests {
         }
         assert!(applied);
         panic!("lead must never grow without a ceiling");
+    }
+    #[test]
+    fn operator_lead_changes_move_the_anchor_and_stay_bounded() {
+        let start = Instant::now();
+        let mut s = MediaSchedule::new(start, 44_100);
+        let deadline = s.deadline();
+        assert_eq!(s.add_shift(40), 40);
+        assert_eq!(s.deadline(), deadline + Duration::from_millis(40));
+        assert_eq!(s.anchor_shift_ns(), 40_000_000);
+        // Negative deltas come back off the same ledger.
+        assert_eq!(s.add_shift(-15), -15);
+        assert_eq!(s.shift, Duration::from_millis(25));
+        // Never below zero.
+        assert_eq!(s.add_shift(-1000), -25);
+        assert_eq!(s.shift, Duration::ZERO);
+        // And never above the re-anchor ceiling.
+        assert_eq!(s.add_shift(10_000), MAX_SHIFT.as_millis() as i64);
+        assert_eq!(s.shift, MAX_SHIFT);
     }
     #[test]
     fn reanchor_does_not_count_a_no_op() {
