@@ -77,6 +77,11 @@ pub struct ProbeOptions {
     pub handshake_only: bool,
     #[serde(default)]
     pub record_mic_path: Option<PathBuf>,
+    /// Correlation id supplied by the IPC host (the request's `session_id`).
+    /// `serde(skip)` keeps the wire parameters unchanged: the engine front end
+    /// fills this in after deserializing, and standalone callers leave it empty.
+    #[serde(skip)]
+    pub report_session_id: String,
 }
 fn default_source() -> String {
     "wav".into()
@@ -1941,50 +1946,59 @@ fn send_packets(
     })();
     // Stop/reconfiguration shares one faded final packet and drains its render
     // deadline on every member before tearing down the common session.
-    if outcome.is_ok() {
-        if let Some(source) = &live {
-            let render = offset_deadline(schedule.deadline(), common_latency, 0)?;
-            let (fade, _) = source.silence_packet(0.0)?;
-            let mut sent = true;
-            for member in members.iter_mut() {
-                sent &= member
-                    .media
-                    .send(
-                        &member.peer.profile.channel.map(&fade),
-                        false,
-                        Instant::now(),
-                        offset_deadline(
-                            schedule.deadline(),
-                            common_latency - member.media.latency(),
-                            member.peer.profile.sync_offset_ms,
-                        )?,
-                        &Health::default(),
-                    )
-                    .is_ok();
-            }
-            if sent {
-                let until = render
-                    + Duration::from_nanos(FRAMES as u64 * 1_000_000_000 / u64::from(rate))
-                    + Duration::from_millis(
-                        members
-                            .iter()
-                            .map(|m| m.peer.profile.sync_offset_ms.max(0) as u64)
-                            .max()
-                            .unwrap_or(0),
-                    );
-                while Instant::now() < until {
-                    if members
-                        .iter_mut()
-                        .any(|m| m.media.service_buffered(Instant::now()).is_err())
-                    {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(2));
+    //
+    // The drain is fallible (the final packet still goes through the packetizer),
+    // but its error must not skip the end-of-session record below. Keep it and
+    // return it after the summary has been emitted.
+    let drained = if outcome.is_ok() {
+        (|| -> Result<()> {
+            if let Some(source) = &live {
+                let render = offset_deadline(schedule.deadline(), common_latency, 0)?;
+                let (fade, _) = source.silence_packet(0.0)?;
+                let mut sent = true;
+                for member in members.iter_mut() {
+                    sent &= member
+                        .media
+                        .send(
+                            &member.peer.profile.channel.map(&fade),
+                            false,
+                            Instant::now(),
+                            offset_deadline(
+                                schedule.deadline(),
+                                common_latency - member.media.latency(),
+                                member.peer.profile.sync_offset_ms,
+                            )?,
+                            &Health::default(),
+                        )
+                        .is_ok();
                 }
+                if sent {
+                    let until = render
+                        + Duration::from_nanos(FRAMES as u64 * 1_000_000_000 / u64::from(rate))
+                        + Duration::from_millis(
+                            members
+                                .iter()
+                                .map(|m| m.peer.profile.sync_offset_ms.max(0) as u64)
+                                .max()
+                                .unwrap_or(0),
+                        );
+                    while Instant::now() < until {
+                        if members
+                            .iter_mut()
+                            .any(|m| m.media.service_buffered(Instant::now()).is_err())
+                        {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                }
+                emit(json!({"event":"timeline_drained","faded":sent}));
             }
-            emit(json!({"event":"timeline_drained","faded":sent}));
-        }
-    }
+            Ok(())
+        })()
+    } else {
+        Ok(())
+    };
     if let Some(source) = &live {
         sample_capture(source, &mut capture_baseline, &mut telemetry);
         emit(json!({"event":"capture_metrics","metrics":source.metrics()}));
@@ -2017,11 +2031,106 @@ fn send_packets(
         fields.insert("qualified".into(), json!(false));
     }
     emit(summary);
+    // Roadmap §12.3: exactly one summary per stream attempt. A normal stop, an
+    // in-loop fault and the teardown above all reach this single call site with
+    // `outcome` already decided, so no path can emit a second record.
+    let summary = session_summary(options, members, &telemetry, applied_lead, start.elapsed());
+    let path = (!options.report_session_id.is_empty()).then(crate::telemetry::summary_path);
+    emit_session_summary(&summary, path.as_deref(), emit);
     drop(volume_workers);
     for m in members.iter_mut() {
         m.close();
     }
+    drained?;
     outcome
+}
+
+/// Build the §12.3 summary from counters that already exist. Nothing is sampled
+/// here, so calling it after the audio loop cannot disturb the audio path.
+fn session_summary(
+    options: &ProbeOptions,
+    members: &[Member],
+    telemetry: &crate::telemetry::SessionTelemetry,
+    applied_lead_ms: i64,
+    duration: Duration,
+) -> crate::telemetry::SessionSummary {
+    let first = members.first();
+    // The desktop regenerates its session id per reconnect; the epoch suffix
+    // keeps resumed attempts inside one IPC `start` distinguishable as well.
+    let session_id = if options.report_session_id.is_empty() {
+        format!("local-{}", telemetry.session_epoch)
+    } else {
+        format!("{}-{}", options.report_session_id, telemetry.session_epoch)
+    };
+    // Existing negotiated topology labels. An unset group mode (a standalone
+    // qualification call) falls back to the member count.
+    let topology = match options.group_mode.as_str() {
+        "software_stereo" => "software_stereo",
+        "native_stereo" => "native_stereo",
+        "single" => "single",
+        _ if members.len() > 1 => "group",
+        _ => "single",
+    };
+    crate::telemetry::SessionSummary {
+        session_id,
+        topology,
+        // The group plan negotiates one codec/timing for the whole session, so
+        // the first member is representative.
+        codec: first.map_or("pcm", |member| member.compat.codec_name()),
+        timing: first.map_or("ntp", |member| member.compat.timing_name()),
+        applied_lead_ms,
+        // One scheduler tick per media packet; `packets` is the existing
+        // per-member counter that `transport_metrics` already publishes.
+        packets: telemetry.packets,
+        rtx_req: members
+            .iter()
+            .map(|member| member.media.metrics.retransmit_requests)
+            .sum(),
+        rtx_resent: members
+            .iter()
+            .map(|member| member.media.metrics.retransmits_sent)
+            .sum(),
+        // Only concealed underruns count: an idle keepalive gap is not a dropout.
+        underruns: telemetry.underruns_active,
+        gap_filled: telemetry.gap_filled,
+        reanchored: telemetry.reanchored,
+        servo_engagements: telemetry.servo_engagements,
+        // Servo "steps" is the existing full-loop reset after a discontinuity
+        // (filter, correction and engagement cleared). It is the closest counter
+        // to the roadmap's `baseline_resets`; there is no separate counter.
+        baseline_resets: telemetry.servo_step_resets,
+        mean_lateness_ms: round3(telemetry.lateness.mean_ms()),
+        p99_lateness_ms: round3(telemetry.lateness.percentile_ms(0.99)),
+        // `percentile_ms(1.0)` returns the true maximum, including out-of-range
+        // samples, without exposing histogram internals.
+        max_lateness_ms: round3(telemetry.lateness.percentile_ms(1.0)),
+        duration_s: round3(duration.as_secs_f64()),
+        // No counter counts audio-session rebuilds: this record *is* the session,
+        // and the reconnect happens outside it. `expired` is the engine's only
+        // in-session counter for "this timeline needed a fresh session", which is
+        // the drift symptom the report correlates with `rebuild_count`.
+        rebuild_count: telemetry.expired,
+    }
+}
+
+/// Best-effort end-of-session record. The IPC event is always emitted; the CSV
+/// append is attempted only when `path` is given, and every I/O error is logged
+/// to stderr (the desktop drains engine stderr into its log) and swallowed.
+fn emit_session_summary(
+    summary: &crate::telemetry::SessionSummary,
+    path: Option<&std::path::Path>,
+    emit: &impl Fn(Json),
+) {
+    emit(crate::telemetry::redact(&summary.event()));
+    let Some(path) = path else {
+        return;
+    };
+    if let Err(error) = crate::telemetry::append_summary_row(path, summary) {
+        eprintln!(
+            "session_summary: could not append {}: {error}",
+            path.display()
+        );
+    }
 }
 
 /// One warning in the existing shape. `reason` is `takeover` (the live loop
@@ -3299,6 +3408,221 @@ mod tests {
             source.discard_stale();
         }
     }
+    /// A session shaped for the summary tests: one loopback peer, no audio
+    /// device, and an optional IPC identity (empty means "do not touch the file").
+    fn summary_options(report_id: &str, group_mode: &str, duration_ms: u32) -> ProbeOptions {
+        let mut options: ProbeOptions = serde_json::from_value(json!({
+            "peers": [{"host": "127.0.0.1"}],
+            "source": "loopback",
+            "duration_ms": duration_ms,
+            "latency_ms": 120,
+            "gain": 0.0
+        }))
+        .unwrap();
+        options.group_mode = group_mode.into();
+        options.report_session_id = report_id.into();
+        options
+    }
+
+    fn summary_events(events: &std::sync::Arc<std::sync::Mutex<Vec<Json>>>) -> Vec<Json> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event["event"] == "session_summary")
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn a_normal_stop_emits_exactly_one_session_summary() {
+        let options = summary_options("", "single", 40);
+        let (member, receiver, server) = local_member();
+        member
+            .media
+            .connect_audio(receiver.local_addr().unwrap())
+            .unwrap();
+        let gain = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0.0f32.to_bits()));
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let mut members = vec![member];
+        let mut takeovers = preemption::TakeoverCounters::default();
+        let outcome = send_packets(
+            &options,
+            &Cancellation::default(),
+            &gain,
+            crate::volume::Control::default(),
+            None,
+            &crate::standby::Control::default(),
+            &Clock::new(),
+            None,
+            &mut members,
+            None,
+            &mut takeovers,
+            &[],
+            &|event| sink.lock().unwrap().push(event),
+        );
+        assert!(matches!(&outcome, Ok(StreamEnd::Finished)), "{outcome:?}");
+        let summaries = summary_events(&events);
+        assert_eq!(
+            summaries.len(),
+            1,
+            "a normal stop must emit exactly one summary: {summaries:?}"
+        );
+        for column in crate::telemetry::SUMMARY_COLUMNS {
+            assert!(summaries[0].get(column).is_some(), "missing {column}");
+        }
+        drop(members);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn one_summary_on_the_fault_path_and_teardown_adds_none() {
+        let options = summary_options("", "single", 0);
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let health = Health::default();
+        let (member, server, methods) =
+            local_member_with_health(receiver.local_addr().unwrap(), None, health.clone());
+        member
+            .media
+            .connect_audio(receiver.local_addr().unwrap())
+            .unwrap();
+        // The media loop checks this on its first iteration and fails exactly like
+        // a worker-detected fault would.
+        health.fail_for_test(Fault::new(
+            "127.0.0.1",
+            "control",
+            "synthetic_fault",
+            true,
+            "synthetic fault",
+        ));
+        let gain = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0.0f32.to_bits()));
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let mut members = vec![member];
+        let mut takeovers = preemption::TakeoverCounters::default();
+        let outcome = send_packets(
+            &options,
+            &Cancellation::default(),
+            &gain,
+            crate::volume::Control::default(),
+            None,
+            &crate::standby::Control::default(),
+            &Clock::new(),
+            None,
+            &mut members,
+            None,
+            &mut takeovers,
+            &[],
+            &|event| sink.lock().unwrap().push(event),
+        );
+        assert!(outcome.is_err(), "the injected fault must end the session");
+        let summaries = summary_events(&events);
+        assert_eq!(
+            summaries.len(),
+            1,
+            "the fault path must emit exactly one summary: {summaries:?}"
+        );
+        drop(members);
+        server.join().unwrap();
+        // The normal teardown still ran after the fault; it must not add a row.
+        assert!(
+            methods
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|method| method == "TEARDOWN"),
+            "normal teardown did not run"
+        );
+    }
+
+    #[test]
+    fn session_summary_copies_every_number_from_its_existing_counter() {
+        let options = summary_options("abc", "software_stereo", 0);
+        let (mut member, _receiver, _server) = local_member();
+        member.media.metrics.retransmit_requests = 7;
+        member.media.metrics.retransmits_sent = 5;
+        let mut telemetry = crate::telemetry::SessionTelemetry::new();
+        for lateness_ms in [1.0, 2.0, 3.0] {
+            telemetry.observe_lateness(lateness_ms);
+        }
+        telemetry.gap_filled = 11;
+        telemetry.reanchored = 2;
+        telemetry.underruns_active = 4;
+        telemetry.underruns_idle = 9;
+        telemetry.servo_engagements = 3;
+        telemetry.servo_step_resets = 6;
+        telemetry.expired = 1;
+        telemetry.lead_extra_ms = 45.0;
+        let summary = session_summary(
+            &options,
+            std::slice::from_ref(&member),
+            &telemetry,
+            45,
+            Duration::from_millis(12_500),
+        );
+        assert_eq!(
+            summary.session_id,
+            format!("abc-{}", telemetry.session_epoch)
+        );
+        assert_eq!(summary.topology, "software_stereo");
+        // `unnegotiated()` is the NTP/PCM profile used by these local peers.
+        assert_eq!(summary.codec, "pcm");
+        assert_eq!(summary.timing, "ntp");
+        assert_eq!(summary.applied_lead_ms, 45);
+        assert_eq!(summary.packets, 3);
+        assert_eq!(summary.rtx_req, 7);
+        assert_eq!(summary.rtx_resent, 5);
+        // Idle keepalive underruns are not dropouts and must not be counted.
+        assert_eq!(summary.underruns, 4);
+        assert_eq!(summary.gap_filled, 11);
+        assert_eq!(summary.reanchored, 2);
+        assert_eq!(summary.servo_engagements, 3);
+        assert_eq!(summary.baseline_resets, 6);
+        assert_eq!(summary.mean_lateness_ms, 2.0);
+        assert_eq!(
+            summary.p99_lateness_ms,
+            round3(telemetry.lateness.percentile_ms(0.99))
+        );
+        assert_eq!(summary.max_lateness_ms, 3.0);
+        assert_eq!(summary.duration_s, 12.5);
+        assert_eq!(summary.rebuild_count, 1);
+    }
+
+    #[test]
+    fn a_summary_file_failure_never_fails_the_session() {
+        let options = summary_options("", "single", 0);
+        let (member, _receiver, _server) = local_member();
+        let telemetry = crate::telemetry::SessionTelemetry::new();
+        let summary = session_summary(
+            &options,
+            std::slice::from_ref(&member),
+            &telemetry,
+            0,
+            Duration::from_secs(1),
+        );
+        let root = std::env::temp_dir().join(format!("airflash-blocked-summary-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        // A regular file where the logs directory should be makes create_dir_all
+        // and the append fail deterministically.
+        let blocker = root.join("logs");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("session-summary.csv");
+        assert!(
+            crate::telemetry::append_summary_row(&path, &summary).is_err(),
+            "the fixture must make the append fail"
+        );
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        // The wrapper returns (), so no I/O failure can propagate into the audio
+        // or control path; the event is still emitted.
+        emit_session_summary(&summary, Some(&path), &|event| {
+            sink.lock().unwrap().push(event)
+        });
+        assert_eq!(summary_events(&events).len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     struct TemporaryRoot(PathBuf);
     impl TemporaryRoot {
         fn new() -> Self {
@@ -3467,6 +3791,7 @@ mod tests {
             group_mode: String::new(),
             handshake_only: false,
             record_mic_path: None,
+            report_session_id: String::new(),
         };
         assert!(o.validate().is_err());
         o.duration_ms = 5000;
