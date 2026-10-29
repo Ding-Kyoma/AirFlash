@@ -475,7 +475,7 @@ WAC 的进程回环走 `INCLUDE_TARGET_PROCESS_TREE`，AirFlash 现在是 `AUTOC
 >
 > 建议的实现：`(priority1, clockClass, stepsRemoved)` 字典序，相等时用 `gid` 打破平局；**3 个 Announce 周期超时回 Listening** 合理。
 >
-> **yield 后是否还发 Announce**：无证据。但 `SETPEERS` 存在说明它会**主动告知对端"谁是对端"**——这比标准 BMCA 实用。建议 yield 后**停发** Announce（标准 BMCA slave 不发），只处理 `SETPEERS`。
+> **yield 后是否还发 Announce**：见 **Q27**。WAC 会让位（`「BMCA: Yielded master to remote, transitioning to slave mode」` → `「BMCA: Entering slave loop, syncing to <ip> (filtering other peers)」`），但**只在 SETUP 协商期**；进入 slave loop 后只发 `Delay_Req`、收 `Sync/Follow_Up`，**不再发 Announce**（与你的暂定一致）。
 
 ### Q18. 三件与抓包相关的小事 `[已确认]`
 
@@ -696,15 +696,11 @@ WAC 的进程回环走 `INCLUDE_TARGET_PROCESS_TREE`，AirFlash 现在是 `AUTOC
 
 ---
 
-### Q27. BMCA 让位要不要做、怎么做？`[阻塞后续实现]`
+### Q27. BMCA 让位要不要做、怎么做？ `[已确认]`
 
 我们已经按 IEEE 1588 解析并比较了 Announce 的 `(priority1, clockClass, accuracy,
 variance, priority2, grandmasterIdentity, stepsRemoved)`，快照里能看出对端是否
-「比我们更有资格当 master」（`better_master`）。**但还没有真的让位**，因为切换会
-移动所有成员的 timeline，还要重发 `SETRATEANCHORTIME`，在没有第二台 HomePod
-可验证时风险大于收益。
-
-**我们暂定**：保持「我们是 master」不变，只在 `clock_status` 里暴露比较结果。
+「比我们更有资格当 master」（`better_master`）。
 
 **需要确认**：
 
@@ -717,9 +713,59 @@ variance, priority2, grandmasterIdentity, stepsRemoved)`，快照里能看出对
 4. `stepsRemoved` 在 WAC 的比较里到底参不参与？（标准里只在同一 grandmaster
    的路径间使用）
 
----
+> **答复**：**会真的让位 —— 但是在 SETUP 协商期一次性决定，不是运行中。**（我第一版答案写错了，这里更正。）
+>
+> 〔串〕完整协商流程（`crates\winaircast-backend\src\session\timing.rs` 与 `airplay-timing`）：
+> ```
+> BMCA transport starting (pid=<n>)
+> BMCA: Starting Mac-style negotiation with <ip> (our priority1=<n>)
+> BMCA: Received Announce from <ip>: priority1=<n>, clock_id=<id>
+> BMCA: Ignoring PTP general from <ip> (not master <id>)
+> BMCA: no Announce from <ip> within <n>; re-probing (attempt <k>)
+> BMCA: probe sent to <ip>, waiting for remote Announce (attempt <k>)
+> BMCA: no Announce from <ip> <k> attempt(s); giving up
+> BMCA: Decision <verdict> our_p1=<n>, remote_p1=<n>, remote_is_master=<bool>
+> BMCA: receiver did not provide a usable winning clock (priority1=<n>, clock_id=<id>)
+> BMCA: Yielded master to remote, transitioning to slave mode
+> BMCA: Entering slave loop, syncing to <ip> (filtering other peers)
+> BMCA slave: Sent Delay_Req (seq=<n>) / Received Sync / Received Follow_Up
+> ```
+>
+> ## 逐条回答
+>
+> **1. 会让位；判据是 `priority1`，时机是 SETUP 期。**
+> 决定点是一条日志：`BMCA: Decision <verdict> our_p1=<n>, remote_p1=<n>, remote_is_master=<bool>`。
+> → **比较的是 `our_p1` 与 `remote_p1`**，加一个 `remote_is_master` 布尔；**没看到 `stepsRemoved`/`clockClass` 参与**（见第 4 条）。
+> → 时机：`Starting Mac-style negotiation` → 发 probe → 收 `Announce` → `Decision` → 可能 `Yielded master to remote` → `Entering slave loop`。**全程在 SETUP 之前/SETUP 期**，`RECORD` 还没发生。
+> → **运行中不会重新协商**：一旦 `Entering slave loop`，代码只处理 `Delay_Req / Sync / Follow_Up`（外加按 `not master <id>` 过滤其他 peer），**没有任何"再次比较 priority1"的串**。
+> → 所以问题里的「N」**不是"连续 N 个更好的 Announce"**，而是**探活重试次数**：`no Announce from <ip> within <n>; re-probing (attempt <k>)` 直到 `no Announce from <ip> <k> attempt(s); giving up`。`<n>`（等待窗口）和 `<k>`（次数）都是运行时参数，**静态判不出具体值**；建议 `n≈1 个 Announce 周期`、`k=3`（与你的 Q17 暂定一致）。
+>
+> **2. 让位不会中断音频 —— 因为它在有音频之前就做完了。**
+> 协商发生在 SETUP 期、`RECORD` 之前，此时没有 timeline、没有包在发。所以 `Yielded master to remote` 是**无感的**。
+> 唯一会断音的是另一条路径：`「Rebuilding the playing group onto <x>」`（`timing.rs:548/549`）—— 那是**组成员变化**触发的组重建，不是 BMCA 让位。
+> → 所以"先建新时钟再切"这个二选一不成立：WAC 的让位是**在无音频窗口内完成的**，不需要平滑切换。
+>
+> **3. 两只 HomePod 报不同 grandmaster —— WAC 只认一个，其余过滤。**
+> 关键串：`「BMCA: Entering slave loop, syncing to <ip> (**filtering other peers**)」`、`「BMCA slave: Ignoring event from <ip> (not master <id>)」`、`「BMCA: Ignoring PTP general/event from <ip> (not master <id>)」`。
+> → 它选出**唯一赢家**（`usable **winning** clock`），其余 peer 的 Announce/Sync/Follow_Up **一律按 `not master <id>` 丢弃**。
+> → 所以不是"取较优的一方"，也不是"坚持自己"，而是 **先选出唯一 master，再把其他全部过滤掉**；如果**没有任何可用赢家** → `receiver did not provide a usable winning clock` → **保持自己是 master**（`Yielded` 不执行）。
+> → 这个设计的好处正是你担心的那点：**同一时刻只有一个时间轴，立体声对不可能分歧**。
+>
+> **4. `stepsRemoved` 不参与决定。**
+> 决定日志只有 `our_p1` / `remote_p1` / `remote_is_master` 三个量。`stepsRemoved` 作为 token 存在（解析了），但**不在 Decision 里出现**；`priority2` 全库 0 命中。
+> → 你第 4 条的判断（stepsRemoved 只在同一 GM 的路径间用）方向对，但 **WAC 干脆没用它** —— 它的"Mac-style negotiation"是**简化的单键比较**。
+>
+> ## 对 AirFlash 的意义
+>
+> 你原来的担心（切换移动 timeline、要重发 `SETRATEANCHORTIME`）**在 WAC 的实现里根本不成立**，因为它把让位压缩到了 SETUP 期。所以：
+>
+> 1. **`better_master` 只上报**（你的暂定）可以保留 —— 但要知道 **WAC 是真的让位的**，只是时机不同。
+> 2. 若要真做，照抄这三条就够，成本远低于你估的：
+>    - **只在 SETUP 期协商**（无 timeline、无 RECORD）→ 天然无断音；
+>    - **单键比较 `priority1`** + `remote_is_master` 布尔 → 不需要完整 BMCA 数据班子集；
+>    - **选不出赢家就保持 master**（fail-open），并**过滤所有非赢家**。
+> 3. `SETRATEANCHORTIME` 在 WAC 里 **0 命中** —— 它压根不发这个命令，所以你担心的"重锚时间基准"在 WAC 路线里不存在。
 
-## 答复区
 ---
 
 ## 答复区
@@ -744,6 +790,7 @@ variance, priority2, grandmasterIdentity, stepsRemoved)`，快照里能看出对
 | **Q15** | 别无条件 `AUTOCONVERTPCM`：**原生优先、失败回退**，并打印失败原因 |
 | **Q25.4** | 直接抄 `SendInput` + `VK_MEDIA_*`（`:34899-34905`），别调 MediaRemote COM |
 | **Q26** | 直接上 **qWAVE**（`QOSTrafficTypeVoice` + 优雅退化），别先做 `IP_TOS` |
+| **Q27** | **让位可以做，而且很便宜**：WAC 把它压在 **SETUP 期**（无 timeline/无 RECORD）→ 天然无断音。判据只看 `priority1` + `remote_is_master`；选不出赢家就保持 master；进 slave loop 后**过滤所有非赢家**。`better_master` 只上报也可以，别在运行中切 |
 
 ### 三条最有价值的新发现
 
