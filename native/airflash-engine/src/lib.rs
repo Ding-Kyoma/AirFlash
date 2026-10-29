@@ -31,3 +31,6 @@ pub mod volume;
 
 #[cfg(windows)]
 pub mod applications;
+
+#[cfg(test)]
+mod test_net;
