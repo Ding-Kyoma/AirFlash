@@ -59,6 +59,7 @@
   "Real-time · 120 ms": "即時 · 120 ms",
   "Normal · 200 ms": "一般 · 200 ms",
   "Buffered · 500 ms": "緩衝 · 500 ms",
+  "Adaptive · shortest safe lead": "自適應 · 最短安全提前量",
   "Custom": "自訂",
   "Custom · {0} ms": "自訂 · {0} ms",
   "Latency settings": "延遲設定",

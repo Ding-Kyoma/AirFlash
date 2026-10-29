@@ -594,8 +594,14 @@ impl Member {
         )?);
         Ok(())
     }
-    fn metrics(&self) -> Json {
-        json!({"host":self.peer.host, "codec":if self.selection.alac {"alac"}else{"pcm"},"transport":self.selection.transport,"timing":if self.selection.ptp{"ptp"}else{"ntp"},"channel":self.peer.profile.channel,"sync_offset_ms":self.peer.profile.sync_offset_ms,"qualification":"experimental","media":self.media.metrics(), "health":self.health.snapshot()})
+    fn metrics(&self, ptp: Option<&PtpMaster>) -> Json {
+        let clock = ptp.and_then(|timer| {
+            timer
+                .snapshots()
+                .into_iter()
+                .find(|snapshot| snapshot.host == self.peer.host)
+        });
+        json!({"id":if self.peer.receiver_id.is_empty() {self.peer.host.to_string()} else {self.peer.receiver_id.clone()}, "host":self.peer.host, "ip":self.peer.host, "active":!self.closed, "codec":if self.selection.alac {"alac"}else{"pcm"},"transport":self.selection.transport,"timing":if self.selection.ptp{"ptp"}else{"ntp"},"clock_role":if self.selection.ptp && self.peer.profile.follow_receiver_clock {"follow"} else if self.selection.ptp {"sender"} else {"ntp"},"channel":self.peer.profile.channel,"sync_offset_ms":self.peer.profile.sync_offset_ms,"qualification":"experimental","media":self.media.metrics(), "health":self.health.snapshot(), "ptp_offset_ns":clock.as_ref().and_then(|s| s.offset_ns), "ptp_offset_count":clock.as_ref().map(|s| s.exchanges), "ptp_ready":clock.as_ref().is_some_and(|s| s.ready), "ptp_phase":clock.as_ref().map(|s| s.phase)})
     }
     fn close(&mut self) {
         if self.closed {
@@ -1079,6 +1085,8 @@ fn send_packets(
     let duration = Duration::from_millis(options.duration_ms as u64);
     let mut schedule = MediaSchedule::new(start, rate);
     let mut packets = 0u64;
+    let mut telemetry = crate::telemetry::SessionTelemetry::new();
+    let mut capture_baseline: Option<crate::live::Metrics> = None;
     for member in members.iter_mut() {
         member.start_feedback(start)?;
     }
@@ -1095,6 +1103,7 @@ fn send_packets(
         vec![crate::volume::Worker::start(volume_peers, volume)?]
     };
     let mut next_metrics = start + Duration::from_secs(1);
+    let mut applied_lead = 0i64;
     let mut last_marker = 0u64;
     let mut next_sync = start;
     let mut silence_packets = 0u64;
@@ -1126,6 +1135,12 @@ fn send_packets(
                     emit(notice);
                 }
                 member.health.check()?;
+                // Control-plane trouble only ends media that has already stopped
+                // arriving; a dead RTSP feedback loop on a healthy RTP stream keeps
+                // playing (and is reported as a warning instead).
+                member
+                    .health
+                    .check_control(member.media.media_healthy(Instant::now(), MEDIA_HEALTH_WINDOW))?;
             }
             if let Some(timer) = &ptp {
                 if members
@@ -1158,6 +1173,18 @@ fn send_packets(
                     .service_buffered(Instant::now())
                     .map_err(|e| Fault::from_error(member.peer.host, "buffered", &e))?;
             }
+            // Adaptive latency: the desktop side asks for more or less media held at
+            // the receiver; the shift is applied to the live timeline, so no session
+            // rebuild and no audible restart is needed.
+            let wanted = requested_lead();
+            if wanted != applied_lead {
+                let applied = schedule.add_shift(wanted - applied_lead);
+                if applied != 0 {
+                    applied_lead += applied;
+                    telemetry.lead_extra_ms = applied_lead as f64;
+                    emit(json!({"event":"lead_changed","channel":"scheduler","host":null,"requested_ms":wanted,"applied_ms":applied_lead,"shift_ms":round3(schedule.shift.as_secs_f64() * 1000.0)}));
+                }
+            }
             let deadline = schedule.deadline();
             let now = Instant::now();
             if now < deadline {
@@ -1166,10 +1193,15 @@ fn send_packets(
             }
             let late = now.saturating_duration_since(deadline);
             schedule.max_lateness_us = schedule.max_lateness_us.max(late.as_micros());
-            let due = (late.as_nanos() * u128::from(rate) / 1_000_000_000 / FRAMES as u128) as u64;
+            telemetry.observe_lateness(late.as_secs_f64() * 1000.0);
+            if let Some(source) = &live {
+                telemetry.capture_age.observe(source.sample_age_ms());
+                // Slow outer loop: sustained lateness trims the capture resampler.
+                source.report_lateness(late.as_secs_f64() * 1000.0);
+            }
             if options.duration_ms > 0 {
                 schedule.recover(now, false)?;
-            } else if recovery_left == 0 && due >= 2 {
+            } else if recovery_left == 0 {
                 let earliest = members
                     .iter()
                     .map(|m| {
@@ -1179,19 +1211,64 @@ fn send_packets(
                     .into_iter()
                     .min()
                     .unwrap();
-                recovery_left = schedule.recovery_silence(now, earliest)?;
-                schedule.recoveries += 1;
-                if let Some(source) = &live {
-                    source.discard_stale();
+                match schedule.late_action(now, earliest) {
+                    crate::transport::LateAction::OnTime => {}
+                    crate::transport::LateAction::Silence(fill) => {
+                        recovery_left = fill;
+                        schedule.recoveries += 1;
+                        telemetry.gap_filled += fill;
+                        if let Some(source) = &live {
+                            source.discard_stale();
+                        }
+                        emit(
+                            json!({"event":"warning","code":"sender_late_recovered","channel":"scheduler","host":null,"recovered":true,"silence_packets":fill,"message":"Sender filled valid timeline slots with encoded silence"}),
+                        );
+                    }
+                    crate::transport::LateAction::Reanchor => {
+                        // Over budget: move the whole timeline forward instead of
+                        // tearing the session down. Sequence numbers and RTP
+                        // timestamps stay untouched; only the rtptime→networkTime
+                        // anchor moves, one frame of phase margin ahead of now.
+                        let Some(shift) = schedule.reanchor(now) else {
+                            telemetry.expired += 1;
+                            emit(
+                                json!({"event":"warning","code":"timeline_reanchor_exhausted","channel":"scheduler","host":null,"recovered":false,"message":"Sender stalled past the re-anchor budget; a fresh group timeline is required"}),
+                            );
+                            return Err(Fault::new(
+                                "",
+                                "scheduler",
+                                "timeline_expired",
+                                true,
+                                "expired audio requires a fresh group timeline",
+                            )
+                            .into());
+                        };
+                        telemetry.reanchored = schedule.reanchored;
+                        telemetry.reanchor_shift_us = schedule.reanchor_shift_us;
+                        if !shift.is_zero() {
+                            recovery_left = 0;
+                            if let Some(source) = &live {
+                                // Everything queued is older than the new deadline.
+                                source.discard_stale();
+                            }
+                            emit(
+                                json!({"event":"warning","code":"timeline_reanchored","channel":"scheduler","host":null,"recovered":true,"late_ms":round3(late.as_secs_f64() * 1000.0),"shift_ms":round3(shift.as_secs_f64() * 1000.0),"lead_ms":round3(schedule.shift.as_secs_f64() * 1000.0),"reanchored":schedule.reanchored,"message":"Sender thread fell behind its catch-up budget; re-anchored the deadline one frame ahead"}),
+                            );
+                        }
+                    }
                 }
-                emit(
-                    json!({"event":"warning","code":"sender_late_recovered","channel":"scheduler","host":null,"recovered":true,"silence_packets":due,"message":"Sender filled valid timeline slots with encoded silence"}),
-                );
+            }
+            // A deliberate lead change (adaptive latency ladder) keeps its value;
+            // only an automatic re-anchor surplus is slewed back.
+            if applied_lead == 0 {
+                schedule.relax(now, late);
             }
             if now >= next_sync {
                 for m in members.iter_mut() {
                     let local = offset_time(
-                        base_ns + schedule.frames * 1_000_000_000 / u64::from(rate),
+                        base_ns
+                            + schedule.anchor_shift_ns()
+                            + schedule.frames * 1_000_000_000 / u64::from(rate),
                         common_latency,
                         m.media.latency(),
                         m.peer.profile.sync_offset_ms,
@@ -1241,10 +1318,34 @@ fn send_packets(
                     emit(clock_status(timer, &hosts, "streaming"));
                 }
                 if let Some(source) = &live {
+                    sample_capture(source, &mut capture_baseline, &mut telemetry);
                     emit(json!({"event":"capture_metrics","metrics":source.metrics()}));
                 }
-                emit(transport_metrics(members, &schedule));
+                let snapshot = transport_metrics(
+                    members,
+                    &schedule,
+                    &telemetry,
+                    common_latency,
+                    live.map(crate::live::Loopback::depth),
+                    ptp,
+                );
+                crate::telemetry::publish_diagnostics(snapshot.clone());
+                emit(snapshot);
                 next_metrics = now + Duration::from_secs(1);
+            }
+            // Receiver-side buttons and sliders arrive on the event channel; relay
+            // them so the desktop side can drive the system media session.
+            for member in members.iter_mut() {
+                for command in member.health.commands() {
+                    emit(json!({
+                        "event": "remote_command",
+                        "host": member.peer.host,
+                        "receiver_id": member.peer.receiver_id,
+                        "commands": command.commands.iter().map(|c| c.name()).collect::<Vec<_>>(),
+                        "source": command.source,
+                        "volume": command.volume,
+                    }));
+                }
             }
             // Every member gets new media before any member services retransmissions.
             for member in members.iter_mut() {
@@ -1319,6 +1420,7 @@ fn send_packets(
         }
     }
     if let Some(source) = &live {
+        sample_capture(source, &mut capture_baseline, &mut telemetry);
         emit(json!({"event":"capture_metrics","metrics":source.metrics()}));
     }
     for member in members.iter() {
@@ -1326,10 +1428,29 @@ fn send_packets(
             emit(notice);
         }
     }
-    emit(transport_metrics(members, &schedule));
-    emit(
-        json!({"event":"metrics","packets_per_member":packets,"frames":schedule.frames,"silence_packets":silence_packets,"max_send_lateness_us":schedule.max_lateness_us,"retransmits":members.iter().map(|m|m.media.metrics.retransmits_sent).sum::<u64>(),"ptp_packets_received":ptp.as_ref().map(|p|p.received.load(Ordering::Relaxed)),"measured_latency_ms":null,"qualified":false}),
+    let snapshot = transport_metrics(
+        members,
+        &schedule,
+        &telemetry,
+        common_latency,
+        live.map(crate::live::Loopback::depth),
+        ptp,
     );
+    crate::telemetry::publish_diagnostics(snapshot.clone());
+    emit(snapshot);
+    let mut summary = telemetry.snapshot();
+    if let Json::Object(ref mut fields) = summary {
+        fields.insert("event".into(), json!("metrics"));
+        fields.insert("packets_per_member".into(), json!(packets));
+        fields.insert("frames".into(), json!(schedule.frames));
+        fields.insert("silence_packets".into(), json!(silence_packets));
+        fields.insert("max_send_lateness_us".into(), json!(schedule.max_lateness_us));
+        fields.insert("retransmits".into(), json!(members.iter().map(|m|m.media.metrics.retransmits_sent).sum::<u64>()));
+        fields.insert("ptp_packets_received".into(), json!(ptp.as_ref().map(|p|p.received.load(Ordering::Relaxed))));
+        fields.insert("measured_latency_ms".into(), Json::Null);
+        fields.insert("qualified".into(), json!(false));
+    }
+    emit(summary);
     drop(volume_workers);
     for m in members.iter_mut() {
         m.close();
@@ -1337,9 +1458,94 @@ fn send_packets(
     outcome
 }
 
-fn transport_metrics(members: &[Member], schedule: &MediaSchedule) -> Json {
-    json!({"event":"transport_metrics","session_uptime_ms":schedule.start.elapsed().as_millis(),"sender_late_recoveries":schedule.recoveries,"skipped_packets":schedule.skipped_packets,"max_send_lateness_us":schedule.max_lateness_us,"members":members.iter().map(Member::metrics).collect::<Vec<_>>()})
+fn sample_capture(
+    source: &crate::live::Loopback,
+    baseline: &mut Option<crate::live::Metrics>,
+    telemetry: &mut crate::telemetry::SessionTelemetry,
+) {
+    let metrics = source.metrics();
+    if let Some(previous) = baseline {
+        telemetry.input_drops += metrics.dropped_frames.saturating_sub(previous.dropped_frames);
+        telemetry.capture_glitches += metrics
+            .discontinuities
+            .saturating_sub(previous.discontinuities);
+        let servo = source.servo_metrics();
+        telemetry.servo_engagements = servo.engagements;
+        telemetry.servo_releases = servo.releases;
+        telemetry.servo_step_resets = servo.steps;
+        telemetry.servo_correction_ms = servo.correction_ppm / 1000.0;
+        telemetry.servo_filtered_ms = servo.filtered_ms;
+        telemetry.servo_drift_ppb = source.drift_ppb();
+        let underruns = metrics
+            .underrun_packets
+            .saturating_sub(previous.underrun_packets);
+        if underruns > 0 {
+            // An underrun while the source has been quiet for a second is a
+            // keepalive gap, not a concealed music dropout.
+            let idle = metrics.last_audio_qpc_ns == 0
+                || crate::wasapi::qpc_ns().saturating_sub(metrics.last_audio_qpc_ns)
+                    > 1_000_000_000;
+            for _ in 0..underruns {
+                telemetry.underflow(if idle {
+                    crate::telemetry::UnderflowCause::IdleKeepalive
+                } else {
+                    crate::telemetry::UnderflowCause::ActiveMedia
+                });
+            }
+        }
+    }
+    *baseline = Some(metrics);
 }
+
+fn transport_metrics(
+    members: &[Member],
+    schedule: &MediaSchedule,
+    telemetry: &crate::telemetry::SessionTelemetry,
+    playout: Duration,
+    queue: Option<(usize, usize)>,
+    ptp: Option<&PtpMaster>,
+) -> Json {
+    let mut snapshot = telemetry.snapshot();
+    if let Json::Object(ref mut fields) = snapshot {
+        fields.insert("event".into(), json!("transport_metrics"));
+        fields.insert("session_uptime_ms".into(), json!(schedule.start.elapsed().as_millis()));
+        fields.insert("sender_late_recoveries".into(), json!(schedule.recoveries));
+        fields.insert("skipped_packets".into(), json!(schedule.skipped_packets));
+        fields.insert("max_send_lateness_us".into(), json!(schedule.max_lateness_us));
+        fields.insert(
+            "playout_ms".into(),
+            json!((playout.as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0),
+        );
+        fields.insert("queue_depth".into(), json!(queue.map(|q| q.0)));
+        fields.insert("queue_capacity".into(), json!(queue.map(|q| q.1)));
+        fields.insert("members".into(), json!(members.iter().map(|m| m.metrics(ptp)).collect::<Vec<_>>()));
+    }
+    snapshot
+}
+fn round3(value: f64) -> f64 {
+    (value * 1000.0).round() / 1000.0
+}
+/// Extra media lead requested by the adaptive latency ladder, in milliseconds.
+///
+/// The engine runs one session at a time (the IPC front end serialises `start`),
+/// so a process-wide cell keeps `set_lead` from having to thread another parameter
+/// through six call sites. Zero means "whatever the timeline needs".
+static LEAD_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// Ceiling for an operator-requested lead. Two seconds matches the re-anchor cap:
+/// beyond that the receiver's own buffer is the limit, not ours.
+pub const MAX_LEAD_MS: i64 = 2000;
+pub fn request_lead(ms: i64) {
+    LEAD_MS.store(ms.clamp(0, MAX_LEAD_MS), std::sync::atomic::Ordering::Release);
+}
+pub fn requested_lead() -> i64 {
+    LEAD_MS.load(std::sync::atomic::Ordering::Acquire)
+}
+pub fn reset_lead() {
+    LEAD_MS.store(0, std::sync::atomic::Ordering::Release);
+}
+/// A receiver that has accepted RTP this recently is still listening, even if the
+/// control channel is unhappy.
+const MEDIA_HEALTH_WINDOW: Duration = Duration::from_secs(2);
 fn offset_time(base: u64, common: Duration, own: Duration, offset_ms: i32) -> Result<u64> {
     Ok(u64::try_from(
         base as i128 + common.as_nanos() as i128 - own.as_nanos() as i128
@@ -1434,6 +1640,125 @@ mod tests {
         };
         (member, receiver, worker)
     }
+    #[test]
+    fn stalled_sender_reanchors_instead_of_rebuilding_and_keeps_seq_linear() {
+        // Protocol-level version of the roadmap acceptance check: after a 300 ms
+        // stall the sender must move its timeline, not tear the session down.
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let audio = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let control = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut media = MediaTransport::new(
+            Packetizer::new([7; 32], 100, 0, 1),
+            audio,
+            control,
+            receiver.local_addr().unwrap(),
+        )
+        .unwrap();
+        media
+            .connect_audio(receiver.local_addr().unwrap())
+            .unwrap();
+        media.configure_latency(Duration::from_millis(200), false);
+        let rate = 44_100u32;
+        let start = Instant::now();
+        let mut schedule = MediaSchedule::new(start, rate);
+        let pcm = vec![0u8; rtp::PCM_BYTES];
+        let mut sends = 0usize;
+        let mut pending_silence = 0u64;
+        let mut stalls = 0usize;
+        for step in 0..40 {
+            if step == 10 || step == 25 {
+                // Simulate the sender thread being descheduled.
+                thread::sleep(Duration::from_millis(300));
+                stalls += 1;
+            }
+            let now = Instant::now();
+            let earliest_render = schedule.deadline() + Duration::from_millis(200);
+            match schedule.late_action(now, earliest_render) {
+                crate::transport::LateAction::OnTime => {}
+                crate::transport::LateAction::Silence(fill) => {
+                    // Covering the gap in place is still the cheapest recovery.
+                    assert_eq!(
+                        schedule.recovery_silence(now, earliest_render).unwrap(),
+                        fill
+                    );
+                    schedule.recoveries += 1;
+                    pending_silence += fill;
+                }
+                crate::transport::LateAction::Reanchor => {
+                    // The pre-change code returned `timeline_expired` here.
+                    assert!(
+                        schedule.recovery_silence(now, earliest_render).is_err(),
+                        "a session-wide expiry is what this test avoids"
+                    );
+                    let shift = schedule.reanchor(now).expect("re-anchor budget");
+                    assert!(!shift.is_zero());
+                }
+            }
+            for _ in 0..pending_silence {
+                while Instant::now() < schedule.deadline() {
+                    thread::sleep(Duration::from_micros(200));
+                }
+                media
+                    .send(
+                        &pcm,
+                        false,
+                        Instant::now(),
+                        schedule.deadline(),
+                        &Health::default(),
+                    )
+                    .expect("concealment must not fail the session");
+                schedule.sent();
+                sends += 1;
+            }
+            pending_silence = 0;
+            while Instant::now() < schedule.deadline() {
+                thread::sleep(
+                    schedule
+                        .deadline()
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(1)),
+                );
+            }
+            media
+                .send(
+                    &pcm,
+                    step == 0,
+                    Instant::now(),
+                    schedule.deadline(),
+                    &Health::default(),
+                )
+                .expect("a stalled sender must recover without a fresh session");
+            schedule.sent();
+            sends += 1;
+        }
+        assert_eq!(stalls, 2);
+        assert!(
+            schedule.reanchored >= 1,
+            "the stall must have been absorbed by a re-anchor"
+        );
+        assert!(schedule.shift > Duration::ZERO);
+        // Every received packet is contiguous and steps exactly one frame block:
+        // re-anchoring moves the anchor, never the sequence.
+        let mut packets = Vec::new();
+        let mut buffer = [0u8; 1600];
+        while let Ok(n) = receiver.recv(&mut buffer) {
+            packets.push(buffer[..n].to_vec());
+        }
+        assert_eq!(packets.len(), sends);
+        for pair in packets.windows(2) {
+            let seq = u16::from_be_bytes([pair[0][2], pair[0][3]]);
+            let next = u16::from_be_bytes([pair[1][2], pair[1][3]]);
+            assert_eq!(next, seq.wrapping_add(1), "sequence must stay linear");
+            let rtp = u32::from_be_bytes(pair[0][4..8].try_into().unwrap());
+            let next_rtp = u32::from_be_bytes(pair[1][4..8].try_into().unwrap());
+            assert_eq!(next_rtp.wrapping_sub(rtp), rtp::FRAMES as u32);
+        }
+        assert_eq!(schedule.skipped_packets, 0, "no slots were dropped");
+    }
+
     #[test]
     fn silence_releases_both_members_and_activity_resumes_current_audio() {
         silence_release(false);

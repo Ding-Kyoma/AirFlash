@@ -42,6 +42,8 @@ pub struct Metrics {
     pub silence_pad_frames: u64,
     pub scheduled_silence_frames: u64,
     pub discontinuities: u64,
+    /// Discontinuity flags that were proven benign (the packet continues the last).
+    pub discontinuities_ignored: u64,
     pub last_discontinuity: Option<String>,
     pub mmcss_registered: bool,
     pub mmcss_priority_set: bool,
@@ -55,6 +57,7 @@ pub struct Metrics {
 }
 struct State {
     splice: crate::continuity::Splice,
+    quantizer: crate::continuity::Quantizer,
     boundary_pending: bool,
     equalizer: crate::equalizer::Processor,
     frames: VecDeque<Frame>,
@@ -88,6 +91,10 @@ pub struct Loopback {
     equalizer_control: crate::equalizer::Control,
     state: Arc<Mutex<State>>,
     stop: Arc<AtomicBool>,
+    /// Slow outer loop: observed playout lateness -> resampler bias.
+    servo: Arc<Mutex<crate::servo::LatenessServo>>,
+    /// Monitor only: capture-clock drift estimate surfaced in telemetry.
+    drift: Arc<Mutex<crate::servo::DriftEstimator>>,
     worker: Option<JoinHandle<()>>,
 }
 impl Loopback {
@@ -114,6 +121,7 @@ impl Loopback {
         let queue_target = rate as usize * 20 / 1000;
         let state = Arc::new(Mutex::new(State {
             splice: crate::continuity::Splice::new(rate),
+            quantizer: crate::continuity::Quantizer::new(),
             boundary_pending: false,
             equalizer: crate::equalizer::Processor::new(equalizer.initial(), rate),
             frames: VecDeque::with_capacity(capacity),
@@ -127,11 +135,26 @@ impl Loopback {
         let stop = Arc::new(AtomicBool::new(false));
         let child_stop = stop.clone();
         let child_state = state.clone();
+        let servo = Arc::new(Mutex::new(crate::servo::LatenessServo::default()));
+        let drift = Arc::new(Mutex::new(crate::servo::DriftEstimator::new(
+            Duration::from_secs(30),
+            rate as f64,
+        )));
+        let child_servo = servo.clone();
+        let child_drift = drift.clone();
         let (tx, rx) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("wasapi-capture".into())
             .spawn(move || {
-                if let Err(e) = capture(target, rate, child_stop, &child_state, &tx) {
+                if let Err(e) = capture(
+                    target,
+                    rate,
+                    child_stop,
+                    &child_state,
+                    &child_servo,
+                    &child_drift,
+                    &tx,
+                ) {
                     let message = format!("{e:#}");
                     child_state.lock().unwrap().error = Some(message.clone());
                     let _ = tx.try_send(Err(message));
@@ -142,6 +165,8 @@ impl Loopback {
                 equalizer_control: equalizer,
                 state,
                 stop,
+                servo,
+                drift,
                 worker: Some(worker),
             }),
             result => {
@@ -153,6 +178,20 @@ impl Loopback {
     }
     pub fn last_audio(&self) -> u64 {
         self.state.lock().unwrap().metrics.last_audio_qpc_ns
+    }
+    /// One lateness sample per packet from the send loop. Positive means the packet
+    /// woke after its deadline; the servo turns a sustained bias into a small
+    /// resampler correction so the steady-state error is removed, not just damped.
+    pub fn report_lateness(&self, late_ms: f64) {
+        self.servo.lock().unwrap().update(late_ms, Instant::now());
+    }
+    /// Snapshot for telemetry: nothing here is needed to run the loop.
+    pub fn servo_metrics(&self) -> crate::servo::ServoCounters {
+        self.servo.lock().unwrap().counters()
+    }
+    /// Captured drift estimate in parts per billion; zero until the window fills.
+    pub fn drift_ppb(&self) -> f64 {
+        self.drift.lock().unwrap().ppb()
     }
     pub fn ended(&self) -> bool {
         self.state.lock().unwrap().ended
@@ -217,7 +256,7 @@ impl Loopback {
             s.ages.push_back(age);
             let processed = s.equalizer.frame([frame.left, frame.right]);
             for value in s.splice.frame(processed, gain, missing) {
-                out.extend(((value * 32767.0).round() as i16).to_be_bytes());
+                out.extend(s.quantizer.quantize(value).to_be_bytes());
             }
         }
         if underrun {
@@ -237,6 +276,19 @@ impl Loopback {
         }
         s.boundary_pending = true;
         s.metrics.last_discontinuity = Some("scheduler_recovery".into());
+    }
+    /// Age of the oldest queued capture frame: how stale the audio about to be
+    /// sent already is. Feeds the `capture_age` telemetry histogram.
+    pub fn sample_age_ms(&self) -> f64 {
+        let s = self.state.lock().unwrap();
+        s.frames
+            .front()
+            .map_or(0.0, |f| qpc_ns().saturating_sub(f.qpc) as f64 / 1e6)
+    }
+    /// `(queued, capacity)` in source frames.
+    pub fn depth(&self) -> (usize, usize) {
+        let s = self.state.lock().unwrap();
+        (s.frames.len(), s.capacity)
     }
     pub fn metrics(&self) -> Metrics {
         let s = self.state.lock().unwrap();
@@ -261,8 +313,7 @@ impl Drop for ComGuard {
         unsafe { CoUninitialize() }
     }
 }
-struct AudioGuard(IAudioClient);
-impl Drop for AudioGuard {
+struct AudioGuard(IAudioClient);impl Drop for AudioGuard {
     fn drop(&mut self) {
         unsafe {
             let _ = self.0.Stop();
@@ -294,6 +345,12 @@ fn endpoint_index(name: &str, endpoints: &[(String, Option<String>)]) -> Result<
         "capture endpoint name is ambiguous; select a device ID: {name}"
     );
     Ok(index)
+}
+
+/// A WASAPI discontinuity flag is benign when this packet starts exactly where the
+/// previous one ended: the loopback buffer wrapped, the stream did not break.
+pub(crate) fn continues_previous(last_end: Option<u64>, position: u64) -> bool {
+    last_end.is_some_and(|end| end == position)
 }
 
 fn capture_flags(flow: EDataFlow) -> Result<u32> {
@@ -341,11 +398,15 @@ fn capture(
     stream_rate: u32,
     stop: Arc<AtomicBool>,
     state: &Arc<Mutex<State>>,
+    servo: &Arc<Mutex<crate::servo::LatenessServo>>,
+    drift: &Arc<Mutex<crate::servo::DriftEstimator>>,
     ready: &mpsc::SyncSender<std::result::Result<(), String>>,
 ) -> Result<()> {
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }?;
     let _com = ComGuard;
     let _priority = Mmcss::new();
+    let mut regulator = crate::servo::QueueRegulator::default();
+    let mut last_tick = Instant::now();
     {
         let mut s = state.lock().unwrap();
         s.metrics.mmcss_registered = _priority.registered();
@@ -450,6 +511,9 @@ fn capture(
     )?;
     let mut inputs = [VecDeque::<f32>::new(), VecDeque::<f32>::new()];
     let mut input_times = VecDeque::new();
+    // Device position where the previous packet ended; used to tell a benign
+    // loopback wrap from a real capture gap.
+    let mut last_end: Option<u64> = None;
     unsafe { client.Start() }?;
     let _audio = AudioGuard(client);
     state.lock().unwrap().metrics.input_rate = rate;
@@ -486,17 +550,25 @@ fn capture(
                 qpc * 100
             };
             if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 {
-                inputs[0].clear();
-                inputs[1].clear();
-                input_times.clear();
-                resampler.reset();
-                let mut shared = state.lock().unwrap();
-                shared.metrics.dropped_frames += shared.frames.len() as u64;
-                shared.frames.clear();
-                shared.boundary_pending = true;
-                shared.metrics.discontinuities += 1;
-                shared.metrics.last_discontinuity = Some("wasapi_discontinuity".into());
+                // WASAPI raises this flag on benign loopback wraparound too. A packet
+                // that starts exactly where the previous one ended continues the
+                // stream; flushing there would drop 20–60 ms of audio for nothing.
+                if continues_previous(last_end, position) {
+                    state.lock().unwrap().metrics.discontinuities_ignored += 1;
+                } else {
+                    inputs[0].clear();
+                    inputs[1].clear();
+                    input_times.clear();
+                    resampler.reset();
+                    let mut shared = state.lock().unwrap();
+                    shared.metrics.dropped_frames += shared.frames.len() as u64;
+                    shared.frames.clear();
+                    shared.boundary_pending = true;
+                    shared.metrics.discontinuities += 1;
+                    shared.metrics.last_discontinuity = Some("wasapi_discontinuity".into());
+                }
             }
+            last_end = Some(position.saturating_add(u64::from(frames)));
             let bytes = if data.is_null() {
                 &[][..]
             } else {
@@ -542,8 +614,19 @@ fn capture(
                     let s = state.lock().unwrap();
                     (s.frames.len(), s.target)
                 };
-                let correction = ((target as f64 - have as f64) / stream_rate as f64 * 0.01)
-                    .clamp(-0.0005, 0.0005);
+                let now = Instant::now();
+                let dt = now.saturating_duration_since(last_tick);
+                last_tick = now;
+                // Inner loop: hold the queue at its target (PI, so a constant
+                // capture-clock offset no longer parks at a depth error).
+                let error_frames = target as f64 - have as f64;
+                let queue_ppm = regulator.update(error_frames, dt);
+                // Outer loop: a sustained playout lateness bias, in the same units.
+                let servo_ppm = servo.lock().unwrap().correction_ppm();
+                // Positive ratio change produces more frames, which drains the
+                // deficit; both controllers already speak that sign.
+                let correction = ((queue_ppm + servo_ppm) / 1e6).clamp(-0.0005, 0.0005);
+                drift.lock().unwrap().observe(now, have as f64);
                 resampler.set_resample_ratio_relative(1.0 + correction, true)?;
                 let output = resampler.process(&input, None)?;
                 let delay = resampler.output_delay() as u64 * 1_000_000_000 / stream_rate as u64;
@@ -565,6 +648,19 @@ fn capture(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn discontinuity_is_only_real_when_the_device_position_jumps() {
+        // Loopback wraparound: the next packet continues the last one.
+        assert!(continues_previous(Some(960), 960));
+        assert!(continues_previous(Some(0), 0));
+        // A genuine gap: position moved past where the previous packet ended.
+        assert!(!continues_previous(Some(960), 1200));
+        // Rewind (endpoint restarted): also a real discontinuity.
+        assert!(!continues_previous(Some(960), 0));
+        // Nothing to compare against yet: treat the packet as a real break.
+        assert!(!continues_previous(None, 960));
+    }
 
     #[test]
     fn capture_direction_selects_loopback_only_for_playback() {
@@ -647,6 +743,7 @@ pub(crate) mod tests {
         Loopback {
             state: Arc::new(Mutex::new(State {
                 splice: crate::continuity::Splice::new(crate::rtp::RATE),
+                quantizer: crate::continuity::Quantizer::new(),
                 boundary_pending: false,
                 equalizer: crate::equalizer::Processor::new(
                     equalizer_control.initial(),
@@ -661,9 +758,25 @@ pub(crate) mod tests {
                 ages: VecDeque::new(),
             })),
             stop: Arc::new(AtomicBool::new(false)),
+            servo: Arc::new(Mutex::new(crate::servo::LatenessServo::default())),
+            drift: Arc::new(Mutex::new(crate::servo::DriftEstimator::new(
+                Duration::from_secs(30),
+                crate::rtp::RATE as f64,
+            ))),
             worker: None,
             equalizer_control,
         }
+    }
+    #[test]
+    fn lateness_samples_reach_the_servo_without_touching_the_audio_path() {
+        let source = source();
+        for step in 0..400 {
+            source.report_lateness(30.0);
+            assert_eq!(step + 1, source.servo_metrics().samples);
+        }
+        assert!(source.servo_metrics().engagements >= 1);
+        assert!(source.servo_metrics().correction_ppm > 0.0);
+        assert_eq!(source.drift_ppb(), 0.0, "the drift window is still empty");
     }
     pub(crate) fn feed(source: &Loopback, amplitude: f32) {
         let mut state = source.state.lock().unwrap();
@@ -727,8 +840,11 @@ pub(crate) mod tests {
         let (pcm, marker) = source.packet(0.5).unwrap();
         let last = &pcm[pcm.len() - 4..];
         let expected = (0.25 * 10f32.powf(-12.0 / 20.0) * 0.5 * 32767.0).round() as i16;
-        assert_eq!(i16::from_be_bytes([last[0], last[1]]), expected);
-        assert_eq!(i16::from_be_bytes([last[2], last[3]]), -expected);
+        // Output is TPDF-dithered, so a single sample may sit one LSB either side.
+        let left = i16::from_be_bytes([last[0], last[1]]);
+        let right = i16::from_be_bytes([last[2], last[3]]);
+        assert!((i32::from(left) - i32::from(expected)).abs() <= 1, "{left} vs {expected}");
+        assert!((i32::from(right) + i32::from(expected)).abs() <= 1, "{right} vs -{expected}");
         assert!(marker.is_some());
     }
     #[test]

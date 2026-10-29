@@ -61,6 +61,7 @@
   "Real-time · 120 ms": "实时 · 120 ms",
   "Normal · 200 ms": "正常 · 200 ms",
   "Buffered · 500 ms": "缓冲 · 500 ms",
+  "Adaptive · shortest safe lead": "自适应 · 最短安全提前量",
   "Custom": "自定义",
   "Custom · {0} ms": "自定义 · {0} ms",
   "Latency settings": "延迟设置",

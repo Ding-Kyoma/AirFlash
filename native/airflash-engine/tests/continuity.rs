@@ -120,15 +120,24 @@ fn feedback_retries_only_complete_transient_responses() {
             fast(),
         )
         .unwrap();
-        until(|| health.snapshot().feedback_successes > 0 || health.check().is_err());
+        until(|| health.snapshot().feedback_successes > 0 || health.control_degraded().is_some() || health.check().is_err());
         if expected.last() == Some(&200) {
             health.check().unwrap();
             assert_eq!(health.snapshot().feedback_failures, 2);
-        } else {
-            let error = health.check().unwrap_err();
-            let fault = error.downcast_ref::<Fault>().unwrap();
+        } else if let Some(fault) = health.control_degraded() {
             assert_eq!(fault.retryable, expected[0] != 403);
             assert_eq!(fault.channel, "feedback");
+            // Control-plane faults no longer end a session whose media is healthy.
+            assert!(health.check().is_ok());
+            assert!(health.check_control(true).is_ok(), "healthy media keeps playing");
+            assert!(health.check_control(false).is_err(), "media stopped: now it is fatal");
+        } else {
+            // Receiver rejected the session: reconnecting is the only fix, so this
+            // stays a hard failure rather than a degradation.
+            let error = health.check().unwrap_err();
+            let fault = error.downcast_ref::<Fault>().unwrap();
+            assert_eq!(fault.channel, "feedback");
+            assert!(matches!(fault.code.as_str(), "authentication_failed" | "session_rejected"));
         }
         drop(worker);
         server.join().unwrap();
@@ -158,9 +167,8 @@ fn feedback_deadline_cseq_error_and_stop_are_bounded() {
             },
         )
         .unwrap();
-        until(|| health.check().is_err());
-        let error = health.check().unwrap_err();
-        let fault = error.downcast_ref::<Fault>().unwrap();
+        until(|| health.control_degraded().is_some());
+        let fault = health.control_degraded().unwrap();
         assert_eq!(
             fault.code,
             if wrong_seq {
@@ -449,9 +457,14 @@ fn retransmit_flood_is_bounded_and_does_not_prevent_new_audio() {
 fn events_report_real_eof_and_stop_without_waiting_for_idle_timeout() {
     let (conn, peer) = pair(); let health = Health::default();
     let worker = EventWorker::start(conn, "test".into(), health.clone(), Cancellation::default()).unwrap();
-    drop(peer); until(|| health.check().is_err());
-    let error = health.check().unwrap_err(); let fault = error.downcast_ref::<Fault>().unwrap();
+    // Losing the event channel degrades the control plane; it must not fail the
+    // session outright, because the media stream is independent.
+    drop(peer); until(|| health.control_degraded().is_some() || health.check().is_err());
+    let fault = health.control_degraded().expect("event channel degraded");
     assert_eq!(fault.code,"peer_closed"); assert_eq!(fault.channel,"events"); assert!(fault.retryable);
+    assert!(health.check().is_ok(), "media stays untouched");
+    assert!(health.check_control(true).is_ok(), "healthy media keeps playing");
+    assert!(health.check_control(false).is_err(), "media stopped: now it is fatal");
     drop(worker);
     let (conn, _peer) = pair();
     let worker = EventWorker::start(conn, "test".into(), Health::default(), Cancellation::default()).unwrap();

@@ -112,8 +112,10 @@ public sealed class AppSettings : ObservableObject
     public int Latency(string id)
     {
         var options = ReadOptions(id);
-        return (options.LatencyMode ?? LatencyMode) switch { "realtime" => 120, "buffered" => 500, "custom" => Math.Clamp(options.CustomBufferMs ?? CustomBufferMs, 0, 2000), _ => 200 };
+        return (options.LatencyMode ?? LatencyMode) switch { "realtime" => 120, "buffered" => 500, "custom" => Math.Clamp(options.CustomBufferMs ?? CustomBufferMs, 0, 2000), LatencyPolicy.Mode => LatencyPolicy.For(new Receiver(id, id, "")).Initial, _ => 200 };
     }
+    /// <summary>Lead for a known receiver: adaptive mode derives it from the topology.</summary>
+    public int Latency(Receiver receiver) => LatencyPolicy.Effective(this, receiver);
     public double Gain(string id) => Math.Clamp(MasterVolume, 0, 100) / 100d;
     public string? SampleRate(Receiver receiver) => receiver.IsSoftwareGroup ? SoftwareGroups.Single(g => g.Id == receiver.Id).SampleRate : ReadOptions(receiver.Id).SampleRate;
     public bool UsesDeviceLatency(Receiver receiver) => (receiver.IsSoftwareGroup ? receiver.Peers : [receiver]).Any(r =>
@@ -199,7 +201,7 @@ public sealed class AppSettings : ObservableObject
         clone.CaptureApplicationInstance = CaptureApplicationInstance;
         return clone;
     }
-    public static readonly string[] Modes = ["realtime", "normal", "buffered", "custom"];
+    public static readonly string[] Modes = ["realtime", "normal", "buffered", "custom", LatencyPolicy.Mode];
     public static readonly string[] SampleRates = ["44100", "48000"];
     public static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, WriteIndented = true, PropertyNameCaseInsensitive = true, IgnoreReadOnlyProperties = true };
 }

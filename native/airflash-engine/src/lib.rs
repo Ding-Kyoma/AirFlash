@@ -4,11 +4,13 @@ pub mod clock;
 pub mod continuity;
 pub mod crypto;
 pub mod equalizer;
+pub mod events;
 pub mod profile;
 pub mod receiver_capabilities;
 pub mod rtp;
 pub mod rtsp;
 pub mod session;
+pub mod servo;
 
 #[cfg(windows)]
 pub mod wasapi;
@@ -20,6 +22,7 @@ pub mod live;
 pub mod credentials;
 
 pub mod standby;
+pub mod telemetry;
 pub mod transport;
 pub mod volume;
 
