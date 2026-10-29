@@ -16,8 +16,17 @@ public static class SoftwareStereo
         return settings.SoftwareGroups.Select(g =>
         {
             var members = new[] { Member(g.LeftId, "left", g.LeftOffsetMs), Member(g.RightId, "right", g.RightOffsetMs) };
-            var usable = members.All(m => m.Online && !m.IsGroup && m.StereoId.Length == 0) && members.Select(m => Receiver.PhysicalKey(m.DeviceId, m.Address)).Distinct().Count() == 2 && members.Select(m => m.Address).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 2;
-            return new Receiver(g.Id, g.Name, "") { IsSoftwareGroup = true, Online = usable, Members = members };
+            // Restoring a saved group goes through the same invariant as the
+            // editor: a pair that no longer routes homogeneously (for example a
+            // legacy config written before Q41) resolves to an unusable group
+            // with no members instead of a mixed one. The settings editor
+            // recomputes and shows the two-level message for it.
+            var membership = new GroupMembership();
+            var homogeneous = true;
+            foreach (var member in members)
+                if (!membership.TryAdd(member, out _)) { homogeneous = false; break; }
+            var usable = homogeneous && members.All(m => m.Online && !m.IsGroup && m.StereoId.Length == 0) && members.Select(m => Receiver.PhysicalKey(m.DeviceId, m.Address)).Distinct().Count() == 2 && members.Select(m => m.Address).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 2;
+            return new Receiver(g.Id, g.Name, "") { IsSoftwareGroup = true, Online = usable, Members = homogeneous ? membership.Members.ToArray() : [] };
         }).ToArray();
     }
     public static IReadOnlyList<Receiver> Candidates(IEnumerable<Receiver> catalog) => catalog.Where(r => !r.IsGroup && r.StereoId.Length == 0).ToArray();

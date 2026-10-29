@@ -87,6 +87,20 @@ public sealed class GateFailureTests
         }
     }
 
+    [Fact]
+    public void MixedTimingGroupRefusalAppendsTheOutdatedReasonWithoutReplacingTheAction()
+    {
+        var outdated = Physical(Bit40, "354.54.5", model: "Old HomePod");
+        var group = new Receiver("stereo:pair", "Pair", "") { Members = [AirPlay2(), outdated] };
+        var notice = Notice("mixed_timing_group", message: "synthetic engine refusal");
+
+        var message = GateFailure.Message(group, notice);
+
+        Assert.StartsWith(L.Get(MixedGroupMessage.ActionKey), message);
+        Assert.Contains(outdated.Name, message);
+        Assert.Contains(L.Format(MixedGroupMessage.OutdatedReasonKey, outdated.Name), message);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
