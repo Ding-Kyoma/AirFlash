@@ -60,11 +60,16 @@
 - 内环 `QueueRegulator`：对采集队列深度做 PI 控制，带抗饱和，限幅 ±400 ppm。
   取代原来的 `(target-have)/rate*0.01` 纯比例式——那个公式在恒定采集时钟偏差下
   会稳定停在几十毫秒的固定误差上。
-- 外环 `LatenessServo`：α=0.2 平滑、250 ms 步长、2 ms 死区、5 ms 进入 / 2 ms 退出，
-  kp=20 ppm/ms、ki=25 ppm/(ms·s)，上限 300 ppm。
+- 外环 `LatenessServo`（常数按 Q5 的答复改成字节级确认的值）：α=0.2 平滑、
+  **engage > 5 ms / release ≤ 1 ms 的非对称迟滞**、`correction_ppb = filtered_ns / 20`
+  （即 50 ppm/ms），**夹 ±50 ppm 且饱和静默计数**；没有积分项。
+- 250 ms 断点按 Q5 的答复改为**整机重置**（filter/correction/engaged 全清零后
+  重新预热），而不是「换个基线继续积分」——后者会把一次卡顿变成缓慢音高漂移。
 - `DriftEstimator`：只观测不参与控制（1000 ppm 拒绝门限），避免两个控制器抢同一个
   执行器。
-- 单个大停顿按「阶跃」处理：重置积分项，不让它变成缓慢的音高变化。
+- **没有做**报告里的帧级 `interval_correction`（每 n 帧插删一帧，PCM 域、编码前）。
+  现在靠重采样器做连续速率修正；按 Q6 的答复，插删在正常会话里「几乎不动」
+  （50 ppm 时约 160 秒才动一帧），是否需要补上仍待评估。
 
 ## P1-7 采集加固（部分完成）
 
@@ -138,9 +143,12 @@ Wi-Fi AP 把音频放进 WMM 语音队列。QoS 服务被禁用或缺失时注�
 
 ## P0-2 自适应提前量（已完成）
 
-- 引擎：`set_lead { ms }`（`session.rs::request_lead`）把请求值作用到
-  `MediaSchedule.shift`，同步锚点跟着移动，因此**不需要重建会话**。上限 2000 ms；
-  人工设定的提前量不会被 `relax()` 回收。
+- 引擎：`set_lead { ms }`（`session.rs::request_lead`）只改**发布映射里的锚点偏移**
+  （`base_ns` 不可变，映射是 `base_ns + anchor_shift_ns() + frames`），**不发
+  `SETRATEANCHORTIME`、不重置 RTP 原点**，所以不需要重建会话，也不会让对端跳段。
+  上一版按 Q8/Q21 的答复修过这一点；上限不再是固定 2000 ms，而是**对端声明的
+  `latency_ms + 100 ms`**（`lead_ceiling`，WAC 自适应范围的上界），`lead_changed`
+  事件里带 `ceiling_ms`。人工设定的提前量不会被 `relax()` 回收。
 - 桌面端：`AirFlash.Core/LatencyPolicy.cs` 按拓扑给出阶梯与已验证下限：
 
   | 拓扑 | 起点 | 下限 | 阶梯 |
@@ -188,9 +196,17 @@ Wi-Fi AP 把音频放进 WMM 语音队列。QoS 服务被禁用或缺失时注�
 
 | 项目 | 现状 | 备注 |
 | --- | --- | --- |
+| P1-10 标定流程 | 未开始 | 需要真机测延迟/丢包，按报告是「用户自助标定」 |
+| P2-12 组拓扑原子化 + 失败回滚 | 未开始 | 屏障已有（全部 connect 后才等 PTP）；缺的是中途失败时 `TEARDOWN` 已建好的成员并重试 |
+| P2-13 兼容 profile | 未开始 | 把散落的 if 收成 `CompatBehavior`，按 `srcvers`/`model` 指纹选择 |
+| P2-14 诊断导出 | 部分 | `diag_summary` + `--self-check` 已能给结构化引擎摘要；缺脱敏与实际导出文件 |
+| P3-1 反向控制的执行端 | 部分 | 引擎已解析事件并转 `remote_command`；桌面端还没真去控制播放器（Q25：`SendInput` + `VK_MEDIA_*`） |
+| P3-2 连接前预判（TXT bit40） | 未开始 | Q18 已指出我们现在用的 **bit41 是错的**，应先改判据 |
+| P3-3 抢占检测 | 未开始 | 按 Q18 用「未预期 TEARDOWN + 随后重新 announce」组合特征 |
+| P3-4 MRP 隧道 | 未开始 | 大工程 |
+| P3-5 经典 RAOP / 初代 AirPlay | 未开始 | 大工程 |
 | P0-4 封面（`image/jpeg`） | 未做 | 尺寸/格式约束需要设备确认，见 Q10；失败也不能干扰音频 |
-| P3-2 TXT 预测（bit40 + `srcvers`） | 未开始 | 发现逻辑在 C#，需要确认 HomePod 上报的 TXT 字段 |
-| P3-3 抢占检测 | 未开始 | 依赖元数据事件 |
+| P0-3 帧级 `interval_correction` | 未做 | 见上文，现用连续重采样代替 |
 | 采集进程退出后自动重开 | 部分 | 现在引擎结束会话、由桌面端重连；进程内自愈未做 |
 | 音量事件（音箱旋钮/遥控器） | 部分 | 事件里的 `volume` 已解析并转发，但还没写回设备音量状态 |
 

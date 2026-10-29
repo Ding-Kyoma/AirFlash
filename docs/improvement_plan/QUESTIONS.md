@@ -713,7 +713,7 @@ variance, priority2, grandmasterIdentity, stepsRemoved)`，快照里能看出对
 4. `stepsRemoved` 在 WAC 的比较里到底参不参与？（标准里只在同一 grandmaster
    的路径间使用）
 
-> **答复**：**会真的让位 —— 但是在 SETUP 协商期一次性决定，不是运行中。**（我第一版答案写错了，这里更正。）
+> **答复**：**会让位 —— 但是在 SETUP 协商期一次性决定，运行中从不重新比较。**
 >
 > 〔串〕完整协商流程（`crates\winaircast-backend\src\session\timing.rs` 与 `airplay-timing`）：
 > ```
@@ -755,16 +755,50 @@ variance, priority2, grandmasterIdentity, stepsRemoved)`，快照里能看出对
 > 决定日志只有 `our_p1` / `remote_p1` / `remote_is_master` 三个量。`stepsRemoved` 作为 token 存在（解析了），但**不在 Decision 里出现**；`priority2` 全库 0 命中。
 > → 你第 4 条的判断（stepsRemoved 只在同一 GM 的路径间用）方向对，但 **WAC 干脆没用它** —— 它的"Mac-style negotiation"是**简化的单键比较**。
 >
-> ## 对 AirFlash 的意义
+> ## 给 AirFlash 的落地规格（可直接照抄）
 >
-> 你原来的担心（切换移动 timeline、要重发 `SETRATEANCHORTIME`）**在 WAC 的实现里根本不成立**，因为它把让位压缩到了 SETUP 期。所以：
+> 你把「保持自己是 master」的暂定划掉了，那就按这个来做 —— **成本比你原先估的低一个数量级**，因为你担心的那两件事在 WAC 路线里都不存在：
+> - 「切换会移动所有成员的 timeline」→ 只发生在**运行中**切换；放在 SETUP 期就没有 timeline 可移。
+> - 「要重发 `SETRATEANCHORTIME`」→ 该命令在 WAC 二进制里 **0 命中**，它压根不发。
 >
-> 1. **`better_master` 只上报**（你的暂定）可以保留 —— 但要知道 **WAC 是真的让位的**，只是时机不同。
-> 2. 若要真做，照抄这三条就够，成本远低于你估的：
->    - **只在 SETUP 期协商**（无 timeline、无 RECORD）→ 天然无断音；
->    - **单键比较 `priority1`** + `remote_is_master` 布尔 → 不需要完整 BMCA 数据班子集；
->    - **选不出赢家就保持 master**（fail-open），并**过滤所有非赢家**。
-> 3. `SETRATEANCHORTIME` 在 WAC 里 **0 命中** —— 它压根不发这个命令，所以你担心的"重锚时间基准"在 WAC 路线里不存在。
+> ### 状态机（四态）
+>
+> ```
+> Idle ──SETUP 开始──► Negotiating ──Decision: 我们更优──► Master   → 正常 SETUP/RECORD
+>                            │
+>                            └──Decision: 对端更优──► Slave    → (Yielded) → slave loop
+>                            └──探活耗尽/无可用赢家──► Master   (fail-open)
+> ```
+>
+> ### 时序（严格在 SETUP 之前或之中，`RECORD` 之前完成）
+>
+> ```
+> 1. 选定 PTP mode（拓扑决定）        → 决定要不要协商
+> 2. 发 probe / 等 Announce            → 窗口 N，重试 k 次
+> 3. 收到 Announce(priority1, clock_id)→ 记录候选
+> 4. Decision: remote_p1 < our_p1 ?     → 唯一判据
+> 5. 让位 → 进入 slave loop（Delay_Req / Sync / Follow_Up）
+>    不让 → 进入 sender master（Announce / Sync / Follow_Up / Signaling）
+> 6. 选不出赢家 → 回 Master（fail-open），并打一条 `no usable winning clock`
+> ```
+>
+> ### 必须照抄的三条硬规则
+>
+> | # | 规则 | 理由（WAC 的依据） |
+> |---|---|---|
+> | 1 | **判据只比 `priority1`**，不要引入 `clockClass`/`priority2`/`stepsRemoved` | `BMCA: Decision` 只带 `our_p1`/`remote_p1`/`remote_is_master`；`priority2` 全库 0 命中 |
+> | 2 | **进 slave 后过滤所有非赢家**（按 `not master <id>` 丢弃） | `Entering slave loop, syncing to <ip> (filtering other peers)` |
+> | 3 | **选不出赢家就保持 master**（fail-open） | `receiver did not provide a usable winning clock` |
+>
+> ### 明确不要做
+>
+> - ❌ 运行中重算 `priority1`（WAC 在 `Entering slave loop` 之后没有任何再比较的串）
+> - ❌ 让位时重发 SETUP 或 `SETRATEANCHORTIME`
+> - ❌ 让位时重建组 —— 那是另一条路径（`Rebuilding the playing group onto <x>`，组成员变化才触发，会断一下）
+>
+> ### 一个可以省掉的担心
+>
+> 你原来写「没有第二台 HomePod 可验证」—— 这条现在**不构成阻塞**：让位只影响 **WAC/AF 自己把谁当 master**，不需要第二台设备参与测试。用一台 HomePod + 一个能构造更好 `priority1` 的假 Announce 源（本机 loopback + 手写 PTP 包）就能验完整个状态机。
 
 ---
 
