@@ -931,8 +931,12 @@ fn run_stream(
     let mut members = Vec::new();
     for peer in &options.peers {
         cancel.check()?;
-        members.push(
-            Member::connect(
+        // A group joins as one unit: if a member cannot be brought up after one
+        // retry, the members already built are dropped (their Drop sends TEARDOWN),
+        // so the receiver never sees a half-configured stereo pair.
+        let mut attempt = 0;
+        let member = loop {
+            match Member::connect(
                 peer,
                 options,
                 &mut ptp,
@@ -941,9 +945,24 @@ fn run_stream(
                 initial_rtp,
                 cancel.clone(),
                 &emit,
-            )
-            .map_err(|e| Fault::from_error(peer.host, "setup", &e))?,
-        );
+            ) {
+                Ok(member) => break member,
+                Err(error) if attempt < MEMBER_SETUP_RETRIES => {
+                    attempt += 1;
+                    emit(json!({
+                        "event": "warning",
+                        "host": peer.host.to_string(),
+                        "channel": "setup",
+                        "code": "member_setup_retry",
+                        "recovered": false,
+                        "message": error.to_string(),
+                    }));
+                    std::thread::sleep(MEMBER_SETUP_RETRY_DELAY);
+                }
+                Err(error) => return Err(Fault::from_error(peer.host, "setup", &error).into()),
+            }
+        };
+        members.push(member);
     }
     if options.handshake_only {
         emit(
@@ -1673,6 +1692,10 @@ const CLOCK_FREEZE_GRACE: Duration = Duration::from_secs(10);
 /// same key; audio is never touched.
 const MAX_EVENT_REBUILDS: u8 = 3;
 const EVENT_REBUILD_INTERVAL: Duration = Duration::from_secs(2);
+/// One retry per member: enough to ride out a transient refusal, short enough that
+/// a stereo pair does not wait seconds before giving up.
+const MEMBER_SETUP_RETRIES: u8 = 1;
+const MEMBER_SETUP_RETRY_DELAY: Duration = Duration::from_millis(400);
 fn offset_time(base: u64, common: Duration, own: Duration, offset_ms: i32) -> Result<u64> {
     Ok(u64::try_from(
         base as i128 + common.as_nanos() as i128 - own.as_nanos() as i128
