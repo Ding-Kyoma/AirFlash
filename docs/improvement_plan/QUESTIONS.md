@@ -2051,7 +2051,7 @@ MFi 设备今天仍会显示通用 fault。要让这条分类真正可用，需�
 
 ---
 
-### Q38. 单机 HomePod + PCM 该 PTP 还是 NTP？ `[待答复]`
+### Q38. 单机 HomePod + PCM 该 PTP 还是 NTP？ `[已确认]`
 
 P2-13c 按 Q33 修正了多设备组：全部成员有 AP2 证据的多设备组一律 PTP，
 Mixed Apple group 不再被压到 NTP；单成员行为则按要求保持不变，97 行表征表
@@ -2076,6 +2076,142 @@ PTP；97 行表里 `realtime: PCM_44, codec: auto` 行同样是 PTP。本次约�
 3. **如果采用，97 行表怎么处理**？是保持 97 行不变、只在表外追加
    「HomePod + PCM → NTP」断言，还是允许新增/修改表行（会改变「97 行」这个
    计数基线）？
+
+> **答复**：**不建议实现。查下来 `codec → timing` 这条映射在 WAC 里是「冷启动兜底值」，一有真实遥测就被覆盖 —— 它不是一个会被强制的协议规则。而它真正的作用在别处：给 PCM 一条更低的校准地板。**
+>
+> ## 一、决定性证据：`Timing` 表达式本身就是 `snapshot ?? plan`
+>
+> 这个模式在 WAC 里出现**两次**，写法一模一样：
+>
+> 〔码〕`:4500`（校准开始）：
+> ```csharp
+> CalibrationPlan plan = LatencyCalibrationPolicy.CreatePlan(identities, _selectedCodec);
+> _plan = plan with { Timing = (initialSnapshot?.Timing ?? plan.Timing) };
+> ```
+> 〔码〕`:5502`（会话中）：
+> ```csharp
+> CalibrationPlan plan = LatencyCalibrationPolicy.CreatePlan(identities, codec);
+> _plan = plan with { Timing = (snapshot?.Timing ?? plan.Timing) };
+> ```
+> 〔码〕`:4875`（遥测到达后重建）：
+> ```csharp
+> if (!_auditionStarted && !_lastRequestedLatency.HasValue)
+> {
+>     _plan = LatencyCalibrationPolicy.CreatePlan(_report.Devices, _report.Codec)
+>         with { Timing = _report.Timing };      // ← 直接覆盖，没有 ??
+> }
+> ```
+>
+> `snapshot?.Timing ?? plan.Timing` 这个写法把话说明白了：**`plan.Timing` 就是 `??` 的右边**，只在没有快照时用它。
+>
+> ⇒ **`isPcm → NTP` 是冷启动默认值，不是运行时约束。** 真实会话一旦报出 timing，它立刻被替换。
+>
+> ## 二、那这条分支真正在干什么：给 PCM 一条**更低的校准地板**
+>
+> 这才是实质。跟 timing 无关：
+>
+> 〔码〕`:38312-38316`：
+> ```csharp
+> public const int SoloHomePodAlacValidatedFloorMs = 50;
+> public const int SoloHomePodPcmValidatedFloorMs  = 45;
+> ```
+> 〔码〕`:38380`：
+> ```csharp
+> public static int? ValidatedFloorMs(CalibrationPlan plan, string? codec)
+> {
+>     if (plan == null || !plan.Topology.Contains("HomePod solo", …)) return null;
+>     return (plan.Topology.Contains("(PCM)", …) || string.Equals(codec, "PCM", …)) ? 45 : 50;
+> }
+> ```
+>
+> 把候选表、地板、可用候选放在一起看：
+>
+> | 分支 | 候选 `CandidatesMs` | 地板 | **实际可用的候选** |
+> |---|---|---|---|
+> | `HomePod solo` (ALAC) | `{50, 40, 30}` | **50** | **只有 50** |
+> | `HomePod solo (PCM)` | `{60, 45, 30}` | **45** | **60 和 45** |
+>
+> ⇒ **PCM 分支存在的意义是「让校准能有第二个可用档位」（60 / 45），ALAC 只有一个（50）。** 这纯粹是**校准向导**的需求 —— 它要在两个档位之间做 A/B 试听。
+>
+> AF 没有这个向导。**照抄一个为向导服务的分支，只会得到一条没有消费者的规则。**
+>
+> ## 三、逐问回答
+>
+> ### 第 1 问：是否采用 `HomePod solo (PCM) → NTP` → **不采用**
+>
+> 三个理由，按重要性排：
+>
+> 1. **它不强制任何东西**。WAC 自己在 `snapshot?.Timing ?? plan.Timing` 里就把它降级成兜底值了。
+> 2. **它的真实目的（校准档位/地板）AF 用不上**。硬抄过来只会多一个没人读的 `if`。
+> 3. **AF 是真引擎，不该预测 → 该观测**。你实际会跟接收器协商，能拿到真实结果，没必要先猜再验。
+>
+> ### 第 2 问：请求的 `Codec::Pcm` 还是协商后的实际 codec → **两个都用，但用在不同阶段**
+>
+> WAC 的完整链条：
+>
+> | 阶段 | 用哪个 codec | 用途 |
+> |---|---|---|
+> | 会话前（`:4500`） | `_selectedCodec`（**用户选择**） | 生成预测 plan（timing / 候选 / 地板） |
+> | 遥测到达（`:4875`） | `_report.Codec` = `snapshot.Codec.ToUpperInvariant()`（**实际**） | 重建 topology 与候选 |
+> | 遥测到达（`:4876`） | `_report.Timing`（**实际**） | 覆盖 Timing |
+>
+> ⇒ **回答你的问题：判定用「最终 codec」，但这条判定本身只影响 `Topology` 和候选表，`Timing` 已经被实际值接管。** 所以你担心的「`Codec::Auto` 也可能落入 NTP 分支」在 WAC 里确实会发生 —— 但**落进去也没关系**，因为 Timing 随后会被覆盖。
+>
+> ### 第 3 问：97 行表怎么处理 → **表不动，表外记一条「不采用」**
+>
+> 既然不实现，97 行保持全绿。建议在表外（或在 `select_timing` 的注释里）写一句可追溯的话：
+>
+> ```rust
+> // WAC 有一条 `n == 1 && allHomePod && isPcm -> NTP` 分支（CreateTopologyPlan）。
+> // 不采纳，原因：
+> //   1. WAC 自己把它当冷启动兜底 —— `_plan = plan with { Timing = snapshot?.Timing ?? plan.Timing }`（:4500/:5502）
+> //   2. 它的实质作用在 ValidatedFloorMs：PCM 地板 45、ALAC 地板 50，
+> //      配合候选 {60,45,30} / {50,40,30} 让校准向导有第二个试听档位。
+> //      AirFlash 没有校准向导，用不上。
+> // 单机 HomePod 一律 PTP。
+> ```
+>
+> 这样下一轮再有人看到 WAC 那个分支时，不用重新挖一遍才敢决定不改。
+>
+> ## 四、比抄这条分支更值得做的两件事
+>
+> ### 1. 用 `/info formats` 而不是 codec 来预判
+>
+> 〔串〕WAC 会读接收器自己声明的 stream 类型：
+> ```
+> Receiver /info formats for '<ip>': realtime=<n>, low-latency=<n>, buffered=<n>
+> ```
+> ⇒ 这才是「这台设备到底能不能用 PCM」的**直接证据**。codec 是你选的，`formats` 是它能收的。用前者判断后者是本末倒置。
+>
+> 如果 `realtime=0`，PCM 根本走不通 —— 这时候讨论「PCM 用 PTP 还是 NTP」没有意义。
+>
+> ### 2. 照 WAC 做「协商结果与预期不符」的断言（不是告警）
+>
+> WAC 的 `:7048` 已经在做这件事（Q33 里提过）：实际 timing ≠ 计划 timing ⇒ 整份遥测判无效。
+>
+> AF 侧可以做同样的低成本检查：
+>
+> ```rust
+> let predicted = select_timing(&devices, codec);
+> let actual    = session.negotiated_timing();      // 从 SETUP 响应 / 首个 Sync 报文读回
+> if actual != predicted {
+>     warn!(?predicted, ?actual, codec = ?codec,
+>           "timing 协商结果与 codec 预测不符；以实际为准");
+> }
+> ```
+>
+> 这条比实现 PCM 分支有用得多：它能在**真机**上一次性回答「PCM 到底走不走 NTP」，而不需要你现在就猜对。
+>
+> ## 五、结论
+>
+> | 你的问题 | 结论 |
+> |---|---|
+> | 要不要采用 `HomePod solo (PCM) → NTP` | **不采用**。它是 `snapshot?.Timing ?? plan.Timing` 的兜底值，不是协议规则 |
+> | 只对 HomePod 生效还是对所有单机 AP2 + PCM | 不实现，此问不适用。若要实现也应只对 HomePod（WAC 的 `allHomePod` 在前，未知型号落到 `n == 1 → AirPlay 2 receiver → PTP`） |
+> | 用请求 codec 还是最终 codec | WAC：会话前用**用户选择**，遥测后用**实际 codec**。但 Timing 已被实际值接管，所以判定 codec 只影响 topology 与候选表 |
+> | 97 行表 | **保持 97 行**，在 `select_timing` 注释里记下「WAC 有此分支、不采纳、原因三条」 |
+> | 更值得做的 | ① 用 `/info formats` 的 `realtime=/low-latency=/buffered=` 预判能否用 PCM；② 加「协商 timing ≠ 预测 timing」的 warn 断言，让真机替你回答 |
+
 ---
 
 ### Q39. `ClaimsAirPlay2Outdated` 的设备 SETUP 失败时，门禁该说什么？ `[待答复]`
