@@ -296,12 +296,58 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   靠 60 秒限速兜底；没有改 RTP/RTSP/编码路径。进程退出靠 50 ms 轮询 + 250 ms
   退避发现，未做事件驱动的退出通知。
 
+## P2-13 兼容 profile（已完成）
+
+`native/airflash-engine/src/profile.rs`、`src/session.rs`、`src/receiver_capabilities.rs`、
+`tests/compat_profile.rs`
+
+- **一个指纹只解析一次**：新增 `CompatFingerprint`，把 `/info` 的
+  `supportedFormats`/`supportedAudioFormatsExtended`、`features`、`sourceVersion`、
+  `model` 以及桌面端下发的 legacy codec 列表收进一个值。`/info` 的 feature 字
+  优先，缺失时才用 mDNS/桌面端下发的 `profile.features`；`airplay2()`（bit40 且
+  `srcvers >= 354.54.6`，bit41 不参与）与 `ptp_expected()`（按型号）是仅有的两个
+  原始结论，调用方不再自己读 bit 或型号字符串。
+- **一个协商结果**：`CompatProfile` = 指纹 + 本次会话的 codec/transport/timing +
+  follow 标记，对外只回答具名问题：`prefers_alac()`、`uses_buffered_stream()`、
+  `uses_ptp()`、`follows_receiver_clock()`、`clock_role()`、`timing_label()`、
+  `timing_protocol()`、`codec_name()`、`transport()`。`Member` 里原来的
+  `selection: Selection` 换成 `compat: CompatProfile`；`session.rs` 里 5 处
+  `transport == Buffered` 比较、15 处 `selection.ptp` 判断（含 `negotiated`/
+  `session_metrics` 两个事件里的 `clock_role`/`timing` 三元表达式）和 2 处
+  `selection.alac` 全部改成问同一个值，`selection.ptp && ptp.is_none()` 等启动顺序不变。
+- **`negotiate_with` 收掉**：型号/固件进了指纹后，原来 7 个参数的
+  `Formats::negotiate_with()` 和专属的 `#[allow(clippy::too_many_arguments)]` 一起删除，
+  换成 `CompatFingerprint::negotiate(profile, rate, inherited_ptp)`；`Formats::negotiate()`
+  只保留为「没有型号证据」的薄封装。`receiver_capabilities::choices()` 也走同一段
+  协商代码，预判与运行时不再各写一份 if。
+- **没引入报告里的哪些行为，以及为什么**（报告那一行是 WAC 的行为清单，AF 没有对应分支）：
+  - `LegacySyncPacketLatency`：AF 只有一套 Sync/Follow_Up 估计器，没有「旧固件用
+    不同同步包延迟」的分支；造这个变体等于凭空给某些型号加时钟行为，离线无法验证。
+  - `SkipFlush`：AF 不处理 FLUSH，也从不发送 FLUSH（`session_simulation.rs` 里还有
+    「会话中不得出现 FLUSH」的断言），没有可收拢的兼容分支；Q18 的答复也确认不需要
+    为 FLUSH 加兼容分支。
+  - `NoPeerDelay`：AF 实现了 PTP peer delay（`clock.rs` 的 `pdelay_response` /
+    `pdelay_follow_up`），但没有按型号或 `srcvers` 关掉它的分支；哪些设备不该收
+    peer delay 没有离线证据，不能猜。
+  - `BplistSetup`：AF 的 SETUP 一直就是 binary plist（`rtsp.rs::plist_request` 只写
+    `application/x-apple-binary-plist`），不存在「旧设备换一种 SETUP 编码」的第二条路。
+  因此 `CompatProfile` 只收 AF 真实存在的判定（codec/transport/timing/follow），
+  没有为不存在的分支造 enum 变体，也没有新增任何设备特例。
+- **行为不变性**：新增 `tests/compat_profile.rs`，一张 97 行的显式表——64 行指纹矩阵
+  （`HomePod1,1`/`AudioAccessory5,1`/`AppleTV6,2`/未知 × features 缺省/0/bit40/
+  bit40|bit41 × `srcvers` 缺省/354.54.5/354.54.6/366.0，legacy codec 列表轮换）
+  加 33 行 transport/codec/timing/legacy 决策行，逐行断言 `/info` 指纹 →
+  codec/transport/timing。这张表在重构前（旧 `negotiate_with` 路径）先全绿，
+  重构后文件字节未动（SHA256 `1C07EDB9…4D3FCA`）再次全绿。
+- **没改的**：`receiver_capabilities` 的能力预判仍只用 `supportedFormats` + 对端自述
+  `features`，不带 `model`/`sourceVersion`，所以 IPC 里 `selected_timing` 的取值
+  与改造前完全一致；要不要让预判跟运行时一样吃型号证据，记在 Q29。
+
 ## 还没做
 
 | 项目 | 现状 | 备注 |
 | --- | --- | --- |
 | P1-10 标定流程 | 未开始 | 需要真机测延迟/丢包，按报告是「用户自助标定」 |
-| P2-13 兼容 profile | 未开始 | 把散落的 if 收成 `CompatBehavior`，按 `srcvers`/`model` 指纹选择 |
 | P2-12 热加入 | 未做 | 目前只做组创建与成员重试，运行中增删成员未实现 |
 | P3-3 抢占检测 | 未开始 | 按 Q18 用「未预期 TEARDOWN + 随后重新 announce」组合特征 |
 | P3-4 MRP 隧道 | 未开始 | 大工程 |
