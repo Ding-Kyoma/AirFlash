@@ -2,7 +2,7 @@
 use crate::crypto::Cipher;
 use anyhow::{Context, Result, ensure};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpStream},
     sync::{
@@ -68,6 +68,16 @@ impl Message {
             .parse()
             .context("invalid status")
     }
+    /// The method when this message is a request rather than a response. A
+    /// receiver can send its own `TEARDOWN` on the same control connection that
+    /// carries our SET_PARAMETER/feedback exchanges; that request must not be
+    /// mistaken for the answer to the request we are waiting on.
+    pub fn method(&self) -> Option<&str> {
+        let mut parts = self.first.split_whitespace();
+        let method = parts.next()?;
+        parts.next()?;
+        matches!(parts.next()?, "RTSP/1.0" | "HTTP/1.0" | "HTTP/1.1").then_some(method)
+    }
     pub fn plist(&self) -> Result<plist::Value> {
         plist::Value::from_reader(std::io::Cursor::new(&self.body)).context("invalid binary plist")
     }
@@ -84,6 +94,8 @@ pub struct Connection {
     cseq: u32,
     cancel: Cancellation,
     timeout: Duration,
+    unsolicited: VecDeque<Message>,
+    close_requested: bool,
 }
 impl Connection {
     pub fn connect(addr: SocketAddr, cancel: Cancellation) -> Result<Self> {
@@ -106,6 +118,8 @@ impl Connection {
             cseq: 0,
             cancel,
             timeout: Duration::from_secs(4),
+            unsolicited: VecDeque::new(),
+            close_requested: false,
         })
     }
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -219,6 +233,12 @@ impl Connection {
             ensure!(!headers.contains_key(&key), "duplicate header {key}");
             headers.insert(key, value.trim().to_string());
         }
+        if headers
+            .get("connection")
+            .is_some_and(|value| value.eq_ignore_ascii_case("close"))
+        {
+            self.close_requested = true;
+        }
         ensure!(
             !headers.contains_key("transfer-encoding"),
             "chunked RTSP unsupported"
@@ -267,6 +287,17 @@ impl Connection {
     pub fn read(&mut self) -> Result<Message> {
         self.read_for(self.timeout, None)?
             .ok_or_else(|| WireError::ReadTimeout.into())
+    }
+    /// Receiver-initiated requests that arrived while a worker was waiting for a
+    /// response. They are kept aside so the response matching can continue, and
+    /// the feedback loop can inspect them without racing SET_PARAMETER.
+    pub fn take_unsolicited(&mut self) -> Vec<Message> {
+        self.unsolicited.drain(..).collect()
+    }
+    /// The peer asked for `Connection: close` on some message. Read-and-clear so
+    /// one header is reported once.
+    pub fn take_close_requested(&mut self) -> bool {
+        std::mem::take(&mut self.close_requested)
     }
     pub fn begin_request(
         &mut self,
@@ -317,6 +348,11 @@ impl Connection {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let response = self.read_for(remaining, None)?.ok_or(WireError::ReadTimeout)
                 .with_context(|| format!("{method} {path}"))?;
+            if response.method().is_some() {
+                ensure!(self.unsolicited.len() < 4, "unsolicited request flood");
+                self.unsolicited.push_back(response);
+                continue;
+            }
             if !self.stale_response(&response) { break response; }
         };
         self.validate_cseq(&response)?;

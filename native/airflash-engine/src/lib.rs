@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod equalizer;
 pub mod events;
 pub mod metadata;
+pub mod preemption;
 pub mod profile;
 pub mod qos;
 pub mod receiver_capabilities;

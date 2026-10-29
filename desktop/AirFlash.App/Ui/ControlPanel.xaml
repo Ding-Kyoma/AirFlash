@@ -199,6 +199,7 @@
           <TextBlock Text="{Binding StatusTitle}" FontWeight="SemiBold" FontSize="12"/>
         </DockPanel>
         <TextBlock Text="{Binding StatusDetail}" Style="{StaticResource Hint}" Margin="13,4,0,0" MaxHeight="62" TextTrimming="CharacterEllipsis" ToolTip="{Binding StatusDetail}"/>
+        <Button Content="{loc:Text 'Reconnect'}" Command="{Binding ReconnectCommand}" Visibility="{Binding CanReconnect, Converter={StaticResource BoolVisibility}}" HorizontalAlignment="Left" Margin="13,8,0,0" Padding="12,4" AutomationProperties.Name="{loc:Text 'Reconnect'}"/>
         <Expander Header="{loc:Text 'View error details'}" Visibility="{Binding ErrorDetails, Converter={StaticResource NonEmpty}}" Margin="0,8,0,0">
           <ScrollViewer MaxHeight="120" VerticalScrollBarVisibility="Auto">
             <TextBlock Text="{Binding ErrorDetails}" Style="{StaticResource Hint}" Margin="0,8,0,0"/>

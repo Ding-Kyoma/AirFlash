@@ -3,6 +3,7 @@ use crate::{
     auth,
     clock::{Clock, PtpMaster},
     crypto::derive,
+    preemption,
     rtp::{self, FRAMES, PCM_BYTES, Packetizer},
     rtsp::{Cancellation, Connection},
     transport::{
@@ -337,6 +338,11 @@ struct Member {
     event_key: Vec<u8>,
     event_rebuilds: u8,
     next_event_rebuild: Instant,
+    /// Media was healthy at the previous poll. Preemption evidence timestamps the
+    /// healthy-to-unhealthy transition once, not every poll while it stays down.
+    media_was_healthy: bool,
+    /// The receiver took this session over. Never send a TEARDOWN back to it.
+    preempted: bool,
 }
 impl Member {
     #[allow(clippy::too_many_arguments)]
@@ -441,6 +447,8 @@ impl Member {
             event_key: secret.to_vec(),
             event_rebuilds: 0,
             next_event_rebuild: Instant::now(),
+            media_was_healthy: true,
+            preempted: false,
         };
         // RAII owns the connection before SETUP so partial handshakes are torn down too.
         let sender_id = "02:57:32:41:50:01";
@@ -581,6 +589,13 @@ impl Member {
         emit(
             json!({"event":"negotiated","receiver_id":peer.receiver_id,"host":peer.host,"port":peer.port,"clock_role":member.compat.clock_role(),"data_port":data_port,"codec":member.compat.codec_name(),"transport":member.compat.transport(),"timing":member.compat.timing_name(),"channel":peer.profile.channel,"sync_offset_ms":peer.profile.sync_offset_ms,"qualification":"experimental","sample_rate":rate,"control_port":member.remote_control,"requested_latency_ms":options.latency_ms,"receiver_latency_min_samples":stream.as_dictionary().and_then(|d|d.get("latencyMin")).and_then(Value::as_unsigned_integer),"measured_latency_ms":null}),
         );
+        // A receiver that already ended the session during setup is a plain setup
+        // failure, never preemption: there is no media or PTP history to pair the
+        // request with yet.
+        ensure!(
+            member.conn.lock().unwrap().take_unsolicited().is_empty(),
+            "receiver ended the session during setup"
+        );
         Ok(member)
     }
     fn record(&mut self) -> Result<()> {
@@ -611,6 +626,47 @@ impl Member {
         )?);
         Ok(())
     }
+    /// One poll of both halves of a takeover: control-plane signals recorded by the
+    /// feedback worker, and receiver-side facts (media stopped, PTP association
+    /// restarted) observed here. Returns the decisive fault together with the media
+    /// health the rest of the control checks need.
+    fn poll_preemption(
+        &mut self,
+        ptp: Option<&PtpMaster>,
+        now: Instant,
+        emit: &impl Fn(Json),
+    ) -> (Option<Fault>, bool) {
+        let media_healthy = self.media.media_healthy(now, MEDIA_HEALTH_WINDOW);
+        // Timestamp the healthy-to-unhealthy edge once. Repeated polling while
+        // media stays down must not keep renewing the evidence.
+        if self.media_was_healthy && !media_healthy {
+            self.health.preemption_media_stopped(now);
+        }
+        self.media_was_healthy = media_healthy;
+        // A receiver that restarted its PTP association is the other
+        // corroborating fact a takeover leaves behind.
+        if let Some(timer) = ptp
+            && self.selection.ptp
+        {
+            if let Some(at) = timer.association_changed_at(self.peer.host) {
+                self.health.preemption_association_changed(at);
+            }
+            if let Some(at) = timer.association_stalled_at(self.peer.host, now) {
+                self.health.preemption_association_changed(at);
+            }
+        }
+        // Only a signal plus corroboration becomes `preempted`; a lone signal
+        // waits out the window and then uses the generic fallback fault.
+        if let Some(verdict) = self.health.preemption_verdict(now) {
+            self.preempted = true;
+            emit(preemption_warning(self, &verdict));
+            return (Some(preemption_fault(self, &verdict)), media_healthy);
+        }
+        (
+            self.health.take_expired_preemption_fault(now),
+            media_healthy,
+        )
+    }
     fn metrics(&self, ptp: Option<&PtpMaster>) -> Json {
         let clock = ptp.and_then(|timer| {
             timer
@@ -626,7 +682,9 @@ impl Member {
         }
         self.closed = true;
         self.feedback.take();
-        if self.session_started {
+        // A receiver that took the session over must not receive a TEARDOWN from
+        // the session it just displaced; the takeover already ended it.
+        if self.session_started && !self.preempted {
             let _ = self.conn.lock().unwrap().finish_session(&self.uri);
         }
         self.events.take();
@@ -1205,13 +1263,16 @@ fn send_packets(
                 for notice in member.health.notices() {
                     emit(notice);
                 }
+                let (preemption, media_healthy) =
+                    member.poll_preemption(ptp, Instant::now(), emit);
+                if let Some(fault) = preemption {
+                    return Err(fault.into());
+                }
                 member.health.check()?;
                 // Control-plane trouble only ends media that has already stopped
                 // arriving; a dead RTSP feedback loop on a healthy RTP stream keeps
                 // playing (and is reported as a warning instead).
-                member
-                    .health
-                    .check_control(member.media.media_healthy(Instant::now(), MEDIA_HEALTH_WINDOW))?;
+                member.health.check_control(media_healthy)?;
                 // The event channel can be reopened on the same key while audio keeps
                 // flowing, so a dead event channel costs metadata and buttons only
                 // until the next attempt. Bounded, because a receiver that refuses
@@ -1595,6 +1656,32 @@ fn send_packets(
     outcome
 }
 
+/// One warning in the existing shape, plus the exact signals and corroboration
+/// that produced the verdict, so a log alone explains why AirFlash stopped.
+fn preemption_warning(member: &Member, verdict: &preemption::Verdict) -> Json {
+    json!({
+        "event": "warning",
+        "host": member.peer.host.to_string(),
+        "channel": "control",
+        "code": "preempted",
+        "recovered": false,
+        "message": "Another controller took over this receiver",
+        "signals": verdict.signals.clone(),
+        "corroboration": verdict.corroboration.clone(),
+    })
+}
+fn preemption_fault(member: &Member, verdict: &preemption::Verdict) -> Fault {
+    Fault::new(
+        member.peer.host,
+        "control",
+        "preempted",
+        false,
+        format!(
+            "Another controller took over this receiver ({}); AirFlash stopped and will not reconnect automatically. Start playback again to claim it back.",
+            verdict.summary()
+        ),
+    )
+}
 fn emit_capture_warnings(source: &crate::live::Loopback, emit: &impl Fn(Json)) {
     for warning in source.take_warnings() {
         emit(json!({
@@ -1766,14 +1853,57 @@ mod tests {
     // Exercises the production media loop and TEARDOWN against two localhost
     // RTSP/UDP peers, with a synthetic capture queue and no HAP/audio devices.
     fn local_member() -> (Member, UdpSocket, JoinHandle<()>) {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(30)))
+            .unwrap();
+        let (member, worker, _) = local_member_with(receiver.local_addr().unwrap(), None);
+        (member, receiver, worker)
+    }
+    /// The fake receiver answers every request. With `teardown` it also sends an
+    /// unsolicited TEARDOWN after the first volume probe and drops the media
+    /// socket, which is the offline shape of "another controller took over".
+    fn local_member_with(
+        receiver_addr: SocketAddr,
+        teardown: Option<std::sync::Arc<std::sync::Mutex<Option<UdpSocket>>>>,
+    ) -> (
+        Member,
+        JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        local_member_with_health(receiver_addr, teardown, Health::default())
+    }
+    fn local_member_with_health(
+        receiver_addr: SocketAddr,
+        teardown: Option<std::sync::Arc<std::sync::Mutex<Option<UdpSocket>>>>,
+        health: Health,
+    ) -> (
+        Member,
+        JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
         let conn =
             Connection::connect(listener.local_addr().unwrap(), Cancellation::default()).unwrap();
         let (socket, _) = listener.accept().unwrap();
+        let methods = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = methods.clone();
+        let worker_health = health.clone();
         let worker = thread::spawn(move || {
             let mut connection = Connection::from_stream(socket, Cancellation::default()).unwrap();
             loop {
-                let request = connection.read().unwrap();
+                let Ok(request) = connection.read() else {
+                    break;
+                };
+                recorded.lock().unwrap().push(
+                    request
+                        .first
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_owned(),
+                );
                 let body = if request.first.starts_with("GET /info") {
                     let value = dictionary(vec![("initialVolume", Value::Real(-15.0))]);
                     let mut bytes = Vec::new();
@@ -1789,23 +1919,42 @@ mod tests {
                 );
                 let mut bytes = response.into_bytes();
                 bytes.extend(body);
-                connection.write(&bytes).unwrap();
+                if connection.write(&bytes).is_err() {
+                    break;
+                }
                 if request.first.starts_with("TEARDOWN ") {
+                    break;
+                }
+                if let Some(slot) = &teardown
+                    && request.first.starts_with("POST /feedback")
+                {
+                    if connection
+                        .write(
+                            b"TEARDOWN rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 4242\r\n\r\n",
+                        )
+                        .is_err()
+                    {
+                        break;
+                    }
+                    drop(slot.lock().unwrap().take());
+                    // On Windows a connected UDP sender keeps "succeeding" after
+                    // the receiver socket is gone, so the media watchdog cannot
+                    // observe this locally. Record the corroboration the watchdog
+                    // would have produced so the end-to-end verdict is still
+                    // exercised; the healthy-to-unhealthy edge itself is unit
+                    // tested with `MediaTransport::expire_media`.
+                    worker_health.preemption_media_stopped(Instant::now());
                     break;
                 }
             }
         });
-        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
-        receiver
-            .set_read_timeout(Some(Duration::from_millis(30)))
-            .unwrap();
         let audio = UdpSocket::bind("127.0.0.1:0").unwrap();
         let control = UdpSocket::bind("127.0.0.1:0").unwrap();
         let media = MediaTransport::new(
             Packetizer::new([7; 32], 1, 0, 1),
             audio,
             control,
-            receiver.local_addr().unwrap(),
+            receiver_addr,
         )
         .unwrap();
         let member = Member {
@@ -1813,14 +1962,14 @@ mod tests {
             peer: Peer {
                 receiver_id: String::new(),
                 host: "127.0.0.1".parse().unwrap(),
-                port: listener.local_addr().unwrap().port(),
+                port,
                 codecs: vec![],
                 profile: crate::profile::Profile::default(),
             },
             conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
             events: None,
             feedback: None,
-            health: Health::default(),
+            health,
             media,
             uri: "rtsp://127.0.0.1/test".into(),
             remote_control: 0,
@@ -1832,8 +1981,159 @@ mod tests {
             event_key: Vec::new(),
             event_rebuilds: 0,
             next_event_rebuild: Instant::now(),
+            media_was_healthy: true,
+            preempted: false,
         };
-        (member, receiver, worker)
+        (member, worker, methods)
+    }
+    #[test]
+    fn a_preempted_member_closes_without_sending_a_teardown() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mut member, worker, methods) =
+            local_member_with(receiver.local_addr().unwrap(), None);
+        member.preempted = true;
+        member.close();
+        drop(member);
+        worker.join().unwrap();
+        assert!(
+            !methods.lock().unwrap().iter().any(|m| m == "TEARDOWN"),
+            "the receiver that took the session over must not get a TEARDOWN back"
+        );
+    }
+    #[test]
+    fn a_normal_member_close_still_sends_teardown() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mut member, worker, methods) =
+            local_member_with(receiver.local_addr().unwrap(), None);
+        member.close();
+        drop(member);
+        worker.join().unwrap();
+        assert_eq!(
+            methods.lock().unwrap().iter().filter(|m| *m == "TEARDOWN").count(),
+            1
+        );
+    }
+    #[test]
+    fn an_unexpected_teardown_with_stopped_media_is_preempted() {
+        // The fake receiver sends TEARDOWN unprompted and drops its media socket.
+        // Media then stops arriving, which is the corroboration required before the
+        // engine is allowed to say "another controller took over".
+        let options: ProbeOptions = serde_json::from_value(json!({
+            "peers":[{"host":"127.0.0.1"}], "source":"loopback", "duration_ms":0,
+            "latency_ms":120, "gain":0.05
+        }))
+        .unwrap();
+        let standby = crate::standby::Control::new(crate::standby::Settings::default());
+        let source = crate::live::tests::source();
+        let gain = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0.05f32.to_bits()));
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = receiver.local_addr().unwrap();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(receiver)));
+        let (mut member, server, _methods) =
+            local_member_with_health(addr, Some(slot), Health::default());
+        member.media.connect_audio(addr).unwrap();
+        let began = Instant::now();
+        let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = warnings.clone();
+        let running = std::sync::atomic::AtomicBool::new(true);
+        let error = thread::scope(|scope| {
+            scope.spawn(|| {
+                while running.load(Ordering::Relaxed) {
+                    crate::live::tests::feed(&source, 0.02);
+                    thread::sleep(Duration::from_millis(10));
+                }
+            });
+            let result = send_packets(
+                &options,
+                &Cancellation::default(),
+                &gain,
+                crate::volume::Control::default(),
+                Some(&source),
+                &standby,
+                &Clock::new(),
+                None,
+                std::slice::from_mut(&mut member),
+                None,
+                &[],
+                &|json| seen.lock().unwrap().push(json),
+            );
+            running.store(false, Ordering::Relaxed);
+            result
+        });
+        let error = match error {
+            Ok(_) => panic!("a preempted session must end with a fault"),
+            Err(error) => error,
+        };
+        let fault = error.downcast_ref::<Fault>().expect("typed fault");
+        assert_eq!(fault.code, "preempted");
+        assert!(!fault.retryable);
+        assert!(member.preempted && member.closed);
+        assert!(
+            began.elapsed() < Duration::from_secs(8),
+            "the verdict must beat the 12 s media failure timeout"
+        );
+        let warning = warnings
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|event| event["code"] == "preempted")
+            .cloned()
+            .expect("preemption must emit one warning");
+        assert_eq!(warning["event"], "warning");
+        assert_eq!(warning["channel"], "control");
+        assert_eq!(warning["recovered"], false);
+        assert!(
+            warning["signals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s == "unexpected_teardown")
+        );
+        assert!(
+            warning["corroboration"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == "media_stopped")
+        );
+        server.join().unwrap();
+    }
+    #[test]
+    fn a_teardown_plus_stopped_media_becomes_a_preempted_fault() {
+        let (mut member, _rx, worker) = local_member();
+        let now = Instant::now();
+        member
+            .health
+            .preemption_signal(preemption::Signal::UnexpectedTeardown);
+        member.media.expire_media(now);
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = emitted.clone();
+        let (fault, healthy) =
+            member.poll_preemption(None, now, &|json| seen.lock().unwrap().push(json));
+        assert!(!healthy, "expired media must report unhealthy");
+        let fault = fault.expect("signal plus stopped media is a verdict");
+        assert_eq!(fault.code, "preempted");
+        assert!(!fault.retryable);
+        assert_eq!(fault.channel, "control");
+        assert!(member.preempted);
+        let emitted = emitted.lock().unwrap();
+        assert_eq!(emitted.len(), 1, "exactly one warning per verdict");
+        assert_eq!(emitted[0]["code"], "preempted");
+        assert_eq!(emitted[0]["corroboration"][0], "media_stopped");
+        drop(emitted);
+        drop(member);
+        worker.join().unwrap();
+    }
+    #[test]
+    fn a_setup_403_stays_a_generic_non_retryable_fault() {
+        // A 403 while opening the session is an authentication/setup failure, not
+        // evidence that another controller took over; the classifier is never run
+        // on this path. Keep its existing (non-retryable) classification.
+        let error = anyhow::anyhow!("SETUP rtsp://127.0.0.1/test: RTSP/1.0 403 Forbidden");
+        let fault = Fault::from_error("127.0.0.1", "setup", &error);
+        assert_ne!(fault.code, "preempted");
+        assert_eq!(fault.code, "protocol_error");
+        assert!(!fault.retryable);
     }
     #[test]
     fn stalled_sender_reanchors_instead_of_rebuilding_and_keeps_seq_linear() {

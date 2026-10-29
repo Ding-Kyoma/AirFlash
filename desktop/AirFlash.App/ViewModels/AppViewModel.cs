@@ -53,7 +53,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public int MasterVolume { get => _settings.MasterVolume; set { if (_closing || _resetting) return; value = Math.Clamp(value, 0, 100); if (value == _settings.MasterVolume) return; _settings.MasterVolume = value; VolumeChanged(); Notify(); } }
     public bool Muted => Session.Muted;
     public string MuteLabel => Muted ? L.Get("Unmute") : L.Get("Mute");
-    public string StatusTitle => _snapshot.State switch { PlaybackState.Connecting => L.Get("Connecting"), PlaybackState.Streaming => L.Get("Playing"), PlaybackState.Standby => L.Get("Standby"), PlaybackState.Pairing => L.Get("Pairing"), PlaybackState.Error => L.Get("Connection error"), _ => L.Get("Ready") };
+    public string StatusTitle => _snapshot.State switch { PlaybackState.Connecting => L.Get("Connecting"), PlaybackState.Streaming => L.Get("Playing"), PlaybackState.Standby => L.Get("Standby"), PlaybackState.Pairing => L.Get("Pairing"), PlaybackState.Error => L.Get("Connection error"), PlaybackState.Preempted => L.Get("Taken over by another device"), _ => L.Get("Ready") };
     public string StatusDetail => _snapshot.Message.Length > 0 ? _snapshot.Message : _snapshot.IsActive ? L.Format("{0} · target {1} ms", _snapshot.Receiver?.Name, _snapshot.TargetLatency) : L.Get("Select a receiver to play system audio");
     public string MonitorLatency => _snapshot.Metrics?.CaptureToSendP95 is { } ms ? $"{ms:F1} ms" : "—";
     public string MonitorQueue => _snapshot.Metrics?.MaxQueueAge is { } ms ? $"{ms:F1} ms" : "—";
@@ -85,7 +85,10 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             return summary;
         }
     }
-    public string ErrorDetails => _snapshot.State == PlaybackState.Error ? _snapshot.Message : Notice;
+    public string ErrorDetails => _snapshot.State is PlaybackState.Error or PlaybackState.Preempted ? _snapshot.Message : Notice;
+    /// <summary>The receiver now belongs to another controller. Reconnecting is a
+    /// deliberate user action, never the automatic transport retry.</summary>
+    public bool CanReconnect => !_closing && _snapshot.State == PlaybackState.Preempted && _snapshot.Receiver is not null;
     public string EngineVersion { get; set; } = L.Get("Unknown");
     public bool EngineReady => _engine is null || _engine.State == EngineAvailability.Ready;
     public bool EngineFailed => _engine?.State == EngineAvailability.Failed;
@@ -100,6 +103,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private void RefreshGlobalLatency() { Notify(nameof(CanEditGlobalLatency)); Notify(nameof(GlobalLatencyHint)); }
     internal void RefreshLatencyChoices() => StreamChoice.Update(LatencyChoices, Choices.LatenciesFor(_settings.CustomBufferMs));
     public AsyncCommand StopCommand { get; }
+    public AsyncCommand ReconnectCommand { get; }
     public AsyncCommand MuteCommand { get; }
     public event Action? SettingsChanged;
     public event Action? CatalogChanged;
@@ -154,6 +158,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         }, dispatcher);
         _discoverySearchTimer.Stop();
         StopCommand = new(() => StopAsync(), ShowError, () => _snapshot.IsActive);
+        ReconnectCommand = new(() => _snapshot.Receiver is { } receiver ? ToggleAsync(receiver) : Task.CompletedTask, ShowError, () => CanReconnect);
         MuteCommand = new(async () => { await Session.SetMutedAsync(!Session.Muted); Notify(nameof(Muted)); Notify(nameof(MuteLabel)); }, ShowError);
         MergeManualReceivers();
         RefreshLatencyChoices();
@@ -368,6 +373,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         {
             RefreshReceivers();
             StopCommand.Refresh();
+            Notify(nameof(CanReconnect));
+            ReconnectCommand.Refresh();
             UpdateDiscoveryDemand();
         }
         foreach (var row in Receivers) row.Refresh();

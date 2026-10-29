@@ -106,6 +106,28 @@ public sealed class IpcFailureTests
     }
 
     [Fact]
+    public async Task APreemptedStreamGetsItsOwnStateAndNeverAutoReconnects()
+    {
+        var connection = new Connection(); var factory = new Factory(connection); var audio = new Audio(false);
+        await using var controller = new SessionController(factory, audio, timing: Timing);
+        var streaming = Signal(); var preempted = Signal();
+        controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Streaming) streaming.TrySetResult(); if (snapshot.State == PlaybackState.Preempted) preempted.TrySetResult(); };
+        await controller.StartAsync(Receiver(), Settings());
+        await connection.Starting.Task.WaitAsync(Limit);
+        connection.Current("streaming");
+        await streaming.Task.WaitAsync(Limit);
+        connection.Current("error", new { code = "preempted", channel = "control", host = "192.0.2.10", retryable = false, message = "Another controller took over this receiver" });
+        await preempted.Task.WaitAsync(Limit);
+        var failed = controller.Snapshot;
+        Assert.Equal(PlaybackState.Preempted, failed.State);
+        Assert.Equal("preempted", failed.Diagnostics?.LastFault?.Code);
+        Assert.Equal(false, failed.Diagnostics?.LastFault?.Retryable);
+        Assert.Equal(L.Get("Another device took over this AirPlay session. Reconnect to claim it back."), failed.Message);
+        Assert.True(connection.Disposed);
+        Assert.Equal(1, factory.OpenCount);
+    }
+
+    [Fact]
     public async Task LifetimeCancellationRemainsIdleAndDisposesItsConnection()
     {
         var connection = new Connection(); var factory = new Factory(connection);
