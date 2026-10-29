@@ -171,22 +171,35 @@ impl Formats {
             transport != Transport::Buffered || alac,
             "buffered audio requires ALAC"
         );
-        let ptp = match profile.timing {
-            Timing::Inherit => inherited_ptp,
-            Timing::Auto => self
-                .features
-                .or(profile.features)
-                .map_or(inherited_ptp, |f| f & (1 << 41) != 0),
-            Timing::Ptp => {
-                ensure!(
-                    self.features
-                        .or(profile.features)
-                        .is_none_or(|f| f & (1 << 41) != 0),
-                    "PTP timing is not advertised"
-                );
-                true
+        // A followed receiver supplies the timeline, so following it is PTP by
+        // definition. A standalone HomePod on HomePod software 27 keeps its own
+        // grandmaster and stays silent on a sender-owned or NTP-timed session;
+        // an absent feature bit or an automatic timing choice must therefore
+        // never downshift a followed receiver to NTP.
+        let ptp = if profile.follow_receiver_clock {
+            ensure!(
+                profile.timing != Timing::Ntp,
+                "following a receiver clock requires PTP timing"
+            );
+            true
+        } else {
+            match profile.timing {
+                Timing::Inherit => inherited_ptp,
+                Timing::Auto => self
+                    .features
+                    .or(profile.features)
+                    .map_or(inherited_ptp, |f| f & (1 << 41) != 0),
+                Timing::Ptp => {
+                    ensure!(
+                        self.features
+                            .or(profile.features)
+                            .is_none_or(|f| f & (1 << 41) != 0),
+                        "PTP timing is not advertised"
+                    );
+                    true
+                }
+                Timing::Ntp => false,
             }
-            Timing::Ntp => false,
         };
         ensure!(
             transport != Transport::Buffered || ptp,
@@ -342,6 +355,57 @@ mod tests {
                 true
             )
             .is_err()
+        );
+    }
+    #[test]
+    fn followed_receiver_keeps_ptp_without_an_advertised_feature_bit() {
+        let formats = Formats {
+            realtime: Some(1 << 18),
+            features: Some(0),
+            ..Default::default()
+        };
+        let followed = Profile {
+            codec: Codec::Auto,
+            transport: Transport::Auto,
+            timing: Timing::Auto,
+            follow_receiver_clock: true,
+            ..Default::default()
+        };
+        let selection = formats
+            .negotiate(&followed, &[0, 1], 44100, false)
+            .unwrap();
+        assert!(selection.ptp, "following a receiver clock must stay on PTP");
+        assert!(selection.alac);
+        assert_eq!(selection.transport, Transport::Realtime);
+        assert!(
+            formats
+                .negotiate(
+                    &Profile {
+                        timing: Timing::Ntp,
+                        ..followed.clone()
+                    },
+                    &[0, 1],
+                    44100,
+                    false
+                )
+                .is_err(),
+            "an explicit NTP choice cannot follow a receiver clock"
+        );
+        // Without follow evidence the same receiver may legitimately advertise
+        // no PTP support and use NTP.
+        assert!(
+            !formats
+                .negotiate(
+                    &Profile {
+                        follow_receiver_clock: false,
+                        ..followed
+                    },
+                    &[0, 1],
+                    44100,
+                    false
+                )
+                .unwrap()
+                .ptp
         );
     }
     #[test]

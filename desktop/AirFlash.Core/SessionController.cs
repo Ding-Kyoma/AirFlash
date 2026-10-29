@@ -520,6 +520,10 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         if (kind == "negotiated")
                         {
                             lock (_sync) { if (epoch != _generation) continue; _diagnostics = _diagnostics with { Negotiated = (_diagnostics.Negotiated ?? []).Where(n => item.Text("receiver_id").Length > 0 ? n.Text("receiver_id") != item.Text("receiver_id") : n.Text("host") != item.Text("host")).Append(item.Clone()).ToArray() }; }
+                            // The handshake alone does not prove that the receiver can render
+                            // the stream; this line records the codec, transport, timing and
+                            // clock role needed to diagnose a silent session.
+                            log?.Invoke($"Receiver negotiated: {item.Text("receiver_id", item.Text("host"))}; host {item.Text("host")}; codec {item.Text("codec")}; transport {item.Text("transport")}; timing {item.Text("timing")}; clock_role {item.Text("clock_role")}; {item.Integer("sample_rate")} Hz");
                         }
                         if (kind is "clock_status" or "scheduler_status")
                         {

@@ -38,6 +38,25 @@ public sealed class SessionTests
             line.Contains("airflash-engine.exe") && line.Contains("waiting_sync_pair"));
     }
 
+    [Fact]
+    public async Task NegotiatedReceiverProfileIsLoggedWithClockRole()
+    {
+        var process = new FakeConnection();
+        var logs = new ConcurrentQueue<string>();
+        await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(),
+            logs.Enqueue, timing: Fast);
+        await controller.StartAsync(Pod(), Settings());
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        process.EmitData(new
+        {
+            @event = "negotiated", receiver_id = "a", host = "127.0.0.1", port = 7000,
+            codec = "alac", transport = "realtime", timing = "ptp", clock_role = "follow",
+            sample_rate = 44100, channel = "stereo", sync_offset_ms = 0
+        });
+        await Until(() => logs.Any(line => line.Contains("Receiver negotiated", StringComparison.Ordinal)));
+        Assert.Contains(logs, line => line.Contains("clock_role follow") && line.Contains("alac") && line.Contains("44100 Hz"));
+    }
+
     private static Receiver Pod(string id = "a") => new(id, id, "127.0.0.1");
     private static AppSettings Settings() => new() { AutoConnectOnDiscover = false, ForceReconnect = false, MasterVolume = 10 };
     private static readonly SessionTiming Fast = new(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1), TimeSpan.FromMilliseconds(10));

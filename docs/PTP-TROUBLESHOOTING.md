@@ -41,6 +41,29 @@ with the receiver model when a `sync`-sourced offset behaves incorrectly.
 An OS error code in `last_send_error` or `last_receive_error` identifies a local
 socket failure. Normal nonblocking polling is not logged as an error.
 
+## Connected but no audio on a standalone HomePod
+
+A standalone HomePod on HomePod software 27 keeps announcing itself as the PTP
+grandmaster and stays silent when the sender also supplies the timeline.
+AirFlash recognises the standalone shape from the receiver TXT record (`model`
+starting with `AudioAccessory`, `igl=1`, no `pgid`, no `tsid`, and `osvers` 27 or
+later) and follows that receiver's clock instead. Releases before 0.5.0 always
+acted as the grandmaster, so they establish the session and send audio that the
+HomePod never renders.
+
+The `Receiver negotiated:` line in `wpf-YYYY-MM-DD.log` records the selected
+codec, transport, timing and `clock_role`. `clock_role follow` means the
+receiver's clock is in use. `clock_role sender` means AirFlash supplies the
+timeline, which is correct for a stereo pair or an Apple TV output but not for a
+standalone OS 27 HomePod. An NTP-timed realtime stream is also silent on a
+HomePod, so a followed receiver stays on PTP even when the PTP feature bit is not
+advertised.
+
+If a current release still streams without audio while `clock_role follow` is
+reported, include that line and the `clock_status` snapshot. UDP 319/320 must
+reach the engine for the follow exchange, so the firewall checks below still
+apply.
+
 ## Windows Firewall
 
 The process owning PTP sockets is
