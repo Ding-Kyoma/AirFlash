@@ -121,7 +121,12 @@ pub struct HealthSnapshot {
 struct HealthState {
     metrics: HealthSnapshot,
     failure: Option<Fault>,
+    /// Control-plane trouble that must not stop healthy media. RTSP/event feedback
+    /// and the UDP RTP stream are independent; an AP roam that kills the control
+    /// socket should not end playback that is still arriving.
+    degraded: Option<Fault>,
     notices: VecDeque<Value>,
+    commands: crate::events::Inbox,
 }
 #[derive(Clone, Default)]
 pub struct Health(Arc<Mutex<HealthState>>);
@@ -138,11 +143,40 @@ impl Health {
     pub fn notices(&self) -> Vec<Value> {
         self.0.lock().unwrap().notices.drain(..).collect()
     }
+    /// Commands the receiver sent on the event channel, in arrival order.
+    pub fn commands(&self) -> Vec<crate::events::ParsedEvent> {
+        self.0.lock().unwrap().commands.drain()
+    }
+    pub fn commands_dropped(&self) -> u64 {
+        self.0.lock().unwrap().commands.dropped()
+    }
     fn fail(&self, fault: Fault) {
         let mut state = self.0.lock().unwrap();
         if state.failure.is_none() {
             state.failure = Some(fault);
         }
+    }
+    /// Record a control-plane fault without stopping the media stream.
+    fn degrade(&self, fault: Fault) {
+        let mut state = self.0.lock().unwrap();
+        if state.degraded.is_none() {
+            state.degraded = Some(fault);
+        }
+    }
+    /// Control-plane verdict: a degraded control channel only ends the session when
+    /// the media side is unhealthy too, or when the receiver rejected our session
+    /// outright (reconnecting is the only fix for that).
+    pub fn check_control(&self, media_healthy: bool) -> Result<()> {
+        let degraded = self.0.lock().unwrap().degraded.clone();
+        match degraded {
+            Some(fault) if !media_healthy || matches!(fault.code.as_str(), "authentication_failed" | "session_rejected") => {
+                Err(fault.into())
+            }
+            _ => Ok(()),
+        }
+    }
+    pub fn control_degraded(&self) -> Option<Fault> {
+        self.0.lock().unwrap().degraded.clone()
     }
     fn notice(&self, host: &str, channel: &str, code: &str, message: &str, recovered: bool) {
         let mut state = self.0.lock().unwrap();
@@ -178,7 +212,14 @@ impl EventWorker {
             .spawn(move || {
                 if let Err(error) = event_loop(&mut connection, &health, &done) {
                     if !done.is_cancelled() {
-                        health.fail(Fault::from_error(host, "events", &error));
+                        let fault = Fault::from_error(host, "events", &error);
+                        if matches!(fault.code.as_str(), "authentication_failed" | "session_rejected") {
+                            health.fail(fault);
+                        } else {
+                            // Losing the event channel silences buttons and metadata;
+                            // it does not stop audio that is still flowing.
+                            health.degrade(fault);
+                        }
                     }
                 }
             })?;
@@ -208,7 +249,17 @@ fn event_loop(connection: &mut Connection, health: &Health, stop: &Cancellation)
             format!("{protocol} 200 OK\r\n{cseq}Content-Length: 0\r\nAudio-Latency: 0\r\n\r\n")
                 .as_bytes(),
         )?;
-        health.0.lock().unwrap().metrics.event_messages += 1;
+        {
+            let mut state = health.0.lock().unwrap();
+            state.metrics.event_messages += 1;
+            // The body carries the actual request: a HomePod pause button shows up
+            // here and nowhere else. Keep the channel alive even when the body is
+            // something we cannot read.
+            let parsed = crate::events::parse(&msg.body);
+            if !parsed.commands.is_empty() || parsed.volume.is_some() {
+                state.commands.push(parsed);
+            }
+        }
     }
     Ok(())
 }
@@ -258,7 +309,20 @@ impl FeedbackWorker {
                         if fault.code != "feedback_rejected" {
                             health.0.lock().unwrap().metrics.feedback_failures += 1;
                         }
-                        health.fail(fault);
+                        if matches!(fault.code.as_str(), "authentication_failed" | "session_rejected") {
+                            health.fail(fault);
+                        } else {
+                            // Feedback is a health probe, not the audio path: keep
+                            // sending and let `check_control` decide when to give up.
+                            health.notice(
+                                &fault.host,
+                                "feedback",
+                                "feedback_lost",
+                                "Receiver feedback stopped; audio continues",
+                                false,
+                            );
+                            health.degrade(fault);
+                        }
                     }
                 }
             })?;
@@ -465,6 +529,11 @@ impl MediaTransport {
     }
     pub fn latency(&self) -> Duration {
         self.latency
+    }
+    /// Media health independent of the control channel: have we moved audio to the
+    /// receiver recently?
+    pub fn media_healthy(&self, now: Instant, window: Duration) -> bool {
+        now.saturating_duration_since(self.last_success) < window
     }
     pub fn service_buffered(&mut self, now: Instant) -> Result<()> {
         if let Some(sender) = &mut self.buffered {
@@ -821,6 +890,41 @@ impl MediaSchedule {
 #[cfg(test)]
 mod schedule_tests {
     use super::*;
+    #[test]
+    fn control_plane_faults_keep_playing_while_media_is_healthy() {
+        let health = Health::default();
+        health.degrade(Fault::new(
+            "127.0.0.1",
+            "feedback",
+            "feedback_timeout",
+            true,
+            "Receiver feedback exceeded the recovery deadline",
+        ));
+        // Healthy media: the session continues.
+        assert!(health.check_control(true).is_ok());
+        assert!(health.check().is_ok(), "nothing failed the media path");
+        assert!(health.control_degraded().is_some());
+        // Media stopped too: now the degradation is fatal.
+        assert!(health.check_control(false).is_err());
+    }
+    #[test]
+    fn authentication_faults_are_fatal_even_with_healthy_media() {
+        let health = Health::default();
+        health.degrade(Fault::new(
+            "127.0.0.1",
+            "feedback",
+            "authentication_failed",
+            false,
+            "Receiver rejected the session",
+        ));
+        assert!(health.check_control(true).is_err());
+    }
+    #[test]
+    fn a_healthy_control_channel_has_nothing_to_report() {
+        let health = Health::default();
+        assert!(health.check_control(false).is_ok());
+        assert!(health.control_degraded().is_none());
+    }
     #[test]
     fn expired_udp_media_is_rejected_before_packetization_or_network_write() {
         let peer = UdpSocket::bind("127.0.0.1:0").unwrap();

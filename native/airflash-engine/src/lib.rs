@@ -4,6 +4,7 @@ pub mod clock;
 pub mod continuity;
 pub mod crypto;
 pub mod equalizer;
+pub mod events;
 pub mod profile;
 pub mod receiver_capabilities;
 pub mod rtp;

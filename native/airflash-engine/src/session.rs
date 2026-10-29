@@ -1134,6 +1134,12 @@ fn send_packets(
                     emit(notice);
                 }
                 member.health.check()?;
+                // Control-plane trouble only ends media that has already stopped
+                // arriving; a dead RTSP feedback loop on a healthy RTP stream keeps
+                // playing (and is reported as a warning instead).
+                member
+                    .health
+                    .check_control(member.media.media_healthy(Instant::now(), MEDIA_HEALTH_WINDOW))?;
             }
             if let Some(timer) = &ptp {
                 if members
@@ -1309,6 +1315,20 @@ fn send_packets(
                 crate::telemetry::publish_diagnostics(snapshot.clone());
                 emit(snapshot);
                 next_metrics = now + Duration::from_secs(1);
+            }
+            // Receiver-side buttons and sliders arrive on the event channel; relay
+            // them so the desktop side can drive the system media session.
+            for member in members.iter_mut() {
+                for command in member.health.commands() {
+                    emit(json!({
+                        "event": "remote_command",
+                        "host": member.peer.host,
+                        "receiver_id": member.peer.receiver_id,
+                        "commands": command.commands.iter().map(|c| c.name()).collect::<Vec<_>>(),
+                        "source": command.source,
+                        "volume": command.volume,
+                    }));
+                }
             }
             // Every member gets new media before any member services retransmissions.
             for member in members.iter_mut() {
@@ -1488,6 +1508,9 @@ fn transport_metrics(
 fn round3(value: f64) -> f64 {
     (value * 1000.0).round() / 1000.0
 }
+/// A receiver that has accepted RTP this recently is still listening, even if the
+/// control channel is unhappy.
+const MEDIA_HEALTH_WINDOW: Duration = Duration::from_secs(2);
 fn offset_time(base: u64, common: Duration, own: Duration, offset_ms: i32) -> Result<u64> {
     Ok(u64::try_from(
         base as i128 + common.as_nanos() as i128 - own.as_nanos() as i128
