@@ -802,6 +802,104 @@ variance, priority2, grandmasterIdentity, stepsRemoved)`，快照里能看出对
 
 ---
 
+---
+
+## 九、捕获自愈（P3-8）
+
+### Q28. 多进程回环能否按 QPC 时间戳逐样本相加？ `[已确认]`
+
+P3-8 现在对同一可执行文件的多个根实例各开一个 process loopback client，解码后按
+`GetBuffer` 的 QPC 时间戳落到同一个采样网格上相加，再进重采样器。
+
+**为什么拿不准**：没有真机，也没有两个实例同时发声的离线环境；不同
+`ActivateAudioInterfaceAsync` client 的 QPC 基准是否严格一致、是否各自带不同的
+额外延迟，只能静态推测。若基准差超过半个样本，相加会变成两路错位混音而不是
+「采样级相加」。是否需要改成「以第一个实例的包为时间基准、其余实例按包序号
+对齐」或「只抓主实例」？
+
+> **答复**：**WAC 没有"多 client 相加"这件事 —— 它的进程回环是单选 + 候选回退，而且默认走设备回环。你的担心成立，且比你想的更严重。**
+>
+> ## 一、WAC 的两个采集后端是互斥的
+>
+> 〔串〕
+> ```
+> wasapi-device-capture        ← 设备回环（默认端点）
+> wasapi-process-capture       ← 进程回环
+> default loopback '<name>'  /  device '<name>'
+> Switching capture to default loopback
+> Switching capture to device: <name>          （capture_eq.rs:103 / 116 / 136）
+> ```
+>
+> **进程回环到底是"同时抓多个 PID"还是"选一个 PID + 候选回退"——静态定不了，两组串互相矛盾**：
+>
+> | 倾向「同时抓」 | 倾向「选一个」 |
+> |---|---|
+> | `Switching to per-process capture (PIDs: <list>)` | `Capture session <x> ended (<y>) - trying next PID candidate` |
+> | `Per-process capture started for candidate PIDs <list>`（复数） | `Selected process PID <n> exited - waiting for a replacement` |
+> | | `process PID <n> (candidate <k>)`（单数 PID + 候选序号） |
+> | | `No process PID candidates supplied` |
+>
+> `trying next` 与 `waiting for a replacement` 读起来像**串行试用**；但 `started for candidate PIDs`（复数）读起来像**全量启动**。Rust 无源码、`active_sources` 语义也未定位，**我给不出结论**。
+>
+> → 但这一点**不影响下面的答案**：无论 WAC 是串行还是并行，它都**没有"把多个 client 的样本按 QPC 相加"**的代码证据。
+>
+> ## 二、QPC 到底能不能用来对齐（平台事实，非 WAC 证据）
+>
+> | 问题 | 答案 |
+> |---|---|
+> | 基准是否严格一致？ | **是**。`QueryPerformanceCounter` 是**全系统单调计数器**，所有 client 共用同一时间基。 |
+> | 偏移有多大？ | **不是半个样本，可能是整个 period。** `IAudioCaptureClient::GetBuffer` 给的 `pu64QPCPosition` 是**该 client 自己缓冲里这帧被捕获的时刻**，它 = 该进程渲染延迟 + 该 client 协商到的 period。不同进程的 period 可以是 3 ms / 10 ms —— 10 ms @ 44.1 kHz = **441 样本**。 |
+> | 能按 QPC 落网格做到采样级相加吗？ | **不能。** |
+>
+> 所以你的判断是对的，而且「超过半个样本就错位」这个门槛**远早于**真实偏移量。
+>
+> ## 三、三条路，按推荐度
+>
+> ### 首选：改抓**设备回环**
+> 这正是 WAC 的默认路径。多个根实例都渲染到同一个默认端点，**OS 混音器已经按采样精确相加过了**。你抓设备回环就直接拿到那个混合结果，**根本不需要对齐**。
+> 代价：会把别的 App 的声音也抓进来 —— WAC 接受这个代价（默认就是 device）。
+>
+> ### 次选：进程回环但**只抓一个**（WAC 的进程模式）
+> 选一个 PID，静音就试下一个候选，退出就等替补，**不相加**。适用于"同一时刻只有一个实例在发声"。
+>
+> ### 最后：多 client 相加（你现在的做法）—— 如果非要
+> 1. **QPC 只用于粗对齐（ms 级）和检测漂移**，不要用于采样对齐；
+> 2. 启动时在一个非静音窗口上做一次**互相关**，求出整数样本偏移；
+> 3. 之后每路用**独立重采样器**锁住这个偏移；
+> 4. 必须有「某一路 rebuffer/重启就整体重算偏移」的逻辑 —— 那会改变它的 QPC 基准。
+>
+> ⚠️ **相加前必须做相位检查**：如果两路内容相关（同一首歌的两个实例），偏移错了会**梳状滤波/相位抵消** —— 听起来是"变薄"而不是"错位"，**极难被发现**。这是多 client 相加最危险的失败模式。
+>
+> ## 四、给 AirFlash 的具体建议
+>
+> **把"自愈"和"多实例"解耦** —— 这是你问题的真正病根：
+>
+> - **自愈**：设备回环本身就有完整的重开路径（`produced no audible samples for <n>ms after a data discontinuity; reopening endpoint`、`Default render endpoint changed while capture was silent; switching from <a> to <b>`、`Capture session <x> ended - reacquiring endpoint, retry <k>`）。**不需要多 client 就能自愈。**
+> - **多实例**：交给 OS 混音器（设备回环）。
+>
+> ⇒ 结论：**默认走设备回环；仅在用户明确要求「只抓这个 App」时才切进程回环。** 这样 P3-8 的全部目标都达成，而 QPC 对齐这个坑从一开始就不存在 —— 不管进程回环内部是单选还是并行。
+
+---
+
+## 十、兼容 profile（P2-13）
+
+### Q29. 能力预判要不要带上 `/info` 的 `model`/`sourceVersion`？ `[待答复]`
+
+**我们暂定**：`receiver_capabilities` 的能力预判继续只用 `supportedFormats` +
+桌面端下发的 legacy codec 列表 + 对端自述 `features`，不带 `/info` 的 `model` /
+`sourceVersion`；只有在 `session.rs` 真正建会话时才用完整指纹。
+
+**需要确认**：同一台 HomePod 如果 `/info` 有 bit40、而桌面端下发 `features` 缺
+bit40，预判会把它的 `selected_timing` 算成 `ntp`，实际会话却按 `model` 走 PTP。
+预判要不要也吃型号证据、与运行时保持一致？这会让 `receiver_capabilities` IPC
+事件里 `selected_timing` 的取值发生变化。
+
+**为什么拿不准**：Q18 的答复是「AF 应改用型号 + 拓扑表」，按字面预判也该带；
+但 P2-13 是纯重构，带型号会改变现有预判的取值，超出「行为不变」的范围，
+所以这轮先保持原状。
+
+---
+
 ## 答复区
 
 > 已在每条条目下方就地回填（`> **答复**`）。下面是需要**优先改代码**的 4 条，按影响排序。
@@ -831,16 +929,3 @@ variance, priority2, grandmasterIdentity, stepsRemoved)`，快照里能看出对
 1. **伺服增益链路把两件事对上了**：`correction_ppb = filtered_ns / 20`，夹 **±50 ppm**。而 AF 现成的重采样环量程是 **±500 ppm** —— 你们的环路**量程绰绰有余，缺的只是"死区 + 增益"**。P0-3 的改造量比报告估计的更小。
 2. **`deadline` 是唯一权威源**，WAC 因此只需要改一处；AF 的 `base_ns` 是局部变量（`session.rs:1041`），这是所有"映射跳变"类问题的**同一根因**。
 3. **`ComputeRecommendation` 是一次算三方案，不升档**：所以"自适应阶梯"整套是 AF 的净增能力，不必也不该去对齐 WAC 的候选表（那张表里有 30/40 这种**永远用不到**的值）。
-
-## 八、捕获自愈（P3-8）
-
-### Q28. 多进程回环能否按 QPC 时间戳逐样本相加？ `[待答复]`
-
-P3-8 现在对同一可执行文件的多个根实例各开一个 process loopback client，解码后按
-`GetBuffer` 的 QPC 时间戳落到同一个采样网格上相加，再进重采样器。
-
-**为什么拿不准**：没有真机，也没有两个实例同时发声的离线环境；不同
-`ActivateAudioInterfaceAsync` client 的 QPC 基准是否严格一致、是否各自带不同的
-额外延迟，只能静态推测。若基准差超过半个样本，相加会变成两路错位混音而不是
-「采样级相加」。是否需要改成「以第一个实例的包为时间基准、其余实例按包序号
-对齐」或「只抓主实例」？
