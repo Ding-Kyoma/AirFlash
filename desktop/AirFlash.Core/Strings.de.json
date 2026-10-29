@@ -364,5 +364,6 @@
   "This device only supports classic AirPlay. AirFlash cannot stream to it yet.": "Dieses Gerät unterstützt nur klassisches AirPlay. AirFlash kann derzeit nicht dorthin streamen.",
   "This device requires a password or pairing that AirFlash could not complete. Pair it again in Receivers.": "Dieses Gerät erfordert ein Kennwort oder eine Kopplung, die AirFlash nicht abschließen konnte. Koppeln Sie es erneut unter Empfänger.",
   "This device requires MFi authentication, which AirFlash cannot perform without Apple hardware.": "Dieses Gerät erfordert eine MFi-Authentifizierung, die AirFlash ohne Apple-Hardware nicht durchführen kann.",
-  "Could not reach the receiver over the network. Check that it is powered on and on the same network as this PC.": "Der Empfänger ist im Netzwerk nicht erreichbar. Prüfen Sie, ob er eingeschaltet und mit demselben Netzwerk wie dieser PC verbunden ist."
+  "Could not reach the receiver over the network. Check that it is powered on and on the same network as this PC.": "Der Empfänger ist im Netzwerk nicht erreichbar. Prüfen Sie, ob er eingeschaltet und mit demselben Netzwerk wie dieser PC verbunden ist.",
+  "AirPlay 2 and classic AirPlay 1/RAOP devices cannot be grouped together. Please connect them separately.": "AirPlay 2- und klassische AirPlay 1/RAOP-Geräte können nicht zu einer Gruppe zusammengefasst werden. Bitte verbinden Sie sie getrennt."
 }

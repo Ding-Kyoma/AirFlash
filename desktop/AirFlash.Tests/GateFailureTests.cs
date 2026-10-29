@@ -69,6 +69,24 @@ public sealed class GateFailureTests
         Assert.Equal(GateFailureKind.None, GateFailure.Classify(group, Notice("protocol_error")));
     }
 
+    [Fact]
+    public void MixedTimingGroupRefusalMapsToTheDedicatedGate()
+    {
+        // The engine refuses the group before any SETUP (QUESTIONS Q39). Even
+        // though the group contains classic evidence, the authoritative code
+        // wins: the advice is "connect them separately", not "replace the
+        // device", and the same string is shown whatever the receiver list says.
+        var group = new Receiver("stereo:pair", "Pair", "") { Members = [Classic(), AirPlay2()] };
+        var notice = Notice("mixed_timing_group", message: "AirPlay 2 and classic AirPlay 1/RAOP devices cannot be grouped together. Please connect them separately.");
+        foreach (Receiver? receiver in new[] { group, AirPlay2(), Classic(), null })
+        {
+            Assert.Equal(GateFailureKind.MixedTimingGroup, GateFailure.Classify(receiver, notice));
+            Assert.Equal(
+                L.Get("AirPlay 2 and classic AirPlay 1/RAOP devices cannot be grouped together. Please connect them separately."),
+                GateFailure.Message(receiver, notice));
+        }
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

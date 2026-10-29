@@ -14,7 +14,13 @@ public enum GateFailureKind
     /// </summary>
     PasswordOrPairing,
     /// <summary>The receiver could not be reached or stopped answering on the network.</summary>
-    Network
+    Network,
+    /// <summary>
+    /// The engine refused a group that mixes AirPlay 2 and classic devices before
+    /// any SETUP (QUESTIONS Q39). Like WAC, AirFlash does not downgrade such a
+    /// group; the user has to connect the two device types separately.
+    /// </summary>
+    MixedTimingGroup
 }
 
 /// <summary>
@@ -40,6 +46,12 @@ public static class GateFailure
     {
         if (notice is null || notice.Code is "preempted" or "timeline_expired" or "clock_lost")
             return GateFailureKind.None;
+        // The engine refuses a mixed group before any SETUP, so this code is
+        // authoritative. It must win over the classic-member evidence below:
+        // those members are not the reason the session failed, and telling the
+        // user to replace the classic device would be the wrong advice.
+        if (notice.Code.Equals("mixed_timing_group", StringComparison.OrdinalIgnoreCase))
+            return GateFailureKind.MixedTimingGroup;
         // MFi-looking text is folded into the general authentication gate: it may
         // only change the wording (see Message), never the authoritative kind.
         if (LooksLikeMfi(notice) || IsPassword(notice, receiver)) return GateFailureKind.PasswordOrPairing;
@@ -65,6 +77,7 @@ public static class GateFailure
             GateFailureKind.ClassicOnly => L.Get("This device only supports classic AirPlay. AirFlash cannot stream to it yet."),
             GateFailureKind.PasswordOrPairing => L.Get("This device requires a password or pairing that AirFlash could not complete. Pair it again in Receivers."),
             GateFailureKind.Network => L.Get("Could not reach the receiver over the network. Check that it is powered on and on the same network as this PC."),
+            GateFailureKind.MixedTimingGroup => L.Get("AirPlay 2 and classic AirPlay 1/RAOP devices cannot be grouped together. Please connect them separately."),
             _ => null
         };
     }
