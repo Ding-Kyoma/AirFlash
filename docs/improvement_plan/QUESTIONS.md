@@ -23,7 +23,7 @@ WAC 的日志只有一句：〔串〕`「Sender thread behind by <n> ms (beyond 
 | **(b) 推进时间轴槽位** | `frames += 跳过的包数 × 352`，`seq/rtptime` 一起前进（等价 AirFlash 现有的 `recover(live=true)` + `skip_packets`） | seq/rtptime 出现空洞（对端会发重传请求，补不上就自己遮盖） |
 | **(c) 只改 lead** | 本地提前一帧发，`seq` 连续、sync 映射不变 | 时间轴完全不变，只是发送提前量变大 |
 
-**我们暂定做 (b)+(c) 的组合**：超过预算时先用 `skip_packets` 把 `seq/rtptime` 推进到"当前时刻"，再把本地 deadline 对齐到 `now + 一帧`（留一帧相位余量）；不改 sync 映射、不改 `start`。理由是 AirFlash 的 `base_ns` 是 `send_packets` 内的局部变量（`session.rs:1041`），平移 `start` 会与它脱节。
+**我们暂时实现的是 (a)+(c) 的混合**（见 [`PROGRESS.md`](PROGRESS.md) 的 P0-1）：`MediaSchedule.shift` 平移整条时间线的起点，`seq` 与 `rtptime` 保持线性不动，`sync` 包里的 `rtptime → 网络时间` 锚点跟着一起平移（每个使用点都加 `anchor_shift_ns()`，包括原来作为局部变量的 `base_ns`），并留一帧相位余量。已明确否决 (b)：跳过 `seq` 会在接收端制造重复 nonce，也破坏「seq 连续」这条验收。**如果 WAC 实际是 (b)，这一项要重做**，所以仍待确认。
 
 **需要确认**：
 
@@ -258,6 +258,69 @@ WAC 的进程回环走 `INCLUDE_TARGET_PROCESS_TREE`，AirFlash 现在是 `AUTOC
 **需要确认**：这条"会话行"是写到引擎 stdout（IPC 事件）、Windows 事件日志，还是 C# 日志文件？WAC 是写到哪个诊断桶里？
 
 ---
+
+## 八、第二轮落地时新增的疑问
+
+> 下面这些是在 P0-3 / P1-7 / P1-9 / P0-2 / P3-1 实现过程中新产生的；都已按「暂定做法」落地，改起来成本不高，但最好一次对齐。
+
+### Q21. 有没有「运行中改提前量」的原生机制？`[待确认]`
+
+我们新增了 IPC `set_lead { ms }`：把请求值作用到 `MediaSchedule.shift`，同步锚点一起移动，**不重建会话**；人工设定的值不受 `relax()` 每秒回收一帧的影响。上限 2000 ms。
+
+**需要确认**：
+
+1. WAC 调整 lead 时是改 sync 映射、改 deadline、还是重发 `SETRATEANCHORTIME`？
+2. 运行中改 lead，接收端会不会出现「同一段音频被播两次」或「跳一段」的可听后果？WAC 是否只在会话边界改？
+3. 2000 ms 的上限是否合理，还是应当按接收端 buffer 能力动态取值？
+
+### Q22. 自适应阶梯的具体数值 `[待确认]`
+
+`LatencyPolicy` 目前用：单只 HomePod ALAC/PTP 起点/下限 50、阶梯 50/60/80/120/200；PCM/PTP 起点 60、下限 45；NTP 起点 200、下限 120；立体声对（原生/软件）起点=下限 120。上调条件是「一分钟内 3 次时间线恢复」，每分钟最多一级。
+
+**需要确认**：
+
+1. 报告里的「50/40/30 阶梯，验证下限 50」自相矛盾（下限 50 就到不了 40/30）。到底是**起点 50 只能往上**，还是**下限 30、50 只是推荐起点**？
+2. 立体声对 120 ms 的下限是硬结论还是保守估计？有没有更小的已验证值？
+3. 上调判据用「恢复次数」对不对？WAC 是用欠载次数、p99 迟到，还是重传率？
+
+### Q23. 16 bit 输出要不要抖动？`[待确认]`
+
+我们加了 TPDF 抖动（±1 LSB），但**数字静音保持精确 0**（接收端遮盖逻辑依赖全零帧判定）。
+
+**需要确认**：WAC 是否也抖动？如果它不抖动，我们和它的听感会有细微差异（我们的本底噪声高约 1 bit，但没有量化失真）。若 WAC 用的是噪声整形（error feedback），请给出阶数/系数。
+
+### Q24. `DATA_DISCONTINUITY` 怎么判真伪？`[待确认]`
+
+我们的做法：记录上一包的设备位置 `position + frames`，若本包 `position` 与之相等就判为「回环绕回」的伪标志，只计数不清队列；否则才是真断流（清队列 + 重置重采样器 + 打 splice 边界）。
+
+**需要确认**：
+
+1. WAC 用 `pu64DevicePosition` 连续性判，还是用 QPC 时间差 / 包间隔判？
+2. 真断流时 WAC 会不会保留重采样器状态（避免滤波器瞬态），只打 splice 标记？我们现在是 `reset()`，可能有一下轻微「咔」。
+
+### Q25. 事件通道 body 的准确形状 `[待确认]`
+
+我们的解析器按 `mrCommand` → `command` → `cmd` → `action` 顺序找键，字符串形式（`play`/`pause`/`toggle`/`next`/`previous`/`mute`/`volume_up`…）与 MRP 数字（0 Play、1 Pause、2 Toggle、3 Stop、4 Next、5 Previous、6 Shuffle、7 Repeat、29 Mute、30 VolUp、31 VolDown）都接受；`volume` 支持 0–1、0–100、dBFS 三种归一化。整个事件以 `remote_command` 转发给桌面端。
+
+**需要确认**：
+
+1. HomePod 按暂停时实际发的是哪个键、什么类型（整数还是字符串）？body 是单个 dict 还是数组？
+2. 数字编码是否就是 MediaRemote 的枚举（0=Play…）？我们用的映射表对不对？
+3. `volume` 的线上单位到底是 0–1 还是 dBFS？AirFlash 现在只有「设备音量 SET_PARAMETER」，没处理过事件里的音量。
+4. 我们只是把命令转发给桌面端、由 C# 去驱动系统媒体控制。WAC 是直接调 MediaRemote/SMTC 还是自己合成键？如果它用 `SendInput` 发 `VK_MEDIA_PLAY_PAUSE`，我们照抄更省事。
+
+### Q26. QoS 标记用哪条路？`[待确认]`
+
+我们要给音频 UDP socket 打 DSCP EF（46），两条路：
+
+| 方案 | 优点 | 代价 |
+| --- | --- | --- |
+| `setsockopt(IPPROTO_IP, IP_TOS, 0xB8)` | 一行、无状态 | Windows 上常被忽略；只能标 socket，不分流向 |
+| qWAVE（`QOSCreateHandle` + `QOSAddSocketToFlow`） | Wi-Fi 上真能拿到 WMM 优先级 | 需要 handle 生命周期管理，失败时要能优雅退化 |
+
+**我们暂定**先做 `setsockopt` 版本（best-effort，失败只记遥测）。
+
+**需要确认**：WAC 用的是 qWAVE 还是 `IP_TOS`？如果 qWAVE，`QOSFlowRate` / `ServiceType` 之类的参数它怎么填？
 
 ## 答复区
 
