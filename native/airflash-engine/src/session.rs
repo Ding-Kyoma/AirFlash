@@ -843,18 +843,24 @@ fn probe_member(
     }
 }
 
-/// The single divergence warning for one group setup.
+/// The internal diagnostic for one group setup, never a user-facing warning.
 ///
-/// Members are one clock domain, so when their timing evidence (or an explicit
-/// NTP request) points different ways the plan forces a common decision. This
-/// names every member and the forced decision; it is emitted once, before any
-/// SETUP, and never per packet.
-fn group_timing_warning(
+/// Q33: the reference implementation has one timing plan per group and asserts
+/// `snapshot.Timing == plan.Timing` at runtime, so a group that runs two clock
+/// domains is a planning bug, not a runtime risk the user can act on. The old
+/// `group_timing_divergence` warning therefore becomes a stderr log line: the
+/// desktop's `warning` channel never sees it, but the evidence summary (every
+/// member, its AirPlay 2 evidence, its solo answer and its explicit request)
+/// survives in the engine log and in diagnostic exports.
+///
+/// It reports when member evidence disagrees or when an explicit per-member
+/// request is overridden by the group plan. Both are expected inputs to the
+/// one-plan design; the line exists to explain why the group chose what it did.
+fn group_timing_diagnostic(
     peers: &[Peer],
     fingerprints: &[crate::profile::CompatFingerprint],
     plan: crate::profile::TimingPlan,
-    codec: crate::profile::Codec,
-) -> Option<Json> {
+) -> Option<String> {
     use crate::profile::Timing;
     if !plan.is_group() || peers.len() != fingerprints.len() {
         return None;
@@ -870,8 +876,11 @@ fn group_timing_warning(
     let airplay2: Vec<_> = evidence.iter().map(|evidence| evidence.airplay2).collect();
     let evidence_disagrees = airplay2.windows(2).any(|pair| pair[0] != pair[1])
         || solos.windows(2).any(|pair| pair[0] != pair[1]);
-    let automatic = crate::profile::select_timing(&evidence, codec);
-    let settings_forced = automatic != plan.timing();
+    let settings_forced = peers.iter().any(|peer| match peer.profile.timing {
+        Timing::Ntp => plan.timing() != Timing::Ntp,
+        Timing::Ptp => plan.timing() != Timing::Ptp,
+        _ => false,
+    });
     if !evidence_disagrees && !settings_forced {
         return None;
     }
@@ -882,24 +891,6 @@ fn group_timing_warning(
             peer.receiver_id.clone()
         }
     };
-    let cause = peers
-        .iter()
-        .zip(&evidence)
-        .find(|(_, evidence)| !evidence.airplay2)
-        .map(|(peer, _)| peer)
-        .or_else(|| {
-            peers
-                .iter()
-                .zip(&solos)
-                .find(|(_, solo)| plan.timing() == Timing::Ntp && **solo == Timing::Ntp)
-                .map(|(peer, _)| peer)
-        })
-        .or_else(|| {
-            peers
-                .iter()
-                .find(|peer| peer.profile.timing == Timing::Ntp)
-        })
-        .or_else(|| peers.first());
     let described: Vec<_> = peers
         .iter()
         .zip(&evidence)
@@ -928,18 +919,15 @@ fn group_timing_warning(
             )
         })
         .collect();
-    Some(json!({
-        "event": "warning",
-        "code": "group_timing_divergence",
-        "channel": "setup",
-        "host": cause.map(|peer| peer.host.to_string()).unwrap_or_default(),
-        "recovered": true,
-        "message": format!(
-            "Group timing evidence disagreed: {}; forced {} for the whole group",
-            described.join(", "),
-            if plan.timing() == Timing::Ptp { "PTP" } else { "NTP" },
-        ),
-    }))
+    Some(format!(
+        "group_timing_divergence: {}; forced {} for the whole group",
+        described.join(", "),
+        if plan.timing() == Timing::Ptp {
+            "PTP"
+        } else {
+            "NTP"
+        },
+    ))
 }
 
 fn load_quiet_wav(options: &ProbeOptions) -> Result<Vec<i16>> {
@@ -1299,20 +1287,21 @@ fn run_stream(
         .iter()
         .map(crate::profile::CompatFingerprint::timing_evidence)
         .collect();
-    let mut timing = crate::profile::select_timing(&evidence, codec);
-    // An explicit NTP request from any member is the conservative group choice:
-    // honouring it keeps the whole group in one clock domain.
-    if timing == crate::profile::Timing::Ptp
-        && options
-            .peers
-            .iter()
-            .any(|peer| peer.profile.timing == crate::profile::Timing::Ntp)
-    {
-        timing = crate::profile::Timing::Ntp;
-    }
-    let plan = crate::profile::TimingPlan::new(timing, probes.len());
-    if let Some(warning) = group_timing_warning(&options.peers, &fingerprints, plan, codec) {
-        emit(warning);
+    // One topology decision for the whole group. `select_timing` already
+    // implements every branch of WAC's `CreateTopologyPlan`; per-member
+    // settings are folded in by `negotiate_planned`, never by changing the
+    // plan here. In particular an explicit NTP request cannot downgrade an
+    // AirPlay 2 group: the only whole-group downgrade is a member without
+    // AirPlay 2 evidence (handled inside `select_timing`).
+    let plan = crate::profile::TimingPlan::new(
+        crate::profile::select_timing(&evidence, codec),
+        probes.len(),
+    );
+    // Q33: a group has exactly one plan, so a timing split is a planning bug,
+    // not a runtime risk. Keep the evidence summary as an internal debug log;
+    // it must never reach the desktop's user-facing `warning` channel.
+    if let Some(diagnostic) = group_timing_diagnostic(&options.peers, &fingerprints, plan) {
+        eprintln!("{diagnostic}");
     }
     // Phase two: every member negotiates under the same timing decision.
     for (index, probe) in probes.into_iter().enumerate() {
@@ -2299,6 +2288,9 @@ mod simulation;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::{
+        AIRPLAY2_BIT, Codec, CompatFingerprint, Formats, Profile, Timing, TimingPlan, Transport,
+    };
     #[test]
     fn lead_ceiling_follows_what_the_receiver_promised_to_buffer() {
         // No declared buffer: only the absolute cap applies.
@@ -2313,6 +2305,81 @@ mod tests {
         assert_eq!(lead_ceiling_from([5000].into_iter()), MAX_LEAD_MS);
         // A request above the ceiling is clamped before it reaches the scheduler.
         assert_eq!(5000.min(lead_ceiling_from([250].into_iter())), 350);
+    }
+    #[test]
+    fn group_timing_diagnostic_is_log_only_and_names_every_member() {
+        let formats = Formats {
+            realtime: Some(1 << 18),
+            features: Some(AIRPLAY2_BIT),
+            ..Default::default()
+        };
+        let advertised = Profile::default();
+        let ap2 = CompatFingerprint::from_evidence(
+            formats,
+            &advertised,
+            &[],
+            Some("AudioAccessory5,1"),
+            None,
+            Some("366.0"),
+        );
+        let ap1 = CompatFingerprint::from_evidence(
+            formats,
+            &advertised,
+            &[],
+            Some("AudioAccessory5,1"),
+            None,
+            None,
+        );
+        let peers: Vec<Peer> = serde_json::from_value(json!([
+            {"receiver_id": "left", "host": "127.0.0.2", "profile": {"timing": "auto"}},
+            {"receiver_id": "right", "host": "127.0.0.3", "profile": {"timing": "auto"}},
+        ]))
+        .unwrap();
+        let plan = TimingPlan::select(&[ap2.timing_evidence(), ap1.timing_evidence()], Codec::Auto);
+        let line = group_timing_diagnostic(&peers, &[ap2.clone(), ap1], plan).unwrap();
+        // The content that used to ride on the warning is still available, but
+        // as a plain string written to the engine log.
+        assert!(line.starts_with("group_timing_divergence:"));
+        assert!(line.contains("left") && line.contains("right"), "{line}");
+        assert!(line.contains("forced NTP for the whole group"), "{line}");
+        // A consistent group has no diagnostic at all.
+        let ap2_plan =
+            TimingPlan::select(&[ap2.timing_evidence(), ap2.timing_evidence()], Codec::Auto);
+        assert_eq!(
+            group_timing_diagnostic(&peers, &[ap2.clone(), ap2], ap2_plan),
+            None
+        );
+    }
+    #[test]
+    fn a_group_plan_governs_explicit_member_timing() {
+        let formats = Formats {
+            realtime: Some(1 << 18),
+            features: Some(crate::profile::AIRPLAY2_BIT),
+            ..Default::default()
+        };
+        let advertised = Profile::default();
+        let appletv = CompatFingerprint::from_evidence(
+            formats,
+            &advertised,
+            &[],
+            Some("AppleTV6,2"),
+            None,
+            Some("366.0"),
+        );
+        let plan = TimingPlan::new(Timing::Ptp, 2);
+        let profile = Profile {
+            codec: Codec::Auto,
+            transport: Transport::Realtime,
+            timing: Timing::Ntp,
+            ..Default::default()
+        };
+        // The group plan wins over the member's explicit request: no second
+        // clock domain, and the Apple TV is a PTP participant.
+        let compat = appletv
+            .negotiate_planned(plan, &profile, 44100, false)
+            .unwrap();
+        assert!(compat.uses_ptp());
+        assert_eq!(compat.timing_protocol(), "PTP");
     }
     // A minimal live-status probe target: one fresh TCP connection, one
     // `GET /info`, one binary plist. `status_flags = None` omits the field.

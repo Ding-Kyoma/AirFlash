@@ -23,14 +23,15 @@ public sealed record Receiver(string Id, string Name, string Address, int Port =
     public string[] Aliases { get; init; } = [];
     public bool IsGroup => IsSoftwareGroup || Members.Length > 0 || Id.StartsWith("stereo:", StringComparison.Ordinal);
     public bool Complete => !IsGroup || Members.Length == 2 && Members.All(m => m.Online && !m.IsGroup && (!IsSoftwareGroup || m.StereoId.Length == 0));
-    /// <summary>TXT-only three-way evidence; missing features never become classic.</summary>
-    public AirPlaySupport Support => AirPlayCapability.Classify(Features, SourceVersion);
-    /// <summary>WAC's list predicate: TXT bit 40 and <c>srcvers &gt;= 354.54.6</c>.</summary>
-    public bool SupportsAirPlay2 => AirPlayCapability.SupportsAirPlay2(Features, SourceVersion);
+    /// <summary>TXT-only four-state label; missing features never become classic.</summary>
+    public AirPlayCapability Support => AirPlayCapabilityClassifier.Classify(Features, SourceVersion);
+    /// <summary>WAC's routing predicate: TXT bit 40 and <c>srcvers &gt;= 354.54.6</c>.</summary>
+    public bool SupportsAirPlay2 => AirPlayRouting.SupportsAirPlay2(Features, SourceVersion);
     private string CapabilityDetail => Support switch
     {
-        AirPlaySupport.AirPlay2 => L.Get("AirPlay 2"),
-        AirPlaySupport.ClassicOnly => L.Get("Classic AirPlay only"),
+        AirPlayCapability.AirPlay2 => L.Get("AirPlay 2"),
+        AirPlayCapability.NotAirPlay2 => L.Get("Classic AirPlay only"),
+        AirPlayCapability.ClaimsAirPlay2Outdated => L.Get("AirPlay 2 claimed, firmware too old"),
         _ => L.Get("AirPlay 2 support unknown")
     };
     private string BaseDetail => Model.Length > 0 ? Model : L.Get("AirFlash receiver");
