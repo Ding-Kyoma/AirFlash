@@ -76,6 +76,46 @@ pub struct Formats {
     pub buffered: Option<u64>,
     pub features: Option<u64>,
 }
+/// AirPlay 2 (and therefore a buffered-audio capable peer) is advertised with
+/// feature bit 40 *and* a firmware version. Bit 41 is not used by the reference
+/// implementation at all, which is why it must not decide timing here.
+pub const AIRPLAY2_BIT: u64 = 1 << 40;
+const AIRPLAY2_MIN_VERSION: (u64, u64, u64) = (354, 54, 6);
+pub fn is_airplay2(features: Option<u64>, source_version: Option<&str>) -> bool {
+    let Some(features) = features else {
+        return false;
+    };
+    // Both halves are required by the reference implementation: a device that sets
+    // the bit but reports an old firmware is not treated as AirPlay 2.
+    features & AIRPLAY2_BIT != 0 && version_at_least(source_version, AIRPLAY2_MIN_VERSION)
+}
+fn version_at_least(version: Option<&str>, minimum: (u64, u64, u64)) -> bool {
+    let Some(version) = version else {
+        return false;
+    };
+    let mut parts = version
+        .split('.')
+        .map(|part| part.parse::<u64>().unwrap_or(0));
+    let parsed = (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    );
+    parsed >= minimum
+}
+/// PTP is a topology decision, not a feature bit: a HomePod keeps its own
+/// grandmaster and needs PTP, while a standalone Apple TV runs on NTP. `None`
+/// means the model is unknown and the caller keeps its usual heuristic.
+pub fn ptp_expected(model: Option<&str>) -> Option<bool> {
+    let model = model?;
+    if model.contains("AppleTV") {
+        Some(false)
+    } else if model.contains("AudioAccessory") || model.contains("HomePod") {
+        Some(true)
+    } else {
+        None
+    }
+}
 fn integer(v: &Value) -> Option<u64> {
     v.as_unsigned_integer()
         .or_else(|| v.as_signed_integer().map(|n| n as u64))
@@ -121,6 +161,21 @@ impl Formats {
         legacy_codecs: &[u8],
         rate: u32,
         inherited_ptp: bool,
+    ) -> Result<Selection> {
+        self.negotiate_with(profile, legacy_codecs, rate, inherited_ptp, None, None)
+    }
+    /// `model` and `source_version` come from `/info`; they let the timing choice
+    /// follow the device instead of a feature bit that the reference implementation
+    /// never reads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn negotiate_with(
+        self,
+        profile: &Profile,
+        legacy_codecs: &[u8],
+        rate: u32,
+        inherited_ptp: bool,
+        model: Option<&str>,
+        source_version: Option<&str>,
     ) -> Result<Selection> {
         ensure!(
             (-500..=500).contains(&profile.sync_offset_ms),
@@ -185,15 +240,18 @@ impl Formats {
         } else {
             match profile.timing {
                 Timing::Inherit => inherited_ptp,
-                Timing::Auto => self
-                    .features
-                    .or(profile.features)
-                    .map_or(inherited_ptp, |f| f & (1 << 41) != 0),
+                Timing::Auto => match ptp_expected(model) {
+                    Some(expectation) => expectation,
+                    // Unknown model: rely on AirPlay 2 evidence alone. A peer that
+                    // advertises nothing is an AirPlay 1 device and has no PTP.
+                    None => is_airplay2(self.features.or(profile.features), source_version),
+                },
                 Timing::Ptp => {
+                    let advertised = ptp_expected(model) == Some(true)
+                        || is_airplay2(self.features.or(profile.features), source_version)
+                        || inherited_ptp;
                     ensure!(
-                        self.features
-                            .or(profile.features)
-                            .is_none_or(|f| f & (1 << 41) != 0),
+                        ptp_expected(model) != Some(false) && advertised,
                         "PTP timing is not advertised"
                     );
                     true
@@ -332,7 +390,7 @@ mod tests {
         let f = Formats {
             realtime: Some(0),
             buffered: Some(1 << 18),
-            features: Some(1 << 41),
+            features: Some(AIRPLAY2_BIT),
         };
         let p = Profile {
             codec: Codec::Auto,
@@ -341,7 +399,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            f.negotiate(&p, &[], 44100, false).unwrap().transport,
+            f.negotiate_with(&p, &[], 44100, false, None, Some("366.0"))
+                .unwrap()
+                .transport,
             Transport::Buffered
         );
         assert!(
@@ -355,6 +415,108 @@ mod tests {
                 true
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn airplay2_needs_the_bit_and_a_modern_firmware() {
+        assert!(is_airplay2(Some(AIRPLAY2_BIT), Some("366.0")));
+        assert!(is_airplay2(Some(AIRPLAY2_BIT | 1), Some("354.54.6")));
+        assert!(!is_airplay2(Some(AIRPLAY2_BIT), Some("354.54.5")));
+        assert!(!is_airplay2(Some(AIRPLAY2_BIT), None));
+        assert!(!is_airplay2(Some(0), Some("366.0")));
+        assert!(!is_airplay2(None, Some("366.0")));
+        // Bit 41 carries no meaning in the reference implementation, so it must not
+        // buy an AirPlay 2 verdict on its own.
+        assert!(!is_airplay2(Some(1 << 41), Some("366.0")));
+    }
+
+    #[test]
+    fn ptp_follows_the_model_before_any_feature_bit() {
+        assert_eq!(ptp_expected(Some("AudioAccessory5,1")), Some(true));
+        assert_eq!(ptp_expected(Some("HomePod1,1")), Some(true));
+        assert_eq!(ptp_expected(Some("AppleTV6,2")), Some(false));
+        assert_eq!(ptp_expected(Some("ThirdPartySpeaker")), None);
+        assert_eq!(ptp_expected(None), None);
+        // A HomePod runs PTP even when it advertises no feature bit at all.
+        let formats = Formats {
+            realtime: Some(1 << 18),
+            ..Default::default()
+        };
+        let auto = Profile {
+            codec: Codec::Auto,
+            transport: Transport::Realtime,
+            timing: Timing::Auto,
+            ..Default::default()
+        };
+        assert!(
+            formats
+                .negotiate_with(&auto, &[], 44100, false, Some("AudioAccessory5,1"), None)
+                .unwrap()
+                .ptp
+        );
+        // An Apple TV on the same settings is NTP, and forcing PTP is rejected.
+        assert!(
+            !formats
+                .negotiate_with(&auto, &[], 44100, false, Some("AppleTV6,2"), None)
+                .unwrap()
+                .ptp
+        );
+        assert!(
+            formats
+                .negotiate_with(
+                    &Profile {
+                        timing: Timing::Ptp,
+                        ..auto
+                    },
+                    &[],
+                    44100,
+                    false,
+                    Some("AppleTV6,2"),
+                    None
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn an_unknown_model_falls_back_to_airplay2_evidence() {
+        let formats = Formats {
+            realtime: Some(1 << 18),
+            features: Some(AIRPLAY2_BIT),
+            ..Default::default()
+        };
+        let auto = Profile {
+            codec: Codec::Auto,
+            transport: Transport::Realtime,
+            timing: Timing::Auto,
+            ..Default::default()
+        };
+        // Unknown model, but a modern AirPlay 2 firmware: PTP.
+        assert!(
+            formats
+                .negotiate_with(&auto, &[], 44100, false, Some("Speaker9,9"), Some("366.0"))
+                .unwrap()
+                .ptp
+        );
+        // Unknown model without AirPlay 2 evidence: no PTP, whatever the session
+        // asked for, because bit 41 alone means nothing.
+        let quiet = Formats {
+            realtime: Some(1 << 18),
+            features: Some(1 << 41),
+            ..Default::default()
+        };
+        assert!(
+            !quiet
+                .negotiate_with(&auto, &[], 44100, false, Some("Speaker9,9"), Some("366.0"))
+                .unwrap()
+                .ptp
+        );
+        assert!(
+            !quiet
+                .negotiate_with(&auto, &[], 44100, true, Some("Speaker9,9"), Some("366.0"))
+                .unwrap()
+                .ptp
         );
     }
     #[test]

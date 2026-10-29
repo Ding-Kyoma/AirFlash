@@ -57,7 +57,10 @@ pub fn choices(formats: Formats, evidence: &Profile, codecs: &[u8]) -> Vec<Profi
                             || timing_name == "auto" && evidence.follow_receiver_clock,
                         ..evidence.clone()
                     };
-                    if let Ok(selected) = formats.negotiate(&profile, codecs, rate, true) {
+                    // Timing is predicted from the peer's own advertisement, not
+                    // from whatever a live session would inherit: without a model
+                    // name this is the only evidence available here.
+                    if let Ok(selected) = formats.negotiate(&profile, codecs, rate, false) {
                         result.push(ProfileChoice {
                             codec: codec_name,
                             transport: transport_name,

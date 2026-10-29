@@ -160,8 +160,29 @@ Wi-Fi AP 把音频放进 WMM 语音队列。QoS 服务被禁用或缺失时注�
 
 - 新「自适应」模式（`LatencyMode = "adaptive"`）：默认仍是 `normal`，用户显式选择后
   才启用；设备级覆盖仍然优先。
-- 上调：一分钟内出现 3 次 `timeline_reanchored` / `sender_late_recovered` 就上一级，
-  每分钟最多一级；下调：干净窗口后逐级回落，不低于下限。
+- 上调：两条判据，任一满足就上一级，每分钟最多一级
+  1. 一分钟内 3 次 `timeline_reanchored` / `sender_late_recovered`（突发性迟到）；
+  2. **慢性 p99 迟到**（Q22 指出的盲区）：引擎每秒 `transport_metrics` 里的
+     `lateness.p99_ms` 连续 10 次 ≥ 3 ms。这类流的延迟从不触及重锚预算，
+     只看「恢复次数」永远发现不了。
+- 下调：干净窗口后逐级回落，不低于下限。
+
+## P3-2 连接前预判（按 Q18 的答复修正）
+
+`profile.rs`
+
+Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<<41` 零命中）。
+现在改成：
+
+- **AirPlay 2 判据**：`features & bit40 != 0` **且** `srcvers >= 354.54.6`（与
+  `SupportsAirPlay2` 一致），`bit41` 不再单独产生任何结论。
+- **PTP 由型号 + 拓扑决定**，不是 feature bit：`ptp_expected()` 里 HomePod /
+  `AudioAccessory` → PTP，Apple TV → NTP，未知型号 → 回到 AirPlay 2 判据。
+  为此 `negotiate_with()` 多带 `/info` 的 `model` 与 `sourceVersion`；旧的四参
+  `negotiate()` 保留给能力预测（那里没有型号信息，用 `inherited_ptp = false`
+  只按对端自述预测）。
+- 显式 `timing: ptp` 在「型号明确说 NTP」或「既无型号支持也无 AirPlay 2 证据」时
+  直接报错，不再放行。
 
 ---
 
@@ -201,7 +222,6 @@ Wi-Fi AP 把音频放进 WMM 语音队列。QoS 服务被禁用或缺失时注�
 | P2-13 兼容 profile | 未开始 | 把散落的 if 收成 `CompatBehavior`，按 `srcvers`/`model` 指纹选择 |
 | P2-14 诊断导出 | 部分 | `diag_summary` + `--self-check` 已能给结构化引擎摘要；缺脱敏与实际导出文件 |
 | P3-1 反向控制的执行端 | 部分 | 引擎已解析事件并转 `remote_command`；桌面端还没真去控制播放器（Q25：`SendInput` + `VK_MEDIA_*`） |
-| P3-2 连接前预判（TXT bit40） | 未开始 | Q18 已指出我们现在用的 **bit41 是错的**，应先改判据 |
 | P3-3 抢占检测 | 未开始 | 按 Q18 用「未预期 TEARDOWN + 随后重新 announce」组合特征 |
 | P3-4 MRP 隧道 | 未开始 | 大工程 |
 | P3-5 经典 RAOP / 初代 AirPlay | 未开始 | 大工程 |
@@ -221,7 +241,6 @@ Wi-Fi AP 把音频放进 WMM 语音队列。QoS 服务被禁用或缺失时注�
 | ~~P2-11 QoS（Q26）~~ **已按答复改成 qWAVE** | 进程级 `QOSCreateHandle`（`OnceLock` 持有到退出）+ `QOSAddSocketToFlow` + `QOSTrafficTypeVoice`；服务不可用时返回 false，只记 `qos_marked` |
 | **[否决]** P0-4 SMTC 策略（Q12） | 2 s 轮询 + 300 ms 稳定窗 | 按答复改成事件驱动（SMTC 的 `MediaPropertiesChanged`/`TimelinePropertiesChanged`），进度策略按答复的阈值 |
 | ~~P0-3 伺服常数（Q5/Q6）~~ **已按答复修正** | 外层改为 `correction_ppb = filtered_ns / 20`（50 ppm/ms），夹 ±50 ppm，**无积分项**；engage >5 ms / release ≤1 ms 非对称迟滞；250 ms 断点改为**整机重置**（filter/correction/engaged 全清零再预热）；饱和静默计数 |
-| P0-2 自适应判据（Q22） | 一分钟 3 次时间线恢复 | 保留该策略层，但**必须叠加 p99 迟到**，否则对慢性迟到不敏感 |
 | P3-1 遥控命令（Q25） | 解析 RTSP 事件里的 `mrCommand` | 同时接受 `SendInput` + `VK_MEDIA_*` 的输入事件路径 |
 | P1-9 事件通道（Q16/Q25） | EOF 后整条会话重启 | 按答复的重建策略细化（不重建音频链路） |
 

@@ -348,11 +348,15 @@ impl Member {
         emit(json!({"event":"phase","host":peer.host,"phase":"info"}));
         let info = conn.request("GET", "/info", &[], &[])?.plist()?;
         let capabilities = info.as_dictionary().context("info is not a dictionary")?;
-        let selection = crate::profile::Formats::parse(&info).negotiate(
+        let selection = crate::profile::Formats::parse(&info).negotiate_with(
             &peer.profile,
             &peer.codecs,
             options.sample_rate,
             options.timing == "ptp",
+            capabilities.get("model").and_then(Value::as_string),
+            capabilities
+                .get("sourceVersion")
+                .and_then(Value::as_string),
         )?;
         if selection.ptp && ptp.is_none() {
             let peers = options.peers.iter().map(|p| p.host).collect();

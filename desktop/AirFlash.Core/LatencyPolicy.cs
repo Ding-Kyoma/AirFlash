@@ -70,3 +70,34 @@ public static class LatencyPolicy
         return For(receiver, codec == "auto" ? null : codec, ptp).Initial;
     }
 }
+
+/// <summary>
+/// Watches the engine's p99 send lateness for a chronic problem the recovery count
+/// cannot see: a stream that never trips the re-anchor budget but is late on almost
+/// every packet still sounds rough, and "three recoveries in a minute" never fires.
+/// </summary>
+/// <remarks>
+/// The engine reports a percentile every metrics tick, so this counts consecutive
+/// ticks above the threshold: one spike is a hiccup, ten in a row is a lead that is
+/// too tight for this link.
+/// </remarks>
+public sealed class LatenessWatch(double thresholdMs = 3.0, int samples = 10)
+{
+    private int _streak;
+    /// <summary>Feed one sample. Returns true at most once per streak.</summary>
+    public bool Observe(double? p99Ms)
+    {
+        if (p99Ms is not { } value || value < thresholdMs)
+        {
+            _streak = 0;
+            return false;
+        }
+        if (++_streak < samples) return false;
+        // Keep the streak pending so a lead change that does not help triggers again
+        // after another full window, instead of firing on every tick.
+        _streak = 0;
+        return true;
+    }
+    public void Reset() => _streak = 0;
+    public int Streak => _streak;
+}
