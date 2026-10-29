@@ -942,3 +942,51 @@ Q24（同上）。
   `build-native.ps1 -Check` 通过；.NET 553 通过；pytest 141 通过；ruff 无问题。
   .NET 首次全量运行时 `EngineStandbyReleasesMuteAndMetricsCannotOverrideState`
   偶发一次事件时序空引用，单跑与全量重跑均通过（历史记录）。
+
+## P3-2c 混组不可表示（桌面，已完成）
+
+`desktop/AirFlash.Core/GroupMembership.cs`、`SoftwareStereo.cs`、
+`GateFailure.cs`、`AirFlash.App/ViewModels/SettingsViewModel.cs`、
+`AirFlash.App/Ui/SettingsWindow.xaml`
+
+- **不是「连接前预检」，而是让混组不可表示**：新增 `GroupMembership`，组内
+  成员只能通过唯一的 `TryAdd(Receiver, out string? error)` 进入；它拿已有
+  第一个成员的 `Receiver.SupportsAirPlay2`（即
+  `AirPlayRouting.SupportsAirPlay2`，TXT bit40 + `srcvers`）与来者比较，
+  不同就拒绝、列表保持不变。第一个成员永远接受（WAC `Members.Count <= 0 ||`
+  的形状），单机路径不经过它，行为不变。
+- **一个谓词**：只比较路由布尔，不把四态展示标签塞回不变量（Q36/Q41）。
+  `ClaimsAirPlay2Outdated` 在路由上仍是 classic，所以和 `NotAirPlay2` 一样
+  触发拒绝；四态只用于决定是否追加原因句。
+- **所有入口**：设置页左右接收器下拉（`SoftwareGroupEditor.LeftId/RightId`）
+  在用户选中第二台设备的瞬间调用 `TryAdd`，失败时下拉回到原值并在卡片内
+  显示文案；`AddGroup()` 创建组时用同一 `TryAdd` 枚举可用组合，只有所有
+  组合都混组才报错；`SoftwareStereo.Resolve()`（会话恢复/目录解析）同样用
+  `TryAdd` 重建已保存的组。`Swap()`、`ReceiverCatalog` 身份迁移只改槽位/
+  身份，不改变成员集合，保持原路径。
+- **两级文案**：动作句固定为已有的
+  `AirPlay 2 and classic AirPlay 1/RAOP devices cannot be grouped together.
+  Please connect them separately.`；冲突方中出现 `ClaimsAirPlay2Outdated`
+  时**追加**一句点名设备的原因，不替换动作句：
+  `「{0}」自称支持 AirPlay 2，但固件版本低于 354.54.6，已按经典设备处理。`
+  英文 key 与 zh / zh-TW / de 三语都已加入；`GateFailure` 的
+  `mixed_timing_group` 兜底也复用同一个组合器，所以引擎拒绝时也是两级信息。
+- **立体声对：不照抄 WAC 的例外**。WAC 的 `!IsCustomStereoPair` 成立是因为
+  自定义对通过 `SetStereoPair` 作为一个逻辑单元交给后端；AF 的软件立体声是
+  两台独立接收器 + 左右声道/偏移，作为 `software_stereo` peers 发给引擎，
+  没有 `SetStereoPair` 语义，引擎 `select_timing` 也照样拒绝混组。放行会
+  构造出后端必然拒绝的组，所以不豁免；代码注释写明了这个取舍。原生
+  HomePod 对是 mDNS `tsid` 的单一发现单元，不经过这条成员列表。
+- **引擎兜底保留**：`native/airflash-engine/src/profile.rs::select_timing` 与
+  `session.rs` 的 `mixed_timing_group` 未改动，仍是 CLI/测试/未来前端的
+  权威拒绝。
+- **测试**：classic 加入 AP2 集合失败且成员不变、AP2 加入 classic 集合对称
+  失败、同类型成功、单成员永远接受、只有 `ClaimsAirPlay2Outdated` 追加原因
+  且不替换动作句、软件立体声对不豁免、历史混组解析为离线空成员、门禁兜底
+  文案复用组合器；既有 `GateFailure`/能力测试全过。
+- **验证**：Rust 265 passed / 2 ignored（未改 native，数字与 main 一致）；
+  clippy `-D warnings` 无告警；`build-native.ps1 -Check` 通过；.NET 565
+  通过；pytest 141 通过；ruff 无问题。
+- **没验证 / 待确认**：没有真机，无法验证真实 HomePod/Apple TV 的 TXT 是否
+  会在运行中改变能力；升级前遗留混组的修复策略、以及缺少 TXT 证据（设备
+  暂时离线）时严格布尔导致的提示语选择，见 Q44。
