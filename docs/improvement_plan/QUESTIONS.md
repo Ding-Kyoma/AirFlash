@@ -883,7 +883,7 @@ P3-8 现在对同一可执行文件的多个根实例各开一个 process loopba
 
 ## 十、兼容 profile（P2-13）
 
-### Q29. 能力预判要不要带上 `/info` 的 `model`/`sourceVersion`？ `[待答复]`
+### Q29. 能力预判要不要带上 `/info` 的 `model`/`sourceVersion`？ `[已确认]`
 
 **我们暂定**：`receiver_capabilities` 的能力预判继续只用 `supportedFormats` +
 桌面端下发的 legacy codec 列表 + 对端自述 `features`，不带 `/info` 的 `model` /
@@ -898,6 +898,72 @@ bit40，预判会把它的 `selected_timing` 算成 `ntp`，实际会话却按 `
 但 P2-13 是纯重构，带型号会改变现有预判的取值，超出「行为不变」的范围，
 所以这轮先保持原状。
 
+> **答复**：**WAC 没有"预判 vs 运行时"两条路径 —— 只有一个 `CreateTopologyPlan`，两边都调它。所以它不存在你要修的那种分裂。**
+>
+> ## WAC 的真实做法：两段式，证据源分开而且是有意的
+>
+> 〔码〕`WinAirCast.decompiled.cs:38404` `CreateTopologyPlan(devices, codec)` 全文就是一个决策表：
+>
+> ```csharp
+> if (devices.Count == 0)                       return ("None", "Unknown", …);
+> if (devices.Any(d => !d.SupportsAirPlay2))    return ("Classic RAOP", "NTP", …, false);   // ← 只看 TXT
+>
+> bool isAppleTv  = devices.Any(d => LooksLikeAppleTv(d.Model, d.Name));
+> bool allHomePod = devices.All(d => LooksLikeHomePod(d.Model, d.Name));
+> bool isPcm      = codec == "PCM";
+>
+> if (n==1 && isAppleTv)        return ("Apple TV solo",      "NTP", {100,80},    live);
+> if (n==1 && allHomePod && pcm)return ("HomePod solo (PCM)", "NTP", {60,45,30},  live);
+> if (n==1 && allHomePod)       return ("HomePod solo",       "PTP", {50,40,30},  live);
+> if (n>1  && allHomePod)       return ("HomePod group",      "PTP", {120,110,100,90}, live);
+> if (n>1  && isAppleTv)        return ("Mixed Apple group",  "PTP", {120,110,100}, live);
+> if (n==1)                     return ("AirPlay 2 receiver", "PTP", {100,80,60}, live);
+>                                return ("AirPlay 2 group",    "PTP", {180,160,140}, live);
+> ```
+>
+> **两段，证据源严格分开**：
+>
+> | 段 | 决定什么 | 证据源 |
+> |---|---|---|
+> | 第一段 | **是不是 AirPlay 2**（不是就走 Classic RAOP + NTP） | **只用 TXT**：`SupportsAirPlay2` = `features` 或 `ft` 的 **bit40** + `srcvers ≥ 354.54.6` |
+> | 第二段 | AP2 里**走 PTP 还是 NTP**、lead 候选多少 | **只用 model/name**：`LooksLikeAppleTv` / `LooksLikeHomePod` |
+>
+> 第二段的判据（`LooksLikeHomePod`，`:38778`）：
+> ```csharp
+> if (!model.Contains("AudioAccessory")) {
+>     if (NameDecides(model)) return name.Contains("HomePod");   // model 缺失/"Unknown" 时才看名字
+>     return false;
+> }
+> return true;
+> ```
+> `LooksLikeAppleTv` 同构（`AppleTV` / `"Apple TV"`）。**model 优先，缺失或被写成 `Unknown` 才退回 name。**
+>
+> ## 为什么你担心的分裂在 WAC 里不会发生
+>
+> 注意第一段是 **`Any(d => !d.SupportsAirPlay2)` 全否**：只要有一台 TXT 里没有 bit40，**整个 plan 退化成 Classic RAOP + NTP**，**model 说什么都不管**。
+>
+> ⇒ **WAC 不是靠"两个来源一致"来避免矛盾，而是靠"只有一个来源"**：`SupportsAirPlay2` 是唯一入口，`selected_timing` 是它的下游。你描述的场景（`/info` 有 bit40 但下发 `features` 缺 bit40）在 WAC 里结果是 **Classic RAOP / NTP** —— 它会**降级**，不会偷偷按 model 走 PTP。
+>
+> ## 对 AirFlash 的建议
+>
+> **1. 「这轮先保持原状」是对的，理由要写对。**
+> 理由不是"带型号会改变取值"（虽然是），而是 **WAC 的时序本来就是两段：AP2 与否在 TXT 定，timing 在型号定。** 你的 `receiver_capabilities` 只做第一段，不做第二段，这是**少做了一步，不是做错了**。
+>
+> **2. 想让预判与运行时一致，正确做法不是"预判也吃 model"，而是"两边调同一个纯函数"。**
+> ```rust
+> // 提议：把决策提成纯函数，预判与会话都调它
+> fn select_timing(txt: &Txt, model: &str, name: &str, codec: Codec, count: usize) -> Timing
+> ```
+> 这样"预判带不带 model"就不再是个需要权衡的选项 —— 反正只有一处实现。这也是 WAC 的实际结构（`CreateTopologyPlan` 是 `static` 纯函数）。
+>
+> **3. 若 P2-13 真的要严守"行为不变"，就在代码里留一条注释**，把这个已知差异钉死，别让它变成日后的谜：
+> ```rust
+> // 已知差异（见 QUESTIONS Q29）：本预判只做 AP2/Classic 判定（TXT bit40 + srcvers），
+> // 不做 PTP/NTP 分支（那需要 model/name）。运行时由 session.rs 用完整指纹决定。
+> // WAC 的做法是把两段合成一个纯函数 CreateTopologyPlan；我们暂未合并。
+> ```
+>
+> **4. 一个必须注意的差异**：WAC 第一段是 **`Any(!SupportsAirPlay2)` 全局降级**。如果你的立体声对/组里只有一台缺 bit40，WAC 会把**整个组**降成 Classic RAOP/NTP。这条比"预判取值变了"严重得多 —— 值得对照检查你现在是不是按成员逐台判的。
 ---
 
 ## 答复区
