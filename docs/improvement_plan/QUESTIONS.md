@@ -1795,7 +1795,7 @@ P3-3 已按 Q32 §五 改掉死锁：`we_hold_session` 不再 latch，改成每�
 
 ---
 
-### Q35. 任务说明要求写 `Strings.json`，但仓库里没有这个文件 `[待答复]`
+### Q35. 任务说明要求写 `Strings.json`，但仓库里没有这个文件 `[已确认]`
 
 P3-2 桌面半的任务说明要求「每个新用户可见字符串都加进 `Strings.json`、
 `Strings.zh.json`、`Strings.zh-TW.json`、`Strings.de.json`」。实际仓库里
@@ -1810,11 +1810,75 @@ P3-2 桌面半的任务说明要求「每个新用户可见字符串都加进 `S
 2. 如果保持现状，任务说明里的「四个文件」是否应改成「英文键 + 三个语言文件」，
    避免下一轮再按字面找 `Strings.json`？
 
-> **答复**：（待补充）
+> **答复**：**不要新建 `Strings.json`。而且不是"可选"—— 建了会引入一个静默漂移源。**
+>
+> ## 一、我核对了你的仓库，现状就是这样
+>
+> ```
+> desktop/AirFlash.Core/Strings.zh.json
+> desktop/AirFlash.Core/Strings.zh-TW.json
+> desktop/AirFlash.Core/Strings.de.json
+> ```
+> `AirFlash.Core.csproj:7-9` 只嵌这三个；`L.cs:10-12` 只加载这三个。**没有 `Strings.json`，历史上也没有。**
+>
+> ## 二、这个设计的核心是「英文串本身就是 key，也是回退值」
+>
+> 〔码〕`L.cs`：
+> ```csharp
+> public static string Get(string english)
+>     => _strings.TryGetValue(english, out var translated) ? translated : english;
+>
+> // Initialize():
+> _strings = lang switch { "zh-TW" => ChineseTraditional, "zh" => ChineseSimplified, "de" => German, _ => [] };
+> ```
+>
+> 两个关键点：
+> 1. **`Get` 的参数就是英文原文** —— 不是 `Get("Device_Connected")` 这种符号键，是 `Get("Connected")`。
+> 2. **英文模式下 `_strings = []`** —— 字典根本不加载，全部走 `?? english` 回退。
+>
+> ⇒ **英文不是一份"资源"，它就是代码本身。** 这是这套设计最省事的地方：新增英文文案时**只需要写 `L.Get("...")`，一个资源文件都不用改**。
+>
+> ## 三、为什么建 `Strings.json` 会有害
+>
+> | 问题 | 后果 |
+> |---|---|
+> | 英文有了第二个来源 | 代码里 `L.Get("Connected")` 和 `Strings.json` 的 `"Connected"` 可以**不一致**，而且**没有任何测试会发现** —— 因为 `en` 分支不读文件 |
+> | 必须改 `Initialize` | 不改的话 `Strings.json` 嵌入了也没人读，纯死文件；改了就把回退语义从「代码即真值」变成「文件即真值」 |
+> | 覆盖率问题 | 若只放新增键（你担心的那种），它会变成一个**看起来权威但残缺**的目录，下一个人会以为缺的键是漏加的 |
+>
+> **"只放新增键"这条要特别否掉** —— 一个不完整的键表比没有键表更糟，因为它制造了错误的完备性暗示。
+>
+> ## 四、那"四个文件"的说明该怎么改
+>
+> 改成一句**可执行**的规则，而不是列文件名：
+>
+> > 新增用户可见字符串时：写 `L.Get("English text")` 或 `L.Format("...{0}...", arg)`，
+> > **英文键就是回退值，不需要英文资源文件**；同时在 `Strings.zh.json`、
+> > `Strings.zh-TW.json`、`Strings.de.json` 三个文件里各加一条 `"English text": "译文"`。
+>
+> ## 五、建议加一个测试来替代"看文件列表"
+>
+> 现在没有任何机制保证三个语言文件覆盖了所有 key。可以加一条廉价的不变量测试：
+>
+> ```csharp
+> // 三个语言文件的键集必须完全一致
+> [Fact] public void LanguageFiles_HaveIdenticalKeys()
+> {
+>     var zh  = Load("AirFlash.Core.Strings.zh.json").Keys;
+>     var tw  = Load("AirFlash.Core.Strings.zh-TW.json").Keys;
+>     var de  = Load("AirFlash.Core.Strings.de.json").Keys;
+>     Assert.Equal(zh.OrderBy(x => x), tw.OrderBy(x => x));
+>     Assert.Equal(zh.OrderBy(x => x), de.OrderBy(x => x));
+> }
+> ```
+>
+> 这比"记得改四个文件"可靠得多 —— 它把**约定**变成了**编译期/测试期事实**。真正需要人工保证的只剩「新增的 `L.Get("...")` 有没有进那三个文件」，而这一条可以用源码扫描补上（扫 `L.Get\("..."\)` 的字面量集合 vs 三个文件的键集）。
+>
+> **一句话**：保持现状，改说明，加测试。不要造 `Strings.json`。
 
 ---
 
-### Q36. bit40 置位但 `srcvers` 缺失时，列表标 unknown 还是 classic？ `[待答复]`
+### Q36. bit40 置位但 `srcvers` 缺失时，列表标 unknown 还是 classic？ `[已确认]`
 
 WAC 的 `SupportsAirPlay2` 在 `Version.TryParse` 失败时返回 false，
 `CreateTopologyPlan` 随即按 Classic RAOP 处理。但任务同时要求「AirPlay 2 状态
@@ -1832,11 +1896,90 @@ WAC 的 `SupportsAirPlay2` 在 `Version.TryParse` 失败时返回 false，
 与 WAC 的布尔判定完全一致（bit40 = 1 但版本缺失也算 classic），只需改
 `AirPlayCapability.Classify` 的一个分支。
 
-> **答复**：（待补充）
+> **答复**：**UI 三态保留，但有一支要改 —— `bit40=1 且 srcvers < 354.54.6` 显示成 classic 也是错的，它不是「已知 classic」，是「自称 AP2 但固件过旧」。**
+>
+> ## 一、先把两件事分开，这是整个问题的关键
+>
+> | | 用途 | 该用什么 |
+> |---|---|---|
+> | **路由判定** | 决定走 AP2 路径还是 Classic RAOP 路径 | **必须严格照 WAC 的布尔**（保守：`false`） |
+> | **UI 标注** | 告诉用户「我们**知道**什么」 | **按证据质量三态**，可以和路由布尔不同 |
+>
+> 你现在把两者混在 `AirPlayCapability.Classify` 里了。它们**本来就该不一样** —— 路由要保守（宁可走老路径），标注要诚实（不知道就说不知道）。
+>
+> ## 二、WAC 的布尔：确认就是 `false`
+>
+> 〔码〕`:14525`：
+> ```csharp
+> internal static bool SupportsAirPlay2(IReadOnlyDictionary<string,string> txt, bool isAirPlay)
+> {
+>     if (!isAirPlay) return false;
+>     if ((ParseFeatureFlags(PreferNonEmpty(GetTxt(txt,"features"), GetTxt(txt,"ft"))) & 0x10000000000L) != 0
+>         && Version.TryParse(GetTxt(txt,"srcvers"), out Version result))
+>         return result >= new Version(354, 54, 6);
+>     return false;                                  // ← srcvers 解析失败就走这里
+> }
+> ```
+> 而且 `ParseFeatureFlags` 对任何畸形输入也返回 `0`。所以 **`false` 是一个"漏斗"，至少吞掉了三种完全不同的情况**：
+>
+> 1. 根本不是 AirPlay 设备（`!isAirPlay`）
+> 2. 有证据、确实不是 AP2（bit40 = 0）
+> 3. **有 bit40 但版本不可解析 / 过旧** ← 你说的这一种
+>
+> ## 三、WAC 自己**没有**设备级能力标注，所以这不是"要不要对齐 WAC"的问题
+>
+> 我把全文件的 UI 文案扫了一遍：`AirPlay 2` 只出现在**错误对话框**里，没有一处是设备列表上的能力徽章：
+> ```
+> Device_AirPlay2CannotJoinAirPlay1        「An AirPlay 1 session is active. Disconnect it before adding AirPlay 2 devices.」
+> Calibration_MixedTransport               「AirPlay 2 与经典 RAOP 设备不能加入同一个测试组。请仅选择一种设备类型。」
+> 「AirPlay 2 receivers without PTP timing are single-device only」
+> 「AirPlay 2 and classic RAOP cannot share one timing group」
+> ```
+> ⇒ **WAC 的 `SupportsAirPlay2` 只服务路由，从不展示给用户。** 你的三态是**净新增的 UI 能力**，没有 WAC 先例可对齐 —— 那就按"标注要诚实"来设计，不用迁就 WAC 的布尔。
+>
+> ## 四、四支逐一给结论
+>
+> | 你的分支 | 结论 |
+> |---|---|
+> | `features` 缺失 → **unknown** | ✅ **对**。无证据就是无证据 |
+> | `features` 存在、bit40 = 0 → **classic** | ✅ **对**。这是**有证据的否定** |
+> | bit40 = 1、srcvers 可解析但 < 354.54.6 → **classic** | ❌ **要改**，见下 |
+> | bit40 = 1、srcvers 缺失/不可解析 → **unknown** | ✅ **对**。这正是你要保留的那一支 |
+>
+> ### 为什么第三支也该改
+>
+> 它和第一、二支**证据性质不同**：
+> - 第 2 支：设备**明说自己不是** AP2 → 「已知 classic」
+> - 第 3 支：设备**明说自己是** AP2（bit40 = 1），只是固件版本不够 → 这是「**自称 AP2，但固件过旧**」，不是「已知 classic」
+>
+> 把它标成 classic，用户会以为「这台设备就是不支持 AirPlay 2」，而事实是「这台设备支持，但需要升级固件」—— **处置建议完全不同**（前者换设备，后者升级固件）。
+>
+> 建议改成四态（或三态 + 一个 tooltip 分支）：
+>
+> ```csharp
+> enum AirPlayCapability { Unknown, NotAirPlay2, ClaimsAirPlay2Outdated, AirPlay2 }
+>
+> // features 缺失                     -> Unknown
+> // bit40 = 0                          -> NotAirPlay2
+> // bit40 = 1 && srcvers 不可解析       -> Unknown          （保留你现在这支）
+> // bit40 = 1 && srcvers < 354.54.6     -> ClaimsAirPlay2Outdated
+> // bit40 = 1 && srcvers >= 354.54.6    -> AirPlay2
+> ```
+>
+> 路由仍用 WAC 的布尔（`ClaimsAirPlay2Outdated` 和 `NotAirPlay2` 都走 classic 路径），**两套判定各归各**。
+>
+> ## 五、顺带一个实现细节
+>
+> `ParseFeatureFlags` 支持 `"a,b"` 双段形式（低 32 位 + 高 32 位），也支持 `0x` 前缀：
+> ```csharp
+> if (array.Length == 2 && TryParse(array[0], out a) && TryParse(array[1], out b))
+>     return (a & 0xFFFFFFFF) | ((b & 0xFFFFFFFF) << 32);
+> ```
+> ⇒ **bit40 落在第二段**。如果你的解析只取了第一段，`features` 形如 `"0x...,0x..."` 的真 AP2 设备会被判成 `NotAirPlay2`。这一条值得单独测一下 —— 它是"显示成 classic"最可能的真实原因，比 `srcvers` 更隐蔽。
 
 ---
 
-### Q37. MFi 门禁没有引擎 code，也没有 TXT 证据，桌面只能匹配消息文本 `[待答复]`
+### Q37. MFi 门禁没有引擎 code，也没有 TXT 证据，桌面只能匹配消息文本 `[已确认]`
 
 报告 15 §15.3 提到 WAC 有明确错误
 `Device requires MFi authentication (not implementable without Apple hardware)`，
@@ -1848,7 +1991,63 @@ MFi 设备今天仍会显示通用 fault。要让这条分类真正可用，需�
 失败时识别并返回独立 code（例如 `mfi_required`），或确认某个 TXT/feature 位
 能作为证据。下一轮是否在引擎侧补这个 code？桌面半本轮没有改引擎。
 
-> **答复**：（待补充）
+> **答复**：**不要为了这条去引擎里加 `mfi_required` —— WAC 自己也没有实现 MFi 检测。那个字符串是它留的占位符，写着「没有 Apple 硬件就无法实现」。**
+>
+> ## 一、核对结果：WAC 全二进制 `MFi` 只出现 **1 次**
+>
+> 我逐字节数过（小写 `mfi` 的那 1 次命中是 `filesystem filesystem` 里的假阳性）：
+>
+> ```
+> Device does not support required feature: <name>
+> Device requires MFi authentication (not implementable without Apple hardware)
+> Operation timed out / Connection refused / Invalid response: / Unexpected status code: / …
+> ```
+>
+> 这是一段 **`Display` 实现的连续 enum 变体**。注意第二句的措辞 —— **括号里是开发者的自白，不是运行时信息**：
+>
+> > "not implementable without Apple hardware"
+>
+> ⇒ **WAC 遇到了和你完全相同的墙**，并且选择：**定义错误变体，但不去检测它**。整份二进制里没有任何 MFi 探测、没有 MFi 特性位判断、没有 MFi 握手。
+>
+> ## 二、也没有 TXT 位可用 —— WAC 的 app 层只认**一个**特性位
+>
+> 我把 C# 里所有 64 位十六进制常量扫了一遍，**全文件只有 `0x10000000000L`（bit40）一个特性位常量**。
+>
+> ⇒ WAC **不存在**「MFi 特性位」这个概念。你想找一个 TXT/feature 位当证据，**在 WAC 这边找不到**。
+>
+> ## 三、那该怎么办：**降级为展示启发式，别当门禁**
+>
+> 你现在的实现（`code=mfi_required` 或 message 含 `MFi` 才分类）本身没错，错的是**它的定位**。建议：
+>
+> | 现在 | 应该 |
+> |---|---|
+> | 当成 `GateFailure` 的一个**分类** | 当成**展示用的启发式**，代码里显式注释「best-effort，非权威判定」 |
+> | 期望引擎返回 `mfi_required` | **不要加** —— 没有可靠触发条件，加了也是永远不触发的死代码（和 WAC 那个变体一样） |
+>
+> 如果一定要给引擎加东西，**加有可靠触发条件的那个**，就在 MFi 字符串的**上一行**：
+>
+> ```
+> Device does not support required feature: <name>
+> ```
+>
+> 这个是 WAC **真的会发**的（后面跟着 `<name>` 参数，说明是运行时装进去的）。它对应的是「SETUP 里我们请求了设备不支持的能力」—— 这个条件在 AF 侧是**可判定**的：你请求的 `audioFormat` / `streams[].type` / `ct` 被拒，就能归类。
+>
+> ⇒ 建议把引擎侧的精力放在**这个**上，而不是 MFi。
+>
+> ## 四、真机上 MFi 设备会怎么表现（† 需要硬件）
+>
+> † 无法静态确定。但可以确定的是：**WAC 的作者在有真机的情况下仍然放弃了这条路径**，说明它不是一个"补个 code 就能解决"的问题 —— 大概率是设备在 pairing/SETUP 阶段要求 Apple 签名的认证流程，没有 MFi 芯片无法完成。
+>
+> 所以对 AF 而言，正确的期望是：**MFi 设备会表现为通用认证失败**，你的任务只是让这个失败**文案友好一点**，而不是让它变成可处理的分类。
+>
+> ## 五、结论
+>
+> | 问题 | 结论 |
+> |---|---|
+> | 下一轮要不要在引擎侧补 `mfi_required` code | **不要**。WAC 也没做；没有可靠触发条件，会是死代码 |
+> | 有没有 TXT/feature 位能当证据 | **没有**。WAC app 层只认 bit40 一个位 |
+> | 现在的 message 匹配怎么办 | **保留**，但显式标注为 best-effort 展示启发式，不进 `GateFailure` 的权威分类 |
+> | 更值得投入的信号 | `Device does not support required feature: <name>` —— 这个 AF 侧**可判定**，且 WAC 真的会发 |
 
 ---
 
