@@ -42,6 +42,8 @@ pub struct Metrics {
     pub silence_pad_frames: u64,
     pub scheduled_silence_frames: u64,
     pub discontinuities: u64,
+    /// Discontinuity flags that were proven benign (the packet continues the last).
+    pub discontinuities_ignored: u64,
     pub last_discontinuity: Option<String>,
     pub mmcss_registered: bool,
     pub mmcss_priority_set: bool,
@@ -55,6 +57,7 @@ pub struct Metrics {
 }
 struct State {
     splice: crate::continuity::Splice,
+    quantizer: crate::continuity::Quantizer,
     boundary_pending: bool,
     equalizer: crate::equalizer::Processor,
     frames: VecDeque<Frame>,
@@ -118,6 +121,7 @@ impl Loopback {
         let queue_target = rate as usize * 20 / 1000;
         let state = Arc::new(Mutex::new(State {
             splice: crate::continuity::Splice::new(rate),
+            quantizer: crate::continuity::Quantizer::new(),
             boundary_pending: false,
             equalizer: crate::equalizer::Processor::new(equalizer.initial(), rate),
             frames: VecDeque::with_capacity(capacity),
@@ -252,7 +256,7 @@ impl Loopback {
             s.ages.push_back(age);
             let processed = s.equalizer.frame([frame.left, frame.right]);
             for value in s.splice.frame(processed, gain, missing) {
-                out.extend(((value * 32767.0).round() as i16).to_be_bytes());
+                out.extend(s.quantizer.quantize(value).to_be_bytes());
             }
         }
         if underrun {
@@ -309,8 +313,7 @@ impl Drop for ComGuard {
         unsafe { CoUninitialize() }
     }
 }
-struct AudioGuard(IAudioClient);
-impl Drop for AudioGuard {
+struct AudioGuard(IAudioClient);impl Drop for AudioGuard {
     fn drop(&mut self) {
         unsafe {
             let _ = self.0.Stop();
@@ -342,6 +345,12 @@ fn endpoint_index(name: &str, endpoints: &[(String, Option<String>)]) -> Result<
         "capture endpoint name is ambiguous; select a device ID: {name}"
     );
     Ok(index)
+}
+
+/// A WASAPI discontinuity flag is benign when this packet starts exactly where the
+/// previous one ended: the loopback buffer wrapped, the stream did not break.
+pub(crate) fn continues_previous(last_end: Option<u64>, position: u64) -> bool {
+    last_end.is_some_and(|end| end == position)
 }
 
 fn capture_flags(flow: EDataFlow) -> Result<u32> {
@@ -502,6 +511,9 @@ fn capture(
     )?;
     let mut inputs = [VecDeque::<f32>::new(), VecDeque::<f32>::new()];
     let mut input_times = VecDeque::new();
+    // Device position where the previous packet ended; used to tell a benign
+    // loopback wrap from a real capture gap.
+    let mut last_end: Option<u64> = None;
     unsafe { client.Start() }?;
     let _audio = AudioGuard(client);
     state.lock().unwrap().metrics.input_rate = rate;
@@ -538,17 +550,25 @@ fn capture(
                 qpc * 100
             };
             if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 {
-                inputs[0].clear();
-                inputs[1].clear();
-                input_times.clear();
-                resampler.reset();
-                let mut shared = state.lock().unwrap();
-                shared.metrics.dropped_frames += shared.frames.len() as u64;
-                shared.frames.clear();
-                shared.boundary_pending = true;
-                shared.metrics.discontinuities += 1;
-                shared.metrics.last_discontinuity = Some("wasapi_discontinuity".into());
+                // WASAPI raises this flag on benign loopback wraparound too. A packet
+                // that starts exactly where the previous one ended continues the
+                // stream; flushing there would drop 20–60 ms of audio for nothing.
+                if continues_previous(last_end, position) {
+                    state.lock().unwrap().metrics.discontinuities_ignored += 1;
+                } else {
+                    inputs[0].clear();
+                    inputs[1].clear();
+                    input_times.clear();
+                    resampler.reset();
+                    let mut shared = state.lock().unwrap();
+                    shared.metrics.dropped_frames += shared.frames.len() as u64;
+                    shared.frames.clear();
+                    shared.boundary_pending = true;
+                    shared.metrics.discontinuities += 1;
+                    shared.metrics.last_discontinuity = Some("wasapi_discontinuity".into());
+                }
             }
+            last_end = Some(position.saturating_add(u64::from(frames)));
             let bytes = if data.is_null() {
                 &[][..]
             } else {
@@ -628,6 +648,19 @@ fn capture(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn discontinuity_is_only_real_when_the_device_position_jumps() {
+        // Loopback wraparound: the next packet continues the last one.
+        assert!(continues_previous(Some(960), 960));
+        assert!(continues_previous(Some(0), 0));
+        // A genuine gap: position moved past where the previous packet ended.
+        assert!(!continues_previous(Some(960), 1200));
+        // Rewind (endpoint restarted): also a real discontinuity.
+        assert!(!continues_previous(Some(960), 0));
+        // Nothing to compare against yet: treat the packet as a real break.
+        assert!(!continues_previous(None, 960));
+    }
 
     #[test]
     fn capture_direction_selects_loopback_only_for_playback() {
@@ -710,6 +743,7 @@ pub(crate) mod tests {
         Loopback {
             state: Arc::new(Mutex::new(State {
                 splice: crate::continuity::Splice::new(crate::rtp::RATE),
+                quantizer: crate::continuity::Quantizer::new(),
                 boundary_pending: false,
                 equalizer: crate::equalizer::Processor::new(
                     equalizer_control.initial(),
@@ -806,8 +840,11 @@ pub(crate) mod tests {
         let (pcm, marker) = source.packet(0.5).unwrap();
         let last = &pcm[pcm.len() - 4..];
         let expected = (0.25 * 10f32.powf(-12.0 / 20.0) * 0.5 * 32767.0).round() as i16;
-        assert_eq!(i16::from_be_bytes([last[0], last[1]]), expected);
-        assert_eq!(i16::from_be_bytes([last[2], last[3]]), -expected);
+        // Output is TPDF-dithered, so a single sample may sit one LSB either side.
+        let left = i16::from_be_bytes([last[0], last[1]]);
+        let right = i16::from_be_bytes([last[2], last[3]]);
+        assert!((i32::from(left) - i32::from(expected)).abs() <= 1, "{left} vs {expected}");
+        assert!((i32::from(right) + i32::from(expected)).abs() <= 1, "{right} vs -{expected}");
         assert!(marker.is_some());
     }
     #[test]
