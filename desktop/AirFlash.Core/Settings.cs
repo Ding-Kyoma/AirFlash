@@ -42,18 +42,33 @@ public sealed class SoftwareStereoGroup : ObservableObject
     public string SampleRate { get => _sampleRate; set => Set(ref _sampleRate, value); }
     public int LeftOffsetMs { get => _leftOffsetMs; set => Set(ref _leftOffsetMs, value); }
     public int RightOffsetMs { get => _rightOffsetMs; set => Set(ref _rightOffsetMs, value); }
-    public SoftwareStereoGroup Clone() => new() { Id = Id, Name = Name, LeftId = LeftId, RightId = RightId, SampleRate = SampleRate, LeftOffsetMs = LeftOffsetMs, RightOffsetMs = RightOffsetMs };
+    /// <summary>
+    /// The mixed-group invariant version this saved pair was checked against
+    /// (QUESTIONS Q45). 0 means the config predates the invariant and the
+    /// one-time migration has not discharged this group yet; once it equals
+    /// <see cref="AppSettings.CurrentSchemaVersion"/> a later device TXT change
+    /// is runtime drift and is never auto-modified.
+    /// </summary>
+    public int MixedInvariantVersion { get; set; }
+    public SoftwareStereoGroup Clone() => new() { Id = Id, Name = Name, LeftId = LeftId, RightId = RightId, SampleRate = SampleRate, LeftOffsetMs = LeftOffsetMs, RightOffsetMs = RightOffsetMs, MixedInvariantVersion = MixedInvariantVersion };
     public void CopyFrom(SoftwareStereoGroup source)
     {
         Name = source.Name; LeftId = source.LeftId; RightId = source.RightId; SampleRate = source.SampleRate;
-        LeftOffsetMs = source.LeftOffsetMs; RightOffsetMs = source.RightOffsetMs;
+        LeftOffsetMs = source.LeftOffsetMs; RightOffsetMs = source.RightOffsetMs; MixedInvariantVersion = source.MixedInvariantVersion;
     }
     public void Swap() { (LeftId, RightId) = (RightId, LeftId); (LeftOffsetMs, RightOffsetMs) = (RightOffsetMs, LeftOffsetMs); }
 }
 public sealed record ManualReceiver(string Id, string Name, string Host, int Port);
 public sealed class AppSettings : ObservableObject
 {
-    public const int CurrentSchemaVersion = 4;
+    /// <summary>Schema 5 introduces the mixed-group invariant (QUESTIONS Q45).</summary>
+    public const int CurrentSchemaVersion = 5;
+    /// <summary>
+    /// Last schema written before the mixed-group invariant. While the one-time
+    /// Q45 migration is pending the store keeps the file at this version so a
+    /// crash cannot silently skip the split.
+    /// </summary>
+    public const int PreMixedInvariantSchemaVersion = 4;
     public int SchemaVersion { get; set; } = CurrentSchemaVersion;
     private bool _StartAtLogin = false;
     public bool StartAtLogin { get => _StartAtLogin; set => Set(ref _StartAtLogin, value); }

@@ -69,7 +69,7 @@ public sealed class SettingsRecoveryTests
         var store = new SettingsStore(fixture.Path);
         var settings = store.Load();
         Assert.Null(settings.Validate());
-        Assert.Equal(4, settings.SchemaVersion);
+        Assert.Equal(5, settings.SchemaVersion);
         Assert.Equal(39, settings.MasterVolume);
         Assert.Equal("endpoint", settings.CaptureMode);
         Assert.Equal("Old endpoint", settings.CaptureEndpoint);
@@ -337,8 +337,8 @@ public sealed class SettingsRecoveryTests
     }
 
     [Theory]
-    [InlineData("5", false)]
-    [InlineData("5", true)]
+    [InlineData("6", false)]
+    [InlineData("6", true)]
     [InlineData("2147483648", false)]
     [InlineData("2147483648", true)]
     [InlineData("18446744073709551615", false)]
@@ -431,7 +431,7 @@ public sealed class SettingsRecoveryTests
         File.WriteAllText(fixture.Path, "{ recoverable malformed source }");
         var store = new SettingsStore(fixture.Path);
         AssertDefaults(store.Load());
-        var future = Encoding.UTF8.GetBytes("""{"SCHEMA_VERSION":5}""");
+        var future = Encoding.UTF8.GetBytes("""{"SCHEMA_VERSION":6}""");
         File.WriteAllBytes(fixture.Path, future);
         Assert.Throws<NotSupportedException>(() => store.Save(new()));
         Assert.Equal(future, File.ReadAllBytes(fixture.Path));
@@ -639,7 +639,7 @@ public sealed class SettingsRecoveryTests
     private static void AssertDefaults(AppSettings settings)
     {
         Assert.Null(settings.Validate());
-        Assert.Equal(4, settings.SchemaVersion);
+        Assert.Equal(5, settings.SchemaVersion);
         Assert.Equal(100, settings.MasterVolume);
         Assert.False(settings.AutoConnectOnDiscover);
         Assert.False(settings.ForceReconnect);
