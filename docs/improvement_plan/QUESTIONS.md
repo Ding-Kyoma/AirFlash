@@ -1738,6 +1738,17 @@ P3-3 已按 Q32 §五 改掉死锁：`we_hold_session` 不再 latch，改成每�
 >
 > **`Dead ⇒ Reclaim` 而不是 `BusyElsewhere`** 很重要：设备死了就没有「被别人占用」这回事。
 >
+> ### ⚠️ 更正（Q42 调查后补，上面这版有两个坑）
+>
+> 1. **`ConnectionRefused` 不等于死。** 收到 RST 说明**对端网络栈是活的**，只是那个端口没监听。上面把它归进 `Dead`，物理语义错了。动作上仍然导致"读不到 statusFlags ⇒ fail-open 回收"，但**日志要能和真死区分开**，否则排障时误导。
+> 2. **`Unknown ⇒ OursActive` 无限容忍是个陷阱。** 真机上"设备关机"很可能返回 `HostUnreachable`/`NetworkUnreachable`，全部落进 `Unknown`，于是永不回收，只能等 `MEDIA_HEALTH_WINDOW` 兜底。
+>
+> 正确的修法**不是**扩充 errno 白名单，而是：
+> - `Unknown` 加**耐心上限**（连续 3 次或 60 s 升级为 `Dead`）
+> - 加**全设备失败交叉校验**（整轮所有成员都失败 ⇒ 大概率是本机网络问题，本轮不回收任何一台）
+>
+> 完整代码与 PowerShell 实测方法见 **Q42**。
+>
 > ## 三、第 1 问：三个值的依据
 >
 > ### 我把这段的格式串挖出来了，但**数字是运行时算的**〔析〕
@@ -2663,7 +2674,7 @@ HomePod + 经典 RAOP 设备、点连接，再看到一条错误。需要确认�
 
 ---
 
-### Q42. 已关机/不可达的 HomePod 在 Windows 上返回哪种 TCP 错误，应该算 `Dead` 吗？ `[待答复]`
+### Q42. 已关机/不可达的 HomePod 在 Windows 上返回哪种 TCP 错误，应该算 `Dead` 吗？ `[已确认]`
 
 Q34 §四 要求用控制端口的裸 TCP connect 做存活探测：接通 ⇒ `Alive`，连接被拒/
 超时 ⇒ `Dead`，其他错误 ⇒ `Unknown`。P3-3e 已按这个规则实现
@@ -2687,6 +2698,332 @@ Q34 §四 要求用控制端口的裸 TCP connect 做存活探测：接通 ⇒ `
    `Dead`？Q34 的「其他错误 ⇒ `Unknown`」是保守选择，代价是关机场景识别不到；
    如果真机主要返回 host-unreachable，这条规则应扩成「能证明主机关机/不可达
    的错误也算 `Dead`」，否则 Q34 的 `Dead` 分支在真机上几乎不可达。
+
+> **答复**：**第 2 问：是的，`HostUnreachable`/`NetworkUnreachable` 应该算 `Dead` —— WAC 自己就把 `network unreachable` 和 `connection refused` 放进同一个桶。** 但更要紧的是：**你这个问题的正确解法不是枚举 errno，而是加一个"失联升级计时器"** —— 因为不管 Windows 返回什么，只要你数得到"连续 N 次探测失败"，结论都一样。另外第 1 问里有个前提需要纠正：**`ConnectionRefused` 意味着主机是活的**，不是死的。
+>
+> ## 一、先纠正一个前提：`ConnectionRefused` ≠ 设备死了
+>
+> 你（和我 Q34 的表述）都把 `refused` 归到 `Dead`。这在**物理层面是错的**：
+>
+> | 结果 | 物理含义 |
+> |---|---|
+> | `ConnectionRefused`（RST 回来了） | **主机活着、协议栈在跑，只是那个端口没监听** |
+> | `Timeout`（没有任何回包） | 主机不响应 |
+> | `HostUnreachable`（ARP/ICMP 明确说不可达） | 主机不在 |
+>
+> **收到 RST 说明对端网络栈回应了你** —— 这是"活着但没在服务 AirPlay"，不是"关机"。
+>
+> ⚠️ 我在 Q34 §四 写「connect 被拒/超时 ⇒ `Dead`」不够准确，这里更正。**动作上**两者确实都导致"读不到 statusFlags ⇒ 只能 fail-open 回收"，但**语义上**别把它们混成一个状态 —— 否则日志里"设备被我判死"和"设备拒连"分不开，排障时会误导。
+>
+> ## 二、WAC 的证据：它根本不区分，就是**二元布尔**
+>
+> 〔串〕WAC 自己的错误分类表（`0x…`，15 个类别连排）：
+> ```
+> 403  pin pairing  timed out  feedback  connection refused  network unreachable
+> broken pipe  reset by peer  i/o error  os error  415
+> unsupported media  unsupported format  unsupported codec  invalid …
+> ```
+> ⇒ **`network unreachable` 和 `connection refused` 是并列的两个桶**，后面走的处理完全一样。
+>
+> 〔串〕存活判定只有布尔：
+> ```
+> Grouped RAOP feedback failed for <ip>, tcp_reachable=<b>
+> feedback timeout (TCP reachable)
+> feedback timeout and TCP probe failed
+> ```
+> 〔串〕探测失败直接回收（fail-open）：
+> ```
+> status probe failed (<err>); reclaiming
+> status probe timed out; reclaiming
+> ```
+>
+> 还有一条佐证：`HostUnreachable` 在二进制里出现 **5 次，全部是 Rust std 的 `ErrorKind` Debug 字符串表**（`NotFoundPermissionDeniedConnectionRefusedConnectionResetHostUnreachable…`），**WAC 自己的代码里一次都没分支过它**。
+>
+> ⇒ **所以对你的第 2 问，WAC 的答案是：不区分，一律算探测失败。** 你把它算 `Dead` 是对齐 WAC 的，不算激进。
+>
+> ## 三、但真正的解法：不要枚举 errno，加「失联升级计时器」
+>
+> 就算这次你把 `EHOSTUNREACH` / `ENETUNREACH` 都加进 `Dead`，下次真机返回一个你没列的码（`WSAEACCES` 10013 防火墙、`WSAENOBUFS` 10055、IPv6 邻居发现失败……），同样的坑会再踩一遍。
+>
+> **换个不依赖 errno 的判据：`Unknown` 不应该无限期容忍，而应该有耐心上限。**
+>
+> ```rust
+> pub struct LivenessTracker {
+>     consecutive_failures: u32,
+>     last_ok: Instant,
+> }
+>
+> pub enum Verdict { Alive, Dead, Unknown }
+>
+> impl LivenessTracker {
+>     /// 关键：Unknown 只是"暂时不知道"，不是"永远算我的"。
+>     pub fn observe(&mut self, probe: ProbeResult, now: Instant) -> Verdict {
+>         match probe {
+>             ProbeResult::Ok => { self.consecutive_failures = 0; self.last_ok = now; Verdict::Alive }
+>             ProbeResult::Refused => Verdict::Dead,      // 主机活着但不在服务 → 读不到 statusFlags
+>             ProbeResult::Timeout
+>             | ProbeResult::HostUnreachable
+>             | ProbeResult::NetUnreachable => Verdict::Dead,
+>             ProbeResult::Other(_) => {
+>                 self.consecutive_failures += 1;
+>                 // 连续失败超过阈值 ⇒ 升级成 Dead，而不是永远 Unknown
+>                 if self.consecutive_failures >= 3 || now - self.last_ok > Duration::from_secs(60) {
+>                     Verdict::Dead
+>                 } else {
+>                     Verdict::Unknown
+>                 }
+>             }
+>         }
+>     }
+> }
+> ```
+>
+> **这个设计的好处**：
+> - **本机瞬时故障**（`WSAENOBUFS`、防火墙抖一下）→ 一两轮就恢复，计数清零 ✅
+> - **设备真关机** → 不管返回哪个码，3 轮之后必然升级成 `Dead` ✅
+> - **不依赖平台错误码表**，跨平台也对 ✅
+>
+> ### 再加一条免费的交叉校验：**看是不是所有设备都失败了**
+>
+> ```rust
+> // 如果整轮探测里所有成员都失败，那大概率是本机网络/路由表的问题，不是设备的问题
+> let all_failed = verdicts.values().all(|v| !matches!(v, Verdict::Alive));
+> if all_failed && members.len() > 1 {
+>     // 本轮不回收任何一个，只记日志
+>     warn!("liveness: all {} probes failed this round; suspect local network", members.len());
+>     return;
+> }
+> ```
+>
+> 这正好解决 `WSAENETUNREACH`（10051，本机路由表暂时失效）这个**真正模棱两可**的情形 —— 它是本机问题，但单看一台设备分不出来。**多设备场景下，全失败 = 我的问题**，这个判据不需要任何 errno 知识。
+>
+> ## 四、第 1 问：真机返回值 —— 静态不可确定，但你现在就能测
+>
+> † **静态不可判定**：这取决于目标机的 ARP/ND 状态、路由器是否代答 ICMP、是否 IPv6 link-local、Windows 版本与防火墙策略。没有 Windows 主机 + 真实 HomePod 就无法确定。
+>
+> 但**不需要改代码就能测**，PowerShell 一段就够（拿到原始 `SocketErrorCode`）：
+>
+> ```powershell
+> $ip='192.168.0.xxx'; $port=7000
+> $c = New-Object Net.Sockets.TcpClient
+> $t = $c.BeginConnect($ip, $port, $null, $null)
+> if (-not $t.AsyncWaitHandle.WaitOne(2000)) { "TIMEOUT" } else {
+>     try { $c.EndConnect($t); "CONNECTED" }
+>     catch { $_.Exception.InnerException.SocketErrorCode }
+> }
+> $c.Close()
+> ```
+>
+> 建议按这三个场景各跑 3 次记录：
+>
+> | 场景 | 预期 |
+> |---|---|
+> | HomePod 正常播放 | `CONNECTED` |
+> | HomePod 断电/拔线 30 s 后 | `HostUnreachable` 或 `TimedOut`（这一格就是你第 1 问的答案） |
+> | HomePod 正常但 AirPlay 端口没监听（比如刚重启） | `ConnectionRefused` ← 注意这个**不是死** |
+> | 把本机 Wi-Fi 断掉 | `NetworkUnreachable` 或 `NetworkDown` ← 这是我的问题 |
+>
+> **这张表跑完，你的三态分类就不用猜了。** 而且大概率会发现第 2、3 行的码根本不同 —— 这正是 `Refused` 不该叫 `Dead` 的实证。
+>
+> ## 五、顺带确认：UDP「发送成功」不是异常，是必然
+>
+> 你观察到「UDP 发送在接管/关机后经常仍然成功」—— **这完全正常，不是 bug**。UDP 是无连接的，内核只把你交的包交给网卡，**没有任何投递确认**。唯一可能浮出来的是 ICMP port-unreachable，而 Windows 默认**异步且不总上报**，通常 1–2 s 后才到、甚至被静默丢弃。
+>
+> ⇒ **结论：UDP 永远不能作为存活信号。** 现在的设计（TCP 探测 + `MEDIA_HEALTH_WINDOW` 兜底）方向是对的，只是兜底窗口现在成了唯一手段，所以才显得慢。加了上面的升级计时器之后，兜底就不再是主力。
+>
+> ## 六、结论
+>
+> | 你的问题 | 结论 |
+> |---|---|
+> | 真机返回哪种错误 | † 静态不可判定。给出 PowerShell 测法与 4 场景对照表，跑一次就有答案 |
+> | `HostUnreachable` 算 `Dead` 吗 | **算**。WAC 把 `network unreachable` 和 `connection refused` 放在同一桶，`HostUnreachable` 它压根不分支 |
+> | `NetworkUnreachable` 算 `Dead` 吗 | **单设备场景算，但要先做「全失败」交叉校验** —— 它更可能是本机路由问题 |
+> | 三态要不要保留 | **保留，但 `Unknown` 必须有耐心上限**（连续 3 次或 60 s 升级为 `Dead`）。无限容忍才是真正的坑 |
+> | `ConnectionRefused` | **语义上是"活着"**，不是死。动作上等同 `Dead`（读不到 statusFlags ⇒ fail-open 回收），但日志要分开 |
+> | 最优解 | 别枚举 errno —— 用「连续失败计数 + 全设备失败判定」，对任何平台返回值都成立 |
+
+---
+
+### Q43. 时间线重置的分桶口径、`start` 的语义与桌面端 join `[已确认]`
+
+Q40 之后 `rebuild_count` 已删除，引擎改为 9 个 reason 分桶（CSV 列
+`timeline_resets_<reason>`）+ `last_timeline_reset_reason`；桌面端新增
+`%APPDATA%\AirFlash\logs\session-desktop.csv`。实现时对「哪些站点算一次重置」
+做了如下决定，其中三处是因为九类里没有精确对应、只能取「最接近」：
+
+| 站点点位 | 归档 | 说明 |
+|---|---|---|
+| `run_live` 首次尝试的 `MediaSchedule::new` | **不计** | 这是一行的基线，不是重置；正常停止必须九桶全 0 |
+| `schedule.add_shift` 实际应用非零 | `latency_change` | 我们主动改 lead |
+| `LateAction::Silence` 补静音槽 | **不计** | seq/rtptime 仍线性，时间线没有重置 |
+| `LateAction::Reanchor` 成功且 shift≠0 | `confirmed_transport_failure` | ⚠️ 最接近，但九类里没有 "sender stall" |
+| `schedule.reanchor` 预算耗尽（`timeline_expired`） | `confirmed_transport_failure` | 确定故障 |
+| `schedule.relax` 回退 surplus | **不计** | 重锚 surplus 的回退，重复计会放大 |
+| standby 暂停后恢复 | `silence_resume` | |
+| 抢占 reclaim / 重新连接接收器 | `session_restart` | |
+| 采集源结束/重建后重开 | `start` | ⚠️ 没有 source_restart，取最接近的 `start` |
+| 正常停止的 faded drain | **不计** | 不是 FLUSH，接收器没有被要求丢弃队列 |
+
+需要确认：
+
+1. `start` 的语义。WAC 把首条时间线也记成 `start`；AF 现在把「首次尝试的
+   基线」排除在外（否则正常停止就不是全 0，而且每行恒为 1 没有信息量），只把
+   「采集源结束后重新开始播放」记成 `start`。这样可以吗？还是希望每个会话的
+   第一行都带 `start=1`？
+2. 成功重锚归档到 `confirmed_transport_failure` 可以吗？它是发送线程错过
+   deadline（可能是本机调度，不一定是网络），但九类里只有这个带漂移含义。
+   如果不该算漂移，是否应该改记 `silence_resume`（同样不精确）或暂时不计？
+3. 桌面 companion 文件的粒度。引擎一个 attempt 一行（`session_id =
+   <IPC id>-<epoch>`），桌面一次 IPC 会话一行（`transport_fault:<code>`，
+   首次 `none`），join 时用引擎 id 去掉最后一个 `-<epoch>` 的前缀。若希望
+   逐 attempt 精确对齐，需要引擎在摘要事件里回传 `session_epoch` 给桌面端
+   （目前桌面端忽略该事件）。要做吗？
+4. `track_change` / `user_seek` / `receiver_rejected_flush` / `flush` 在 AF 的
+   实时采集链路里没有对应站点（没有播放列表、seek，也不发 FLUSH），这四个桶
+   目前恒为 0。保留空桶等以后接播放器，还是从 schema 里删掉？
+
+> **答复**：表格整体判得很准，**但有两条会伤到信号，建议改**：
+> ① **`LateAction::Reanchor` 不能归到 `confirmed_transport_failure`** —— 那是我在 Q40 里让你**唯一信任**的漂移信号，把"本机调度错过 deadline"折进去，等于把它污染掉；
+> ② **`add_shift → latency_change` 需要最小幅度阈值**，否则它会变成最大的一桶，把别的信号淹掉。
+> 另外第 4 问的答案可能和直觉相反：**四个恒为 0 的桶要留着，它们是 tripwire。**
+>
+> ## 一、先逐条复核你这张表
+>
+> | 站点点位 | 你的归档 | 判定 | 说明 |
+> |---|---|---|---|
+> | 首次 `MediaSchedule::new` | 不计 | ✅ **对** | 基线不是重置 |
+> | `add_shift` 非零 | `latency_change` | ⚠️ **方向对，但要加阈值** | 见 §二 |
+> | `LateAction::Silence` | 不计 | ✅ **对，而且很关键** | seq/rtptime 仍线性 ⇒ 时间线没断。这正好对应 WAC 把 `gap_filled` 和 `reanchored` 分开统计 |
+> | `LateAction::Reanchor` 成功 | `confirmed_transport_failure` | ❌ **改** | 见 §三 |
+> | `reanchor` 预算耗尽 | `confirmed_transport_failure` | ✅ **对** | 确定故障 |
+> | `schedule.relax` 回退 | 不计 | ✅ **对** | 重复计会放大，你判断对了 |
+> | standby 恢复 | `silence_resume` | ⚠️ 可接受 | standby 是用户/OS 动作，不是"源静音"；但九类里它最接近。若以后想区分，加 `standby_resume` |
+> | 抢占 / 重连 | `session_restart` | ✅ **对** | |
+> | 采集源重建 | `start` | ❌ **改名** | 见 §四 |
+> | 正常停止 drain | 不计 | ✅ **对** | |
+>
+> ## 二、`latency_change` 需要最小幅度阈值
+>
+> 你写的是「`add_shift` 实际应用非零 ⇒ 计一次」。问题在于**自适应 lead 的日常微调**也是非零 —— 如果环路每 100 ms 调 1 个采样，这个桶会一路涨到几千，然后：
+>
+> - 它会变成 CSV 里最大的数字，**把 `confirmed_transport_failure` 彻底淹没**
+> - Q40 那张表里「`latency_change` 频繁 → 自适应 lead 反复横跳」这条推论会永远成立，等于没有信息
+>
+> **建议拆成两个量**：
+>
+> ```rust
+> // 1) 只有"可感知的"调整才算一次重置
+> if shift.abs() >= Duration::from_millis(1) {
+>     resets.latency_change += 1;
+> }
+> // 2) 微调单独累计幅度，不占桶
+> metrics.lead_shift_total_us += shift.as_micros() as i64;
+> metrics.lead_shift_count   += 1;
+> ```
+>
+> 这样「横跳」由 `lead_shift_count` 表达，「大跳」由 `latency_change` 表达，两者互不污染。
+>
+> ## 三、`LateAction::Reanchor` 不该算 `confirmed_transport_failure`（最重要的一条）
+>
+> 你自己的怀疑是对的：**发送线程错过 deadline 可能只是本机调度**（GC/线程抢占/CPU 争用/磁盘抖动），跟网络无关。
+>
+> 而 `confirmed_transport_failure` 这个名字里有个 **confirmed** —— 它是 WAC 里唯一表示"传输层确实坏了"的桶。我在 Q40 里给的建议是：
+>
+> > `confirmed_transport_failure > 0` 且间隔 ~10 min ⇒ **漂移（P0-3 未做完）—— 唯一可靠信号**
+>
+> **一旦把本机调度也塞进去，这条推论立刻失效** —— 你会看到一堆 `confirmed_transport_failure`，然后去查网络，而真正的原因是你的发送线程被抢了 CPU。这是最难查的一类误诊。
+>
+> ### 建议加第 10 桶：`sender_stall`
+>
+> ```rust
+> pub struct TimelineResets {
+>     // … WAC 的 9 个桶 …
+>     pub source_restart: u32,   // 见 §四
+>     pub sender_stall:   u32,   // 本机侧错过 deadline 触发的重锚
+> }
+> ```
+>
+> 归档规则：
+>
+> | 情形 | 归档 |
+> |---|---|
+> | `reanchor` 预算耗尽（`timeline_expired`） | `confirmed_transport_failure` |
+> | `Reanchor` 成功，且**有 RTP 侧证据**（丢包/rtx/under-run 同时发生） | `confirmed_transport_failure` |
+> | `Reanchor` 成功，但 RTP 侧干净（`rtx_req` 没涨、`underruns` 没涨） | **`sender_stall`** |
+>
+> 最后那行判据很便宜：你已经在采 `rtx_req` / `underruns` 了，重锚时看一眼有没有同步变化就行。
+>
+> **收益**：`confirmed_transport_failure > 0` 恢复成干净信号；而 `sender_stall` 单独非零直接指向「提高发送线程优先级 / 减少分配 / 加大缓冲」—— 这是**完全不同**的修法。
+>
+> ## 四、`start` 的语义：同意排除基线，但把"源重建"改个名
+>
+> ### 第 1 问：排除首次基线 → **同意你的做法**
+>
+> 理由和你说的一致，而且可以再说强一点：**「正常停止九桶全 0」是一个可断言的不变量**，它让"这一行是干净的"变成一个可以直接 grep 的条件。如果每行恒有 `start=1`，这个不变量就没了，而换来的是零信息量（因为恒定）。
+>
+> 你担心的另一个方向 —— "全 0 会不会是根本没播" —— 不用担心：那种行用 `packets == 0` 一眼就能看出来，不需要 `start` 来兼职。
+>
+> ### 但 `start` 这个名字被占用得不对
+>
+> WAC 的 `start` = **会话开始**。你拿它表示**采集源重建后重开**，这两件事完全不同，而且以后你想统计"源重建频率"时，会看到 `start` 而无法判断它到底是会话开始还是源重建。
+>
+> **建议：`start` 保持"会话首条时间线"的语义且不计入行（即你现在的做法），另加 `source_restart` 桶。** 最终 schema 变成 **11 个桶**：WAC 的 9 个 + `source_restart` + `sender_stall`。
+>
+> 多两个桶的成本是零，收益是两个语义各自精确。
+>
+> ## 五、第 3 问：桌面 companion 的粒度 → **不要加 `session_epoch`，改 `fault` 多重性**
+>
+> ### 现在的 join 已经够了
+>
+> 引擎 `session_id = <IPC id>-<epoch>`，桌面 `<IPC id>`，去掉末段前缀 join —— 这足以回答「这次 IPC 会话里引擎重启了几次、原因各是什么」。
+>
+> **逐 attempt 精确对齐解决不了你现在真正的问题**，因为桌面端本来就**没有** per-attempt 的信息：它只记了 `transport_fault:<code>` 且**只记首次**。就算引擎回传 `session_epoch`，桌面端也没有第二个 fault 可以配上去。
+>
+> ### 真正该改的是：**桌面只记首次 fault，丢掉了重试故事**
+>
+> 「首次 `none`，之后第一个 fault」这个设计有个硬伤：**一次 IPC 会话里重连 5 次、每次不同原因，你只看到第一条。** 这恰恰是排障最需要的信息。
+>
+> 建议桌面端改成三个字段（都不需要引擎配合）：
+>
+> ```
+> transport_fault_first     // 第一个非 none 的 code
+> transport_fault_count     // 一共发生几次
+> transport_fault_seq       // 紧凑序列，如 "timeout;refused;timeout"
+> ```
+>
+> `transport_fault_seq` 用 `;` 分隔、**只保留前 5 个 + `…`** 防止膨胀。这样：
+> - 单次故障 → `first == seq`，不增加阅读负担
+> - 反复重连 → 序列直接告诉你模式（比如全是 `refused` ⇒ 端口问题；`timeout;timeout;refused` ⇒ 设备在重启）
+>
+> 如果以后确实需要 per-attempt，再让引擎回传 `session_epoch` —— 但那时桌面端也得先有 per-attempt 的 fault 记录，否则加了也白加。
+>
+> ## 六、第 4 问：四个恒为 0 的桶 → **保留，它们是 tripwire**
+>
+> `track_change` / `user_seek` / `receiver_rejected_flush` / `flush` 现在恒为 0，因为 AF 没有播放器、不发 FLUSH。**建议留着**，四个理由按重要性排：
+>
+> 1. **恒为 0 本身就是信息 —— 它是一条绊线。** 如果哪天 `flush` 突然非零，说明**有新的代码路径开始发 FLUSH 了**。这是你想第一时间知道的回归，而删掉这列就永远发现不了。
+> 2. **schema 稳定性。** 现在删、以后接播放器再加，所有已经写好的分析脚本（以及已经积累的 CSV）全部要改。四列的成本接近零，改 schema 的成本不是。
+> 3. **和 WAC 的可比性。** Q40 让你采用这 9 个名字，价值就在于"同一套词汇能对照"。少四个桶，对照表就有洞。
+> 4. **空桶让"异常桶非零"更醒目。** 一列长期为 0 突然变正，比在一堆都非零的列里发现变化容易得多。
+>
+> 建议在 schema 文档里写一句：
+>
+> ```
+> track_change / user_seek / receiver_rejected_flush / flush
+>   —— 当前构建预期恒为 0（无播放列表、无 seek、不发 FLUSH）。
+>      非零 ⇒ 出现了新的代码路径，需复核。
+> ```
+>
+> ## 七、结论
+>
+> | 你的问题 | 结论 |
+> |---|---|
+> | 1. `start` 语义、排除首次基线 | **同意排除**（「正常停止全 0」是可断言不变量）。但把"源重建"改名成 `source_restart`，别占用 `start` |
+> | 2. 成功重锚归档到 `confirmed_transport_failure` | ❌ **不要**。会污染唯一干净的漂移信号。加 `sender_stall`，用「RTP 侧是否同步异常」区分 |
+> | 3. 要不要引擎回传 `session_epoch` | **暂时不要**。前缀 join 已够；真正缺的是桌面端**只记首次 fault**，改成 `first/count/seq` 三个字段 |
+> | 4. 四个恒 0 的桶 | **保留**。它们是 tripwire：非零 ⇒ 新代码路径出现 |
+> | 额外 | `add_shift → latency_change` **加 1 ms 阈值**，微调走 `lead_shift_count`，否则该桶会淹没一切 |
+> | 最终 schema | **11 桶** = WAC 9 个 + `source_restart` + `sender_stall` |
 
 ---
 
@@ -2721,3 +3058,4 @@ Q34 §四 要求用控制端口的裸 TCP connect 做存活探测：接通 ⇒ `
 3. **`ComputeRecommendation` 是一次算三方案，不升档**：所以"自适应阶梯"整套是 AF 的净增能力，不必也不该去对齐 WAC 的候选表（那张表里有 30/40 这种**永远用不到**的值）。
 
 ---
+
