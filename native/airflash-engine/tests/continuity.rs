@@ -1,7 +1,6 @@
 //! Short deterministic/local-network fault injection. Never connects to a speaker.
 use airflash_engine::{
     crypto::Cipher,
-    preemption::Signal,
     rtp::{PCM_BYTES, Packetizer, RATE, Retransmit},
     rtsp::{Cancellation, Connection},
     transport::*,
@@ -128,15 +127,6 @@ fn feedback_retries_only_complete_transient_responses() {
         } else if let Some(fault) = health.control_degraded() {
             assert!(fault.retryable);
             assert_eq!(fault.channel, "feedback");
-            if expected == vec![403] {
-                // 403 is evidence, not an authentication verdict: the session
-                // thread probes the receiver's live statusFlags.
-                assert_eq!(fault.code, "forbidden");
-                assert_eq!(
-                    health.take_preemption_signals(),
-                    vec![Signal::Forbidden]
-                );
-            }
             // Control-plane faults no longer end a session whose media is healthy.
             assert!(health.check().is_ok());
             assert!(health.check_control(true).is_ok(), "healthy media keeps playing");
@@ -152,6 +142,18 @@ fn feedback_retries_only_complete_transient_responses() {
             let fault = error.downcast_ref::<Fault>().unwrap();
             assert_eq!(fault.channel, "feedback");
             assert!(matches!(fault.code.as_str(), "authentication_failed" | "session_rejected"));
+            if expected == vec![403] {
+                // Q32: 403 is an access/authentication error, never "another
+                // controller took our session". It must not start a
+                // statusFlags probe (which is what latching the old tracker
+                // would eventually wedge).
+                assert_eq!(fault.code, "authentication_failed");
+                assert!(!fault.retryable);
+                assert!(
+                    health.take_preemption_signals().is_empty(),
+                    "a 403 must never become preemption evidence"
+                );
+            }
         }
         drop(worker);
         server.join().unwrap();

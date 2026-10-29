@@ -2,16 +2,16 @@
 //! symptoms only leave evidence.
 //!
 //! The reference sender does not infer a takeover from what the control channel
-//! does. An unexpected `TEARDOWN`, a `403`, or `Connection: close` is logged with
+//! does. An unexpected `TEARDOWN` or a `Connection: close` is logged with
 //! context (`policy`, `rtp_healthy`, `packets_prepared`) and then the receiver is
 //! asked directly: `GET /info` and read `statusFlags`. That live answer is the
 //! only criterion:
 //!
 //! | probe result | action |
 //! | --- | --- |
-//! | no active session | reclaim |
+//! | no active session | confirmation probe, then reclaim if it agrees |
 //! | an active session that is ours | not preemption: fall through |
-//! | an active session that is not ours | queue one re-probe, not a failure |
+//! | an active session that is not ours | confirmation probe, then queue |
 //! | probe failed / timed out | reclaim anyway (fail-open) |
 //!
 //! The bit values are recovered from the reference implementation (Q31 answer):
@@ -25,6 +25,23 @@
 //! takes a second dimension, [`Tracker::we_hold_session`]. Without it, filling
 //! in `0x20000` would misjudge our own healthy session as a takeover and
 //! immediately reclaim it, interrupting working audio.
+//!
+//! Ownership is **derived live**, never latched (Q32): healthy RTP always wins
+//! over a control-plane signal, and an "our session ended" conclusion is trusted
+//! for [`ENDED_TRUST_WINDOW`] only. `403` is an access/authentication error in
+//! the reference classification, never takeover evidence: the feedback worker
+//! routes it to the existing authentication fault path, so it cannot reach this
+//! module at all. That closes the deadlock where a `403` latched "not ours",
+//! every probe reported our own session as somebody else's, and the queue never
+//! ended.
+//!
+//! Two more guards make every state reachable from a probe finite:
+//! - a state-changing verdict (`Free` or `BusyElsewhere`) is re-probed once
+//!   after [`CONFIRM_DELAY`]; a disagreement keeps the non-destructive outcome
+//!   (never reclaim);
+//! - consecutive confirmed `BusyElsewhere` requeues are bounded by
+//!   [`BUSY_LIMIT`]; at the limit the sender reclaims anyway and logs
+//!   `busy_exhausted`.
 //!
 //! Re-announcing is never enough on its own: a receiver that is serving another
 //! sender still announces. The anti-storm limiter is a consecutive counter: a
@@ -55,6 +72,28 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// alone.
 pub const REPROBE_DELAY: Duration = Duration::from_secs(3);
 
+/// How long the "the receiver ended our session" conclusion is trusted while
+/// RTP is unhealthy. Q32 requires the conclusion to be self-healing; an
+/// indefinitely latched `false` turns a momentary unhealthy RTP sample into a
+/// permanent `BusyElsewhere` loop. 2 s is the reference implementation's media
+/// gap window, the same window [`Tracker::we_hold_session`] uses for
+/// `rtp_healthy`.
+pub const ENDED_TRUST_WINDOW: Duration = Duration::from_secs(2);
+
+/// Delay between a state-changing verdict and the one confirmation probe Q32
+/// asks for. Our choice: Q32 recovered the need for a second probe and its two
+/// failure modes (a false `Free` reclaims; a false `Busy` stalls), but not
+/// WAC's interval.
+pub const CONFIRM_DELAY: Duration = Duration::from_millis(500);
+
+/// Consecutive confirmed `BusyElsewhere` requeues after which the sender stops
+/// queueing and reclaims anyway (`busy_exhausted`). Our choice: Q32 asks for an
+/// upper bound and leaves the number to us. 3 mirrors [`TAKEOVER_LIMIT`] and,
+/// at [`REPROBE_DELAY`] = 3 s, bounds one session attempt to roughly 9 s of
+/// queueing before the reclaim path takes over. The takeover counter still
+/// applies on top, so even repeated forced reclaims end in `yield`.
+pub const BUSY_LIMIT: u32 = 3;
+
 /// A takeover counter reaches this many consecutive reclaims and the sender
 /// yields. Our choice: Q30 only recovered the *shape* of the limiter
 /// (`taken over <n> times in a row`), not WAC's threshold.
@@ -84,12 +123,15 @@ pub const STEREO_PARTNER_UNREACHABLE: u64 = 0x0000_4000;
 pub const PASSWORD_REQUIRED: u64 = 0x0000_0080;
 
 /// One control-plane thing the receiver did. Evidence only, never a verdict.
+///
+/// A `403` is deliberately absent: Q32 classifies it as an access/auth error
+/// (the same family as password/PIN/470), never as "our session ended". The
+/// feedback worker routes it to the existing `authentication_failed` path, so
+/// it does not become preemption evidence either.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signal {
     /// The receiver sent a `TEARDOWN` we did not ask for.
     UnexpectedTeardown,
-    /// The receiver answered an RTSP request with `403 Forbidden`.
-    Forbidden,
     /// The receiver asked for the control connection to be closed.
     ConnectionClose,
 }
@@ -98,19 +140,19 @@ impl Signal {
     pub fn name(self) -> &'static str {
         match self {
             Self::UnexpectedTeardown => "unexpected_teardown",
-            Self::Forbidden => "forbidden",
             Self::ConnectionClose => "connection_close",
         }
     }
 
-    /// Whether this signal means the receiver ended or refused **our** session.
-    /// An unexpected `TEARDOWN` ends it outright; a `403` is the receiver
-    /// refusing a request on it. Both say the session is not ours any more, so
-    /// no later probe on this member can make us its owner again.
-    /// `Connection: close` is deliberately **not** here: a keep-alive or event
-    /// channel can be closed while the RTSP session itself is still ours.
+    /// Whether this signal genuinely means the receiver ended **our** session.
+    ///
+    /// Only an unexpected `TEARDOWN` does. `Connection: close` can be a
+    /// keep-alive or event-channel restart while the RTSP session is still
+    /// ours. There is no `403` arm at all (Q32): it is an access/auth error and
+    /// treating it as "session ended" is what latched the old tracker into
+    /// `BusyElsewhere` forever.
     pub fn ends_session(self) -> bool {
-        matches!(self, Self::UnexpectedTeardown | Self::Forbidden)
+        matches!(self, Self::UnexpectedTeardown)
     }
 }
 
@@ -119,13 +161,6 @@ impl Signal {
 /// part of every normal session ending and must never look like a takeover.
 pub fn incoming_teardown(method: Option<&str>) -> Option<Signal> {
     (method == Some("TEARDOWN")).then_some(Signal::UnexpectedTeardown)
-}
-
-/// A status code that is preemption evidence. Only `403`: `401` and `454` stay
-/// on the authentication/session path they had before this module existed and
-/// must never be reclassified just because another controller might be around.
-pub fn status_signal(status: u16) -> Option<Signal> {
-    (status == 403).then_some(Signal::Forbidden)
 }
 
 /// What a live `GET /info` probe could tell us.
@@ -172,8 +207,8 @@ pub struct ProbeReport {
 ///
 /// `we_hold_session` is the context the receiver cannot give us (the reference
 /// sender gets it from where in its lifecycle it probes). It is true when our
-/// own media is still flowing and the receiver never ended this session; see
-/// [`Tracker::we_hold_session`] for where that evidence comes from. The
+/// own media is still flowing and the receiver's "session ended" conclusion (if
+/// any) is still fresh; see [`we_hold_session`] for the exact derivation. The
 /// three-way shape is Q31's prescription: the session bit alone cannot
 /// distinguish our own session from another sender's.
 pub fn classify(status_flags: u64, we_hold_session: bool) -> ProbeOutcome {
@@ -205,17 +240,26 @@ fn report_from_info(info: &Value, we_hold_session: bool) -> ProbeReport {
     }
 }
 
-/// What to do after the verdict table has seen the probe result.
+/// What to do after the verdict table — and, for state-changing verdicts, its
+/// confirmation probe — has been applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProbeAction {
     /// Stop the old session and take the receiver back on a fresh connection.
     Reclaim,
+    /// The bounded busy queue was exhausted: reclaim even though the receiver
+    /// still reports an active session (`busy_exhausted`). A fail-open exit, so
+    /// a permanently busy (or permanently misreported) receiver can never keep
+    /// the sender queueing forever.
+    ReclaimBusyExhausted,
     /// Leave the receiver alone for now and ask again after [`REPROBE_DELAY`].
     Requeue,
     /// Not preemption: the receiver's active session is ours. Take no
     /// preemption action, so the control symptom falls through to the existing
     /// non-preemption path and a healthy session is never interrupted.
     FallThrough,
+    /// The first verdict would change state and is waiting for its one
+    /// confirmation probe after [`CONFIRM_DELAY`]. Nothing has been decided.
+    Confirm,
 }
 
 /// The Q30 verdict table, for a probe that completed.
@@ -234,6 +278,75 @@ pub fn action_for_result(result: &Result<ProbeReport>) -> ProbeAction {
     match result {
         Ok(report) => action_for(report.outcome),
         Err(_) => ProbeAction::Reclaim,
+    }
+}
+
+/// Adjudicate a state-changing first verdict against its confirmation probe.
+///
+/// `second` is `None` when the confirmation probe failed; the first verdict
+/// then stands (fail-open on the reclaim path, the queue on the busy path).
+/// When the two probes disagree the **non-destructive** interpretation wins and
+/// a reclaim is never issued: `OursActive` falls through, `BusyElsewhere`
+/// keeps queueing. `Unknown` is not a verdict, so it never counts as a
+/// disagreement; the first verdict stands unchanged.
+fn confirm(
+    first: ProbeOutcome,
+    second: Option<ProbeOutcome>,
+) -> (ProbeAction, Option<(ProbeOutcome, ProbeOutcome)>) {
+    let Some(second) = second else {
+        return (action_for(first), None);
+    };
+    if second == ProbeOutcome::Unknown {
+        return (action_for(first), None);
+    }
+    if second == first {
+        return (action_for(first), None);
+    }
+    let action = if first == ProbeOutcome::OursActive || second == ProbeOutcome::OursActive {
+        ProbeAction::FallThrough
+    } else if first == ProbeOutcome::BusyElsewhere || second == ProbeOutcome::BusyElsewhere {
+        ProbeAction::Requeue
+    } else {
+        // Both usable verdicts are in the Free family; nothing destructive
+        // contradicted the first one.
+        action_for(first)
+    };
+    (action, Some((first, second)))
+}
+
+/// Whether the receiver's active session is ours, derived **live** from the
+/// evidence this engine already has (Q32):
+///
+/// - `rtp_healthy` is `MediaTransport::media_healthy`: we successfully moved
+///   audio to this receiver within the health window. It always wins — even
+///   over a receiver `TEARDOWN` — because that is the reference
+///   implementation's "control poison with healthy RTP ⇒ deferring teardown"
+///   rule, and because a UDP send keeps "succeeding" long enough that a stale
+///   control conclusion must not override live media.
+/// - `ended_at` is when the receiver last ended this session (unexpected
+///   `TEARDOWN`). That conclusion is honored for [`ENDED_TRUST_WINDOW`] only:
+///   after the window the tracker holds the session again, so the evidence is
+///   self-healing instead of latching `false` forever (Q32). A `403` is never
+///   written here at all.
+///
+/// `now` is explicit so the window boundary is unit-testable.
+///
+/// Q32's sketch writes the window as `t.elapsed() < 2s`. Read literally that
+/// returns `false` forever once the window expires, which is exactly the latch
+/// the same answer forbids; the invariant Q32 states is self-healing, so the
+/// *ended* conclusion is trusted for [`ENDED_TRUST_WINDOW`] and then expires
+/// (`elapsed >= window` ⇒ we hold again).
+pub fn we_hold_session(rtp_healthy: bool, ended_at: Option<Instant>, now: Instant) -> bool {
+    if rtp_healthy {
+        return true;
+    }
+    match ended_at {
+        // The "receiver ended our session" conclusion expires: once it is older
+        // than the trust window it is no longer evidence against ownership. This
+        // is the self-healing half of Q32 — a recent control symptom may make us
+        // queue, but it can never wedge the probe in `BusyElsewhere` forever.
+        Some(ended) => now.saturating_duration_since(ended) >= ENDED_TRUST_WINDOW,
+        None => true,
     }
 }
 
@@ -256,9 +369,8 @@ fn probe_infos(
 /// Probe the receiver's live status on a fresh RTSP connection.
 ///
 /// `we_hold_session` is the locally derived context [`classify`] needs: our own
-/// media is still flowing and the receiver has not ended this session (see
-/// [`Tracker::we_hold_session`]). It is an input, never something the probe
-/// invents.
+/// media is still flowing and the receiver's ended conclusion (if any) is fresh
+/// (see [`we_hold_session`]). It is an input, never something the probe invents.
 ///
 /// The caller's existing control connection is deliberately not used: after a
 /// takeover it belongs to a session the receiver already ended, and encrypted
@@ -383,6 +495,29 @@ impl fmt::Display for Reclaim {
 
 impl std::error::Error for Reclaim {}
 
+/// One state-changing verdict waiting for its confirmation probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingProbe {
+    first: ProbeOutcome,
+}
+
+/// What one probe result means after the confirmation rule and the bounded busy
+/// queue have been applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProbeNote {
+    /// True when the diagnostic log line changed (same rule as before): a
+    /// repeated busy verdict does not print the same line every interval.
+    pub log_changed: bool,
+    /// The action to take now. [`ProbeAction::Confirm`] means the confirmation
+    /// probe is scheduled and nothing has been decided yet.
+    pub action: ProbeAction,
+    /// Set when the first and confirmation probes gave different usable
+    /// verdicts. The caller logs the disagreement.
+    pub disagreement: Option<(ProbeOutcome, ProbeOutcome)>,
+    /// The busy queue hit [`BUSY_LIMIT`] and the verdict was forced to reclaim.
+    pub busy_exhausted: bool,
+}
+
 /// Per-member evidence and probe scheduling. Only the session thread probes;
 /// feedback workers merely append [`Signal`]s to `Health`.
 #[derive(Debug, Default)]
@@ -390,11 +525,14 @@ pub struct Tracker {
     signals: Vec<Signal>,
     next_probe: Option<Instant>,
     last_report: Option<ProbeLog>,
-    /// The receiver ended or refused our own session (a `TEARDOWN` it did not
-    /// get from us, or a `403`). Sticky for this member: the member is dropped
-    /// and rebuilt on every reclaim, so a fresh session starts with a clean
-    /// tracker while a displaced one can never claim ownership again.
-    session_ended: bool,
+    /// When the receiver last ended our own session (an unexpected `TEARDOWN`).
+    /// Deliberately **not** sticky: [`we_hold_session`] trusts it for
+    /// [`ENDED_TRUST_WINDOW`] only. A `403` is never recorded here (Q32).
+    ended_at: Option<Instant>,
+    /// First state-changing verdict waiting for its confirmation probe.
+    pending: Option<PendingProbe>,
+    /// Confirmed `BusyElsewhere` requeues in a row for this session attempt.
+    busy_requeues: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -407,40 +545,27 @@ struct ProbeLog {
 impl Tracker {
     pub fn observe(&mut self, signal: Signal, at: Instant) {
         const MAX_SIGNALS: usize = 8;
-        self.session_ended |= signal.ends_session();
+        if signal.ends_session() {
+            self.ended_at = Some(at);
+        }
         if self.signals.len() == MAX_SIGNALS {
             self.signals.remove(0);
         }
         self.signals.push(signal);
-        // A new signal asks for a probe now, unless a busy queue is already
-        // waiting. Repeated symptoms must not shorten the re-probe interval.
+        // A new signal asks for a probe now, unless a probe is already queued.
+        // Repeated symptoms must not shorten the confirmation or re-probe
+        // interval.
         if self.next_probe.is_none() {
             self.next_probe = Some(at);
         }
     }
 
     /// Whether the receiver's active session is ours to lose — the
-    /// `we_hold_session` dimension [`classify`] needs.
-    ///
-    /// Derived from evidence this engine already has, never from a new probe:
-    /// - `rtp_healthy` is `MediaTransport::media_healthy`: we successfully moved
-    ///   audio to this receiver within the health window. It is the same piece of
-    ///   context the reference implementation logs next to a control EOF, and it
-    ///   is why an active session must not be treated as a takeover by default:
-    ///   our own healthy session has exactly that bit set.
-    /// - the receiver never ended this session ([`Self::session_ended`]): a UDP
-    ///   send keeps "succeeding" after a takeover, so RTP health alone stays
-    ///   true and would hide a real takeover behind `ours_active` forever.
-    ///
-    /// Media health is always computable inside the live loop (the tracker is
-    /// only polled from the streaming loop, after the media watchdog is armed),
-    /// so there is no "unavailable" case to fall back from. If it ever were
-    /// unknown, `false` is the conservative value: a false only turns a
-    /// session-active probe into [`ProbeOutcome::BusyElsewhere`] — the requeue
-    /// branch, which neither reclaims nor ends the session — while `true` would
-    /// declare a session ours with no evidence at all.
-    pub fn we_hold_session(&self, rtp_healthy: bool) -> bool {
-        rtp_healthy && !self.session_ended
+    /// `we_hold_session` dimension [`classify`] needs. See the free
+    /// [`we_hold_session`] for the exact derivation; this only supplies the
+    /// tracker's recorded `ended_at`.
+    pub fn we_hold_session(&self, rtp_healthy: bool, now: Instant) -> bool {
+        we_hold_session(rtp_healthy, self.ended_at, now)
     }
 
     /// Signals collected since the last call, for the one evidence log line
@@ -457,10 +582,15 @@ impl Tracker {
         self.next_probe
     }
 
-    /// Feed one probe result back. Returns true when the diagnostic log line
-    /// changed (first result or a different outcome/raw value), so a busy queue
-    /// does not print the same line every interval.
-    pub fn note_result(&mut self, result: &Result<ProbeReport>, now: Instant) -> bool {
+    /// Feed one probe result back and apply the confirmation rule plus the
+    /// bounded busy queue.
+    ///
+    /// A `Free` or `BusyElsewhere` first verdict is not acted on: it schedules
+    /// one confirmation probe after [`CONFIRM_DELAY`]. `OursActive` and the
+    /// fail-open paths (`Unknown`, error, timeout) are acted on immediately.
+    /// A confirmed `BusyElsewhere` queues another probe after [`REPROBE_DELAY`]
+    /// until [`BUSY_LIMIT`], then turns into [`ProbeAction::ReclaimBusyExhausted`].
+    pub fn note_result(&mut self, result: &Result<ProbeReport>, now: Instant) -> ProbeNote {
         let log = match result {
             Ok(report) => ProbeLog {
                 outcome: Some(report.outcome),
@@ -473,15 +603,82 @@ impl Tracker {
                 error: true,
             },
         };
-        let changed = self.last_report != Some(log);
+        let log_changed = self.last_report != Some(log);
         self.last_report = Some(log);
-        self.next_probe = match result {
-            Ok(report) if report.outcome == ProbeOutcome::BusyElsewhere => {
-                Some(now + REPROBE_DELAY)
+
+        if let Some(pending) = self.pending.take() {
+            let second = result.as_ref().ok().map(|report| report.outcome);
+            let (action, disagreement) = confirm(pending.first, second);
+            return self.settle(action, disagreement, log_changed, now);
+        }
+
+        match result {
+            Ok(report) if report.outcome == ProbeOutcome::Free => {
+                self.schedule_confirmation(ProbeOutcome::Free, log_changed, now)
             }
-            _ => None,
+            Ok(report) if report.outcome == ProbeOutcome::BusyElsewhere => {
+                self.schedule_confirmation(ProbeOutcome::BusyElsewhere, log_changed, now)
+            }
+            // `OursActive` changes nothing; `Unknown`/error are fail-open and
+            // reclaim immediately. Neither waits for a confirmation.
+            _ => {
+                let action = action_for_result(result);
+                self.settle(action, None, log_changed, now)
+            }
+        }
+    }
+
+    fn schedule_confirmation(
+        &mut self,
+        first: ProbeOutcome,
+        log_changed: bool,
+        now: Instant,
+    ) -> ProbeNote {
+        let due = now + CONFIRM_DELAY;
+        self.pending = Some(PendingProbe { first });
+        self.next_probe = Some(due);
+        ProbeNote {
+            log_changed,
+            action: ProbeAction::Confirm,
+            disagreement: None,
+            busy_exhausted: false,
+        }
+    }
+
+    fn settle(
+        &mut self,
+        action: ProbeAction,
+        disagreement: Option<(ProbeOutcome, ProbeOutcome)>,
+        log_changed: bool,
+        now: Instant,
+    ) -> ProbeNote {
+        let (action, busy_exhausted) = match action {
+            ProbeAction::Requeue => {
+                self.busy_requeues = self.busy_requeues.saturating_add(1);
+                if self.busy_requeues >= BUSY_LIMIT {
+                    // The queue must have an exit even if the receiver keeps
+                    // answering "somebody else" forever (Q32).
+                    self.next_probe = None;
+                    (ProbeAction::ReclaimBusyExhausted, true)
+                } else {
+                    self.next_probe = Some(now + REPROBE_DELAY);
+                    (ProbeAction::Requeue, false)
+                }
+            }
+            ProbeAction::Reclaim | ProbeAction::ReclaimBusyExhausted | ProbeAction::FallThrough => {
+                // Any non-busy verdict breaks the consecutive run.
+                self.busy_requeues = 0;
+                self.next_probe = None;
+                (action, false)
+            }
+            ProbeAction::Confirm => unreachable!("a confirmation is scheduled, not settled"),
         };
-        changed
+        ProbeNote {
+            log_changed,
+            action,
+            disagreement,
+            busy_exhausted,
+        }
     }
 }
 
@@ -501,6 +698,28 @@ mod tests {
         }
     }
 
+    fn busy() -> Result<ProbeReport> {
+        Ok(report(ProbeOutcome::BusyElsewhere))
+    }
+
+    fn free() -> Result<ProbeReport> {
+        Ok(report(ProbeOutcome::Free))
+    }
+
+    /// Run one complete confirmed `BusyElsewhere` cycle and return the note of
+    /// the confirmation probe.
+    fn confirm_busy(tracker: &mut Tracker, now: Instant) -> (ProbeNote, Instant) {
+        let first = tracker.note_result(&busy(), now);
+        assert_eq!(
+            first.action,
+            ProbeAction::Confirm,
+            "the first busy verdict must be confirmed before anything is queued"
+        );
+        let confirmation = now + CONFIRM_DELAY;
+        let second = tracker.note_result(&busy(), confirmation);
+        (second, confirmation)
+    }
+
     #[test]
     fn control_signals_are_evidence_only_and_keep_their_classification() {
         assert_eq!(incoming_teardown(None), None);
@@ -513,10 +732,11 @@ mod tests {
         // `incoming_teardown` never sees a method on that response.
         assert_eq!(incoming_teardown(None), None);
 
-        assert_eq!(status_signal(403), Some(Signal::Forbidden));
-        assert_eq!(status_signal(401), None);
-        assert_eq!(status_signal(454), None);
-        assert_eq!(status_signal(200), None);
+        // Only the receiver's own TEARDOWN ends our session. `Connection:
+        // close` can be a keep-alive/event-channel restart; 403 is not even a
+        // signal any more (it is an access/auth error, Q32).
+        assert!(Signal::UnexpectedTeardown.ends_session());
+        assert!(!Signal::ConnectionClose.ends_session());
     }
 
     #[test]
@@ -752,51 +972,317 @@ mod tests {
     }
 
     #[test]
-    fn a_session_the_receiver_ended_is_never_ours_again() {
+    fn healthy_rtp_always_wins_over_an_ended_control_state() {
         let base = Instant::now();
         let mut tracker = Tracker::default();
-        assert!(tracker.we_hold_session(true));
-        assert!(!tracker.we_hold_session(false));
-        // A control-channel close can be a keep-alive restart: it is evidence,
-        // not proof that the session changed hands.
+        tracker.observe(Signal::UnexpectedTeardown, at(base, 0));
+        // The receiver says it ended the session and RTP is not healthy: trust
+        // the conclusion inside the window.
+        assert!(!tracker.we_hold_session(false, at(base, 0)));
+        // RTP is still flowing: that is stronger than any control signal, even
+        // the receiver's own TEARDOWN (WAC: control poison + healthy RTP =>
+        // deferring teardown).
+        for elapsed in [0, 1, 1_999, 60_000] {
+            assert!(
+                tracker.we_hold_session(true, at(base, elapsed)),
+                "healthy RTP must never be overridden by a control signal"
+            );
+        }
+    }
+
+    #[test]
+    fn a_403_cannot_wedge_the_probe() {
+        // The old deadlock: 403 latched `session_ended = true`, every probe saw
+        // our own session bit and requeued, forever. A 403 is now an
+        // access/auth fault on the feedback channel and never reaches this
+        // tracker. What remains is the self-healing ended conclusion, which
+        // cannot wedge even if a control signal does mark the session ended.
+        let base = Instant::now();
+        let mut tracker = Tracker::default();
+        tracker.observe(Signal::UnexpectedTeardown, at(base, 0));
+        assert!(!tracker.we_hold_session(false, at(base, 0)));
+        assert!(
+            !tracker.we_hold_session(false, at(base, 1_999)),
+            "the ended conclusion is trusted inside the window"
+        );
+        assert!(
+            tracker.we_hold_session(false, at(base, 2_000)),
+            "after ENDED_TRUST_WINDOW the tracker recovers by itself"
+        );
+        // And a healthy RTP sample recovers it immediately, without waiting.
+        assert!(tracker.we_hold_session(true, at(base, 1)));
+        // Repeated observations refresh the trust window, as fresh evidence.
+        tracker.observe(Signal::UnexpectedTeardown, at(base, 5_000));
+        assert!(!tracker.we_hold_session(false, at(base, 5_000)));
+        assert!(tracker.we_hold_session(false, at(base, 7_000)));
+    }
+
+    #[test]
+    fn a_connection_close_never_ends_the_session_by_itself() {
+        let base = Instant::now();
+        let mut tracker = Tracker::default();
+        tracker.observe(Signal::ConnectionClose, at(base, 0));
+        assert!(tracker.we_hold_session(false, at(base, 0)));
+        assert!(tracker.we_hold_session(true, at(base, 0)));
+    }
+
+    #[test]
+    fn a_state_changing_verdict_is_confirmed_before_it_is_acted_on() {
+        let base = Instant::now();
+        let mut tracker = Tracker::default();
+        tracker.observe(Signal::ConnectionClose, at(base, 0));
+
+        let first = tracker.note_result(&free(), at(base, 0));
+        assert_eq!(
+            first.action,
+            ProbeAction::Confirm,
+            "a lone Free must not reclaim: the receiver may be handing us back"
+        );
+        assert!(!first.busy_exhausted);
+        assert_eq!(first.disagreement, None);
+        assert_eq!(
+            tracker.scheduled(),
+            Some(at(base, 0) + CONFIRM_DELAY),
+            "exactly one confirmation probe, CONFIRM_DELAY later"
+        );
+        assert!(!tracker.due(
+            at(base, 0) + CONFIRM_DELAY - Duration::from_millis(1)
+        ));
+
+        let second = tracker.note_result(&free(), at(base, 0) + CONFIRM_DELAY);
+        assert_eq!(
+            second.action,
+            ProbeAction::Reclaim,
+            "two agreeing Free probes reclaim"
+        );
+        assert_eq!(tracker.scheduled(), None);
+    }
+
+    #[test]
+    fn ours_active_and_fail_open_verdicts_are_not_delayed_by_a_confirmation() {
+        for result in [
+            Ok(report(ProbeOutcome::OursActive)),
+            Ok(report(ProbeOutcome::Unknown)),
+            Err(anyhow!("probe timed out")),
+        ] {
+            let mut tracker = Tracker::default();
+            let note = tracker.note_result(&result, Instant::now());
+            assert_eq!(
+                note.action,
+                action_for_result(&result),
+                "OursActive falls through and fail-open reclaims without a wait"
+            );
+            assert_eq!(tracker.scheduled(), None);
+        }
+    }
+
+    #[test]
+    fn a_single_free_busy_disagreement_does_not_reclaim() {
+        let base = Instant::now();
+        // Free first, BusyElsewhere on the confirmation probe.
+        let mut tracker = Tracker::default();
+        assert_eq!(
+            tracker.note_result(&free(), at(base, 0)).action,
+            ProbeAction::Confirm
+        );
+        let note = tracker.note_result(
+            &busy(),
+            at(base, 0) + CONFIRM_DELAY,
+        );
+        assert_eq!(
+            note.action,
+            ProbeAction::Requeue,
+            "a disagreement must not reclaim: prefer the non-destructive outcome"
+        );
+        assert_eq!(
+            note.disagreement,
+            Some((ProbeOutcome::Free, ProbeOutcome::BusyElsewhere))
+        );
+        assert_eq!(
+            tracker.scheduled(),
+            Some(at(base, 0) + CONFIRM_DELAY + REPROBE_DELAY),
+            "the queue wins a Free/Busy disagreement"
+        );
+
+        // BusyElsewhere first, Free on the confirmation probe.
+        let mut tracker = Tracker::default();
+        assert_eq!(
+            tracker.note_result(&busy(), at(base, 0)).action,
+            ProbeAction::Confirm
+        );
+        let note = tracker.note_result(&free(), at(base, 0) + CONFIRM_DELAY);
+        assert_eq!(note.action, ProbeAction::Requeue);
+        assert_eq!(
+            note.disagreement,
+            Some((ProbeOutcome::BusyElsewhere, ProbeOutcome::Free))
+        );
+
+        // Either first verdict against OursActive falls through: our session is
+        // active, nothing is reclaimed and nothing is queued.
+        for first in [free(), busy()] {
+            let mut tracker = Tracker::default();
+            tracker.note_result(&first, at(base, 0));
+            let note = tracker.note_result(
+                &Ok(report(ProbeOutcome::OursActive)),
+                at(base, 0) + CONFIRM_DELAY,
+            );
+            assert_eq!(note.action, ProbeAction::FallThrough);
+            assert!(note.disagreement.is_some());
+            assert_eq!(tracker.scheduled(), None);
+        }
+    }
+
+    #[test]
+    fn busy_elsewhere_never_loops_forever() {
+        let base = Instant::now();
+        let mut tracker = Tracker::default();
+        tracker.observe(Signal::ConnectionClose, at(base, 0));
+        let mut now = at(base, 0);
+        for attempt in 1..=BUSY_LIMIT {
+            let (note, confirmation) = confirm_busy(&mut tracker, now);
+            if attempt < BUSY_LIMIT {
+                assert_eq!(
+                    note.action,
+                    ProbeAction::Requeue,
+                    "confirmed busy {attempt} still queues"
+                );
+                assert!(!note.busy_exhausted);
+                assert_eq!(
+                    tracker.scheduled(),
+                    Some(confirmation + REPROBE_DELAY),
+                    "the queue never shortens the re-probe interval"
+                );
+                now = confirmation + REPROBE_DELAY;
+            } else {
+                assert_eq!(
+                    note.action,
+                    ProbeAction::ReclaimBusyExhausted,
+                    "after BUSY_LIMIT confirmed busy verdicts the sender must escape"
+                );
+                assert!(note.busy_exhausted);
+                assert_eq!(
+                    tracker.scheduled(),
+                    None,
+                    "the forced reclaim must leave no queued probe behind"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_busy_verdict_resets_the_consecutive_busy_run() {
+        let base = Instant::now();
+        let mut tracker = Tracker::default();
+        let (first, confirmation) = confirm_busy(&mut tracker, at(base, 0));
+        assert_eq!(first.action, ProbeAction::Requeue);
+        let (second, confirmation) = confirm_busy(&mut tracker, confirmation + REPROBE_DELAY);
+        assert_eq!(second.action, ProbeAction::Requeue);
+        // Our own session appears: no queue, and the run is broken.
+        assert_eq!(
+            tracker.note_result(&Ok(report(ProbeOutcome::OursActive)), confirmation).action,
+            ProbeAction::FallThrough
+        );
+        // A fresh busy run starts from one again, so it cannot inherit a stale
+        // near-limit count from minutes ago.
+        let (next, _) = confirm_busy(&mut tracker, confirmation + Duration::from_secs(10));
+        assert_eq!(next.action, ProbeAction::Requeue);
+        assert!(!next.busy_exhausted);
+    }
+
+    #[test]
+    fn busy_outcome_queues_the_next_probe_instead_of_failing() {
+        let base = Instant::now();
+        let mut tracker = Tracker::default();
+        tracker.observe(Signal::ConnectionClose, at(base, 0));
+        assert!(tracker.due(at(base, 0)));
+        let (note, confirmation) = confirm_busy(&mut tracker, at(base, 0));
+        assert_eq!(note.action, ProbeAction::Requeue);
+        assert_eq!(
+            tracker.scheduled(),
+            Some(confirmation + REPROBE_DELAY),
+            "busy is a queue, not a retry storm"
+        );
+        assert!(!tracker.due(confirmation + REPROBE_DELAY - Duration::from_millis(1)));
+        assert!(tracker.due(confirmation + REPROBE_DELAY));
+        // A repeated busy verdict does not change the log line, so it stays
+        // quiet, but it is still confirmed before it is queued.
+        let repeated = tracker.note_result(&busy(), confirmation + REPROBE_DELAY);
+        assert!(!repeated.log_changed);
+        assert_eq!(
+            repeated.action,
+            ProbeAction::Confirm,
+            "each verdict is confirmed"
+        );
+        // Fresh evidence while queued must not cut the interval short.
+        tracker.observe(
+            Signal::ConnectionClose,
+            confirmation + REPROBE_DELAY + Duration::from_millis(500),
+        );
+        assert_eq!(
+            tracker.scheduled(),
+            Some(confirmation + REPROBE_DELAY + CONFIRM_DELAY),
+            "a signal while a confirmation is pending must not reschedule it"
+        );
+    }
+
+    #[test]
+    fn free_or_failed_probe_clears_the_queue_for_this_tracker() {
+        let base = Instant::now();
+        for result in [
+            Ok(report(ProbeOutcome::Free)),
+            Ok(report(ProbeOutcome::Unknown)),
+            Err(anyhow!("timed out")),
+        ] {
+            let mut tracker = Tracker::default();
+            tracker.observe(Signal::UnexpectedTeardown, at(base, 0));
+            let note = tracker.note_result(&result, at(base, 100));
+            if matches!(result, Ok(report) if report.outcome == ProbeOutcome::Free) {
+                // Free is confirmed once; the second agreeing probe clears it.
+                assert_eq!(note.action, ProbeAction::Confirm);
+                assert_eq!(tracker.scheduled(), Some(at(base, 100) + CONFIRM_DELAY));
+                let settled = tracker.note_result(&result, at(base, 100) + CONFIRM_DELAY);
+                assert_eq!(settled.action, ProbeAction::Reclaim);
+            } else {
+                assert_eq!(note.action, ProbeAction::Reclaim);
+            }
+            assert_eq!(tracker.scheduled(), None);
+            assert!(!tracker.due(at(base, 5_000)));
+        }
+    }
+
+    #[test]
+    fn probe_log_only_changes_on_a_different_result() {
+        let base = Instant::now();
+        let mut tracker = Tracker::default();
         tracker.observe(Signal::ConnectionClose, at(base, 0));
         assert!(
-            tracker.we_hold_session(true),
-            "a Connection: close does not end the session by itself"
+            tracker.note_result(&free(), at(base, 0)).log_changed,
+            "the first Free is logged"
         );
-        tracker.observe(Signal::UnexpectedTeardown, at(base, 1));
         assert!(
-            !tracker.we_hold_session(true),
-            "after the receiver's own TEARDOWN our RTP cannot own bit 17"
+            !tracker
+                .note_result(&free(), at(base, 0) + CONFIRM_DELAY)
+                .log_changed,
+            "an agreeing confirmation is not a new log line"
         );
-        // Sticky: a later healthy sample cannot undo it for this member.
-        assert!(!tracker.we_hold_session(true));
-    }
-
-    #[test]
-    fn a_forbidden_response_means_we_no_longer_hold_the_session() {
-        let base = Instant::now();
-        let mut tracker = Tracker::default();
-        tracker.observe(Signal::Forbidden, at(base, 0));
-        assert!(!tracker.we_hold_session(true));
-        assert!(!tracker.we_hold_session(false));
-    }
-
-    #[test]
-    fn only_a_busy_probe_is_requeued() {
-        let base = Instant::now();
-        let mut ours = Tracker::default();
-        ours.observe(Signal::ConnectionClose, at(base, 0));
-        assert!(ours.note_result(&Ok(report(ProbeOutcome::OursActive)), at(base, 0)));
-        assert_eq!(
-            ours.scheduled(),
-            None,
-            "our own session must not start a re-probe queue"
+        assert!(
+            tracker
+                .note_result(&busy(), at(base, 4_000))
+                .log_changed,
+            "a different outcome is logged"
         );
-        let mut busy = Tracker::default();
-        busy.observe(Signal::ConnectionClose, at(base, 0));
-        assert!(busy.note_result(&Ok(report(ProbeOutcome::BusyElsewhere)), at(base, 0)));
-        assert_eq!(busy.scheduled(), Some(at(base, 0) + REPROBE_DELAY));
+        // The busy count is irrelevant to the log dedup.
+        assert!(
+            !tracker
+                .note_result(&busy(), at(base, 4_000) + CONFIRM_DELAY)
+                .log_changed
+        );
+        assert!(
+            tracker
+                .note_result(&free(), at(base, 8_000))
+                .log_changed,
+            "a later Free after a busy run is logged"
+        );
     }
 
     #[test]
@@ -885,64 +1371,5 @@ mod tests {
         assert!(tracker.due(at(base, 0)));
         assert_eq!(tracker.take_signals(), vec![Signal::UnexpectedTeardown]);
         assert!(tracker.take_signals().is_empty());
-    }
-
-    #[test]
-    fn busy_outcome_queues_the_next_probe_instead_of_failing() {
-        let base = Instant::now();
-        let mut tracker = Tracker::default();
-        tracker.observe(Signal::Forbidden, at(base, 0));
-        assert!(tracker.due(at(base, 0)));
-        assert!(tracker.note_result(&Ok(report(ProbeOutcome::BusyElsewhere)), at(base, 0)));
-        assert_eq!(
-            tracker.scheduled(),
-            Some(at(base, 0) + REPROBE_DELAY),
-            "busy is a queue, not a retry storm"
-        );
-        assert!(!tracker.due(at(base, 0) + REPROBE_DELAY - Duration::from_millis(1)));
-        assert!(tracker.due(at(base, 0) + REPROBE_DELAY));
-        // A second busy probe does not change the log line, so it stays quiet.
-        assert!(!tracker.note_result(
-            &Ok(report(ProbeOutcome::BusyElsewhere)),
-            at(base, REPROBE_DELAY.as_millis() as u64)
-        ));
-        // Fresh evidence while queued must not cut the interval short.
-        tracker.observe(Signal::ConnectionClose, at(base, 500));
-        assert_eq!(
-            tracker.scheduled(),
-            Some(at(base, 0) + REPROBE_DELAY + REPROBE_DELAY)
-        );
-    }
-
-    #[test]
-    fn free_or_failed_probe_clears_the_queue_for_this_tracker() {
-        let base = Instant::now();
-        for result in [
-            Ok(report(ProbeOutcome::Free)),
-            Ok(report(ProbeOutcome::Unknown)),
-            Err(anyhow!("timed out")),
-        ] {
-            let mut tracker = Tracker::default();
-            tracker.observe(Signal::UnexpectedTeardown, at(base, 0));
-            assert!(tracker.note_result(&result, at(base, 100)));
-            assert_eq!(tracker.scheduled(), None);
-            assert!(!tracker.due(at(base, 5_000)));
-        }
-    }
-
-    #[test]
-    fn probe_log_only_changes_on_a_different_result() {
-        let base = Instant::now();
-        let mut tracker = Tracker::default();
-        tracker.observe(Signal::Forbidden, at(base, 0));
-        assert!(tracker.note_result(
-            &Ok(report(ProbeOutcome::BusyElsewhere)),
-            at(base, 0)
-        ));
-        assert!(!tracker.note_result(
-            &Ok(report(ProbeOutcome::BusyElsewhere)),
-            at(base, 2_000)
-        ));
-        assert!(tracker.note_result(&Ok(report(ProbeOutcome::Free)), at(base, 4_000)));
     }
 }

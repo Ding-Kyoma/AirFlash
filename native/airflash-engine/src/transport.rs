@@ -340,10 +340,10 @@ impl FeedbackWorker {
                         if fault.code != "feedback_rejected" {
                             health.0.lock().unwrap().metrics.feedback_failures += 1;
                         }
-                        // Control-plane symptoms are only evidence. A 403 is
-                        // deliberately not `authentication_failed`: the session
-                        // thread probes `statusFlags` and decides. 401/454 keep
-                        // their old classification.
+                        // 401 and 403 are access/authentication failures in
+                        // the reference classification (Q32): they take the
+                        // existing hard auth path, not the preemption probe.
+                        // 454 and other rejections stay on `session_rejected`.
                         if matches!(fault.code.as_str(), "authentication_failed" | "session_rejected") {
                             health.fail(fault);
                         } else {
@@ -447,9 +447,6 @@ fn feedback_loop(
         }
         connection.validate_cseq(&response)?;
         let status = response.status()?;
-        if let Some(signal) = preemption::status_signal(status) {
-            health.preemption_signal(signal);
-        }
         if status == 200 {
             failures = 0;
             let recovered = {
@@ -493,27 +490,28 @@ fn feedback_loop(
                 &format!("Receiver feedback returned {status}; retrying while audio continues"),
                 false,
             );
-        } else if status == 403 {
-            // Evidence, not a verdict: the feedback channel is unusable, but the
-            // session thread probes the receiver's live `statusFlags` before
-            // deciding whether this was a takeover. 401/454 keep the old path.
+        } else if status == 401 || status == 403 {
+            // 403 is an access/authentication error in the reference
+            // classification (password/PIN/470 family), never "another
+            // controller took the session" (Q32). It goes down the same hard
+            // auth path as 401; it is not preemption evidence and can never
+            // latch `we_hold_session` to false.
             return Err(Fault::new(
                 host,
                 "feedback",
-                "forbidden",
-                true,
-                format!("Receiver web/control request was forbidden: {}", response.first),
+                "authentication_failed",
+                false,
+                format!(
+                    "Receiver denied access to the feedback channel (HTTP {status}): {}",
+                    response.first
+                ),
             )
             .into());
         } else {
             return Err(Fault::new(
                 host,
                 "feedback",
-                if status == 401 {
-                    "authentication_failed"
-                } else {
-                    "session_rejected"
-                },
+                "session_rejected",
                 status == 454,
                 format!("Receiver feedback rejected: {}", response.first),
             )
