@@ -94,6 +94,42 @@
 
 队列有界（32 条），超限丢最旧的并计数。
 
+## P1-8 掩盖升级（已完成）
+
+`continuity.rs` 的 `Splice`
+
+原来欠载只有 5 ms 的 raised-cosine 交叉淡化，之后就是硬零：听感是「咔」一下
+再无声。现在进入欠载时从最后一个样点做约 −52 dB / 10 ms 的指数衰减尾，
+尾巴结束后才是精确静音（接收端的遮盖判断仍能认出全零帧）。
+测试断言：尾巴期间幅度单调不上升、10 ms 内落到 1% 以下、随后是精确 0。
+
+## P2-11 QoS 标记（已完成）
+
+`native/airflash-engine/src/qos.rs`
+
+音频 UDP socket 打 DSCP 46（EF），让 Wi-Fi AP 把音频放进 WMM 语音队列。
+用 `setsockopt(IPPROTO_IP, IP_TOS)` 做，best-effort：失败只记遥测
+（`MediaMetrics.qos_marked`），不影响会话。qWAVE（`QOSAddSocketToFlow`）留作
+后续，见 Q26。
+
+## P0-4 元数据（引擎与桌面已打通，封面未做）
+
+`native/airflash-engine/src/metadata.rs`、`AirFlash.Core/NowPlaying.cs`
+
+- IPC `set_now_playing { title, artist, album, genre, duration_ms, position_ms, playing }`。
+- 引擎侧 worker 在控制连接上依次发送：
+  1. `SET_PARAMETER` + `text/parameters`：`progress: <start>/<position>/<duration>`（毫秒）；
+  2. `SET_PARAMETER` + `application/x-dmap-tagged`：`mlit` 里的 `minm`/`asar`/`asal`/`asgn`。
+- 节流：同一曲目进度只在 ≥1500 ms 变化时重发；标签变化才重发 DMAP；
+  标签没变时不会重复发第二遍（`tags_sent`）。
+- 桌面侧 `NowPlayingPump`：2 s 轮询 + 300 ms 稳定窗，去抖后只在
+  标签/播放状态/时长变化或进度变化 ≥1500 ms 时下发。
+- 来源：`AirFlash.App/Metadata/SmtcNowPlayingSource.cs` 读 Windows SMTC。
+  为此把 App 的 TFM 提到 `net10.0-windows10.0.19041.0`（`net10.0-windows` 没有
+  WinRT 投影，拿不到 `Windows.Media.Control`）；SMTC 不可用时返回 null，
+  只保留上一次显示，不影响推流。
+- 没做：封面（`image/jpeg`）。尺寸/格式约束无法离线验证，且失败不能干扰音频。
+
 ## P0-2 自适应提前量（已完成）
 
 - 引擎：`set_lead { ms }`（`session.rs::request_lead`）把请求值作用到
@@ -119,10 +155,9 @@
 
 | 项目 | 现状 | 备注 |
 | --- | --- | --- |
-| P0-4 元数据（MRP/DACP、Now Playing） | 未开始 | 需要 WPF 侧接 SMTC（要改 TFM 到 `net10.0-windows10.0.19041.0`）并给引擎加 `SET_PARAMETER` 的 progress/tags 编码，是剩余项里最大的一块 |
-| P1-8 掩盖升级（衰减替代硬切） | 未开始 | 现在 8 个包内仍是静音填补，超出后改重锚 |
+| P0-4 封面（`image/jpeg`） | 未做 | 尺寸/格式约束需要设备确认，见 Q10；失败也不能干扰音频 |
 | P1-6 / P3-7 BMCA | 未开始 | 只在多 HomePod 时才有意义，需要真实设备验证 |
-| P2-11 QoS（qWAVE / DSCP EF） | 未开始 | 需要 `Win32_Networking_WinSock` feature，改动小 |
 | P3-2 TXT 预测（bit40 + `srcvers`） | 未开始 | 发现逻辑在 C#，需要确认 HomePod 上报的 TXT 字段 |
 | P3-3 抢占检测 | 未开始 | 依赖元数据事件 |
 | 采集进程退出后自动重开 | 部分 | 现在引擎结束会话、由桌面端重连；进程内自愈未做 |
+| 音量事件（音箱旋钮/遥控器） | 部分 | 事件里的 `volume` 已解析并转发，但还没写回设备音量状态 |

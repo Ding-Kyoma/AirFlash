@@ -455,8 +455,29 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         try { await connection.SendAsync(session, "set_gain", new { gain = Gain(_receiver) }, CancellationToken.None).ConfigureAwait(false); }
         catch (Exception error) when (error is IOException or ObjectDisposedException or InvalidOperationException) { log?.Invoke(L.Format("Volume command deferred to the next session: {0}", error.Message)); }
     }
-    private int _adaptiveLead = -1;
-    private long _recoveries;
+    /// <summary>Forward Now Playing to the engine, which turns it into the
+    /// receiver's `SET_PARAMETER` progress and DMAP tag payloads.</summary>
+    public async Task PublishNowPlayingAsync(NowPlaying? now, CancellationToken cancellation = default)
+    {
+        if (now is null || now.IsEmpty) return;
+        IEngineConnection? connection; string? session;
+        lock (_sync) { connection = _connection; session = _sessionId; }
+        if (connection is null || session is null) return;
+        if (Snapshot.State is not (PlaybackState.Streaming or PlaybackState.Standby)) return;
+        try
+        {
+            await connection.SendAsync(session, "set_now_playing", new
+            {
+                title = now.Title, artist = now.Artist, album = now.Album, genre = now.Genre,
+                duration_ms = now.DurationMs, position_ms = now.PositionMs, playing = now.Playing
+            }, cancellation).ConfigureAwait(false);
+        }
+        catch (Exception error) when (error is IOException or ObjectDisposedException or InvalidOperationException)
+        {
+            log?.Invoke(L.Format("Now Playing deferred to the next session: {0}", error.Message));
+        }
+    }
+    private int _adaptiveLead = -1;    private long _recoveries;
     private long _recoveryWindow;
     /// <summary>
     /// Walk the latency ladder one step up when the engine keeps having to recover

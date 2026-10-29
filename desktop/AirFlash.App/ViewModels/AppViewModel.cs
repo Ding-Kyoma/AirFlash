@@ -42,6 +42,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public IApplicationCatalog Applications { get; }
     public bool IsClosing => _closing;
     public SessionController Session { get; }
+    public NowPlayingPump NowPlaying { get; }
+    private readonly CancellationTokenSource _nowPlayingStop;
     public ObservableCollection<ReceiverViewModel> Receivers { get; } = [];
     public IReadOnlyList<Receiver> AllReceivers => _known.Values.Concat(SoftwareStereo.Resolve(_known.Values, _settings)).OrderBy(r => r.Name, StringComparer.CurrentCultureIgnoreCase).ToArray();
     public AppSettings Settings => _settings;
@@ -116,6 +118,11 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         _discovery.SetInterface(_settings.DiscoveryInterfaceId);
         Session = new(factory, audio, AppPaths.Log);
         Session.Changed += SessionChanged;
+        // Now Playing is polled from SMTC and pushed only when it actually changed;
+        // the engine turns it into the receiver's SET_PARAMETER payloads.
+        NowPlaying = new NowPlayingPump(new AirFlash.App.Metadata.SmtcNowPlayingSource(AppPaths.Log), log: AppPaths.Log);
+        _nowPlayingStop = new();
+        _ = Task.Run(() => NowPlaying.RunAsync(now => _ = Session.PublishNowPlayingAsync(now), _nowPlayingStop.Token));
         _discovery.Changed += list => _dispatcher.BeginInvoke(() => OnDiscovered(list));
         _discovery.Failed += message => _dispatcher.BeginInvoke(() => ShowError(new IOException(message)));
         _discovery.RunningChanged += running => _dispatcher.BeginInvoke(() =>
@@ -587,6 +594,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private async Task DisposeCoreAsync()
     {
         _closing = true; _volumeTimer.Stop(); _autoTimer.Stop(); _startupDiscoveryTimer.Stop(); _discoverySearchTimer.Stop(); _discovery.Dispose();
+        _nowPlayingStop.Cancel();
         if (_engine is not null) _engine.Changed -= EngineChanged;
         await _startup;
         Endpoints.Dispose();
