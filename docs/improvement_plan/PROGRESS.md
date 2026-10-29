@@ -344,7 +344,7 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   `select_timing`（单成员 `TimingPlan`），但输入不变，所以 IPC 里
   `selected_timing` 的取值与改造前完全一致。
 
-## P3-3 抢占识别（按 WAC 模型返工，已完成）
+## P3-3 抢占识别（WAC 模型 + `statusFlags` 位定义，已完成）
 
 `native/airflash-engine/src/preemption.rs`（重写）、`rtsp.rs`、`transport.rs`、
 `session.rs`、桌面状态与文案
@@ -355,24 +355,52 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   **live `GET /info` 的 `statusFlags`**，控制面动作只是带上下文的证据，而且
   **探测失败/超时反而照样回收**（fail-open）。原实现会把「接收器已被别人占用、
   但本地媒体尚未停流」误判成普通网络故障，也会在探测不到时错过回收时机。
-- **唯一判据是 live probe**：新增 `ProbeOutcome { Free, BusyElsewhere, Unknown }`，
-  `probe()` / `probe_report()` 在**新开的 RTSP 连接**上发 `GET /info`，复用
-  `rtsp::Connection` 与二进制 plist 解析，不引入第二个 HTTP 客户端；默认超时
-  2 s，超时、连接失败、RTSP 错误、plist 错误都返回 `Err`。控制面三条线索
-  （未预期 TEARDOWN、403、`Connection: close`）只触发探测，不再参与判定。
+- **唯一判据是 live probe**：`ProbeOutcome { Free, OursActive, BusyElsewhere,
+  Unknown }`，`probe()` / `probe_report()` 在**新开的 RTSP 连接**上发
+  `GET /info`，复用 `rtsp::Connection` 与二进制 plist 解析，不引入第二个 HTTP
+  客户端；默认超时 2 s，超时、连接失败、RTSP 错误、plist 错误都返回 `Err`。
+  控制面三条线索（未预期 TEARDOWN、403、`Connection: close`）只触发探测，
+  不再单独参与判定。
+- **位定义已落定（Q31 答复）**：不再保留 `ANOTHER_SENDER_BIT = None`，改成三个
+  64 位常量，命名与 WAC 相同：`RECEIVER_SESSION_ACTIVE = 0x20000`（131072，
+  bit17，`ReceiverStatusFlags.ReceiverSessionActive`）、
+  `STEREO_PARTNER_UNREACHABLE = 0x4000`（16384，bit14）、
+  `PASSWORD_REQUIRED = 0x80`（128，bit7，
+  `ReceiverAccessPolicy.PasswordRequiredFlag`）。`statusFlags` 按 WAC 的
+  `ulong` 当 **`u64`** 解析：旧实现只取低 32 位，现在高于 `u32::MAX` 的位图也
+  完整参与判定，不再把高位值当 `Free`/`Unknown`。bit14 和 bit7 **不参与判定**：
+  单测把两位与 bit17 交叉组合，断言判决不变；bit14 只在 probe 日志里作为遥测
+  （`stereo_partner_unreachable`）出现。
+- **三分类**（`classify(status_flags, we_hold_session)`）：
+  | `statusFlags & 0x20000` | `we_hold_session` | 判定 | 动作 |
+  | --- | --- | --- | --- |
+  | 0 | 任意 | `Free` | 立即回收 |
+  | 置位 | `true` | `OursActive` | **不回收**：`FallThrough`，走原来的非抢占路径 |
+  | 置位 | `false` | `BusyElsewhere` | 3 s 后再探（排队，不回收） |
+  | 缺字段/类型错 | 任意 | `Unknown` | 照样回收（fail-open） |
+- **`we_hold_session` 的来源**：不新增任何探测，用引擎已有的媒体证据
+  `MediaTransport::media_healthy(now, MEDIA_HEALTH_WINDOW=2s)`（就是 WAC 日志
+  里的 `rtp_healthy`：最近 2 s 内成功发过音频），**并且**要求接收器没有结束过
+  我们的会话：收到未预期 `TEARDOWN` 或 `403` 后，`Tracker::session_ended` 把这
+  个成员永久记为「会话已不属于我们」（每次回收都会重建 `Member`，新会话从干净
+  状态开始）。第二个条件不能省：UDP 发送在接管之后仍会「成功」，只看媒体健康
+  会让真正的接管永远停在 `OursActive`，再也不回收。`Connection: close` 不算
+  结束会话（keep-alive/事件通道可以在会话仍属于我们时关闭）。媒体健康在 live
+  循环里总是可算（`Tracker` 只在 `start_feedback` 之后、媒体循环里被轮询），
+  没有「取不到」的分支；若真取不到，保守取 `false`：`false` 只会把置位探测降级
+  成 `BusyElsewhere`（排队，不回收、不结束会话），而 `true` 会在没有证据时说
+  会话是我们的。
+- **`OursActive` 不是抢占**：`action_for(OursActive) = FallThrough`，
+  `poll_preemption` 返回 `PreemptionPoll::None`，不 `poison` 控制连接、不增加
+  连续计数，照常走 `health.check()` / `check_control(media_healthy)` 这些原有的
+  非抢占路径；会话结束时仍然正常回发 `TEARDOWN`。
 - **判决表**（`action_for` / `action_for_result`）逐条对应 Q30：
   | 探测结果 | 动作 |
   | --- | --- |
   | `Free` | 立即回收 |
+  | `OursActive` | 不回收，`FallThrough` 到原非抢占路径 |
   | `BusyElsewhere` | 3 s 后再探（排队，不是失败、不结束会话） |
   | `Unknown` / `Err` / 超时 | 照样回收（fail-open，绝不落入通用故障分支） |
-- **位定义未知时的安全降级**：`statusFlags` 的位映射在 Q30 §6 里是「静态不可判定」。
-  只保留一个解释函数 `another_sender(flags) -> bool`，常量
-  `ANOTHER_SENDER_BIT: Option<u32> = None`。只要它还是 `None`，
-  `another_sender` 恒为 `false`，任何格式正确的 `statusFlags` 都只能得到
-  `Free`，绝不会产生 `BusyElsewhere`，也就不会因为猜错 bit 而永久排队；
-  原始 `statusFlags` 会原样写进 `preemption_probe` 日志，供真机对照。
-  单测用 0、1、`1<<31`、`0x8000_0000`、`u32::MAX` 等位图断言只可能是 `Free`。
 - **连续计数 + 时间窗 + yielding**：`TakeoverCounter` 按接收器（IP）计数，
   每个 live 播放进程跨 reclaim 复用。`TAKEOVER_LIMIT=3`、
   `TAKEOVER_WINDOW=30s`、`REPROBE_DELAY=3s`、`PROBE_TIMEOUT=2s` 都是**我们选的
@@ -397,33 +425,49 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   （`forbidden` warning/fault 可重试），不再冒充认证失败。`preempted` 的
   `Member::close()` 仍不回发 TEARDOWN。
 - **不会形成重连风暴**：一个 live 循环里每个探测周期最多回收一次；busy 时
-  只排下一次探测，不重建会话；连续计数到上限立即让步。正常会话不探测，
-  只有控制面出现证据后才发一次 `/info`。
+  只排下一次探测，不重建会话；`OursActive` 不排队，等下一个控制面信号再探；
+  连续计数到上限立即让步。正常会话不探测，只有控制面出现证据后才发一次
+  `/info`。
+- **可观测性**：`preemption_evidence` 行保留 WAC 的三项上下文
+  （`policy`/`rtp_healthy`/`packets_prepared`）；`preemption_probe` 行现在也带
+  这三项，并新增 `we_hold_session`、完整 64 位 `status_flags`（`0x%016x`）和
+  `stereo_partner_unreachable` 遥测位（只上报，不参与判定）。
 - 测试：
-  - `preemption.rs` 表驱动单测：判决表六种组合、`Err` fail-open、未知位图
-    只可能 `Free`、缺字段/类型错误为 `Unknown`、原始 flags 保留、首
-    takeover 计 1、窗口内递增、窗口外重置为 1、到上限 yielding、按 IP
-    独立计数、busy 排队不缩短间隔。
+  - `preemption.rs` 表驱动单测：三分类表（无会话位时即使 bit14/bit7 置位、
+    `we_hold_session` 两种取值都是 `Free`；置位 + 持有是 `OursActive` 且动作
+    不是回收；置位 + 不持有是 `BusyElsewhere`）、bit14/bit7 不改变判决、
+    `u64` 高位（>`u32::MAX`）参与判定、缺字段/字符串/负数都是 `Unknown`、
+    原始 64 位 flags 保留、`Err` fail-open、首 takeover 计 1、窗口内递增、
+    窗口外重置为 1、到上限 yielding、按 IP 独立计数、busy 排队不缩短间隔、
+    `OursActive` 不排队、`TEARDOWN`/`403` 之后 `we_hold_session` 变 `false`
+    且不可恢复、`Connection: close` 不改变它。
   - `tests/preemption_probe.rs`：localhost `/info` 服务器，验证两次探测各开
-    一条新连接、`GET /info`、任意未知位图都是 `Free`、无 `statusFlags`
-    为 `Unknown`、连接拒绝/静默超时为 `Err` 且判决为回收。
+    一条新连接；同一置位位图在 `we_hold_session` 两种取值下分别是
+    `OursActive` / `BusyElsewhere`；bit14+bit7 与 `1<<40` 高位不影响 `Free`；
+    高位 + bit17 仍能识别会话；缺 `statusFlags` 为 `Unknown`；连接拒绝/静默
+    超时为 `Err` 且判决为回收。
   - `tests/rtsp_contract.rs`：中毒连接不写出任何请求，`finish_session` 也
     不写 TEARDOWN。
   - `session.rs`：假接收器主动发 TEARDOWN 后，完整 media 循环走
     `PreemptionPoll::Reclaimed`，断言 `preempted`、旧连接中毒、warning
     `reason=takeover`、证据行带 `policy`/`rtp_healthy`/`packets_prepared`、
-    probe 行带原始 `statusFlags`、没有回发 TEARDOWN；另有缺字段、探测失败、
-    连续上限三条路径。
+    probe 行带 `we_hold_session`/`status_flags`/`stereo_partner_unreachable`、
+    没有回发 TEARDOWN；**「我们自己的活动会话不会被判成接管」**：bit17 置位 +
+    媒体健康 + 一个 `Connection: close` 信号，`poll_preemption` 返回 `None`、
+    不中毒、计数不变、没有 `preempted` warning、probe 日志是 `ours_active`，
+    关闭时仍正常发 TEARDOWN；同一置位位图但接收器发过 TEARDOWN 时得到
+    `Waiting`（`busy_elsewhere`），不回收。另有缺字段、探测失败、连续上限
+    三条路径。
   - 桌面 `IpcFailureTests`：`reason=limit` 使用「反复接管后让步」文案，且
     仍是 `PlaybackState.Preempted`、不自动重连。
 - **没做/没验证**：
-  - Q31 答复从 WAC 里恢复了 `ReceiverSessionActive = 0x20000`（字段本身是
-    64 位 `ulong`），但这个 bit 表示「接收器上有**任意**活动会话」，包括我们
-    自己的；要区分「另一个 sender」还需要 `we_hold_session` 这一维，而 AF 在
-    探测时仍自认为持有会话，控制面症状也不足以可靠地回答这个问题。所以
-    `ANOTHER_SENDER_BIT` 仍是 `None`：所有格式正确的 `statusFlags` 都按
-    `Free` 处理，不会误回收自己的会话，也不会永久排队。当前解析只取低 32 位；
-    若真机返回高位值，`u32::try_from` 失败会得到 `Unknown` 并 fail-open 回收。
+  - 真机 `statusFlags` 仍未取样（Q32）：HomePod 在我们自己播放、空闲、被接管
+    三种状态下 bit17 是否分别置位/清零、接管瞬间 `/info` 是否仍可读、字段是否
+    始终是整数，都没有实测。代码已按 WAC 的位定义实现，异常一律按 `Unknown`
+    fail-open 回收。
+  - `we_hold_session` 的第二个条件把「未预期 TEARDOWN / 403」当作会话结束的
+    证据，这是按协议语义做的推断；真机上是否存在「403 但会话仍属于我们」的
+    情况未验证（若存在，结果只是多排队 3 s 再探，不会误回收）。
   - `TAKEOVER_LIMIT`、`TAKEOVER_WINDOW`、`REPROBE_DELAY`、`PROBE_TIMEOUT`
     均为本地取值，未与 WAC 的运行时参数核对；Q31 还建议回收前隔 500 ms 再
     确认一次 `Free`，本次没有实现，仍按 Q30 的单次探测决策。

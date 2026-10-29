@@ -9,9 +9,22 @@
 //!
 //! | probe result | action |
 //! | --- | --- |
-//! | free | reclaim |
-//! | another sender is playing | queue one re-probe, not a failure |
+//! | no active session | reclaim |
+//! | an active session that is ours | not preemption: fall through |
+//! | an active session that is not ours | queue one re-probe, not a failure |
 //! | probe failed / timed out | reclaim anyway (fail-open) |
+//!
+//! The bit values are recovered from the reference implementation (Q31 answer):
+//! `ReceiverStatusFlags.ReceiverSessionActive = 131072 (0x20000, bit 17)`,
+//! `ReceiverStatusFlags.StereoPartnerUnreachable = 16384 (0x4000, bit 14)` and
+//! `ReceiverAccessPolicy.PasswordRequiredFlag = 128 (0x80, bit 7)`, all on a
+//! 64-bit (`ulong`) field. Only the session bit is a decision input, and it is
+//! **not** an "another sender" bit: it is true for our own session too. The
+//! reference sender's "is playing another sender's session" line is context —
+//! it probes from a reclaim path that already lost the session — so [`classify`]
+//! takes a second dimension, [`Tracker::we_hold_session`]. Without it, filling
+//! in `0x20000` would misjudge our own healthy session as a takeover and
+//! immediately reclaim it, interrupting working audio.
 //!
 //! Re-announcing is never enough on its own: a receiver that is serving another
 //! sender still announces. The anti-storm limiter is a consecutive counter: a
@@ -19,13 +32,8 @@
 //! increments the count; at [`TAKEOVER_LIMIT`] the sender yields instead of
 //! fighting for the device.
 //!
-//! The meaning of the individual `statusFlags` bits is **unknown** (Q30 §6 calls
-//! it static-undeterminable; Q31 later recovered `ReceiverSessionActive` but not
-//! an "another sender" bit). [`ANOTHER_SENDER_BIT`] is therefore `None`: while
-//! it stays `None`, [`another_sender`] can only be `false` and a well-formed
-//! probe can only be [`ProbeOutcome::Free`], never `BusyElsewhere`. AirFlash can
-//! never wedge waiting on a bit it does not understand; the raw value is logged
-//! so it can be mapped from a real receiver.
+//! Real-device values are still unverified: the raw `statusFlags` value is
+//! always logged so it can be mapped from a receiver that owns the session.
 use crate::rtsp::{Cancellation, Connection};
 use anyhow::{Context, Result};
 use plist::Value;
@@ -56,14 +64,24 @@ pub const TAKEOVER_LIMIT: u32 = 3;
 /// long after the first. Our choice: WAC's window was not recovered either.
 pub const TAKEOVER_WINDOW: Duration = Duration::from_secs(30);
 
-/// The `statusFlags` bit that means "another sender is playing". Q30 §6 marks
-/// the bit map as static-undeterminable. Q31's answer recovered a *related*
-/// WAC constant, `ReceiverSessionActive = 0x20000` (a 64-bit `ulong`), but that
-/// bit is true for **our own** session too; distinguishing "another sender"
-/// needs a `we_hold_session` dimension that this engine does not reliably have
-/// at probe time. Leave this `None`: a wrong mask would either reclaim our own
-/// healthy session or queue forever on a receiver we own. Do **not** guess it.
-pub const ANOTHER_SENDER_BIT: Option<u32> = None;
+/// `ReceiverStatusFlags.ReceiverSessionActive` in the reference implementation:
+/// `131072uL`, i.e. bit 17 of a 64-bit `ulong` `statusFlags` field (Q31).
+///
+/// The literal meaning is "the receiver has an active session" — **including our
+/// own**. It is therefore not enough to decide a takeover; [`classify`] adds the
+/// locally derived `we_hold_session` dimension. A real HomePod's value is still
+/// unverified, which is why the raw field is logged on every probe.
+pub const RECEIVER_SESSION_ACTIVE: u64 = 0x0002_0000;
+
+/// `ReceiverStatusFlags.StereoPartnerUnreachable`: `16384uL`, i.e. bit 14 (Q31).
+/// It says nothing about who owns the active session, so it must never influence
+/// [`classify`]; the probe log surfaces it as telemetry only.
+pub const STEREO_PARTNER_UNREACHABLE: u64 = 0x0000_4000;
+
+/// `ReceiverAccessPolicy.PasswordRequiredFlag`: `128uL`, i.e. bit 7 (Q31). The
+/// reference implementation classifies the receiver's access policy from it; it
+/// is not a session-ownership signal and must never influence [`classify`].
+pub const PASSWORD_REQUIRED: u64 = 0x0000_0080;
 
 /// One control-plane thing the receiver did. Evidence only, never a verdict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +102,16 @@ impl Signal {
             Self::ConnectionClose => "connection_close",
         }
     }
+
+    /// Whether this signal means the receiver ended or refused **our** session.
+    /// An unexpected `TEARDOWN` ends it outright; a `403` is the receiver
+    /// refusing a request on it. Both say the session is not ours any more, so
+    /// no later probe on this member can make us its owner again.
+    /// `Connection: close` is deliberately **not** here: a keep-alive or event
+    /// channel can be closed while the RTSP session itself is still ours.
+    pub fn ends_session(self) -> bool {
+        matches!(self, Self::UnexpectedTeardown | Self::Forbidden)
+    }
 }
 
 /// A signal the receiver sent us. `None` means the message was a response to a
@@ -103,13 +131,20 @@ pub fn status_signal(status: u16) -> Option<Signal> {
 /// What a live `GET /info` probe could tell us.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProbeOutcome {
-    /// The receiver is not playing another sender's session.
+    /// No active session on the receiver ([`RECEIVER_SESSION_ACTIVE`] is clear),
+    /// whatever the other bits say.
     Free,
-    /// The receiver is playing another sender's session. Only reachable when
-    /// [`ANOTHER_SENDER_BIT`] is known.
+    /// The receiver's active session is **ours**: the session bit is set and we
+    /// still hold the session ([`Tracker::we_hold_session`]). Never a reclaim
+    /// trigger — the receiver is still serving us, so the control-plane symptom
+    /// is something else.
+    OursActive,
+    /// The receiver has an active session and we do not hold it: another sender
+    /// owns the device. Queue one re-probe, do not fight.
     BusyElsewhere,
-    /// The probe completed but `statusFlags` was missing or not a `u32`.
-    /// Structurally unclassifiable; the caller reclaims (fail-open).
+    /// The probe completed but `statusFlags` was missing or not an unsigned
+    /// 64-bit integer. Structurally unclassifiable; the caller reclaims
+    /// (fail-open), exactly like a failed probe.
     Unknown,
 }
 
@@ -117,6 +152,7 @@ impl ProbeOutcome {
     pub fn name(self) -> &'static str {
         match self {
             Self::Free => "free",
+            Self::OursActive => "ours_active",
             Self::BusyElsewhere => "busy_elsewhere",
             Self::Unknown => "unknown",
         }
@@ -127,25 +163,26 @@ impl ProbeOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProbeReport {
     pub outcome: ProbeOutcome,
-    /// WAC's field is a 64-bit `ulong`; keep the full value for the log even
-    /// though [`another_sender`] currently interprets the low 32 bits.
+    /// The reference implementation's field is a 64-bit `ulong`; keep the whole
+    /// value for the log instead of truncating it to the bits we know.
     pub status_flags: Option<u64>,
 }
 
-/// The one and only interpreter of `statusFlags` bit semantics.
-pub fn another_sender(flags: u32) -> bool {
-    ANOTHER_SENDER_BIT.is_some_and(|mask| flags & mask != 0)
-}
-
-fn outcome_for_flags(flags: u64) -> ProbeOutcome {
-    // `another_sender` is the one bit interpreter and takes the low 32 bits,
-    // which cover every bit recovered so far (WAC's bit 17). High bits are
-    // still logged; they cannot mark BusyElsewhere while the mask is `None`.
-    if another_sender(flags as u32) {
-        ProbeOutcome::BusyElsewhere
-    } else {
-        // With ANOTHER_SENDER_BIT = None this is every well-formed probe.
+/// The one and only interpreter of `statusFlags` session bits.
+///
+/// `we_hold_session` is the context the receiver cannot give us (the reference
+/// sender gets it from where in its lifecycle it probes). It is true when our
+/// own media is still flowing and the receiver never ended this session; see
+/// [`Tracker::we_hold_session`] for where that evidence comes from. The
+/// three-way shape is Q31's prescription: the session bit alone cannot
+/// distinguish our own session from another sender's.
+pub fn classify(status_flags: u64, we_hold_session: bool) -> ProbeOutcome {
+    if status_flags & RECEIVER_SESSION_ACTIVE == 0 {
         ProbeOutcome::Free
+    } else if we_hold_session {
+        ProbeOutcome::OursActive
+    } else {
+        ProbeOutcome::BusyElsewhere
     }
 }
 
@@ -153,12 +190,12 @@ fn status_flags(info: &Value) -> Option<u64> {
     info.as_dictionary()?.get("statusFlags")?.as_unsigned_integer()
 }
 
-/// Parse one `/info` body. Kept separate from the socket so the unknown-bit
-/// property is unit-testable without a receiver.
-fn report_from_info(info: &Value) -> ProbeReport {
+/// Parse one `/info` body. Kept separate from the socket so the classification
+/// table is unit-testable without a receiver.
+fn report_from_info(info: &Value, we_hold_session: bool) -> ProbeReport {
     match status_flags(info) {
         Some(flags) => ProbeReport {
-            outcome: outcome_for_flags(flags),
+            outcome: classify(flags, we_hold_session),
             status_flags: Some(flags),
         },
         None => ProbeReport {
@@ -175,13 +212,19 @@ pub enum ProbeAction {
     Reclaim,
     /// Leave the receiver alone for now and ask again after [`REPROBE_DELAY`].
     Requeue,
+    /// Not preemption: the receiver's active session is ours. Take no
+    /// preemption action, so the control symptom falls through to the existing
+    /// non-preemption path and a healthy session is never interrupted.
+    FallThrough,
 }
 
 /// The Q30 verdict table, for a probe that completed.
 pub fn action_for(outcome: ProbeOutcome) -> ProbeAction {
     match outcome {
-        ProbeOutcome::BusyElsewhere => ProbeAction::Requeue,
         ProbeOutcome::Free | ProbeOutcome::Unknown => ProbeAction::Reclaim,
+        // Never a reclaim: the receiver is still serving our own session.
+        ProbeOutcome::OursActive => ProbeAction::FallThrough,
+        ProbeOutcome::BusyElsewhere => ProbeAction::Requeue,
     }
 }
 
@@ -194,7 +237,12 @@ pub fn action_for_result(result: &Result<ProbeReport>) -> ProbeAction {
     }
 }
 
-fn probe_infos(addr: SocketAddr, cancel: &Cancellation, timeout: Duration) -> Result<ProbeReport> {
+fn probe_infos(
+    addr: SocketAddr,
+    cancel: &Cancellation,
+    timeout: Duration,
+    we_hold_session: bool,
+) -> Result<ProbeReport> {
     let mut connection =
         Connection::connect(addr, cancel.clone()).with_context(|| format!("status probe {addr}"))?;
     connection.set_timeout(timeout)?;
@@ -202,17 +250,27 @@ fn probe_infos(addr: SocketAddr, cancel: &Cancellation, timeout: Duration) -> Re
         .request("GET", "/info", &[], &[])
         .context("status probe GET /info")?;
     let info = message.plist().context("status probe /info plist")?;
-    Ok(report_from_info(&info))
+    Ok(report_from_info(&info, we_hold_session))
 }
 
 /// Probe the receiver's live status on a fresh RTSP connection.
+///
+/// `we_hold_session` is the locally derived context [`classify`] needs: our own
+/// media is still flowing and the receiver has not ended this session (see
+/// [`Tracker::we_hold_session`]). It is an input, never something the probe
+/// invents.
 ///
 /// The caller's existing control connection is deliberately not used: after a
 /// takeover it belongs to a session the receiver already ended, and encrypted
 /// RTSP cannot be re-keyed mid-session (Q16). Any TCP/RTSP/plist error or read
 /// timeout is returned as `Err`; the policy layer turns that into a reclaim.
-pub fn probe(addr: SocketAddr, cancel: &Cancellation, timeout: Duration) -> Result<ProbeOutcome> {
-    Ok(probe_infos(addr, cancel, timeout)?.outcome)
+pub fn probe(
+    addr: SocketAddr,
+    cancel: &Cancellation,
+    timeout: Duration,
+    we_hold_session: bool,
+) -> Result<ProbeOutcome> {
+    Ok(probe_infos(addr, cancel, timeout, we_hold_session)?.outcome)
 }
 
 /// Same as [`probe`], but keeps the raw `statusFlags` for the diagnostic log.
@@ -220,8 +278,9 @@ pub fn probe_report(
     addr: SocketAddr,
     cancel: &Cancellation,
     timeout: Duration,
+    we_hold_session: bool,
 ) -> Result<ProbeReport> {
-    probe_infos(addr, cancel, timeout)
+    probe_infos(addr, cancel, timeout, we_hold_session)
 }
 
 /// Why the sender stopped reclaiming.
@@ -331,6 +390,11 @@ pub struct Tracker {
     signals: Vec<Signal>,
     next_probe: Option<Instant>,
     last_report: Option<ProbeLog>,
+    /// The receiver ended or refused our own session (a `TEARDOWN` it did not
+    /// get from us, or a `403`). Sticky for this member: the member is dropped
+    /// and rebuilt on every reclaim, so a fresh session starts with a clean
+    /// tracker while a displaced one can never claim ownership again.
+    session_ended: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -343,6 +407,7 @@ struct ProbeLog {
 impl Tracker {
     pub fn observe(&mut self, signal: Signal, at: Instant) {
         const MAX_SIGNALS: usize = 8;
+        self.session_ended |= signal.ends_session();
         if self.signals.len() == MAX_SIGNALS {
             self.signals.remove(0);
         }
@@ -352,6 +417,30 @@ impl Tracker {
         if self.next_probe.is_none() {
             self.next_probe = Some(at);
         }
+    }
+
+    /// Whether the receiver's active session is ours to lose — the
+    /// `we_hold_session` dimension [`classify`] needs.
+    ///
+    /// Derived from evidence this engine already has, never from a new probe:
+    /// - `rtp_healthy` is `MediaTransport::media_healthy`: we successfully moved
+    ///   audio to this receiver within the health window. It is the same piece of
+    ///   context the reference implementation logs next to a control EOF, and it
+    ///   is why an active session must not be treated as a takeover by default:
+    ///   our own healthy session has exactly that bit set.
+    /// - the receiver never ended this session ([`Self::session_ended`]): a UDP
+    ///   send keeps "succeeding" after a takeover, so RTP health alone stays
+    ///   true and would hide a real takeover behind `ours_active` forever.
+    ///
+    /// Media health is always computable inside the live loop (the tracker is
+    /// only polled from the streaming loop, after the media watchdog is armed),
+    /// so there is no "unavailable" case to fall back from. If it ever were
+    /// unknown, `false` is the conservative value: a false only turns a
+    /// session-active probe into [`ProbeOutcome::BusyElsewhere`] — the requeue
+    /// branch, which neither reclaims nor ends the session — while `true` would
+    /// declare a session ours with no evidence at all.
+    pub fn we_hold_session(&self, rtp_healthy: bool) -> bool {
+        rtp_healthy && !self.session_ended
     }
 
     /// Signals collected since the last call, for the one evidence log line
@@ -431,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn verdict_table_matches_q30() {
+    fn verdict_table_matches_q30_and_never_reclaims_our_own_session() {
         assert_eq!(action_for(ProbeOutcome::Free), ProbeAction::Reclaim);
         assert_eq!(
             action_for(ProbeOutcome::BusyElsewhere),
@@ -439,6 +528,11 @@ mod tests {
         );
         // A probe that completed but could not be classified is fail-open.
         assert_eq!(action_for(ProbeOutcome::Unknown), ProbeAction::Reclaim);
+        // The receiver still serving us is not a preemption verdict.
+        assert_eq!(
+            action_for(ProbeOutcome::OursActive),
+            ProbeAction::FallThrough
+        );
         assert_eq!(
             action_for_result(&Ok(report(ProbeOutcome::Free))),
             ProbeAction::Reclaim
@@ -450,6 +544,26 @@ mod tests {
         assert_eq!(
             action_for_result(&Ok(report(ProbeOutcome::Unknown))),
             ProbeAction::Reclaim
+        );
+        assert_eq!(
+            action_for_result(&Ok(report(ProbeOutcome::OursActive))),
+            ProbeAction::FallThrough
+        );
+    }
+
+    #[test]
+    fn recovered_bit_values_match_the_reference_implementation() {
+        // Q31: ReceiverStatusFlags / ReceiverAccessPolicy, a 64-bit `ulong`.
+        assert_eq!(RECEIVER_SESSION_ACTIVE, 131_072u64);
+        assert_eq!(STEREO_PARTNER_UNREACHABLE, 16_384u64);
+        assert_eq!(PASSWORD_REQUIRED, 128u64);
+        assert_eq!(RECEIVER_SESSION_ACTIVE, 1 << 17);
+        assert_eq!(STEREO_PARTNER_UNREACHABLE, 1 << 14);
+        assert_eq!(PASSWORD_REQUIRED, 1 << 7);
+        // The telemetry bits must never overlap the decision bit.
+        assert_eq!(
+            RECEIVER_SESSION_ACTIVE & (STEREO_PARTNER_UNREACHABLE | PASSWORD_REQUIRED),
+            0
         );
     }
 
@@ -468,45 +582,142 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_bitmap_can_only_ever_yield_free_never_busy() {
-        assert_eq!(ANOTHER_SENDER_BIT, None);
+    fn no_session_is_free_even_when_other_bits_are_set() {
+        // 0x20000 clear => nobody is being served, whatever else the receiver
+        // reports and whoever we think we are.
         for flags in [
-            0,
+            0u64,
             1,
-            0b10,
             1 << 7,
-            1 << 31,
+            1 << 14,
+            (1 << 7) | (1 << 14),
             0x0000_0100,
             0x8000_0000,
-            u32::MAX,
+            0x0000_1000_0000,
+            u64::from(u32::MAX) & !RECEIVER_SESSION_ACTIVE,
         ] {
-            assert!(
-                !another_sender(flags),
-                "statusFlags=0x{flags:08x} must not be guessed as busy"
-            );
-            assert_eq!(outcome_for_flags(u64::from(flags)), ProbeOutcome::Free);
+            for we_hold_session in [false, true] {
+                assert_eq!(
+                    classify(flags, we_hold_session),
+                    ProbeOutcome::Free,
+                    "statusFlags=0x{flags:016x} has no active session"
+                );
+                assert_eq!(
+                    action_for(classify(flags, we_hold_session)),
+                    ProbeAction::Reclaim
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_active_session_we_hold_is_ours_and_never_a_reclaim() {
+        // The scenario Q31 warns about: our own healthy session sets the same
+        // bit the reference sender's reclaim path reads as "another sender".
+        for flags in [
+            RECEIVER_SESSION_ACTIVE,
+            RECEIVER_SESSION_ACTIVE | STEREO_PARTNER_UNREACHABLE,
+            RECEIVER_SESSION_ACTIVE | PASSWORD_REQUIRED,
+            RECEIVER_SESSION_ACTIVE | STEREO_PARTNER_UNREACHABLE | PASSWORD_REQUIRED,
+            0x0001_0002_0000,
+        ] {
             assert_eq!(
-                action_for(outcome_for_flags(u64::from(flags))),
-                ProbeAction::Reclaim
+                classify(flags, true),
+                ProbeOutcome::OursActive,
+                "statusFlags=0x{flags:016x} is our own session"
             );
+            assert_ne!(
+                action_for(classify(flags, true)),
+                ProbeAction::Reclaim,
+                "our own active session must never be reclaimed"
+            );
+        }
+    }
+
+    #[test]
+    fn an_active_session_we_do_not_hold_is_busy_elsewhere() {
+        for flags in [
+            RECEIVER_SESSION_ACTIVE,
+            RECEIVER_SESSION_ACTIVE | STEREO_PARTNER_UNREACHABLE,
+            RECEIVER_SESSION_ACTIVE | PASSWORD_REQUIRED,
+            0x0001_0002_0000,
+        ] {
+            assert_eq!(
+                classify(flags, false),
+                ProbeOutcome::BusyElsewhere,
+                "statusFlags=0x{flags:016x} is somebody else's session"
+            );
+            assert_eq!(
+                action_for(classify(flags, false)),
+                ProbeAction::Requeue,
+                "another sender is a queue, never a reclaim"
+            );
+        }
+    }
+
+    #[test]
+    fn stereo_and_password_bits_do_not_influence_the_verdict() {
+        let telemetry_bits = [
+            0u64,
+            STEREO_PARTNER_UNREACHABLE,
+            PASSWORD_REQUIRED,
+            STEREO_PARTNER_UNREACHABLE | PASSWORD_REQUIRED,
+        ];
+        for telemetry in telemetry_bits {
+            for session in [0u64, RECEIVER_SESSION_ACTIVE] {
+                for we_hold_session in [false, true] {
+                    assert_eq!(
+                        classify(session | telemetry, we_hold_session),
+                        classify(session, we_hold_session),
+                        "statusFlags=0x{:016x} must not change the verdict",
+                        session | telemetry
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn status_flags_above_u32_max_are_classified_on_the_full_64_bits() {
+        // The old mask was 32-bit; a value with a high bit plus bit 17 must
+        // still be recognised as an active session.
+        for flags in [1u64 << 32, 0xFFFF_FFFF_0000_0000, 0x1_0000_0000] {
+            assert_eq!(classify(flags, false), ProbeOutcome::Free);
+        }
+        for flags in [
+            (1u64 << 32) | RECEIVER_SESSION_ACTIVE,
+            0xFFFF_FFFF_0002_0000,
+            0x8000_0000_0002_0000,
+        ] {
+            assert_eq!(classify(flags, true), ProbeOutcome::OursActive);
+            assert_eq!(classify(flags, false), ProbeOutcome::BusyElsewhere);
         }
     }
 
     #[test]
     fn missing_or_malformed_status_flags_is_unknown_and_reclaims() {
         let mut info = plist::Dictionary::new();
-        let report = report_from_info(&Value::Dictionary(info.clone()));
-        assert_eq!(
-            report,
-            ProbeReport {
-                outcome: ProbeOutcome::Unknown,
-                status_flags: None
-            }
-        );
+        for we_hold_session in [false, true] {
+            let report = report_from_info(&Value::Dictionary(info.clone()), we_hold_session);
+            assert_eq!(
+                report,
+                ProbeReport {
+                    outcome: ProbeOutcome::Unknown,
+                    status_flags: None
+                },
+                "a missing field is unclassifiable, never a guess"
+            );
+        }
         info.insert("statusFlags".into(), Value::String("not a number".into()));
-        let report = report_from_info(&Value::Dictionary(info));
+        let report = report_from_info(&Value::Dictionary(info.clone()), true);
         assert_eq!(report.outcome, ProbeOutcome::Unknown);
         assert_eq!(action_for(report.outcome), ProbeAction::Reclaim);
+        // A negative integer is not a valid unsigned statusFlags either.
+        info.insert("statusFlags".into(), Value::Integer((-1i64).into()));
+        assert_eq!(
+            report_from_info(&Value::Dictionary(info), true).outcome,
+            ProbeOutcome::Unknown
+        );
     }
 
     #[test]
@@ -514,22 +725,78 @@ mod tests {
         let mut info = plist::Dictionary::new();
         info.insert("statusFlags".into(), Value::Integer(0x1234_5678.into()));
         assert_eq!(
-            report_from_info(&Value::Dictionary(info)),
+            report_from_info(&Value::Dictionary(info), false),
             ProbeReport {
                 outcome: ProbeOutcome::Free,
                 status_flags: Some(0x1234_5678)
             }
         );
-        // WAC's field is a 64-bit ulong; a high bit is still logged and must
-        // not turn a well-formed probe into `Unknown` while the mask is unset.
+        // The field is a 64-bit `ulong`: a high bit is preserved in the log and
+        // must not turn a well-formed probe into `Unknown`.
         let mut wide = plist::Dictionary::new();
         wide.insert(
             "statusFlags".into(),
             Value::Integer(0x1_0000_0002u64.into()),
         );
-        let report = report_from_info(&Value::Dictionary(wide));
+        let report = report_from_info(&Value::Dictionary(wide), false);
         assert_eq!(report.outcome, ProbeOutcome::Free);
         assert_eq!(report.status_flags, Some(0x1_0000_0002));
+        let mut active = plist::Dictionary::new();
+        active.insert(
+            "statusFlags".into(),
+            Value::Integer(0x1_0002_0000u64.into()),
+        );
+        let report = report_from_info(&Value::Dictionary(active), false);
+        assert_eq!(report.outcome, ProbeOutcome::BusyElsewhere);
+        assert_eq!(report.status_flags, Some(0x1_0002_0000));
+    }
+
+    #[test]
+    fn a_session_the_receiver_ended_is_never_ours_again() {
+        let base = Instant::now();
+        let mut tracker = Tracker::default();
+        assert!(tracker.we_hold_session(true));
+        assert!(!tracker.we_hold_session(false));
+        // A control-channel close can be a keep-alive restart: it is evidence,
+        // not proof that the session changed hands.
+        tracker.observe(Signal::ConnectionClose, at(base, 0));
+        assert!(
+            tracker.we_hold_session(true),
+            "a Connection: close does not end the session by itself"
+        );
+        tracker.observe(Signal::UnexpectedTeardown, at(base, 1));
+        assert!(
+            !tracker.we_hold_session(true),
+            "after the receiver's own TEARDOWN our RTP cannot own bit 17"
+        );
+        // Sticky: a later healthy sample cannot undo it for this member.
+        assert!(!tracker.we_hold_session(true));
+    }
+
+    #[test]
+    fn a_forbidden_response_means_we_no_longer_hold_the_session() {
+        let base = Instant::now();
+        let mut tracker = Tracker::default();
+        tracker.observe(Signal::Forbidden, at(base, 0));
+        assert!(!tracker.we_hold_session(true));
+        assert!(!tracker.we_hold_session(false));
+    }
+
+    #[test]
+    fn only_a_busy_probe_is_requeued() {
+        let base = Instant::now();
+        let mut ours = Tracker::default();
+        ours.observe(Signal::ConnectionClose, at(base, 0));
+        assert!(ours.note_result(&Ok(report(ProbeOutcome::OursActive)), at(base, 0)));
+        assert_eq!(
+            ours.scheduled(),
+            None,
+            "our own session must not start a re-probe queue"
+        );
+        let mut busy = Tracker::default();
+        busy.observe(Signal::ConnectionClose, at(base, 0));
+        assert!(busy.note_result(&Ok(report(ProbeOutcome::BusyElsewhere)), at(base, 0)));
+        assert_eq!(busy.scheduled(), Some(at(base, 0) + REPROBE_DELAY));
     }
 
     #[test]
