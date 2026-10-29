@@ -1454,7 +1454,43 @@ P2-13b 已把协商改成「先探测全组、再算一个 `TimingPlan`、最后
 
 ---
 
-### Q34. 任务说明要求写 `Strings.json`，但仓库里没有这个文件 `[待答复]`
+### Q34. Q32 修复落地后的三个取值与真机行为 `[待答复]`
+
+P3-3 已按 Q32 §五 改掉死锁：`we_hold_session` 不再 latch，改成每轮按
+`rtp_healthy` + `ended_at` 实时推导（RTP 健康无条件优先；`ended_at` 只在不
+健康时作证据）；`403` 从抢占证据降级为 `/feedback` 的
+`authentication_failed`（与 401 同类，不再写 `ended_at`、不再触发探测）；
+状态改变类判决（`Free` / `BusyElsewhere`）增加一次 500 ms 后的确认探测；
+连续确认的 `BusyElsewhere` 达到上限后强制回收并打印 `busy_exhausted`。
+落地后有四个新问题没有静态答案：
+
+1. **三个值的依据**：`ENDED_TRUST_WINDOW=2s` 与 WAC 的 `2 s gap window` 和
+   引擎自己的 `MEDIA_HEALTH_WINDOW` 对齐，但 `CONFIRM_DELAY=500ms`、
+   `BUSY_LIMIT=3`（约 3 × 3 s 排队后强制回收）纯属**我们选的值**。Q32 只
+   要求「可自愈 / 有上限 / 二次确认」，没有给 WAC 的运行时参数。如果 WAC
+   有实际值（例如它二次确认的间隔、或 `taken over in a row` 的计数上限），
+   请给出来，我们按它校准。
+2. **运行中 `/feedback` 返回 403 该不该结束会话**：WAC 的静态分类只说 403 是
+   访问/认证错误（密码/PIN/470 同族），没有说「音频仍在流」时的运行策略。
+   现在 AirFlash 把它当 `authentication_failed` 硬失败，当前会话会结束并让
+   用户看到认证错误；另一种可能是只降级控制通道、继续放 RTP。真机上
+   HomePod 在什么条件下会对 `/feedback` 回 403（限流？不支持？权限变化？）
+   未验证。
+3. **真接管 + RTP 仍「健康」的时间窗**：按 Q32 的无条件规则，只要
+   `media_healthy` 为真，bit17 就判 `OursActive`，不回收。真接管后 UDP 发送
+   还能成功多久，取决于接收器是否回 ICMP port-unreachable、Windows 是否把
+   它变成 `WSAECONNRESET`，我们没有实测。如果这个窗口很长，是否需要给
+   `rtp_healthy` 再加一个「接收器侧活性」维度？目前引擎只有本地发送成功，
+   没有接收器→发送端的 RTP 反馈。
+4. **busy 上限对「合法占用」的影响**：若另一台控制器合法地长时间占用接收器
+   （例如用户在 iPhone 上持续播放），约 9 s 后我们会强制回收，连续三次强制
+   回收后以 `preempted(limit)` 让步、不再自动重连。这个等待时间是否太短？
+   是否应把 `BUSY_LIMIT` 放宽到 5–10（15–30 s）？Q32 只说「到上限就重新判定，
+   不是永远排队」，没有给时间尺度。
+
+---
+
+### Q35. 任务说明要求写 `Strings.json`，但仓库里没有这个文件 `[待答复]`
 
 P3-2 桌面半的任务说明要求「每个新用户可见字符串都加进 `Strings.json`、
 `Strings.zh.json`、`Strings.zh-TW.json`、`Strings.de.json`」。实际仓库里
@@ -1473,7 +1509,7 @@ P3-2 桌面半的任务说明要求「每个新用户可见字符串都加进 `S
 
 ---
 
-### Q35. bit40 置位但 `srcvers` 缺失时，列表标 unknown 还是 classic？ `[待答复]`
+### Q36. bit40 置位但 `srcvers` 缺失时，列表标 unknown 还是 classic？ `[待答复]`
 
 WAC 的 `SupportsAirPlay2` 在 `Version.TryParse` 失败时返回 false，
 `CreateTopologyPlan` 随即按 Classic RAOP 处理。但任务同时要求「AirPlay 2 状态
@@ -1495,7 +1531,7 @@ WAC 的 `SupportsAirPlay2` 在 `Version.TryParse` 失败时返回 false，
 
 ---
 
-### Q36. MFi 门禁没有引擎 code，也没有 TXT 证据，桌面只能匹配消息文本 `[待答复]`
+### Q37. MFi 门禁没有引擎 code，也没有 TXT 证据，桌面只能匹配消息文本 `[待答复]`
 
 报告 15 §15.3 提到 WAC 有明确错误
 `Device requires MFi authentication (not implementable without Apple hardware)`，

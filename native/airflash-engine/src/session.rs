@@ -359,11 +359,13 @@ struct Member {
 enum PreemptionPoll {
     /// No evidence, or the next probe is not due yet.
     None,
-    /// The receiver is playing another sender's session. This is a queue: the
-    /// next probe is scheduled, the session keeps its media loop.
+    /// A probe (or its confirmation) is in flight, or the receiver is playing
+    /// another sender's session. This is a queue, not a failure: the next probe
+    /// is scheduled and the session keeps its media loop.
     Waiting,
-    /// A takeover was confirmed (or the probe failed open): end this attempt
-    /// and reclaim the receiver on a fresh connection.
+    /// A takeover was confirmed (or the probe failed open, or the busy queue
+    /// was exhausted): end this attempt and reclaim the receiver on a fresh
+    /// connection.
     Reclaimed { consecutive: u32 },
     /// The consecutive limit was hit: stop reclaiming, non-retryable.
     Yield(Fault),
@@ -683,8 +685,12 @@ impl Member {
     }
     /// Drain control-plane evidence, then ask the receiver's live `statusFlags`
     /// when a probe is due. Control symptoms never decide on their own:
-    /// - `BusyElsewhere` queues another probe and keeps the media loop alive.
-    /// - `Free` / `Unknown` / probe error / timeout reclaim (fail-open).
+    /// - A `Free` or `BusyElsewhere` verdict is confirmed by one more probe
+    ///   after [`preemption::CONFIRM_DELAY`]; a disagreement never reclaims.
+    /// - `BusyElsewhere` queues another probe and keeps the media loop alive,
+    ///   but only up to [`preemption::BUSY_LIMIT`] confirmed verdicts in a row:
+    ///   then it forces a reclaim and logs `busy_exhausted`.
+    /// - `Unknown` / probe error / timeout reclaim immediately (fail-open).
     /// - The per-receiver consecutive counter decides whether a reclaim is
     ///   allowed or the sender must yield.
     fn poll_preemption(
@@ -710,17 +716,18 @@ impl Member {
         }
         let address = SocketAddr::new(self.peer.host, self.peer.port);
         // The dimension the receiver's session bit cannot give us: our own media
-        // is still flowing and the receiver never ended this session. Without it
-        // our own healthy session would look like "a session is active and we
-        // are reclaiming", i.e. a takeover of ourselves (Q31).
-        let we_hold_session = self.preemption.we_hold_session(media_healthy);
+        // is still flowing (or the ended conclusion is stale). Without it our own
+        // healthy session would look like "a session is active and we are
+        // reclaiming", i.e. a takeover of ourselves (Q31/Q32).
+        let we_hold_session = self.preemption.we_hold_session(media_healthy, now);
         let result = preemption::probe_report(
             address,
             cancel,
             preemption::PROBE_TIMEOUT,
             we_hold_session,
         );
-        if self.preemption.note_result(&result, now) {
+        let note = self.preemption.note_result(&result, now);
+        if note.log_changed {
             emit(preemption_probe(
                 self,
                 &result,
@@ -728,13 +735,23 @@ impl Member {
                 media_healthy,
             ));
         }
-        match preemption::action_for_result(&result) {
-            preemption::ProbeAction::Requeue => (PreemptionPoll::Waiting, media_healthy),
+        if let Some((first, second)) = note.disagreement {
+            emit(preemption_probe_disagreement(self, first, second));
+        }
+        match note.action {
+            // The first verdict would change state; wait for its one
+            // confirmation probe. The old control symptom must not decide while
+            // its verdict is being checked.
+            preemption::ProbeAction::Confirm
+            | preemption::ProbeAction::Requeue => (PreemptionPoll::Waiting, media_healthy),
             // The active session on the receiver is ours: the control-plane
             // symptom is something else, so take no preemption action and fall
             // through to the existing health checks below.
             preemption::ProbeAction::FallThrough => (PreemptionPoll::None, media_healthy),
-            preemption::ProbeAction::Reclaim => {
+            preemption::ProbeAction::Reclaim | preemption::ProbeAction::ReclaimBusyExhausted => {
+                if note.busy_exhausted {
+                    emit(preemption_busy_exhausted(self));
+                }
                 // Confirmed (or fail-open). The old encrypted control connection
                 // belongs to the session the receiver already ended; the reclaim
                 // must use a fresh connection, never this one (Q16).
@@ -2092,6 +2109,43 @@ fn preemption_probe(
     }
     event
 }
+/// The confirmation probe disagreed with the first verdict. Both raw outcomes
+/// are logged; the caller keeps the non-destructive verdict (never a reclaim),
+/// so a receiver flapping between `Free` and `BusyElsewhere` cannot make us
+/// fight for it.
+fn preemption_probe_disagreement(
+    member: &Member,
+    first: preemption::ProbeOutcome,
+    second: preemption::ProbeOutcome,
+) -> Json {
+    json!({
+        "event": "warning",
+        "host": member.peer.host.to_string(),
+        "channel": "preemption",
+        "code": "preemption_probe_disagreement",
+        "recovered": true,
+        "first": first.name(),
+        "second": second.name(),
+        "message": "The two statusFlags probes disagreed; keeping the non-destructive verdict",
+    })
+}
+/// The busy queue hit its bound. This is a distinct, visible outcome: the
+/// sender stops queueing and reclaims even though the receiver still reports an
+/// active session, so the `BusyElsewhere` loop can never run forever.
+fn preemption_busy_exhausted(member: &Member) -> Json {
+    json!({
+        "event": "warning",
+        "host": member.peer.host.to_string(),
+        "channel": "preemption",
+        "code": "busy_exhausted",
+        "recovered": false,
+        "attempts": preemption::BUSY_LIMIT,
+        "message": format!(
+            "Receiver kept reporting another sender's session for {} probes in a row; reclaiming anyway",
+            preemption::BUSY_LIMIT
+        ),
+    })
+}
 fn emit_capture_warnings(source: &crate::live::Loopback, emit: &impl Fn(Json)) {
     for warning in source.take_warnings() {
         emit(json!({
@@ -2263,28 +2317,37 @@ mod tests {
     // A minimal live-status probe target: one fresh TCP connection, one
     // `GET /info`, one binary plist. `status_flags = None` omits the field.
     fn status_probe_server(status_flags: Option<u64>) -> (SocketAddr, JoinHandle<()>) {
+        status_probe_server_seq(vec![status_flags])
+    }
+    /// Same, but answers one `/info` per entry, each on a fresh connection. A
+    /// state-changing verdict (Free / BusyElsewhere) is always confirmed by a
+    /// second probe, so tests expecting a verdict need two (or more) entries.
+    fn status_probe_server_seq(responses: Vec<Option<u64>>) -> (SocketAddr, JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let worker = thread::spawn(move || {
-            let (socket, _) = listener.accept().unwrap();
-            let mut connection = Connection::from_stream(socket, Cancellation::default()).unwrap();
-            let request = connection.read().unwrap();
-            assert!(request.first.starts_with("GET /info"));
-            let mut body = Dictionary::new();
-            if let Some(flags) = status_flags {
-                body.insert("statusFlags".into(), Value::Integer(flags.into()));
+            for status_flags in responses {
+                let (socket, _) = listener.accept().unwrap();
+                let mut connection =
+                    Connection::from_stream(socket, Cancellation::default()).unwrap();
+                let request = connection.read().unwrap();
+                assert!(request.first.starts_with("GET /info"));
+                let mut body = Dictionary::new();
+                if let Some(flags) = status_flags {
+                    body.insert("statusFlags".into(), Value::Integer(flags.into()));
+                }
+                let mut bytes = Vec::new();
+                Value::Dictionary(body).to_writer_binary(&mut bytes).unwrap();
+                let response = format!(
+                    "RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n",
+                    request.headers["cseq"],
+                    bytes.len()
+                )
+                .into_bytes();
+                let mut response = response;
+                response.extend(bytes);
+                connection.write(&response).unwrap();
             }
-            let mut bytes = Vec::new();
-            Value::Dictionary(body).to_writer_binary(&mut bytes).unwrap();
-            let response = format!(
-                "RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n",
-                request.headers["cseq"],
-                bytes.len()
-            )
-            .into_bytes();
-            let mut response = response;
-            response.extend(bytes);
-            connection.write(&response).unwrap();
         });
         (address, worker)
     }
@@ -2448,9 +2511,9 @@ mod tests {
     #[test]
     fn an_unexpected_teardown_probes_the_receiver_and_reclaims() {
         // The control symptom only triggers a probe. The fake receiver's fresh
-        // `/info` connection says statusFlags=0, so the verdict is a reclaim on
-        // a different connection rather than a fault.
-        let (probe_addr, probe_server) = status_probe_server(Some(0));
+        // `/info` connections say statusFlags=0, so the confirmed verdict is a
+        // reclaim on a different connection rather than a fault.
+        let (probe_addr, probe_server) = status_probe_server_seq(vec![Some(0), Some(0)]);
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
         let (mut member, worker, methods) =
             local_member_with_health(receiver.local_addr().unwrap(), None, Health::default());
@@ -2461,13 +2524,36 @@ mod tests {
         let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = emitted.clone();
         let mut counters = preemption::TakeoverCounters::default();
+        let now = Instant::now();
         let (poll, healthy) = member.poll_preemption(
             &Cancellation::default(),
             &mut counters,
-            Instant::now(),
+            now,
             &|json| seen.lock().unwrap().push(json),
         );
         assert!(healthy);
+        assert!(
+            matches!(poll, PreemptionPoll::Waiting),
+            "the first Free verdict must be confirmed before it is acted on"
+        );
+        assert!(!member.preempted);
+        assert_eq!(
+            member.preemption.scheduled(),
+            Some(now + preemption::CONFIRM_DELAY)
+        );
+        {
+            let events = emitted.lock().unwrap();
+            assert!(
+                !events.iter().any(|event| event["code"] == "preempted"),
+                "one probe is not enough to reclaim"
+            );
+        }
+        let (poll, _) = member.poll_preemption(
+            &Cancellation::default(),
+            &mut counters,
+            now + preemption::CONFIRM_DELAY,
+            &|json| seen.lock().unwrap().push(json),
+        );
         assert!(matches!(
             poll,
             PreemptionPoll::Reclaimed { consecutive: 1 }
@@ -2499,8 +2585,9 @@ mod tests {
                 .expect("the raw statusFlags must be logged");
             assert_eq!(probe["outcome"], "free");
             assert_eq!(probe["status_flags"], 0);
-            // The receiver ended this session, so its RTP cannot be read as ours.
-            assert_eq!(probe["we_hold_session"], false);
+            // Q32: healthy RTP wins over the receiver's TEARDOWN; the Free
+            // verdict itself does not depend on this dimension.
+            assert_eq!(probe["we_hold_session"], true);
             assert!(probe["rtp_healthy"].is_boolean());
             assert!(probe["policy"].is_string());
             assert!(probe["packets_prepared"].is_number());
@@ -2581,15 +2668,15 @@ mod tests {
         probe_server.join().unwrap();
     }
     #[test]
-    fn a_receiver_that_ended_our_session_is_busy_even_while_rtp_still_sends() {
-        // After a real takeover UDP sends keep "succeeding", so media health
-        // alone would keep saying "ours". The receiver's own TEARDOWN is the
-        // sticky evidence that turns the same bitmap into a re-probe queue.
-        let (probe_addr, probe_server) = status_probe_server(Some(
-            preemption::RECEIVER_SESSION_ACTIVE | preemption::STEREO_PARTNER_UNREACHABLE,
-        ));
+    fn healthy_rtp_beats_a_receiver_teardown_signal() {
+        // Q32: RTP health is stronger than any control-plane signal. The
+        // receiver's own TEARDOWN with our media still flowing does not make the
+        // active session bit somebody else's: it is our session, so fall
+        // through instead of reclaiming or queueing.
+        let (probe_addr, probe_server) =
+            status_probe_server(Some(preemption::RECEIVER_SESSION_ACTIVE));
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let (mut member, worker, _methods) =
+        let (mut member, worker, methods) =
             local_member_with_health(receiver.local_addr().unwrap(), None, Health::default());
         member.peer.port = probe_addr.port();
         member
@@ -2606,11 +2693,83 @@ mod tests {
         );
         assert!(healthy);
         assert!(
-            matches!(poll, PreemptionPoll::Waiting),
-            "another sender's session is a queue, never a reclaim"
+            matches!(poll, PreemptionPoll::None),
+            "our own active session must never reclaim or queue"
         );
         assert!(!member.preempted);
         assert!(!member.conn.lock().unwrap().is_poisoned());
+        assert_eq!(
+            member.preemption.scheduled(),
+            None,
+            "OursActive does not schedule a probe"
+        );
+        {
+            let events = emitted.lock().unwrap();
+            let probe = events
+                .iter()
+                .find(|event| event["code"] == "preemption_probe")
+                .expect("the probe must be logged");
+            assert_eq!(probe["outcome"], "ours_active");
+            assert_eq!(probe["we_hold_session"], true);
+            assert_eq!(probe["status_flags"], preemption::RECEIVER_SESSION_ACTIVE);
+            assert!(events.iter().all(|event| event["code"] != "preempted"));
+        }
+        drop(member);
+        worker.join().unwrap();
+        // Not displaced: the session still ends with its normal TEARDOWN.
+        assert_eq!(
+            methods.lock().unwrap().iter().filter(|m| *m == "TEARDOWN").count(),
+            1
+        );
+        probe_server.join().unwrap();
+    }
+    #[test]
+    fn ended_session_with_unhealthy_rtp_is_busy_elsewhere() {
+        // Only when the RTP side is unhealthy too does the receiver's TEARDOWN
+        // turn a session-active probe into BusyElsewhere. The verdict is
+        // confirmed once before it is queued.
+        let active = preemption::RECEIVER_SESSION_ACTIVE | preemption::STEREO_PARTNER_UNREACHABLE;
+        let (probe_addr, probe_server) = status_probe_server_seq(vec![Some(active), Some(active)]);
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mut member, worker, _methods) =
+            local_member_with_health(receiver.local_addr().unwrap(), None, Health::default());
+        member.peer.port = probe_addr.port();
+        // Push the health window past the last successful send so RTP is
+        // unhealthy, then let the receiver end the session right now.
+        let now = Instant::now() + Duration::from_secs(3);
+        member
+            .health
+            .preemption_signal(preemption::Signal::UnexpectedTeardown);
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = emitted.clone();
+        let mut counters = preemption::TakeoverCounters::default();
+        let (first, healthy) = member.poll_preemption(
+            &Cancellation::default(),
+            &mut counters,
+            now,
+            &|json| seen.lock().unwrap().push(json),
+        );
+        assert!(!healthy, "the media health window has expired");
+        assert!(
+            matches!(first, PreemptionPoll::Waiting),
+            "the first busy verdict is confirmed before queueing"
+        );
+        assert!(!member.preempted);
+        assert!(!member.conn.lock().unwrap().is_poisoned());
+        let (poll, _) = member.poll_preemption(
+            &Cancellation::default(),
+            &mut counters,
+            now + preemption::CONFIRM_DELAY,
+            &|json| seen.lock().unwrap().push(json),
+        );
+        assert!(
+            matches!(poll, PreemptionPoll::Waiting),
+            "another sender's session is a queue, never a reclaim"
+        );
+        assert_eq!(
+            member.preemption.scheduled(),
+            Some(now + preemption::CONFIRM_DELAY + preemption::REPROBE_DELAY)
+        );
         {
             let events = emitted.lock().unwrap();
             let probe = events
@@ -2636,7 +2795,7 @@ mod tests {
         member.peer.port = probe_addr.port();
         member
             .health
-            .preemption_signal(preemption::Signal::Forbidden);
+            .preemption_signal(preemption::Signal::ConnectionClose);
         let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = emitted.clone();
         let mut counters = preemption::TakeoverCounters::default();
@@ -2706,7 +2865,10 @@ mod tests {
     }
     #[test]
     fn hitting_the_consecutive_limit_yields_with_reason_limit() {
-        let (probe_addr, probe_server) = status_probe_server(Some(0));
+        // Two agreeing Free probes are needed: the first Free schedules the one
+        // confirmation probe and the second one carries the reclaim into the
+        // takeover counter, which is already at the limit here.
+        let (probe_addr, probe_server) = status_probe_server_seq(vec![Some(0), Some(0)]);
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
         let (mut member, worker, _methods) =
             local_member_with_health(receiver.local_addr().unwrap(), None, Health::default());
@@ -2720,10 +2882,20 @@ mod tests {
             .preemption_signal(preemption::Signal::UnexpectedTeardown);
         let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = emitted.clone();
-        let (poll, _) = member.poll_preemption(
+        let (first, _) = member.poll_preemption(
             &Cancellation::default(),
             &mut counters,
             now,
+            &|json| seen.lock().unwrap().push(json),
+        );
+        assert!(
+            matches!(first, PreemptionPoll::Waiting),
+            "the first Free still needs its confirmation"
+        );
+        let (poll, _) = member.poll_preemption(
+            &Cancellation::default(),
+            &mut counters,
+            now + preemption::CONFIRM_DELAY,
             &|json| seen.lock().unwrap().push(json),
         );
         let fault = match poll {
@@ -2746,6 +2918,22 @@ mod tests {
         drop(member);
         worker.join().unwrap();
         probe_server.join().unwrap();
+    }
+    #[test]
+    fn busy_exhausted_is_a_distinct_logged_outcome() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (member, worker, _methods) =
+            local_member_with(receiver.local_addr().unwrap(), None);
+        let event = preemption_busy_exhausted(&member);
+        assert_eq!(event["code"], "busy_exhausted");
+        assert_eq!(event["channel"], "preemption");
+        assert_eq!(event["attempts"], preemption::BUSY_LIMIT);
+        assert!(event["message"]
+            .as_str()
+            .unwrap()
+            .contains(&preemption::BUSY_LIMIT.to_string()));
+        drop(member);
+        worker.join().unwrap();
     }
     #[test]
     fn a_setup_403_stays_a_generic_non_retryable_fault() {
