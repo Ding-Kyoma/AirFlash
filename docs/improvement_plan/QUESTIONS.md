@@ -2663,6 +2663,48 @@ HomePod + 经典 RAOP 设备、点连接，再看到一条错误。需要确认�
 
 ---
 
+### Q43. 时间线重置的分桶口径、`start` 的语义与桌面端 join `[待答复]`
+
+Q40 之后 `rebuild_count` 已删除，引擎改为 9 个 reason 分桶（CSV 列
+`timeline_resets_<reason>`）+ `last_timeline_reset_reason`；桌面端新增
+`%APPDATA%\AirFlash\logs\session-desktop.csv`。实现时对「哪些站点算一次重置」
+做了如下决定，其中三处是因为九类里没有精确对应、只能取「最接近」：
+
+| 站点点位 | 归档 | 说明 |
+|---|---|---|
+| `run_live` 首次尝试的 `MediaSchedule::new` | **不计** | 这是一行的基线，不是重置；正常停止必须九桶全 0 |
+| `schedule.add_shift` 实际应用非零 | `latency_change` | 我们主动改 lead |
+| `LateAction::Silence` 补静音槽 | **不计** | seq/rtptime 仍线性，时间线没有重置 |
+| `LateAction::Reanchor` 成功且 shift≠0 | `confirmed_transport_failure` | ⚠️ 最接近，但九类里没有 "sender stall" |
+| `schedule.reanchor` 预算耗尽（`timeline_expired`） | `confirmed_transport_failure` | 确定故障 |
+| `schedule.relax` 回退 surplus | **不计** | 重锚 surplus 的回退，重复计会放大 |
+| standby 暂停后恢复 | `silence_resume` | |
+| 抢占 reclaim / 重新连接接收器 | `session_restart` | |
+| 采集源结束/重建后重开 | `start` | ⚠️ 没有 source_restart，取最接近的 `start` |
+| 正常停止的 faded drain | **不计** | 不是 FLUSH，接收器没有被要求丢弃队列 |
+
+需要确认：
+
+1. `start` 的语义。WAC 把首条时间线也记成 `start`；AF 现在把「首次尝试的
+   基线」排除在外（否则正常停止就不是全 0，而且每行恒为 1 没有信息量），只把
+   「采集源结束后重新开始播放」记成 `start`。这样可以吗？还是希望每个会话的
+   第一行都带 `start=1`？
+2. 成功重锚归档到 `confirmed_transport_failure` 可以吗？它是发送线程错过
+   deadline（可能是本机调度，不一定是网络），但九类里只有这个带漂移含义。
+   如果不该算漂移，是否应该改记 `silence_resume`（同样不精确）或暂时不计？
+3. 桌面 companion 文件的粒度。引擎一个 attempt 一行（`session_id =
+   <IPC id>-<epoch>`），桌面一次 IPC 会话一行（`transport_fault:<code>`，
+   首次 `none`），join 时用引擎 id 去掉最后一个 `-<epoch>` 的前缀。若希望
+   逐 attempt 精确对齐，需要引擎在摘要事件里回传 `session_epoch` 给桌面端
+   （目前桌面端忽略该事件）。要做吗？
+4. `track_change` / `user_seek` / `receiver_rejected_flush` / `flush` 在 AF 的
+   实时采集链路里没有对应站点（没有播放列表、seek，也不发 FLUSH），这四个桶
+   目前恒为 0。保留空桶等以后接播放器，还是从 schema 里删掉？
+
+> **答复**：（待答复）
+
+---
+
 ## 答复区
 
 > 已在每条条目下方就地回填（`> **答复**`）。下面是需要**优先改代码**的 4 条，按影响排序。
@@ -2694,3 +2736,4 @@ HomePod + 经典 RAOP 设备、点连接，再看到一条错误。需要确认�
 3. **`ComputeRecommendation` 是一次算三方案，不升档**：所以"自适应阶梯"整套是 AF 的净增能力，不必也不该去对齐 WAC 的候选表（那张表里有 30/40 这种**永远用不到**的值）。
 
 ---
+
