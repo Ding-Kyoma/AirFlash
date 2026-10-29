@@ -281,7 +281,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             }
             catch (PairCancelledException) { }
             catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
-            catch (Exception error) { if (RecordFailure(epoch, error) is { } notice) Publish(epoch, FailureState(notice), FailureMessage(notice)); }
+            catch (Exception error) { if (RecordFailure(epoch, error) is { } notice) Publish(epoch, FailureState(notice), FailureMessage(receiver, notice)); }
             finally { await RestoreAudioAsync().ConfigureAwait(false); }
         }, CancellationToken.None);
     }
@@ -694,7 +694,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                 if (startedAt != 0 && Stopwatch.GetElapsedTime(startedAt) >= TimeSpan.FromSeconds(10)) attempts = 0;
                 ++attempts;
                 if (RecordFailure(epoch, error) is not { } notice) return;
-                Publish(epoch, FailureState(notice), FailureMessage(notice));
+                Publish(epoch, FailureState(notice), FailureMessage(receiver, notice));
                 // A preempted receiver belongs to another controller now; retrying
                 // would fight it. The user gets an explicit reconnect action instead.
                 if (notice.Code == "preempted" || !(_settings.ForceReconnect || receiver.IsSoftwareGroup || notice.Code is "timeline_expired" or "clock_lost") || attempts > _settings.MaxReconnectAttempts || notice.Retryable == false || notice.Retryable is null && IsAuthenticationFailure(error.Message)) return;
@@ -744,17 +744,26 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         }
     }
     private static PlaybackState FailureState(EngineNotice notice) => notice.Code == "preempted" ? PlaybackState.Preempted : PlaybackState.Error;
-    private static string FailureMessage(EngineNotice notice) => notice.Code switch
+    private static string FailureMessage(Receiver? receiver, EngineNotice notice) => notice.Code switch
     {
         // The engine separates a single takeover from hitting the consecutive
         // limit so the user knows whether reconnecting can help.
         "preempted" when notice.Reason == "limit" => L.Get("Another device keeps taking over this AirPlay session. AirFlash yielded and will not reconnect automatically."),
         "preempted" => L.Get("Another device took over this AirPlay session. Reconnect to claim it back."),
-        _ => notice.Detail
+        _ => GateFailure.Message(receiver, notice) ?? notice.Detail
     };
     private EngineNotice? RecordFailure(long epoch, Exception error)
     {
-        var notice = error is EngineFailure engineFailure ? engineFailure.Notice : new EngineNotice("host_error", "", "desktop", error.Message);
+        // A failure to reach the receiver is desktop evidence, not an engine
+        // verdict: keep it distinct from engine protocol errors so the gate
+        // classifier does not blame the network for an IPC problem.
+        var notice = error switch
+        {
+            EngineFailure engineFailure => engineFailure.Notice,
+            SocketException socket => new EngineNotice("network_error", "", "desktop", socket.Message, true),
+            NetworkFailure network => new EngineNotice("network_error", "", "desktop", network.Message, true),
+            _ => new EngineNotice("host_error", "", "desktop", error.Message)
+        };
         PlaybackDiagnostics diagnostics;
         lock (_sync)
         {
@@ -766,6 +775,10 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         return notice;
     }
     private sealed class PairCancelledException : OperationCanceledException;
+    private sealed class NetworkFailure : IOException
+    {
+        public NetworkFailure(string message) : base(message) { }
+    }
     private static bool IsAuthenticationFailure(string message) => new[] { "pairing", "srp", "verification", "credentials", "signature", "identity", "authentication" }.Any(word => message.Contains(word, StringComparison.OrdinalIgnoreCase));
     private void SetConnection(IEngineConnection connection, string session) { lock (_sync) { _connection = connection; _sessionId = session; _equalizerReady = false; _sentStandby = null; } }
     private void ClearConnection(IEngineConnection connection) { lock (_sync) if (ReferenceEquals(_connection, connection)) { _connection = null; _sessionId = null; _equalizerReady = false; _sentStandby = null; } }
@@ -793,8 +806,10 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private static async Task<string> ResolveAsync(string host, CancellationToken cancellation)
     {
         if (IPAddress.TryParse(host, out var literal) && literal.AddressFamily == AddressFamily.InterNetwork) return host;
-        var addresses = await Dns.GetHostAddressesAsync(host, cancellation).ConfigureAwait(false);
-        return addresses.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork)?.ToString() ?? throw new IOException(L.Format("Cannot resolve IPv4 address: {0}", host));
+        IPAddress[] addresses;
+        try { addresses = await Dns.GetHostAddressesAsync(host, cancellation).ConfigureAwait(false); }
+        catch (SocketException error) { throw new NetworkFailure(L.Format("Cannot resolve IPv4 address: {0} ({1})", host, error.Message)); }
+        return addresses.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork)?.ToString() ?? throw new NetworkFailure(L.Format("Cannot resolve IPv4 address: {0}", host));
     }
     private async Task RestoreAudioAsync()
     {
