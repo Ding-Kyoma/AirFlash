@@ -1588,7 +1588,7 @@ P2-13b 已把协商改成「先探测全组、再算一个 `TimingPlan`、最后
 
 ---
 
-### Q34. Q32 修复落地后的三个取值与真机行为 `[待答复]`
+### Q34. Q32 修复落地后的三个取值与真机行为 `[已确认]`
 
 P3-3 已按 Q32 §五 改掉死锁：`we_hold_session` 不再 latch，改成每轮按
 `rtp_healthy` + `ended_at` 实时推导（RTP 健康无条件优先；`ended_at` 只在不
@@ -1621,6 +1621,177 @@ P3-3 已按 Q32 §五 改掉死锁：`we_hold_session` 不再 latch，改成每�
    回收后以 `preempted(limit)` 让步、不再自动重连。这个等待时间是否太短？
    是否应把 `BUSY_LIMIT` 放宽到 5–10（15–30 s）？Q32 只说「到上限就重新判定，
    不是永远排队」，没有给时间尺度。
+
+> **答复**：**第 2 问有硬答案，而且结论和你的实现相反 —— WAC 明确「保持健康媒体会话」。第 3 问的缺失维度也找到了：WAC 用 TCP 探针，不是 RTP 反馈。**
+>
+> ## 一、第 2 问（最关键）：`/feedback` 回 403，WAC 不结束会话
+>
+> 〔串〕`session/tick.rs`，就在你问的那个位置附近：
+> ```
+> AirPlay 2 feedback rejected by <ip> with status <n>; keeping healthy media session
+> ```
+>
+> **"keeping healthy media session" 是 WAC 明确写下的一句话，而且是它对「feedback 被拒绝」的唯一分支** —— 不区分 403 还是别的状态码，一律保持。
+>
+> 〔串〕同一段的完整决策树：
+> ```
+> AirPlay 2 feedback rejected by <ip> with status <n>; keeping healthy media session
+> feedback timeout (TCP reachable)
+> feedback timeout and TCP probe failed
+> feedback error: <e>
+>
+> RAOP feedback to <ip> timed out and TCP probe failed (<err>)
+> RAOP feedback to <ip> failed (<err>)
+> RAOP device <ip> unresponsive; scheduling reconnect
+> Grouped RAOP feedback failed for <ip>, tcp_reachable=<b>
+> ```
+>
+> | 情况 | WAC 的动作 |
+> |---|---|
+> | feedback 被**拒绝**（任意 status，**含 403**） | **保持媒体会话**，不结束、不重连 |
+> | feedback **超时**但 TCP 可达 | 降级为「控制通道有问题」，媒体继续 |
+> | feedback 超时 **+ TCP 探针也失败** | 判 `unresponsive` → `scheduling reconnect` |
+> | feedback 其他错误 | 记录 |
+>
+> ⇒ **你现在把 403 当 `authentication_failed` 硬失败、结束会话，是错的。** 按 WAC 的做法它应该：**记一条 warning，保持 RTP 继续发，什么都不动。**
+>
+> 理由也很清楚：`/feedback` 是**辅助通道**（上报接收器状态），它挂掉不影响音频数据面。WAC 整个设计里有一条很强的原则〔串〕：
+> ```
+> feedback failure is not media failure
+> ```
+> **这句话就是答案。** 你要改的不是「403 该不该降级」，而是「控制通道失败**永远**不该结束会话」。
+>
+> ## 二、第 3 问：缺的维度是 **TCP 探针**，不是 RTP 反馈
+>
+> 你说「引擎只有本地发送成功，没有接收器→发送端的 RTP 反馈」—— 对，而且**WAC 也没有**。它用的是更便宜的东西：
+>
+> ```
+> feedback timeout (TCP reachable)        ← 超时了，但 TCP 连得上 ⇒ 设备活着
+> feedback timeout and TCP probe failed   ← 超时 + 连不上 ⇒ 设备真没了
+> Grouped RAOP feedback failed for <ip>, tcp_reachable=<b>   ← 这个 bool 是一等诊断字段
+> RAOP feedback to <ip> timed out and TCP probe failed (<err>)
+> ```
+>
+> ⇒ **WAC 的「接收器侧活性」= 对控制端口做一次 TCP connect。** 成功即「还活着」，失败才判 unresponsive。
+>
+> ### 给 AF 的具体改法
+>
+> ```rust
+> enum ReceiverLiveness {
+>     Alive,      // TCP connect 成功
+>     Unknown,    // 探针本身出错（DNS/路由），不当作死亡
+>     Dead,       // connect 被拒/超时
+> }
+>
+> fn receiver_liveness(ip: IpAddr, port: u16, timeout: Duration) -> ReceiverLiveness {
+>     match TcpStream::connect_timeout(&(ip, port).into(), timeout) {
+>         Ok(_)                          => Alive,
+>         Err(e) if is_refused_or_timeout(&e) => Dead,
+>         Err(_)                         => Unknown,   // 宁可 Unknown，别误判
+>     }
+> }
+> ```
+>
+> 然后 `rtp_healthy` 的判定改成 **两维**：
+>
+> ```rust
+> // OursActive 需要「我们在发」+「接收器活着」
+> // 但注意：Dead 不立刻判抢占 —— dead 时 statusFlags 根本探不到，
+> //        应该走 fail-open 回收，而不是 BusyElsewhere
+> match (media_healthy, liveness) {
+>     (true,  Alive)   => OursActive,
+>     (true,  Dead)    => Reclaim,        // 设备没了，不是被抢
+>     (true,  Unknown) => OursActive,     // 保守：仍当自己的
+>     (false, _)       => 看 statusFlags,
+> }
+> ```
+>
+> **`Dead ⇒ Reclaim` 而不是 `BusyElsewhere`** 很重要：设备死了就没有「被别人占用」这回事。
+>
+> ## 三、第 1 问：三个值的依据
+>
+> ### 我把这段的格式串挖出来了，但**数字是运行时算的**〔析〕
+>
+> 格式串在 `0x1408d7dd8`，字节级布局（已逐字节确认）：
+> ```
+> 08 "HomePod "                                          ← 字面量 8
+> c0 0c " taken over "                                   ← 参数0(ip)，字面量 12
+> c0 1d " times in a row, each within "                  ← 参数1(count)，字面量 29
+> c0 39 " of a reclaim; it is in use from another device, yielding"  ← 参数2(秒)，字面量 57
+> ```
+> 三个参数：`ip` / **count** / **秒**。引用点 `0x140537767`（`lea rdx,[0x1408d7dc8]`）→ `0x14053776e`。
+>
+> **第三个参数是格式化出来的秒数，不是内联常数** —— 所以静态拿不到具体值（和 Q30 §6 的结论一致）。但它至少证明：**WAC 的窗口单位是「秒」，量级由代码算出来**，不是硬编码的 tick 数。
+>
+> ### 三个值我的意见
+>
+> | 参数 | 你的值 | 意见 |
+> |---|---|---|
+> | `ENDED_TRUST_WINDOW` | 2 s | ✅ **保持**。与 WAC `2 s gap window`、你自己 `MEDIA_HEALTH_WINDOW` 三处对齐，很干净 |
+> | `CONFIRM_DELAY` | 500 ms | ✅ **保持**。Q32 要的是「第二次确认」，不是「等足够久」；500 ms 远小于任何协议超时，纯粹是防抖动 |
+> | `BUSY_LIMIT` | 3 | ❌ **见 §四，这个值的语义有问题，不是大小问题** |
+>
+> ## 四、第 4 问：`BUSY_LIMIT=3` 的问题不在数值，在**它算错了东西**
+>
+> 你现在的链路是：
+> ```
+> BusyElsewhere → 3 s 后再探 → 连续 3 次 ⇒ 强制回收
+> 强制回收 × 3 ⇒ preempted(limit)，不再自动重连
+> ```
+> 总时长 **≈ 9 s** 就放弃。对「iPhone 上持续播放」这种**合法的长时间占用**，9 s 必然误判。
+>
+> ### 但真正的问题是：`BUSY_LIMIT` 不该度量「等了多久」，该度量「拉锯有多快」
+>
+> 回看 WAC 的原话〔串〕：
+> ```
+> taken over <n> times in a row, each within <n>s of a reclaim;
+>   it is in use from another device, yielding
+> ```
+>
+> 拆开看它数的是什么：
+> - **`in a row`** = 连续被抢（不是连续探测）
+> - **`each within <n>s of a reclaim`** = 每次都必须**紧跟在一次 reclaim 之后**
+>
+> ⇒ **它度量的是「抢回来又被抢走」的循环速度，不是「我排队等了多久」。**
+>
+> 这两者本质不同：
+>
+> | | 度量什么 | 正确的反应 |
+> |---|---|---|
+> | WAC 的计数器 | **抢了又被抢**的循环次数 + 时间窗 | 循环太快 ⇒ 对方真在用，`yielding` |
+> | 你的 `BUSY_LIMIT` | **排队探测**次数 | 排队久 ≠ 被抢，只说明设备忙 |
+>
+> 一个简单的场景就能暴露差别：用户用 iPhone 播了 10 分钟，AF 每 3 s 探一次。按你的规则 9 s 后就强制回收 —— **但一次都没被抢过**。
+>
+> ### 建议改成两级
+>
+> ```rust
+> // 第一级：BusyElsewhere 只是「排队」，不设上限 —— 但要退避
+> //   3 s, 6 s, 12 s, 24 s, 封顶 60 s。合法长占用会自然稳定在 60 s 一探。
+> //   永不因为「等太久」而强制回收。
+>
+> // 第二级：只有「真的被抢了又抢回来」才计数（这才是 WAC 的语义）
+> struct TakeoverCycle { consecutive: u32, last_reclaim: Instant }
+> const CYCLE_WINDOW: Duration = Duration::from_secs(30);   // WAC 的量级
+> const CYCLE_LIMIT:  u32      = 3;
+> // reclaim 后若在 CYCLE_WINDOW 内又被抢 ⇒ consecutive += 1，超窗重置为 1
+> // consecutive >= CYCLE_LIMIT ⇒ yielding：停止自动重连，
+> //   等显式触发（用户点播放 / 低频轮询发现 Free）才恢复
+> ```
+>
+> **关键差异**：`yielding` 之后**不是「等 9 s 再试」，是「停止自动重连，等一个外部触发」**。WAC 的 `yielding` 是终态（"it is in use from another device"），不是定时器。
+>
+> ⇒ 回答你的「要不要把 `BUSY_LIMIT` 放宽到 5–10（15–30 s）」：**方向对但不够**。放宽只是把误判从 9 s 推到 30 s，本质还是「按时间放弃」。**应该把「排队」和「被抢」彻底分开** —— 排队永不放弃（只退避），被抢的循环才计数。
+>
+> ## 五、一句话总结
+>
+> | 你的问题 | 结论 |
+> |---|---|
+> | 403 该不该结束会话 | ❌ **不该**。WAC：`feedback failure is not media failure`、`keeping healthy media session` |
+> | 缺的活性维度是什么 | **TCP connect 探针**（WAC 的 `TCP reachable` / `tcp_reachable=<b>`）；探针失败 ⇒ `unresponsive` ⇒ 重连，**不是** `BusyElsewhere` |
+> | `ENDED_TRUST_WINDOW` / `CONFIRM_DELAY` | ✅ 保持 |
+> | `BUSY_LIMIT` 数值 | ⚠️ **语义需重构**：排队（退避、永不放弃）≠ 被抢循环（计数、yielding） |
+> | `yielding` 之后怎么办 | **停止自动重连**，等显式触发或低频轮询发现 `Free`；不是定时重试 |
 
 ---
 
