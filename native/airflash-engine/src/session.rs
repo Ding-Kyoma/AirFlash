@@ -646,7 +646,7 @@ impl Member {
         // A receiver that restarted its PTP association is the other
         // corroborating fact a takeover leaves behind.
         if let Some(timer) = ptp
-            && self.selection.ptp
+            && self.compat.uses_ptp()
         {
             if let Some(at) = timer.association_changed_at(self.peer.host) {
                 self.health.preemption_association_changed(at);
