@@ -1250,7 +1250,7 @@ P3-3 已按 Q30 改成「live `GET /info` 的 `statusFlags` 判空闲 / 他人�
 
 ---
 
-### Q32. 真机上 bit17 会不会在我们自己播放时置位？「TEARDOWN / 403 ⇒ 会话已不属于我们」这个推断成立吗？ `[待答复]`
+### Q32. 真机上 bit17 会不会在自己播放时置位？「TEARDOWN / 403 ⇒ 会话已不属于我们」成立吗？ `[部分确认]`
 
 P3-3 已按 Q31 的位定义实现三分类：`statusFlags & 0x20000 == 0` ⇒ `Free`
 （回收）；置位且 `we_hold_session` ⇒ `OursActive`（`FallThrough`，不回收）；
@@ -1272,6 +1272,148 @@ P3-3 已按 Q31 的位定义实现三分类：`statusFlags & 0x20000 == 0` ⇒ `
    接管后短暂回旧值（bit17 仍置位），我们会判成 `OursActive` 并暂停探测，直到
    下一个控制面信号；如果短暂清零，我们会按 `Free` 立刻回收。前者是 Q31 §三
    「二次确认」想解决的问题，本次仍未实现。
+
+> **答复**：**第 2 问有硬答案 —— 在 WAC 的分类里 403 是「访问/认证」错误，根本不是「会话不属于我们」的信号。而且你这个设计有一个会导致永久卡死的死锁，见 §五。**
+>
+> ## 一、第 1 问：bit17 在「我们自己播放」时置不置位
+>
+> † 静态不可判定（真机行为）。但我能给你**一个不需要写代码、30 秒就能测完**的办法 —— 而且比我上一轮建议的更好：
+>
+> **`statusFlags` 同时存在于 mDNS TXT 的 `sf` / `flags` 里。** 所以只要用任意 mDNS 浏览器看就够：
+>
+> ```bash
+> # macOS
+> dns-sd -L "<HomePod 名>" _airplay._tcp local.
+> # 或直接看 TXT
+> dns-sd -B _airplay._tcp local.
+> ```
+> 在「空闲」「AF 正在播」「iPhone 接管中」三个时刻各看一次 `sf=` 的十六进制值。
+>
+> ⇒ 你甚至不用先实现探测就能拿到答案。**建议先做这一步再写 `ANOTHER_SENDER_BIT`。**
+>
+> ## 二、第 2 问：403 能不能当「会话已不属于我们」—— **不能，WAC 明确把它归到别的类**
+>
+> 〔串〕`airplay-client/src/connection.rs:1021` 附近的错误分类：
+> ```
+> <method> rejected with status <n>
+> access denied by receiver (HTTP 403)
+> <…> requires on-screen PIN pairing (HTTP 470)
+> <…> rejected by receiver (HTTP <n>)
+> ```
+>
+> 〔串〕`auth.rs`：
+> ```
+> authentication rejected
+> verification failed
+> pairing failed
+> invalid signature
+> Receiver refused PIN pairing (HTTP 403). On macOS, check AirPlay Receiver access and password settings
+> requires on-screen pin pairing
+> ```
+>
+> 〔串〕backend 的错误枚举（`session/codec.rs` 邻域）把 `403` 和这些并列：
+> ```
+> 403  pin  pairing  timed out  feedback  connection refused  network unreachable
+> broken pipe  reset by peer  i/o error  os error  415  unsupported …
+> ```
+>
+> **WAC 的模型里，403 = 「接收器拒绝了你的访问」**（密码/权限/PIN），`470` = 需要屏幕 PIN。
+> 它**从不**把 403 解释成「会话被抢走了」。
+>
+> ⇒ **你那条「未预期 `TEARDOWN` / `403` ⇒ 本成员永久记为已结束」的推断，方向是错的。**
+> 403 最可能的原因是**认证/权限状态变了**（HomePod 固件更新后要求密码、macOS 侧关了访问控制等），跟抢占无关。
+>
+> ## 三、WAC 真正的「媒体是否还在流」判据：**RTP 增量窗口**
+>
+> 〔串〕`session/tick.rs` 的 Control EOF 日志 —— 这才是你要抄的东西：
+> ```
+> Control EOF <…>: elapsed_ms=<n>, packet_delta=<n>, expected_~<n>,
+>                   underrun_delta=<n>, retransmit_delta=<n>, rtptime=<n>
+> 2 s gap window <…>
+> (no teardown; discontinuity would show as packet_delta expected or underrun_delta>0)
+> ```
+>
+> 注意两点：
+> 1. **窗口就是 2 s** —— 和你现在用的 2 s 一致，这个数是对的；
+> 2. 它判「媒体真的停了」靠的是 **`packet_delta` / `expected` / `underrun_delta` / `retransmit_delta`**，不是靠 RTSP 状态码。
+>
+> 〔串〕`session/control.rs` 的控制毒化决策矩阵：
+> ```
+> Apple TV group secondary control poison (receiver session dead, rtp_healthy=<b>)
+> Apple TV group primary control poison (receiver may be silent, rtp_healthy=<b>)
+> Solo Apple TV control poison and RTP unhealthy: <…>
+> Solo Apple TV control poison with healthy RTP <…> deferring teardown: <reason>
+> control dead and RTP path unhealthy
+> control degraded and RTP path unhealthy
+> Apple TV group secondary control degraded budget exhausted
+> ```
+>
+> ⇒ **控制面出问题 + RTP 健康 ⇒ 延迟 teardown**；**RTP 也不健康 ⇒ 才拆**。
+> 这和你 `we_hold_session = rtp_healthy` 的直觉**完全一致** —— 这一维你选对了。
+>
+> ## 四、第 3 问：接管瞬间 `statusFlags` 是新值还是旧值
+>
+> † 不可判定。但 WAC 的行为给了两个间接线索：
+>
+> 〔串〕`is playing another sender's session (statusFlags=0x<n>); checking again in <n>s`
+> ⇒ WAC **假定它会变，并靠重探兜底**。它没有"读一次就信"。
+>
+> 〔串〕`Receiver /info statusFlags changed since discovery for '<ip>': mDNS=0x<a>, live=0x<b>`
+> ⇒ 它**同时持有两份并对比**，说明两边都可能停滞。
+>
+> ⇒ 你 Q31 §三 想要的那个「二次确认」在这里**确实还是必要的**，而且现在有了第二个理由：不只是防「假 Free」，也防「假 Busy」。
+>
+> ## 五、⚠️ 你这个设计有个死锁，真机上一定会撞
+>
+> 你的规则是：**「未预期 TEARDOWN 或 403 之后，本成员永久记为已结束，直到回收重建」**。
+>
+> 把它和 §二 的结论连起来：
+>
+> ```
+> 403 到达（真实原因：认证/权限，会话其实还是我们的）
+>   → we_hold_session = false   （永久，直到回收）
+>   → 下次探测：statusFlags & 0x20000 != 0（因为会话确实是我们的）
+>   → 但我们不持有 ⇒ 判 BusyElsewhere
+>   → 3 s 后再探
+>   → 还是 BusyElsewhere …… 永远
+> ```
+>
+> **它永远等不到 `Free`，因为那个 bit 是你自己会话的置位；而 `we_hold_session` 被永久锁死为 false —— 于是永不回收。**
+>
+> WAC 用「连续计数 + yielding」正是为了打破这种僵局：**数到上限就重新判定，而不是永远排队**。
+>
+> ### 修法（二选一，建议都做）
+>
+> **① `we_hold_session` 必须可自愈，不能 latch。**
+> ```rust
+> // 不要永久记，改成按 RTP 健康度实时推导 + 有限期信任
+> fn we_hold_session(rtp_healthy: bool, ended_at: Option<Instant>) -> bool {
+>     if rtp_healthy { return true; }                       // RTP 还在发 ⇒ 肯定是我们的
+>     match ended_at {
+>         Some(t) => t.elapsed() < Duration::from_secs(2),  // 2 s 内信这个结论
+>         None    => true,
+>     }
+> }
+> ```
+> 注意第一行：**RTP 健康就无条件认为会话是我们的**，这比任何控制面信号都硬。403 到达但 RTP 还在出包，就是 WAC 那句 `control poison with healthy RTP → deferring teardown`。
+>
+> **② `BusyElsewhere` 也要计数，撞上限就强行回收。**
+> ```rust
+> // 排队次数上限；到顶就当作 Free 处理（fail-open），报 BusyElsewhereExhausted
+> if busy_retries >= BUSY_LIMIT { reclaim(); }
+> ```
+> 这是 WAC 的 `taken over in a row … yielding` 的镜像：它能认输，你也要能**脱身**。
+>
+> ## 六、一句话总结
+>
+> | 你的设计 | 结论 |
+> |---|---|
+> | `rtp_healthy` 当 `we_hold_session` 的主要证据 | ✅ **对**，与 WAC 的 `control poison + healthy RTP → defer` 一致 |
+> | 2 s 窗口 | ✅ **对**，WAC 的 `2 s gap window` 就是它 |
+> | 「403 ⇒ 会话已结束」 | ❌ **错**，WAC 把 403 归为认证/访问错误；这是死锁的源头 |
+> | 「永久记为已结束」 | ❌ **必须改成可自愈**，否则永远卡在 `BusyElsewhere` |
+> | `BusyElsewhere` 无限重试 | ❌ **要加上限**，否则没有出口 |
+> | 接管瞬间二次确认 | ✅ **仍需要**（防假 Free，也防假 Busy） |
 
 ---
 
