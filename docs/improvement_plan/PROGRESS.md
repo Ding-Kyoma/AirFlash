@@ -93,17 +93,38 @@
 会话循环每秒用 `check_control(media_healthy)` 判定：只有「媒体也停了」才把降级
 升级为终止。窗口 2 秒。
 
-## P3-1 `mrCommand` 解析（已完成）
+**PTP 失步按 Q16 #3 改成「冻结」而不是拆会话**：`clock.rs` 新增
+`timeline_frozen()`，交换停止后仍用最后一次 offset 继续映射，最长
+`CLOCK_FREEZE_GRACE = 10 s`；进入/退出冻结各发一条 `clock_frozen` 警告
+（`recovered` 区分）。超过宽限、或对端从未应答，才发 `clock_lost` 结束会话。
+Q16 的原话是「off = 冻结 correction，不是计时拆会话」——10 秒这个数是我们自己
+的耐心上限，不是 WAC 的。
 
-`native/airflash-engine/src/events.rs`
+**事件通道有限次重建（Q16 #2）**：多设备策略是「保留共享 RTP，除非媒体面失败」，
+所以我们只在**事件通道**上重连：`Member` 记住 `event_addr` 与密钥，事件通道
+降级后最多重建 3 次、每次间隔 2 秒，成功则 `clear_degraded()` 并发
+`event_channel_rebuilt`（`recovered: true`），失败只发警告。音频链路全程不动。
+Q16 #1 提到的「加密 RTSP 不能中途换密钥」对我们不适用：AF 用的是同一把
+`Events-*` 密钥，重开连接不需要重新配对。
 
-事件通道的 body 过去被 `200 OK`  acknowledgment 后直接丢弃。现在解析
+## P3-1 `mrCommand` 解析与执行（已完成）
+
+`native/airflash-engine/src/events.rs`、`AirFlash.Core/RemoteCommand.cs`、
+`AirFlash.App/Input/MediaKeys.cs`
+
+事件通道的 body 过去被 `200 OK` acknowledgment 后直接丢弃。现在解析
 `mrCommand` / `command` / `cmd` / `action`，同时接受字符串与 MRP 数字编码，
 支持命令数组与可选 `volume`（0–1、0–100、dBFS 三种线上形式），以
 `remote_command` 事件转给桌面端。无法识别的 body 返回空结果而不是报错，
 事件通道不会因为一条怪消息掉线。
 
 队列有界（32 条），超限丢最旧的并计数。
+
+按 Q25 的答复补上**执行端**：`RemoteCommand` 把命令映射到媒体键
+（`play/pause/toggle`→`VK_MEDIA_PLAY_PAUSE`、`next`→`VK_MEDIA_NEXT_TRACK`、
+`previous`→`VK_MEDIA_PREV_TRACK`、`stop`→`VK_MEDIA_STOP`），由
+`MediaKeys.Press()` 用 `SendInput` 注入；音量类命令没有对应媒体键，留给应用
+自己处理。注入失败只记日志，不影响推流。
 
 ## P1-8 掩盖升级（已完成）
 
@@ -160,8 +181,29 @@ Wi-Fi AP 把音频放进 WMM 语音队列。QoS 服务被禁用或缺失时注�
 
 - 新「自适应」模式（`LatencyMode = "adaptive"`）：默认仍是 `normal`，用户显式选择后
   才启用；设备级覆盖仍然优先。
-- 上调：一分钟内出现 3 次 `timeline_reanchored` / `sender_late_recovered` 就上一级，
-  每分钟最多一级；下调：干净窗口后逐级回落，不低于下限。
+- 上调：两条判据，任一满足就上一级，每分钟最多一级
+  1. 一分钟内 3 次 `timeline_reanchored` / `sender_late_recovered`（突发性迟到）；
+  2. **慢性 p99 迟到**（Q22 指出的盲区）：引擎每秒 `transport_metrics` 里的
+     `lateness.p99_ms` 连续 10 次 ≥ 3 ms。这类流的延迟从不触及重锚预算，
+     只看「恢复次数」永远发现不了。
+- 下调：干净窗口后逐级回落，不低于下限。
+
+## P3-2 连接前预判（按 Q18 的答复修正）
+
+`profile.rs`
+
+Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<<41` 零命中）。
+现在改成：
+
+- **AirPlay 2 判据**：`features & bit40 != 0` **且** `srcvers >= 354.54.6`（与
+  `SupportsAirPlay2` 一致），`bit41` 不再单独产生任何结论。
+- **PTP 由型号 + 拓扑决定**，不是 feature bit：`ptp_expected()` 里 HomePod /
+  `AudioAccessory` → PTP，Apple TV → NTP，未知型号 → 回到 AirPlay 2 判据。
+  为此 `negotiate_with()` 多带 `/info` 的 `model` 与 `sourceVersion`；旧的四参
+  `negotiate()` 保留给能力预测（那里没有型号信息，用 `inherited_ptp = false`
+  只按对端自述预测）。
+- 显式 `timing: ptp` 在「型号明确说 NTP」或「既无型号支持也无 AirPlay 2 证据」时
+  直接报错，不再放行。
 
 ---
 
@@ -192,16 +234,38 @@ Wi-Fi AP 把音频放进 WMM 语音队列。QoS 服务被禁用或缺失时注�
 
 ---
 
+## P2-14 诊断导出（已完成脱敏与导出）
+
+`native/airflash-engine/src/telemetry.rs`、`AirFlash.Core/DiagnosticExport.cs`、
+设置页「导出诊断信息」按钮
+
+- 引擎 `telemetry::redact()`：按 key（`host`/`ip`/`mac`/`path`/`receiver_id` 等）
+  与自由文本里的 IPv4/MAC 一起替换成**稳定假名**（`host-1`、`host-2`…，同一地址
+  全篇同名），`secret`/`password`/`key`/`authorization`/`token` 直接 `[redacted]`；
+  所有计数器、直方图、版本号原样保留。`diag_summary` 现在返回脱敏后的快照。
+- 桌面 `DiagnosticExport`：向引擎要一份脱敏快照（没有引擎时返回 null 而不是抛错），
+  拼上 app/engine 版本、OS、CPU 数、日志尾部 80 行，写到日志目录的
+  `AirFlash-diagnostics-<时间戳>.json`，并打开该目录。
+- 测试：脱敏（同一主机同一假名、自由文本里的 IP 也被替换、数字不变）、快照往返、
+  无引擎不抛错、文件命名。
+
+## P2-12 组拓扑原子化（已完成）
+
+`session.rs`
+
+- **原子性本来就有**：`Member` 的 `Drop` 会调 `close()`，`session_started` 为真时
+  发 `TEARDOWN`，所以第 N 个成员失败时，前 N-1 个随 `Vec` 一起被拆掉，接收端
+  不会看到「半配好的立体声对」。
+- 本轮补的是**重试**：每个成员最多重试 1 次（间隔 400 ms），失败时先发
+  `member_setup_retry` 警告再重连；仍然失败才把 `setup` 错误上抛，由上面的
+  RAII 负责回滚。
+
 ## 还没做
 
 | 项目 | 现状 | 备注 |
 | --- | --- | --- |
 | P1-10 标定流程 | 未开始 | 需要真机测延迟/丢包，按报告是「用户自助标定」 |
-| P2-12 组拓扑原子化 + 失败回滚 | 未开始 | 屏障已有（全部 connect 后才等 PTP）；缺的是中途失败时 `TEARDOWN` 已建好的成员并重试 |
 | P2-13 兼容 profile | 未开始 | 把散落的 if 收成 `CompatBehavior`，按 `srcvers`/`model` 指纹选择 |
-| P2-14 诊断导出 | 部分 | `diag_summary` + `--self-check` 已能给结构化引擎摘要；缺脱敏与实际导出文件 |
-| P3-1 反向控制的执行端 | 部分 | 引擎已解析事件并转 `remote_command`；桌面端还没真去控制播放器（Q25：`SendInput` + `VK_MEDIA_*`） |
-| P3-2 连接前预判（TXT bit40） | 未开始 | Q18 已指出我们现在用的 **bit41 是错的**，应先改判据 |
 | P3-3 抢占检测 | 未开始 | 按 Q18 用「未预期 TEARDOWN + 随后重新 announce」组合特征 |
 | P3-4 MRP 隧道 | 未开始 | 大工程 |
 | P3-5 经典 RAOP / 初代 AirPlay | 未开始 | 大工程 |
@@ -221,7 +285,6 @@ Wi-Fi AP 把音频放进 WMM 语音队列。QoS 服务被禁用或缺失时注�
 | ~~P2-11 QoS（Q26）~~ **已按答复改成 qWAVE** | 进程级 `QOSCreateHandle`（`OnceLock` 持有到退出）+ `QOSAddSocketToFlow` + `QOSTrafficTypeVoice`；服务不可用时返回 false，只记 `qos_marked` |
 | **[否决]** P0-4 SMTC 策略（Q12） | 2 s 轮询 + 300 ms 稳定窗 | 按答复改成事件驱动（SMTC 的 `MediaPropertiesChanged`/`TimelinePropertiesChanged`），进度策略按答复的阈值 |
 | ~~P0-3 伺服常数（Q5/Q6）~~ **已按答复修正** | 外层改为 `correction_ppb = filtered_ns / 20`（50 ppm/ms），夹 ±50 ppm，**无积分项**；engage >5 ms / release ≤1 ms 非对称迟滞；250 ms 断点改为**整机重置**（filter/correction/engaged 全清零再预热）；饱和静默计数 |
-| P0-2 自适应判据（Q22） | 一分钟 3 次时间线恢复 | 保留该策略层，但**必须叠加 p99 迟到**，否则对慢性迟到不敏感 |
 | P3-1 遥控命令（Q25） | 解析 RTSP 事件里的 `mrCommand` | 同时接受 `SendInput` + `VK_MEDIA_*` 的输入事件路径 |
 | P1-9 事件通道（Q16/Q25） | EOF 后整条会话重启 | 按答复的重建策略细化（不重建音频链路） |
 

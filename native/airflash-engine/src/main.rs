@@ -555,9 +555,12 @@ fn main() {
                 send(&request.id, &request.session_id, json!({"event":"stopped"}));
             }
             "diag_summary" => {
-                // One-shot, redacted snapshot for issue reports: no host names,
-                // no credentials, no file paths beyond the engine's own version.
-                let latest = airflash_engine::telemetry::diagnostics();
+                // One-shot, redacted snapshot for issue reports: hosts and paths
+                // become stable pseudonyms, credentials are dropped, and every
+                // counter keeps its value.
+                let latest = airflash_engine::telemetry::redact(
+                    &airflash_engine::telemetry::diagnostics(),
+                );
                 send(
                     &request.id,
                     &request.session_id,

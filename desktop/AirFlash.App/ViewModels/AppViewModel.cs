@@ -7,6 +7,7 @@ namespace AirFlash.App.ViewModels;
 public sealed class AppViewModel : ObservableObject, IAsyncDisposable
 {
     private readonly ISettingsStore _store;
+    private readonly IEngineFactory _factory;
     private readonly IDiscoveryService _discovery;
     private readonly IAutostart _autostart;
     private readonly IAudioService _audio;
@@ -110,6 +111,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         RetryEngineCommand = new(() => _engine?.InitializeAsync() ?? Task.CompletedTask, ShowError, () => EngineFailed && !_closing);
         if (_engine is not null) _engine.Changed += EngineChanged;
         _store = store; _discovery = discovery; _autostart = autostart; _audio = audio; _dispatcher = dispatcher;
+        _factory = factory;
         Applications = applications ?? new ApplicationCatalog(factory);
         Endpoints = new(audio, dispatcher);
         Endpoints.DevicesChanged += OnEndpointsChangedAsync;
@@ -118,6 +120,13 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         _discovery.SetInterface(_settings.DiscoveryInterfaceId);
         Session = new(factory, audio, AppPaths.Log);
         Session.Changed += SessionChanged;
+        // A receiver's own buttons arrive as transport commands; forward them to the
+        // media keys so the app that is playing reacts, without touching the stream.
+        Session.RemoteCommandReceived += command =>
+        {
+            if (command.VirtualKey is not { } key) return;
+            _dispatcher.BeginInvoke(() => AirFlash.App.Input.MediaKeys.Press(key, AppPaths.Log));
+        };
         // Now Playing is polled from SMTC and pushed only when it actually changed;
         // the engine turns it into the receiver's SET_PARAMETER payloads.
         NowPlaying = new NowPlayingPump(new AirFlash.App.Metadata.SmtcNowPlayingSource(AppPaths.Log), log: AppPaths.Log);
@@ -590,6 +599,27 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         ResetCompleted?.Invoke();
     }
     public string Diagnostics() => $"AirFlash {AppPaths.DisplayVersion} / WPF\n" + L.Format("Engine: {0}\nStatus: {1}\n{2}\nLocal p95: {3}\nQueue age: {4}\nUnderruns: {5}; drops: {6}\nEnd-to-end latency: not measured", EngineVersion, StatusTitle, StatusDetail, MonitorLatency, MonitorQueue, MonitorUnderruns, MonitorDrops) + "\n" + System.Text.Json.JsonSerializer.Serialize(_snapshot.Diagnostics, AppSettings.JsonOptions);
+    /// <summary>Write a redacted diagnostic bundle into the log folder and open it.
+    /// The engine's own snapshot arrives pseudonymised; the log tail is included
+    /// as-is, so the user can see exactly what would be shared.</summary>
+    public async Task<string> ExportDiagnosticsAsync()
+    {
+        var snapshot = await DiagnosticExport.SnapshotAsync(_factory).ConfigureAwait(false);
+        var tail = LogTail(80);
+        var bundle = DiagnosticExport.Compose(AppPaths.DisplayVersion, EngineVersion, snapshot, tail);
+        var path = DiagnosticExport.Write(AppPaths.LogDirectory, bundle);
+        AppPaths.Log($"Diagnostics exported to {path}");
+        return path;
+    }
+    private static IEnumerable<string> LogTail(int lines)
+    {
+        try
+        {
+            var file = Path.Combine(AppPaths.LogDirectory, $"wpf-{DateTime.Today:yyyy-MM-dd}.log");
+            return File.Exists(file) ? File.ReadLines(file).TakeLast(lines).ToArray() : [];
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { return []; }
+    }
     public ValueTask DisposeAsync() => new(_disposeTask ??= DisposeCoreAsync());
     private async Task DisposeCoreAsync()
     {

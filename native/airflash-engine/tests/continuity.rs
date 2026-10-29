@@ -131,6 +131,10 @@ fn feedback_retries_only_complete_transient_responses() {
             assert!(health.check().is_ok());
             assert!(health.check_control(true).is_ok(), "healthy media keeps playing");
             assert!(health.check_control(false).is_err(), "media stopped: now it is fatal");
+            // A rebuilt channel clears the verdict without touching the session.
+            health.clear_degraded();
+            assert!(health.control_degraded().is_none());
+            assert!(health.check_control(false).is_ok());
         } else {
             // Receiver rejected the session: reconnecting is the only fix, so this
             // stays a hard failure rather than a degradation.

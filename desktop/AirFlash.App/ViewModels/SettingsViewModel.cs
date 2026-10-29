@@ -89,6 +89,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     public RelayCommand RefreshReceiverProfilesCommand { get; }
     public RelayCommand OpenLogsCommand { get; }
     public RelayCommand CopyDiagnosticsCommand { get; }
+    public RelayCommand ExportDiagnosticsCommand { get; }
     public event Action<bool>? CloseRequested;
     public event Action? AddReceiverRequested;
     public event Action<Receiver>? PairRequested;
@@ -124,6 +125,16 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         RefreshAdaptersCommand = new(RefreshAdapters);
         OpenLogsCommand = new(() => { try { AppPaths.OpenLogs(); } catch (Exception error) { ShowError(error); } });
         CopyDiagnosticsCommand = new(() => { try { Clipboard.SetText(App.Diagnostics()); } catch (Exception error) { ShowError(error); } });
+        ExportDiagnosticsCommand = new(async () =>
+        {
+            try
+            {
+                var path = await App.ExportDiagnosticsAsync();
+                AppPaths.OpenLogs();
+                Progress = L.Format("Diagnostics saved to {0}", Path.GetFileName(path));
+            }
+            catch (Exception error) { ShowError(error); }
+        });
         AddReceiverCommand = new(() => { if (CanEdit) AddReceiverRequested?.Invoke(); }, () => CanEdit);
         AddGroupCommand = new(AddGroup, () => CanEdit && GroupCandidates.Count >= 2);
         LicensesCommand = new(() => new Ui.LicensesWindow().Show());

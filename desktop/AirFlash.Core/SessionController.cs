@@ -40,6 +40,10 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private bool _equalizerReady, _equalizerDisposed;
     private (bool Enabled, double Seconds)? _sentStandby;
     public event Action<string?>? EqualizerFeedback;
+    /// <summary>Raised when a receiver sends a transport command back (its own
+    /// buttons, or a remote pointed at it). The engine has already acknowledged it;
+    /// acting on it is the desktop's job.</summary>
+    public event Action<RemoteCommand>? RemoteCommandReceived;
     public Task PreviewEqualizerAsync(Guid owner, EqualizerSettings equalizer)
     {
         if (equalizer.Validate() is { } error) throw new ArgumentException(error, nameof(equalizer));
@@ -477,12 +481,15 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             log?.Invoke(L.Format("Now Playing deferred to the next session: {0}", error.Message));
         }
     }
-    private int _adaptiveLead = -1;    private long _recoveries;
+    private int _adaptiveLead = -1;
+    private long _recoveries;
     private long _recoveryWindow;
+    private readonly LatenessWatch _lateness = new();
     /// <summary>
     /// Walk the latency ladder one step up when the engine keeps having to recover
-    /// the timeline. Three recoveries inside a minute is a pattern, not a hiccup;
-    /// one step per minute keeps the adjustment inaudible.
+    /// the timeline, or when it is chronically late without ever recovering. Three
+    /// recoveries inside a minute is a pattern, not a hiccup; one step per minute
+    /// keeps the adjustment inaudible.
     /// </summary>
     private async Task AdaptLeadAsync(IEngineConnection connection, string session, long epoch, JsonElement item)
     {
@@ -492,13 +499,27 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         if (_recoveryWindow == 0 || Stopwatch.GetElapsedTime(_recoveryWindow, now) > TimeSpan.FromSeconds(60)) { _recoveryWindow = now; _recoveries = 0; }
         if (++_recoveries < 3) return;
         _recoveryWindow = now; _recoveries = 0;
-        var options = _settings.ReadOptions(_receiver.Id);
-        var plan = LatencyPolicy.For(_receiver, options.Codec == "auto" ? null : options.Codec, options.Timing is not "ntp");
+        await RaiseLeadAsync(connection, session, epoch, "repeated recoveries").ConfigureAwait(false);
+    }
+    /// <summary>Chronic lateness: the p99 of send lateness stays high without ever
+    /// reaching the re-anchor budget, so the recovery counter never fires.</summary>
+    private async Task AdaptLeadToLatenessAsync(IEngineConnection connection, string session, long epoch, TransportMetrics metrics)
+    {
+        if (_settings.LatencyMode != LatencyPolicy.Mode || _receiver is null) return;
+        if (!_lateness.Observe(metrics.LatenessP99Ms)) return;
+        await RaiseLeadAsync(connection, session, epoch, "sustained p99 lateness").ConfigureAwait(false);
+    }
+    private async Task RaiseLeadAsync(IEngineConnection connection, string session, long epoch, string reason)
+    {
+        if (_receiver is not { } receiver) return;
+        var options = _settings.ReadOptions(receiver.Id);
+        var plan = LatencyPolicy.For(receiver, options.Codec == "auto" ? null : options.Codec, options.Timing is not "ntp");
         var current = _adaptiveLead < 0 ? plan.Initial : _adaptiveLead;
         var next = LatencyPolicy.Next(current, plan, true);
         if (next == current) return;
         _adaptiveLead = next;
-        log?.Invoke(L.Format("Adaptive latency: raised the lead to {0} ms after repeated recoveries", next));
+        lock (_sync) { if (epoch != _generation) return; }
+        log?.Invoke(L.Format("Adaptive latency: raised the lead to {0} ms after {1}", next, reason));
         try { await connection.SendAsync(session, "set_lead", new { ms = next }, CancellationToken.None).ConfigureAwait(false); }
         catch (Exception error) when (error is IOException or ObjectDisposedException or InvalidOperationException) { _adaptiveLead = current; log?.Invoke(L.Format("Adaptive latency change failed: {0}", error.Message)); }
     }
@@ -622,6 +643,16 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                             }
                             PublishCurrent(epoch);
                         }
+                        else if (kind == "remote_command" && startedAt != 0)
+                        {
+                            lock (_sync) { if (epoch != _generation) continue; }
+                            foreach (var command in RemoteCommand.Parse(item))
+                            {
+                                log?.Invoke($"Remote command from {command.Host ?? "receiver"}: {command.Name}");
+                                try { RemoteCommandReceived?.Invoke(command); }
+                                catch (Exception error) { log?.Invoke($"Remote command {command.Name} failed: {error.Message}"); }
+                            }
+                        }
                         else if (kind == "warning" && startedAt != 0)
                         {
                             var notice = EngineNotice.Parse(item);
@@ -638,7 +669,9 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         }
                         else if (kind == "transport_metrics" && startedAt != 0)
                         {
-                            lock (_sync) { if (epoch != _generation) continue; _diagnostics = _diagnostics with { Transport = TransportMetrics.Parse(item) }; }
+                            var metrics = TransportMetrics.Parse(item);
+                            lock (_sync) { if (epoch != _generation) continue; _diagnostics = _diagnostics with { Transport = metrics }; }
+                            _ = AdaptLeadToLatenessAsync(connection, session, epoch, metrics);
                             var current = Snapshot; Publish(epoch, current.State, current.Message);
                         }
                         else if (kind == "capture_metrics" && item.TryGetProperty("metrics", out var metrics))

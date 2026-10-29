@@ -16,10 +16,16 @@ public sealed record MemberTransportMetrics(string Host, long? PacketsSent, long
             health.Boolean("feedback_delayed"), health.Integer("event_messages"), media.Number("receiver_latency_ms"), media.Boolean("receiver_latency_estimated"));
     }
 }
-public sealed record TransportMetrics(double? SessionUptimeMs, long? SenderLateRecoveries, long? SkippedPackets, double? MaxSendLatenessUs, IReadOnlyList<MemberTransportMetrics> Members)
+public sealed record TransportMetrics(double? SessionUptimeMs, long? SenderLateRecoveries, long? SkippedPackets, double? MaxSendLatenessUs, IReadOnlyList<MemberTransportMetrics> Members, double? LatenessP50Ms = null, double? LatenessP99Ms = null)
 {
-    public static TransportMetrics Parse(JsonElement item) => new(item.Number("session_uptime_ms"), item.Integer("sender_late_recoveries"), item.Integer("skipped_packets"), item.Number("max_send_lateness_us"),
-        item.TryGetProperty("members", out var members) && members.ValueKind == JsonValueKind.Array ? members.EnumerateArray().Select(MemberTransportMetrics.Parse).ToArray() : []);
+    public static TransportMetrics Parse(JsonElement item)
+    {
+        var lateness = item.TryGetProperty("lateness", out var histogram) && histogram.ValueKind == JsonValueKind.Object ? histogram : default;
+        return new(item.Number("session_uptime_ms"), item.Integer("sender_late_recoveries"), item.Integer("skipped_packets"), item.Number("max_send_lateness_us"),
+            item.TryGetProperty("members", out var members) && members.ValueKind == JsonValueKind.Array ? members.EnumerateArray().Select(MemberTransportMetrics.Parse).ToArray() : [],
+            lateness.ValueKind == JsonValueKind.Object ? lateness.Number("p50_ms") : null,
+            lateness.ValueKind == JsonValueKind.Object ? lateness.Number("p99_ms") : null);
+    }
 }
 public sealed record EngineNotice(string Code, string Host, string Channel, string Message, bool? Retryable = null)
 {

@@ -201,6 +201,7 @@
   "Send Windows system audio to an AirFlash receiver or an existing HomePod stereo pair.": "将 Windows 系统音频发送到 AirFlash 接收器。支持单个播放目标，以及现有 HomePod 立体声组合。",
   "GPLv3 or later, or commercial license · .NET / WPF / NAudio / Rust": "GPLv3 或更高版本，或商业授权 · .NET / WPF / NAudio / Rust",
   "Open log folder": "打开日志目录",
+  "Export diagnostics": "导出诊断信息",
   "Buy the author a cup of milk tea~": "请作者喝一杯奶茶~",
   "Thanks~": "感谢~",
   "WeChat and Alipay payment QR codes": "微信和支付宝收款二维码",
