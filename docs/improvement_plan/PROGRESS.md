@@ -343,52 +343,93 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   `features`，不带 `model`/`sourceVersion`，所以 IPC 里 `selected_timing` 的取值
   与改造前完全一致；要不要让预判跟运行时一样吃型号证据，记在 Q29。
 
-## P3-3 抢占识别（已完成）
+## P3-3 抢占识别（按 WAC 模型返工，已完成）
 
-`native/airflash-engine/src/preemption.rs`（新）、`rtsp.rs`、`transport.rs`、
-`clock.rs`、`session.rs`、桌面状态与文案
+`native/airflash-engine/src/preemption.rs`（重写）、`rtsp.rs`、`transport.rs`、
+`session.rs`、桌面状态与文案
 
-- **信号只收集，不立刻下结论**：`preemption::Signal` 只有三种——未预期
-  `TEARDOWN`（接收器主动发来的请求；我们自己的 `TEARDOWN` 响应不算）、RTSP
-  `403`、响应头 `Connection: close`。`Connection` 把接收器主动发来的请求暂存到
-  `unsolicited`，由 feedback worker 在轮询间隙统一 `drain`，没有散落到
-  SETUP/音量请求的 `if` 里；SETUP 期间收到则按通用 setup 失败处理。
-- **结论必须有旁证**：`Evidence::classify(now, WINDOW=3s)` 要求至少一个新鲜信号
-  加一个旁证——媒体健康从好到坏的那一次跳变（`media_stopped`），或 PTP Announce
-  的 clock identity 改变 / 对端静默超过其协商的 exchange timeout
-  （`association_changed`）。时间按绝对间隔配对，媒体先停、403 后到也能配对；
-  信号重复只刷新时间，不延长窗口。
-- **只有信号时回退**：窗口内没有旁证就等窗口结束，返回原来的通用故障
-  （`peer_teardown`、`peer_closed` 或 `authentication_failed`，retryable 不变），
-  不会把一次网络抖动说成抢占。
-- **结束方式**：结论成立时发一条现有形状的 `warning`（`code=preempted`、
-  `channel=control`、`recovered=false`，并带 `signals`/`corroboration` 列出证据），
-  Fault 为 `preempted`、`retryable=false`，消息明确要求手动重连；`Member`
-  置 `preempted` 后 `close()` **不再回发 TEARDOWN**，引擎也不重试。
-- **桌面**：新增 `PlaybackState.Preempted`，状态标题「已被其他设备接管」，详情
-  走本地化文案，状态区出现「重新连接」按钮；自动重连在 `preempted` 上显式短路，
-  只有用户按按钮才重新 `StartAsync`。`warning` 仍进入现有诊断/日志管道。
-- 测试：`preemption.rs` 表驱动谓词（三种信号各自单独出现都不是抢占；信号 +
-  两种旁证分别成立；窗口外旁证不配对；403 在 SETUP 是通用故障；自己发起的
-  `TEARDOWN` 不算；重复信号不延窗）；`clock.rs` 的 identity 变化时间戳与静默
-  判定；`session.rs` 的 localhost 假接收器在 feedback 过程中主动发 `TEARDOWN`，
-  断言 `preempted`、`retryable=false`、warning 证据、没有回发 `TEARDOWN`；
-  桌面 IPC 测试断言 `PlaybackState.Preempted`、本地化文案与 `OpenCount==1`
-  （不自动重连）。
+- **为什么返工**：上一版把「未预期 TEARDOWN / RTSP 403 / `Connection: close`」
+  当信号，再要求媒体停流或 PTP association 改变作旁证，才判 `preempted`；
+  没有旁证就退回通用故障。Q30 的答复指出这个方向反了：WAC 的权威判据是
+  **live `GET /info` 的 `statusFlags`**，控制面动作只是带上下文的证据，而且
+  **探测失败/超时反而照样回收**（fail-open）。原实现会把「接收器已被别人占用、
+  但本地媒体尚未停流」误判成普通网络故障，也会在探测不到时错过回收时机。
+- **唯一判据是 live probe**：新增 `ProbeOutcome { Free, BusyElsewhere, Unknown }`，
+  `probe()` / `probe_report()` 在**新开的 RTSP 连接**上发 `GET /info`，复用
+  `rtsp::Connection` 与二进制 plist 解析，不引入第二个 HTTP 客户端；默认超时
+  2 s，超时、连接失败、RTSP 错误、plist 错误都返回 `Err`。控制面三条线索
+  （未预期 TEARDOWN、403、`Connection: close`）只触发探测，不再参与判定。
+- **判决表**（`action_for` / `action_for_result`）逐条对应 Q30：
+  | 探测结果 | 动作 |
+  | --- | --- |
+  | `Free` | 立即回收 |
+  | `BusyElsewhere` | 3 s 后再探（排队，不是失败、不结束会话） |
+  | `Unknown` / `Err` / 超时 | 照样回收（fail-open，绝不落入通用故障分支） |
+- **位定义未知时的安全降级**：`statusFlags` 的位映射在 Q30 §6 里是「静态不可判定」。
+  只保留一个解释函数 `another_sender(flags) -> bool`，常量
+  `ANOTHER_SENDER_BIT: Option<u32> = None`。只要它还是 `None`，
+  `another_sender` 恒为 `false`，任何格式正确的 `statusFlags` 都只能得到
+  `Free`，绝不会产生 `BusyElsewhere`，也就不会因为猜错 bit 而永久排队；
+  原始 `statusFlags` 会原样写进 `preemption_probe` 日志，供真机对照。
+  单测用 0、1、`1<<31`、`0x8000_0000`、`u32::MAX` 等位图断言只可能是 `Free`。
+- **连续计数 + 时间窗 + yielding**：`TakeoverCounter` 按接收器（IP）计数，
+  每个 live 播放进程跨 reclaim 复用。`TAKEOVER_LIMIT=3`、
+  `TAKEOVER_WINDOW=30s`、`REPROBE_DELAY=3s`、`PROBE_TIMEOUT=2s` 都是**我们选的
+  值**，不是从 WAC 静态恢复的常数，注释里已标明（Q31 答复建议 re-probe 取
+  3–5 s，这里取了下限）。窗口内再次 takeover 计数
+  +1；超过窗口重置为 **1**（不是 0）；达到上限不再回收，返回不可重试的
+  `preempted` fault，`reason="limit"`，warning 也是 `reason="limit"`。单次
+  正常接管走 `reason="takeover"`；两种 reason 同时出现在 warning、fault 和
+  桌面文案里，用户能区分「被接管」与「反复被接管后让步」。
+- **回收在引擎内部完成**：live 循环捕获专用的 `preemption::Reclaim` 错误，
+  **不把它当故障上报**；旧 `Member` 被丢弃，`run_live` 用新连接重新
+  `run_stream`，`TakeoverCounters` 跨轮保留。有限时长探测没有 live 循环，
+  捕获 `Reclaim` 后转成终态 `PREEMPTED(takeover)`。这样桌面不需要新增自动
+  重连逻辑，正常会话行为也不变。
+- **旧连接必须中毒**：回收前 `Connection::poison()`，之后任何 `write` /
+  `finish_session` 都返回 `WireError::Poisoned`，不会把 TEARDOWN 或新请求
+  发回已被接管的会话；回收只能走新连接（与 Q16 的「加密 RTSP 不能中途
+  re-key」一致）。`run_live` 同时 `discard_stale()`，避免旧 capture backlog
+  灌进新会话。
+- **保留的边界**：我们自己发起的 `TEARDOWN` 仍不算抢占；`401` 仍是
+  `authentication_failed`，`454` 仍是 `session_rejected`；`403` 降级为证据
+  （`forbidden` warning/fault 可重试），不再冒充认证失败。`preempted` 的
+  `Member::close()` 仍不回发 TEARDOWN。
+- **不会形成重连风暴**：一个 live 循环里每个探测周期最多回收一次；busy 时
+  只排下一次探测，不重建会话；连续计数到上限立即让步。正常会话不探测，
+  只有控制面出现证据后才发一次 `/info`。
+- 测试：
+  - `preemption.rs` 表驱动单测：判决表六种组合、`Err` fail-open、未知位图
+    只可能 `Free`、缺字段/类型错误为 `Unknown`、原始 flags 保留、首
+    takeover 计 1、窗口内递增、窗口外重置为 1、到上限 yielding、按 IP
+    独立计数、busy 排队不缩短间隔。
+  - `tests/preemption_probe.rs`：localhost `/info` 服务器，验证两次探测各开
+    一条新连接、`GET /info`、任意未知位图都是 `Free`、无 `statusFlags`
+    为 `Unknown`、连接拒绝/静默超时为 `Err` 且判决为回收。
+  - `tests/rtsp_contract.rs`：中毒连接不写出任何请求，`finish_session` 也
+    不写 TEARDOWN。
+  - `session.rs`：假接收器主动发 TEARDOWN 后，完整 media 循环走
+    `PreemptionPoll::Reclaimed`，断言 `preempted`、旧连接中毒、warning
+    `reason=takeover`、证据行带 `policy`/`rtp_healthy`/`packets_prepared`、
+    probe 行带原始 `statusFlags`、没有回发 TEARDOWN；另有缺字段、探测失败、
+    连续上限三条路径。
+  - 桌面 `IpcFailureTests`：`reason=limit` 使用「反复接管后让步」文案，且
+    仍是 `PlaybackState.Preempted`、不自动重连。
 - **没做/没验证**：
-  - 没有真实 HomePod/接收器，也没有抓包。三种信号里只有「未预期 TEARDOWN」
-    在 localhost 上真实跑通；`403` 与 `Connection: close` 只有解析器/谓词单测，
-    没有真实对端触发。
-  - Windows 上已连接的 UDP socket 在对端 socket 关闭后仍返回成功，localhost
-    无法自然制造「媒体停止」；集成测试在假接收器发 `TEARDOWN` 的同时直接记录
-    旁证，真正的「健康→不健康」跳变由 `MediaTransport` 单测覆盖，未做真实网络
-    丢包下的时序验证。
-  - PTP 旁证只在 `clock.rs` 单测层验证（Announce identity 改变 / 静默超时），
-    没有把「信号 + PTP 重启」放进完整会话端到端跑一遍。
-  - 3 秒窗口与「至少一个旁证」是按现有故障节奏推的；真实接管时接收器先发
-    TEARDOWN、回 403 还是直接断流，见 Q30。
-  - 正常路径的协议字节没有变化；SETUP 的 401/403/454 仍走原有非重试路径，
-    没有被抢占分类接管。
+  - Q31 答复从 WAC 里恢复了 `ReceiverSessionActive = 0x20000`（字段本身是
+    64 位 `ulong`），但这个 bit 表示「接收器上有**任意**活动会话」，包括我们
+    自己的；要区分「另一个 sender」还需要 `we_hold_session` 这一维，而 AF 在
+    探测时仍自认为持有会话，控制面症状也不足以可靠地回答这个问题。所以
+    `ANOTHER_SENDER_BIT` 仍是 `None`：所有格式正确的 `statusFlags` 都按
+    `Free` 处理，不会误回收自己的会话，也不会永久排队。当前解析只取低 32 位；
+    若真机返回高位值，`u32::try_from` 失败会得到 `Unknown` 并 fail-open 回收。
+  - `TAKEOVER_LIMIT`、`TAKEOVER_WINDOW`、`REPROBE_DELAY`、`PROBE_TIMEOUT`
+    均为本地取值，未与 WAC 的运行时参数核对；Q31 还建议回收前隔 500 ms 再
+    确认一次 `Free`，本次没有实现，仍按 Q30 的单次探测决策。
+  - 没有抓包验证 HomePod 被接管时 `/info` 响应是否仍可读、是否要求认证、
+    `statusFlags` 是否在接管瞬间变化。
+  - 立体声对中一个成员在探测时最多阻塞 2 s；本地测试未覆盖两台接收器同时
+    被接管的时序。
 
 ## 还没做
 

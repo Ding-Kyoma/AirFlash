@@ -133,6 +133,16 @@ impl Connection {
         self.tx = Some(Cipher::new(tx));
         self.rx = Some(Cipher::new(rx));
     }
+    /// Declare this control connection unusable. A takeover ends the receiver
+    /// side of the encrypted RTSP session, and it cannot be re-keyed in place
+    /// (Q16), so a reclaim must open a fresh connection. Any later write fails
+    /// with [`WireError::Poisoned`] instead of reusing stale nonce state.
+    pub fn poison(&mut self) {
+        self.poisoned = true;
+    }
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
     pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
         self.cancel.check()?;
         if self.poisoned {
@@ -365,6 +375,9 @@ impl Connection {
     }
     /// Cancellation stops media immediately, but leaves a short teardown budget.
     pub fn finish_session(&mut self, uri: &str) -> Result<()> {
+        if self.poisoned {
+            return Err(WireError::Poisoned.into());
+        }
         let cancellation = std::mem::take(&mut self.cancel);
         let timeout = std::mem::replace(&mut self.timeout, Duration::from_millis(300));
         let result = self.request("TEARDOWN", uri, &[], &[]).map(|_| ());

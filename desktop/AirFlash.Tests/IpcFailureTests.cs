@@ -128,6 +128,25 @@ public sealed class IpcFailureTests
     }
 
     [Fact]
+    public async Task PreemptedAtTheTakeoverLimitUsesTheYieldMessage()
+    {
+        var connection = new Connection(); var factory = new Factory(connection); var audio = new Audio(false);
+        await using var controller = new SessionController(factory, audio, timing: Timing);
+        var preempted = Signal();
+        controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Preempted) preempted.TrySetResult(); };
+        await controller.StartAsync(Receiver(), Settings());
+        await connection.Starting.Task.WaitAsync(Limit);
+        connection.Current("error", new { code = "preempted", channel = "control", host = "192.0.2.10", retryable = false, reason = "limit", message = "Another controller keeps taking over this receiver" });
+        await preempted.Task.WaitAsync(Limit);
+        var failed = controller.Snapshot;
+        Assert.Equal(PlaybackState.Preempted, failed.State);
+        Assert.Equal("limit", failed.Diagnostics?.LastFault?.Reason);
+        Assert.Equal(L.Get("Another device keeps taking over this AirPlay session. AirFlash yielded and will not reconnect automatically."), failed.Message);
+        Assert.True(connection.Disposed);
+        Assert.Equal(1, factory.OpenCount);
+    }
+
+    [Fact]
     public async Task LifetimeCancellationRemainsIdleAndDisposesItsConnection()
     {
         var connection = new Connection(); var factory = new Factory(connection);

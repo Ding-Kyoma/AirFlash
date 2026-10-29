@@ -27,9 +27,13 @@ public sealed record TransportMetrics(double? SessionUptimeMs, long? SenderLateR
             lateness.ValueKind == JsonValueKind.Object ? lateness.Number("p99_ms") : null);
     }
 }
-public sealed record EngineNotice(string Code, string Host, string Channel, string Message, bool? Retryable = null)
+public sealed record EngineNotice(string Code, string Host, string Channel, string Message, bool? Retryable = null, string? Reason = null)
 {
-    public static EngineNotice Parse(JsonElement item) => new(item.Text("code", "engine_error"), item.Text("host"), item.Text("channel"), item.Text("message", L.Get("Audio engine error.")), item.Boolean("retryable"));
+    public static EngineNotice Parse(JsonElement item)
+    {
+        var reason = item.Text("reason");
+        return new(item.Text("code", "engine_error"), item.Text("host"), item.Text("channel"), item.Text("message", L.Get("Audio engine error.")), item.Boolean("retryable"), string.IsNullOrEmpty(reason) ? null : reason);
+    }
     public string Detail => string.Join(" · ", new[] { Message, Host, Channel, Code }.Where(s => !string.IsNullOrWhiteSpace(s)));
 }
 public sealed record PlaybackDiagnostics(long ReconnectCount = 0, EngineNotice? LastFault = null, StreamMetrics? CaptureBeforeFault = null,

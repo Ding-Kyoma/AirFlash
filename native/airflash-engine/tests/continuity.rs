@@ -1,6 +1,7 @@
 //! Short deterministic/local-network fault injection. Never connects to a speaker.
 use airflash_engine::{
     crypto::Cipher,
+    preemption::Signal,
     rtp::{PCM_BYTES, Packetizer, RATE, Retransmit},
     rtsp::{Cancellation, Connection},
     transport::*,
@@ -120,34 +121,22 @@ fn feedback_retries_only_complete_transient_responses() {
             fast(),
         )
         .unwrap();
-        if expected == vec![403] {
-            // A lone 403 is only a preemption signal. The generic authentication
-            // fault is held for the evidence window, then released unchanged.
-            let end = Instant::now() + Duration::from_secs(5);
-            let fault = loop {
-                if let Some(fault) = health.take_expired_preemption_fault(Instant::now()) {
-                    break fault;
-                }
-                assert!(
-                    Instant::now() < end,
-                    "deferred preemption fallback never expired"
-                );
-                thread::sleep(Duration::from_millis(20));
-            };
-            assert_eq!(fault.code, "authentication_failed");
-            assert_eq!(fault.channel, "feedback");
-            assert!(!fault.retryable);
-            drop(worker);
-            server.join().unwrap();
-            continue;
-        }
         until(|| health.snapshot().feedback_successes > 0 || health.control_degraded().is_some() || health.check().is_err());
         if expected.last() == Some(&200) {
             health.check().unwrap();
             assert_eq!(health.snapshot().feedback_failures, 2);
         } else if let Some(fault) = health.control_degraded() {
-            assert_eq!(fault.retryable, expected[0] != 403);
+            assert!(fault.retryable);
             assert_eq!(fault.channel, "feedback");
+            if expected == vec![403] {
+                // 403 is evidence, not an authentication verdict: the session
+                // thread probes the receiver's live statusFlags.
+                assert_eq!(fault.code, "forbidden");
+                assert_eq!(
+                    health.take_preemption_signals(),
+                    vec![Signal::Forbidden]
+                );
+            }
             // Control-plane faults no longer end a session whose media is healthy.
             assert!(health.check().is_ok());
             assert!(health.check_control(true).is_ok(), "healthy media keeps playing");

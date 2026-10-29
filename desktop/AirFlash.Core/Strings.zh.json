@@ -49,6 +49,8 @@
   "Connection error": "连接出错",
   "Taken over by another device": "已被其他设备接管",
   "Another device took over this AirPlay session. Reconnect to claim it back.": "另一台设备已接管本次 AirPlay 会话。重新连接以取回播放。",
+  "Another device keeps taking over this AirPlay session. AirFlash yielded and will not reconnect automatically.": "另一台设备反复接管本次 AirPlay 会话。AirFlash 已让步，不再自动重连。",
+  "Another device took over this AirPlay session. AirFlash reclaimed it.": "另一台设备接管了本次 AirPlay 会话，AirFlash 已重新取回。",
   "Reconnect": "重新连接",
   "Ready": "准备就绪",
   "{0} · target {1} ms": "{0} · 目标 {1} ms",

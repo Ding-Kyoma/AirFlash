@@ -1098,6 +1098,158 @@ TEARDOWN、回 403、直接断流，还是先改 PTP announce，也测不出这�
 
 ---
 
+### Q31. 真机上 `/info` 的 `statusFlags` 如何取值，探测在接管瞬间是否仍可用？ `[部分确认]`
+
+P3-3 已按 Q30 改成「live `GET /info` 的 `statusFlags` 判空闲 / 他人播放，
+探测失败或超时 fail-open 回收」。但以下事实没有真机无法确定，代码里因此保留
+`ANOTHER_SENDER_BIT = None`（在填上之前，每个格式正确的探测都只能得到 `Free`，
+不会产生 `BusyElsewhere`）：
+
+1. `statusFlags` 在 HomePod 空闲、AirFlash 自己播放、另一台控制器播放时分别是
+   什么值？哪个 bit 表示「另一个 sender 正在播放」？`/info` 的该字段是否
+   始终是 32 位无符号整数，还是某些型号是字符串/浮点？
+2. 接管瞬间（接收器刚把会话交给别人）`/info` 是否仍能立刻应答？是否需要
+   认证、会不会先回 403/454 或直接断开？这决定 `PROBE_TIMEOUT=2s` 是否够，
+   以及 fail-open 回收会不会在接收器尚未完成切换时过早触发。
+3. Q30 §6 没有静态恢复的四个运行时参数：连续上限、时间窗、
+   `checking again in <n>s` 的间隔、探测超时。当前取
+   `TAKEOVER_LIMIT=3` / `TAKEOVER_WINDOW=30s` / `REPROBE_DELAY=2s` /
+   `PROBE_TIMEOUT=2s`，都是本地选择；真机日志能否给出更接近 WAC 的值？
+4. WAC 的「live 与 mDNS 不一致时信 live」是否意味着接管后 mDNS TXT 仍可能
+   报告旧值？AirFlash 目前不缓存 mDNS 的 `statusFlags`，只信 live，但需要在
+   真机上确认这样不会在接管后读到过期的一份。
+
+> **答复**：**第 1 问有硬答案 —— WAC 里就有位定义，`ANOTHER_SENDER_BIT` 不用猜。第 2、3、4 问确实要真机，但每一问我能给你「该测什么 + 判据长什么样」。**
+>
+> ## 一、`statusFlags` 的位定义：WAC 有，而且不止一位〔码〕
+>
+> `WinAirCast.decompiled.cs:30026` 有一整个类专管这件事：
+>
+> ```csharp
+> public static class ReceiverStatusFlags
+> {
+>     public const ulong StereoPartnerUnreachable = 16384uL;   // 0x4000  bit14
+>     public const ulong ReceiverSessionActive    = 131072uL;  // 0x20000 bit17
+>
+>     public static bool IsStereoPartnerUnreachable(ulong sf) => (sf & 0x4000)  != 0;
+>     public static bool IsReceiverSessionActive(ulong sf)   => (sf & 0x20000) != 0;
+> }
+> ```
+>
+> 同一文件 `:29981` 还有一个：
+> ```csharp
+> public static class ReceiverAccessPolicy
+> {
+>     public const ulong PasswordRequiredFlag = 128uL;          // 0x80    bit7
+>     public static ReceiverAccess Classify(ulong sf, bool advertisesPassword, int? acl) {
+>         if (advertisesPassword || (sf & 0x80) != 0L) return PasswordRequired;
+>         if (acl.GetValueOrDefault() != 2)            return Open;
+>         return HomeMembersOnly;
+>     }
+> }
+> ```
+>
+> | bit | 常量 | 含义 |
+> |---|---|---|
+> | **7** | `PasswordRequiredFlag` | 需要密码 |
+> | **14** | `StereoPartnerUnreachable` | 立体声配对伙伴不可达 |
+> | **17** | `ReceiverSessionActive` | **接收器上有活动会话** |
+>
+> **类型是 `ulong`（64 位无符号）**，不是 32 位。C# 侧 `DiscoveredDeviceInfo` 的字段就是 `ulong StatusFlags`（`:12425`）。
+>
+> ## 二、⚠️ 但 `0x20000` 不等于「**另一个** sender 在播」
+>
+> 这是最要命的一处语义差。`ReceiverSessionActive` 的字面意思是「**有**活动会话」——**包括你自己的**。
+>
+> WAC 怎么区分？**它不靠单独的 bit，靠上下文。** 看它那条日志：
+> ```
+> HomePod <ip> is playing another sender's session (statusFlags=0x<n>); checking again in <n>s
+> ```
+> 「another sender's」这个判断发生在**回收流程里**（此时它本来就没持有会话），而不是靠某个 bit。
+>
+> ⇒ **AirFlash 的正确用法**：
+> ```rust
+> const STATUS_FLAG_RECEIVER_SESSION_ACTIVE: u64 = 0x20000;
+>
+> fn classify(sf: u64, we_hold_session: bool) -> Probe {
+>     if sf & 0x20000 == 0 {
+>         Probe::Free                       // 无人占用
+>     } else if we_hold_session {
+>         Probe::OursActive                 // 就是我们自己在用 —— 不是抢占！
+>     } else {
+>         Probe::BusyElsewhere              // 我们没会话但它有 ⇒ 别人在用
+>     }
+> }
+> ```
+> **你现在的 `ANOTHER_SENDER_BIT = None` 可以直接填 `0x20000`，但必须配上 `we_hold_session` 这一维**，否则会把自己正在播的会话误判成被抢占 —— 那会立刻触发一轮"回收"，把好好的会话打断。
+>
+> ## 三、第 2 问：接管瞬间探测还能不能用
+>
+> † 静态不可判定（需要真机）。但我能从 WAC 里给你**它假设了什么**：
+>
+> 〔串〕
+> ```
+> Receiver /info for '<ip>' has unexpected field types (<err>); continuing without the live probe
+> ```
+> ⇒ WAC 对 `/info` 的**任何解析异常都是容错的**，退回用发现阶段的数据继续。这就是 fail-open。
+>
+> 〔串〕`/info` 是**不认证**的裸 `GET`（同 `GET_PARAMETER`、`OPTIONS` 一个层），不走 HAP/FairPlay。
+>
+> **所以 `PROBE_TIMEOUT = 2s` 够不够，判据不是"够不够快"而是"答错了会怎样"**：
+>
+> | 情况 | 2 s 是否安全 | 理由 |
+> |---|---|---|
+> | 接管中 `/info` 仍答**旧值 `Free`** | **不安全** —— fail-open 会立刻回收，可能撞上正在切换的接收器 | 这是 2 s 真正的风险，不是超时 |
+> | `/info` 直接超时 | 安全 | 走 fail-open 回收，行为与 WAC 一致 |
+> | `/info` 回 403/454 | 安全 | 同上 |
+>
+> ⇒ **真正的防线不是调 timeout，是「回收前再确认一次」**。建议：
+> ```rust
+> // 探测说 Free，但先别急着 SETUP —— 隔一个短延迟再探一次
+> if probe()? .is_free() {
+>     sleep(CONFIRM_DELAY);            // 建议 500 ms，远小于 2 s
+>     if probe()?.is_free() { reclaim() }
+> }
+> ```
+> 这一手 WAC 没有（它是单次探测决策），但**代价极小、收益明确**，而且它不改变 fail-open 语义 —— 只是把"过早回收"的概率压下去。
+>
+> ## 四、第 3 问：四个运行时参数
+>
+> † 静态拿不到（已确认：`WINAIRCAST_` 环境变量里没有 takeover 相关项，二进制里 `WINAIRCAST_TAKEOVER` 0 命中）。
+>
+> 但你现在的本地选择**有一处值得改**：
+>
+> | 参数 | 你现在 | 我的意见 |
+> |---|---|---|
+> | `TAKEOVER_LIMIT` | 3 | **合理**。WAC 的语义是"连续 N 次"，3 是常见工程值。保持。 |
+> | `TAKEOVER_WINDOW` | 30 s | **合理**。窗口要显著大于一次 reclaim+播放的周期，30 s 站得住。 |
+> | `REPROBE_DELAY` | 2 s | **建议放宽到 3–5 s**。WAC 的 `checking again in <n>s` 是"排队"，不是"快速重试"。2 s 太急，会在对方刚建立的会话上反复敲门。 |
+> | `PROBE_TIMEOUT` | 2 s | **保持**，但配上面第三节的二次确认。 |
+>
+> **真机日志怎么给出更准的值**：让 AF 打一行带上下文的回收日志（照抄 WAC 的字段），跑几次真实接管后直接看分布：
+> ```
+> takeover probe: ip=<ip> sf=0x<n> we_hold=<b> probe_ms=<n> decision=<free|ours|busy|err> consecutive=<n> since_last=<ms>
+> ```
+> 有了 `probe_ms` 的 p99，`PROBE_TIMEOUT` 就有依据；有了 `since_last` 的分布，`TAKEOVER_WINDOW` 就有依据。
+>
+> ## 五、第 4 问：mDNS 会不会报旧值
+>
+> **会。WAC 那条日志就是证据**〔串〕：
+> ```
+> Receiver /info statusFlags changed since discovery for '<ip>': mDNS=0x<a>, live=0x<b>
+> ```
+> 两边**确实会不一致**，而且 WAC 专门为此打了一条日志 → 说明这是**常态**，不是异常。
+>
+> ⇒ **AirFlash「只信 live、不缓存 mDNS」的做法是对的**，不用改。而且这就是 WAC 的选择（它打印差异后以 live 为准）。
+>
+> 唯一的补充：**发现阶段仍然要用 mDNS 的 `sf`/`flags` 做初判**（决定要不要显示"可连接"），只是**决策回收时必须重新 live 探测**。别把两处混成一处。
+>
+> ## 六、一句话总结
+>
+> `0x20000` 填进去，但**加一维 `we_hold_session`**；`PROBE_TIMEOUT` 不用改，**加一次二次确认**；`REPROBE_DELAY` 从 2 s 放宽到 3–5 s；mDNS 只用于发现、live 只用于决策 —— 这两条记得别串。
+
+---
+
 ## 答复区
 
 > 已在每条条目下方就地回填（`> **答复**`）。下面是需要**优先改代码**的 4 条，按影响排序。
