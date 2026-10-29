@@ -124,7 +124,7 @@ internal static class UiSettingsRecovery
              "equalizer":{"enabled":true,"preamp_db":-3.5,"band_gains_db":[7.5,0,0,0,0,0,0,0,0,0],"unknown_eq":{"keep":"eq"}}}
             """);
         File.WriteAllBytes(path, original); var store = new SettingsStore(path); var initial = store.Load();
-        Check(initial.Validate() is null && initial.SchemaVersion == 4 && initial.CustomBufferMs == 2000 && initial.Extra?.ContainsKey("stream_sample_rate") != true, "valid settings: legacy migration validates, retires the global rate, and clamps the buffer", checks);
+        Check(initial.Validate() is null && initial.SchemaVersion == 5 && initial.CustomBufferMs == 2000 && initial.Extra?.ContainsKey("stream_sample_rate") != true, "valid settings: legacy migration validates, retires the global rate, and clamps the buffer", checks);
         var discovery = new FixtureDiscovery(); var audio = new FixtureAudio(); var engine = new UiSmoke.MockFactory();
         await using var app = new AppViewModel(store, discovery, new FixtureAutostart(), audio, engine, Application.Current.Dispatcher);
         app.Start(); await app.Startup.WaitAsync(TimeSpan.FromSeconds(5)); await Pump();
@@ -143,7 +143,7 @@ internal static class UiSettingsRecovery
 
     private static void VerifyFutureSchema(List<string> checks, string directory)
     {
-        var path = Path.Combine(directory, "future-schema.json"); var original = Encoding.UTF8.GetBytes("{\"schema_version\":5,\"auto_connect_on_discover\":true,\"start_at_login\":true}");
+        var path = Path.Combine(directory, "future-schema.json"); var original = Encoding.UTF8.GetBytes("{\"schema_version\":6,\"auto_connect_on_discover\":true,\"start_at_login\":true}");
         File.WriteAllBytes(path, original); var rejected = false;
         try { _ = new SettingsStore(path).Load(); }
         catch (NotSupportedException) { rejected = true; }

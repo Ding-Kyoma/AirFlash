@@ -1248,3 +1248,64 @@ Q24（同上）。
 - **没验证 / 待确认**：没有真机，无法验证真实 HomePod/Apple TV 的 TXT 是否
   会在运行中改变能力；升级前遗留混组的修复策略、以及缺少 TXT 证据（设备
   暂时离线）时严格布尔导致的提示语选择，见 Q45。
+
+## P3-2d 遗留混组迁移与运行期漂移（桌面，已完成）
+
+`desktop/AirFlash.Core/MixedGroupMigration.cs`（新增）、`GroupMembership.cs`、
+`SoftwareStereo.cs`、`Settings.cs`、`SettingsStore.cs`、
+`AirFlash.App/ViewModels/AppViewModel.cs`、`SettingsViewModel.cs`、
+`AirFlash.App/Ui/SettingsWindow.xaml`、`Converters.cs`、`App.xaml`、
+`AirFlash.Core/Strings.zh.json` / `Strings.zh-TW.json` / `Strings.de.json`
+
+- **同一种「发现混组」，两种相反处理**：旧版本保存的混组在旧规则下合法，
+  属**迁移**：可以自动拆、只做一次、结果确定、写日志。已按新规则保存、
+  后来设备 TXT 改变才变混的组属**运行期漂移**：绝不自动改配置，只解析为
+  不可用并给显式修复动作。把两者混成「每次发现混组就拆」会悄悄改掉用户
+  后来仍可能正常的配置，也会让一次性迁移变成常驻行为。
+- **版本与完成标记**：`AppSettings.CurrentSchemaVersion = 5`；
+  `SoftwareStereoGroup.MixedInvariantVersion` 记录该组是对着哪一版不变量
+  检查过（0 = 旧配置尚未检查）。`SettingsStore.Load` 在文件版本 < 5 且存在
+  未检查组时置 `MixedGroupMigrationPending`；pending 期间保存仍写
+  `PreMixedInvariantSchemaVersion = 4`，首次保存把原文件保成 `.pre-wpf.bak`，
+  完成时写 `.pre-v5.bak`，所以进程崩溃/断电不会让迁移被静默跳过。第二次
+  加载看到的就是已完成文件，`pending` 为 false。
+- **迁移在发现结果上执行**：配置里没有能力字段，只看 JSON 无法判断异构。
+  `AppViewModel.ReconcileDiscoveryAsync` 在每次发现时先调用
+  `MixedGroupMigration.Apply(settings, catalog, AppPaths.Log)`；成员用与连接
+  相同的 `SoftwareStereo.Member` 解析。左右任一离线/无 TXT 时保持未检查；
+  两边都有证据且同质时提前把标记提到 5（这样以后 TXT 再变就是漂移，永远
+  不会再被自动拆）；两边证据矛盾才拆。全部组完成（或拆掉）后
+  `CompleteMixedGroupMigration` 写 schema 5，迁移不会再进入。手工接收器
+  永远没有 TXT，属永久 `Unknown`，包含它的组直接完成检查、不拆，避免文件
+  永久停在 schema 4。
+- **拆分保留设备级设置**：`SoftwareStereo.Split` 只移除组记录和该组自己的
+  `settings.Receivers` 项（组级音量/延迟等），左右成员各自的音量、延迟、
+  codec、采样率、隐藏、自动连接和自定义名称全部原样保留；若
+  `LastReceiverId` 指向被拆组则清空。每拆一组写一行固定格式日志：
+  `mixed_group_migrated: ["左","右"] → ["左"], ["右"] (group "组名")`
+  （JSON 转义、非 ASCII 不转义），便于从日志核对拆分结果。
+- **`TryAdd` 只拒绝已证明的矛盾**：证据三值化在 `AirPlayEvidence`。
+  `Unknown`（离线、无 TXT、`srcvers` 缺失/不可解析）永远放行；只有
+  `Yes` vs `No` 在添加瞬间拒绝，仍显示既有两级文案。真正的裁决在
+  `SoftwareStereo.Resolve`：两侧证据都到齐后 `HasProvenConflict` 才判混，
+  组解析为 `Online=false`、`Members=[]`，但 `settings.SoftwareGroups` 完全
+  不变。`ClaimsAirPlay2Outdated` 按 Q36 是路由 false，与 classic 可同组，
+  与 `AirPlay2` 仍冲突。
+- **修复动作**：设置页对已保存的矛盾组显示「该软件立体声组当前无法使用。」
+  加既有两级文案，并把普通「拆分组」换成「拆分为两个独立接收器」
+  （`RepairCommand`，仅在 `HasMembershipConflict` 时可见）；`Unknown`
+  成员不是错误，只显示一条提示。三条新文案（不可用标题、修复按钮、
+  Unknown 提示）都进了 zh / zh-TW / de，英文 key 直接作为 key。
+- **测试**：新增 `MixedGroupMigrationTests`：旧混组拆一次、设备设置保留、
+  只写一行日志、第二次加载不再拆不再写日志；旧同质组只标记不拆；证据缺失
+  时推迟到 TXT 到达；手工接收器组直接完成不拆；运行期漂移不改配置、`Split`
+  修复且保留设备设置。`GroupMembershipTests` 拆成「classic 仍拒绝」和
+  「Unknown 接受」，并新增 `Resolve` 在证据到达后拒绝、修复前配置不变。
+  既有 `GroupMembershipTests` / `SoftwareStereoTests` / `GateFailureTests`
+  全过。schema 断言 4 → 5，未来版本测试 5 → 6。
+- **验证**：.NET 574 通过；pytest 141 通过；ruff 无问题；
+  `build-native.ps1 -Check` 通过（Rust 284 passed / 2 ignored，clippy
+  `-D warnings` 无告警，静态 CRT 与兼容性审计通过；未改 native）。
+- **没验证 / 待确认**：没有真机，无法验证真实设备在运行中改变 TXT 的行为，
+  也没有覆盖真实 HomePod 升级前后的混组配置；以上迁移/漂移结论来自
+  单元测试与合成 TXT。

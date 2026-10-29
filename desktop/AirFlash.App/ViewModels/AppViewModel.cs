@@ -263,6 +263,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     }
     private async Task ReconcileDiscoveryAsync(IReadOnlyList<Receiver> list)
     {
+        await MigrateMixedGroupsAsync(list);
         var currentSnapshot = Session.Snapshot;
         var discoverySession = currentSnapshot;
         var originalSettings = _settings.Clone();
@@ -328,6 +329,29 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
                 await Session.RefreshReceiverAsync(next, discoverySession, ReceiverMigrations);
         }
         ScheduleAutoConnect();
+    }
+    /// <summary>
+    /// Q45 one-time migration. The stored config version decides whether the
+    /// legacy split may run at all, but heterogeneity can only be proven with
+    /// TXT evidence, so the pass runs on the discovery catalog. Once every saved
+    /// pair is discharged (or split) the store persists schema 5 and this can
+    /// never run again; a TXT change after that is runtime drift and is never
+    /// auto-modified. Missing evidence leaves the pair pending, not split.
+    /// </summary>
+    private async Task MigrateMixedGroupsAsync(IReadOnlyList<Receiver> catalog)
+    {
+        if (_store is not SettingsStore store || !store.MixedGroupMigrationPending) return;
+        var report = MixedGroupMigration.Apply(_settings, catalog, AppPaths.Log);
+        if (MixedGroupMigration.IsSettled(_settings))
+        {
+            await store.CompleteMixedGroupMigrationAsync(_settings);
+            Notify(nameof(Settings)); SettingsChanged?.Invoke();
+        }
+        else if (report.Changed)
+        {
+            await SaveSettingsAsync(_settings);
+            Notify(nameof(Settings)); SettingsChanged?.Invoke();
+        }
     }
     private void MergeManualReceivers()
     {
