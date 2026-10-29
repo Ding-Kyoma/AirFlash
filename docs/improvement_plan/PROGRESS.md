@@ -679,10 +679,10 @@ Q24（同上）。
   `srcvers`、单机 AP2/classic/unknown 与组/软件组 `Detail`、门禁分类表
   （classic、密码、MFi、网络、未知、组内 classic、非 setup 不误标），以及
   3 条 `SessionController` 消息落地测试。
-- **验证**：本节提交在开发分支跑过——Rust lib 191 passed + 1 ignored、main 2、
-  集成 34 passed + 1 ignored（soak），共 227 passed / 2 ignored；clippy
-  `-D warnings` 无告警；`build-native.ps1 -Check` 通过；.NET 541 通过；
-  pytest 141 通过；ruff 无问题。
+- **验证**：本节提交在合并了 main（含 P3-3d）的树上跑过——Rust lib 198 passed
+  + 1 ignored、main 2、集成 34 passed + 1 ignored（soak），共 234 passed /
+  2 ignored；clippy `-D warnings` 无告警；`build-native.ps1 -Check` 通过；
+  .NET 541 通过；pytest 141 通过；ruff 无问题。
 - **P3-2 整体状态**：引擎半（`profile.rs::is_airplay2`、`ptp_expected`，见上文
   「P3-2 连接前预判」）此前已完成，本轮补完桌面半，因此 **P3-2 的引擎半和
   桌面半都已落地**。`还没做` 表里本来就没有 P3-2，不需要删除。
