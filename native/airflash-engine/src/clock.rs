@@ -337,6 +337,21 @@ impl PeerState {
                 .is_some_and(|at| now.duration_since(at) < SAMPLE_LIFETIME)
         })
     }
+    /// The last offset, kept alive for a grace window after the exchanges stop.
+    ///
+    /// The reference implementation freezes drift correction when PTP goes quiet
+    /// rather than ending the session, so the timeline keeps using the final
+    /// estimate until the caller's grace expires.
+    fn frozen_offset(&self, now: Instant, grace: Duration) -> Option<f64> {
+        let at = self.offset_at?;
+        if now.duration_since(at) > grace {
+            return None;
+        }
+        self.offset.or(self.sync_offset)
+    }
+    fn stale_for(&self, now: Instant) -> Option<Duration> {
+        self.last.map(|last| now.duration_since(last))
+    }
     /// Prefer a fresh delay measurement, then follow the ongoing Sync estimates
     /// when usable delay responses stop arriving.
     fn effective_offset(&self, now: Instant) -> Option<f64> {
@@ -936,19 +951,50 @@ impl PtpMaster {
             .is_some_and(|s| s.ready(Instant::now()))
     }
     pub fn timeline(&self, host: IpAddr, local_ns: u64) -> Result<(u64, u64)> {
+        self.timeline_frozen(host, local_ns, Duration::ZERO)
+            .map(|(id, network, _)| (id, network))
+    }
+    /// Same mapping as [`Self::timeline`], but a stale offset keeps working for
+    /// `grace`. The flag reports whether the offset was frozen, which is what the
+    /// session turns into a warning instead of a reconnect.
+    pub fn timeline_frozen(
+        &self,
+        host: IpAddr,
+        local_ns: u64,
+        grace: Duration,
+    ) -> Result<(u64, u64, bool)> {
         let states = self.states.lock().unwrap();
         let s = states.get(&host).context("unknown timing peer")?;
         if !s.follow {
-            return Ok((self.clock_id, local_ns));
+            return Ok((self.clock_id, local_ns, false));
         }
         let now = Instant::now();
-        anyhow::ensure!(s.ready(now), "receiver clock is not ready");
-        let offset = s.effective_offset(now).context("missing clock offset")?;
+        let (offset, frozen) = if s.ready(now) {
+            (
+                s.effective_offset(now).context("missing clock offset")?,
+                false,
+            )
+        } else {
+            (
+                s.frozen_offset(now, grace)
+                    .context("receiver clock is not ready")?,
+                true,
+            )
+        };
         let mapped = local_ns as i128 + offset.round() as i128;
         Ok((
             s.clock_id.context("missing receiver clock identity")?,
             u64::try_from(mapped)?,
+            frozen,
         ))
+    }
+    /// How long the peer has been silent, or `None` when it never answered.
+    pub fn stale_for(&self, host: IpAddr, now: Instant) -> Option<Duration> {
+        self.states
+            .lock()
+            .unwrap()
+            .get(&host)
+            .and_then(|s| s.stale_for(now))
     }
 }
 fn send_ptp(
@@ -1235,6 +1281,41 @@ impl Drop for PtpMaster {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_stale_offset_survives_only_inside_the_grace_window() {
+        let now = Instant::now();
+        let peer = PeerState {
+            offset: Some(1_500.0),
+            offset_at: Some(now),
+            ..PeerState::default()
+        };
+        // Fresh: the normal path returns it and nothing is frozen.
+        assert_eq!(peer.delay_offset(now), Some(1_500.0));
+        assert!(!peer.ready(now));
+        // Three seconds later the offset is stale for the regular path but still
+        // usable for a frozen timeline inside the grace window.
+        let later = now + Duration::from_secs(3);
+        assert_eq!(peer.delay_offset(later), None);
+        assert_eq!(
+            peer.frozen_offset(later, Duration::from_secs(10)),
+            Some(1_500.0)
+        );
+        assert_eq!(peer.frozen_offset(later, Duration::from_secs(2)), None);
+        // Without a measurement there is nothing to freeze.
+        let empty = PeerState::default();
+        assert_eq!(empty.frozen_offset(now, Duration::from_secs(10)), None);
+    }
+    #[test]
+    fn staleness_is_measured_from_the_last_exchange() {
+        let now = Instant::now();
+        let mut peer = PeerState::default();
+        assert_eq!(peer.stale_for(now), None);
+        peer.exchanged(now);
+        assert_eq!(
+            peer.stale_for(now + Duration::from_millis(700)),
+            Some(Duration::from_millis(700))
+        );
+    }
     #[test]
     fn readiness_requires_exchange_streak_and_expires() {
         let now = Instant::now();

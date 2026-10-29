@@ -328,6 +328,8 @@ struct Member {
     ready: bool,
     closed: bool,
     session_started: bool,
+    /// True while the timeline is running on a frozen PTP offset.
+    clock_frozen: bool,
 }
 impl Member {
     #[allow(clippy::too_many_arguments)]
@@ -430,6 +432,7 @@ impl Member {
             ready: false,
             closed: false,
             session_started: false,
+            clock_frozen: false,
         };
         // RAII owns the connection before SETUP so partial handshakes are torn down too.
         let sender_id = "02:57:32:41:50:01";
@@ -1164,10 +1167,23 @@ fn send_packets(
                     .check_control(member.media.media_healthy(Instant::now(), MEDIA_HEALTH_WINDOW))?;
             }
             if let Some(timer) = &ptp {
-                if members
-                    .iter()
-                    .any(|m| m.selection.ptp && !timer.ready(m.peer.host))
-                {
+                // PTP silence is not an immediate fault: the last offset keeps
+                // driving the timeline for a grace window (the reference
+                // implementation freezes drift correction here rather than ending
+                // the session). Only a peer that never answered, or one that stayed
+                // silent past the grace, ends the session.
+                let now = Instant::now();
+                if let Some(host) = members.iter().find_map(|m| {
+                    if !m.selection.ptp {
+                        return None;
+                    }
+                    match timer.stale_for(m.peer.host, now) {
+                        Some(stale) if stale <= CLOCK_FREEZE_GRACE => None,
+                        Some(_) => Some(m.peer.host),
+                        None if timer.ready(m.peer.host) => None,
+                        None => Some(m.peer.host),
+                    }
+                }) {
                     let hosts: Vec<_> = members
                         .iter()
                         .filter(|m| m.selection.ptp)
@@ -1175,11 +1191,7 @@ fn send_packets(
                         .collect();
                     emit(clock_status(timer, &hosts, "lost"));
                     return Err(Fault::new(
-                        hosts
-                            .iter()
-                            .find(|host| !timer.ready(**host))
-                            .map(ToString::to_string)
-                            .unwrap_or_default(),
+                        host.to_string(),
                         "clock",
                         "clock_lost",
                         true,
@@ -1298,7 +1310,26 @@ fn send_packets(
                         m.peer.profile.sync_offset_ms,
                     )?;
                     let (id, network) = if m.selection.ptp {
-                        let (id, t) = ptp.as_ref().unwrap().timeline(m.peer.host, local)?;
+                        let (id, t, frozen) = ptp.as_ref().unwrap().timeline_frozen(
+                            m.peer.host,
+                            local,
+                            CLOCK_FREEZE_GRACE,
+                        )?;
+                        if frozen != m.clock_frozen {
+                            m.clock_frozen = frozen;
+                            emit(json!({
+                                "event": "warning",
+                                "host": m.peer.host.to_string(),
+                                "channel": "clock",
+                                "code": "clock_frozen",
+                                "recovered": !frozen,
+                                "message": if frozen {
+                                    "PTP timing is stale; holding the last offset"
+                                } else {
+                                    "PTP timing is fresh again"
+                                },
+                            }));
+                        }
                         (Some(id), t)
                     } else {
                         (None, local)
@@ -1587,6 +1618,10 @@ const BRMCA_NEGOTIATION_TIMEOUT: Duration = Duration::from_millis(1_200);
 /// A receiver that has accepted RTP this recently is still listening, even if the
 /// control channel is unhappy.
 const MEDIA_HEALTH_WINDOW: Duration = Duration::from_secs(2);
+/// How long a stale PTP offset keeps driving the timeline. The reference
+/// implementation freezes drift correction on PTP silence instead of ending the
+/// session; ten seconds is our own patience limit before we do end it.
+const CLOCK_FREEZE_GRACE: Duration = Duration::from_secs(10);
 fn offset_time(base: u64, common: Duration, own: Duration, offset_ms: i32) -> Result<u64> {
     Ok(u64::try_from(
         base as i128 + common.as_nanos() as i128 - own.as_nanos() as i128
@@ -1693,6 +1728,7 @@ mod tests {
             ready: true,
             closed: false,
             session_started: true,
+            clock_frozen: false,
         };
         (member, receiver, worker)
     }

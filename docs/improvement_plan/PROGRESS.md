@@ -93,6 +93,13 @@
 会话循环每秒用 `check_control(media_healthy)` 判定：只有「媒体也停了」才把降级
 升级为终止。窗口 2 秒。
 
+**PTP 失步按 Q16 #3 改成「冻结」而不是拆会话**：`clock.rs` 新增
+`timeline_frozen()`，交换停止后仍用最后一次 offset 继续映射，最长
+`CLOCK_FREEZE_GRACE = 10 s`；进入/退出冻结各发一条 `clock_frozen` 警告
+（`recovered` 区分）。超过宽限、或对端从未应答，才发 `clock_lost` 结束会话。
+Q16 的原话是「off = 冻结 correction，不是计时拆会话」——10 秒这个数是我们自己
+的耐心上限，不是 WAC 的。
+
 ## P3-1 `mrCommand` 解析与执行（已完成）
 
 `native/airflash-engine/src/events.rs`、`AirFlash.Core/RemoteCommand.cs`、
