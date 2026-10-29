@@ -308,10 +308,11 @@ pub const LEAD_SHIFT_RESET_US: u64 = 5_000;
 pub struct RtpBaseline {
     /// The span the steady window actually covers: from its oldest sample to the
     /// pre-stall baseline sample. Never assumed to be
-    /// [`STEADY_WINDOW`](RtpEvidence::STEADY_WINDOW) — a re-anchor can leave a
-    /// gap in the samples, and dividing by a nominal 30 s instead of this makes
-    /// the steady fraction too small and *overestimates* the ratio, i.e. biases
-    /// toward the transport-fault side (Q47 §一).
+    /// [`STEADY_WINDOW`](RtpEvidence::STEADY_WINDOW). A session younger than the
+    /// window, or a re-anchor that skipped samples, covers less than 30 s; dividing
+    /// by the nominal 30 s then makes the steady fraction too small and
+    /// *overestimates* the ratio, i.e. biases toward the transport-fault side
+    /// (Q47 §一).
     pub baseline_span: Duration,
     /// Packets sent over the steady window; zero means the denominator has no
     /// volume to normalise by, so the relative test is skipped.
