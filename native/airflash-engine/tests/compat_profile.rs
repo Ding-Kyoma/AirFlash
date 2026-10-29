@@ -322,7 +322,7 @@ fn model_fingerprint_maps_to_its_timing_expectation() {
     }
 }
 
-/// The group rule from Q29: the whole group converges on one timing decision,
+/// The group rule corrected by Q33: every multi-device AirPlay 2 group is PTP,
 /// while a single receiver keeps exactly the rows above.
 #[test]
 fn group_plans_converge_on_one_clock_domain() {
@@ -341,27 +341,39 @@ fn group_plans_converge_on_one_clock_domain() {
         model: Some("AppleTV6,2"),
         name: None,
     };
-    // All members advertise AirPlay 2: PTP, exactly as the table expects.
+    let unknown_ap2 = TimingEvidence {
+        airplay2: true,
+        model: None,
+        name: None,
+    };
+    // All-HomePod group: PTP.
     assert_eq!(
         select_timing(&[homepod, homepod], Codec::Auto),
         Timing::Ptp
     );
-    // One member missing bit40 downgrades the entire group.
+    // Generic AirPlay 2 group (unknown vendors): PTP.
+    assert_eq!(
+        select_timing(&[unknown_ap2, unknown_ap2], Codec::Auto),
+        Timing::Ptp
+    );
+    // Mixed HomePod + Apple TV group: PTP, despite the solo Apple TV answer.
+    assert_eq!(
+        select_timing(&[homepod, appletv], Codec::Auto),
+        Timing::Ptp
+    );
+    // One member missing bit40 still downgrades the entire group.
     assert_eq!(
         select_timing(&[homepod, homepod_without_ap2], Codec::Auto),
         Timing::Ntp
     );
-    // Inside the AirPlay 2 branch the conservative member wins.
-    assert_eq!(
-        select_timing(&[homepod, appletv], Codec::Auto),
-        Timing::Ntp
-    );
-    // A single receiver is unchanged: a HomePod without bit40 still runs PTP.
+    // A single receiver is unchanged: a HomePod without bit40 still runs PTP,
+    // an Apple TV runs NTP, and a HomePod stays PTP even for PCM.
     assert_eq!(
         select_timing(&[homepod_without_ap2], Codec::Auto),
         Timing::Ptp
     );
     assert_eq!(select_timing(&[appletv], Codec::Auto), Timing::Ntp);
+    assert_eq!(select_timing(&[homepod], Codec::Pcm), Timing::Ptp);
 }
 
 #[test]
@@ -409,6 +421,51 @@ fn every_group_member_negotiates_the_shared_timing_decision() {
                 .uses_ptp()
         );
     }
+    // Mixed HomePod + Apple TV (both AirPlay 2): still one PTP domain, and the
+    // Apple TV is negotiated as a PTP participant even though its solo answer
+    // is NTP.
+    let appletv_info = info(
+        Some("AppleTV6,2"),
+        Some(BIT40),
+        Some("366.0"),
+        Some(REALTIME),
+        Some(BUFFERED_ALAC),
+    );
+    let appletv = CompatFingerprint::from_info(&appletv_info, &Profile::default(), &[]);
+    let plan = TimingPlan::select(
+        &[ap2.timing_evidence(), appletv.timing_evidence()],
+        Codec::Auto,
+    );
+    assert_eq!(plan.timing(), Timing::Ptp);
+    for fingerprint in [&ap2, &appletv] {
+        let compat = fingerprint
+            .negotiate_planned(plan, &profile, 44100, false)
+            .unwrap();
+        assert!(compat.uses_ptp());
+        assert_eq!(compat.timing_protocol(), "PTP");
+    }
+    // The group decision also governs an explicit per-member NTP request.
+    let explicit_ntp = Profile {
+        timing: Timing::Ntp,
+        ..profile.clone()
+    };
+    assert!(
+        appletv
+            .negotiate_planned(plan, &explicit_ntp, 44100, false)
+            .unwrap()
+            .uses_ptp()
+    );
+    // Solo, the same Apple TV keeps its characterized NTP answer.
+    assert_eq!(
+        TimingPlan::single(&appletv, Codec::Auto).timing(),
+        Timing::Ntp
+    );
+    assert!(
+        !appletv
+            .negotiate_planned(TimingPlan::single(&appletv, Codec::Auto), &profile, 44100, false)
+            .unwrap()
+            .uses_ptp()
+    );
     // A group of one member is the characterized single-receiver behaviour.
     let single = TimingPlan::single(&ap1, Codec::Auto);
     assert_eq!(single.timing(), Timing::Ptp);

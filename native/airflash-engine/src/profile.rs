@@ -163,10 +163,14 @@ impl TimingEvidence<'_> {
 /// and the session runtime.
 ///
 /// `members` is the whole group; a single receiver is a one-element slice.
-/// - Any member without AirPlay 2 evidence downgrades the whole group to NTP.
-/// - Inside the AirPlay 2 branch the group takes the conservative answer: a
-///   member that would run NTP on its own (an Apple TV solo) keeps the whole
-///   group on NTP, so one group never runs two clock domains.
+/// - Any member without AirPlay 2 evidence downgrades the whole group to NTP
+///   (WAC's `Any(!SupportsAirPlay2)` branch, which drives Classic RAOP).
+/// - Every multi-device AirPlay 2 group runs PTP, with no exceptions. WAC picks
+///   that branch from the topology (`n > 1`), never from the members' solo
+///   answers: a HomePod group, a mixed HomePod + Apple TV group and an
+///   unknown-vendor AirPlay 2 group all return PTP. "Solo Apple TV is NTP"
+///   only exists in the `n == 1` branch; inside a group the Apple TV is a PTP
+///   follower so the group keeps a single clock domain.
 /// - A single receiver keeps the exact behaviour the compatibility table
 ///   characterizes; only groups converge.
 ///
@@ -182,19 +186,14 @@ pub fn select_timing(members: &[TimingEvidence<'_>], codec: Codec) -> Timing {
         return first.solo_timing();
     }
     // Stage one is a whole-group gate: one member without AirPlay 2 evidence
-    // turns the group into the conservative NTP topology.
+    // turns the group into the Classic RAOP / NTP topology.
     if members.iter().any(|member| !member.airplay2) {
         return Timing::Ntp;
     }
-    // Stage two: one clock domain per group, conservative across members.
-    if members
-        .iter()
-        .any(|member| member.solo_timing() == Timing::Ntp)
-    {
-        Timing::Ntp
-    } else {
-        Timing::Ptp
-    }
+    // Stage two: every `n > 1` branch of `CreateTopologyPlan` returns PTP.
+    // Member solo answers are deliberately not folded in here -- the only solo
+    // answer that would say NTP is the Apple TV, and that branch is `n == 1`.
+    Timing::Ptp
 }
 /// The already-computed timing decision for one session, plus how many receivers
 /// it covers.
@@ -348,12 +347,20 @@ impl CompatFingerprint {
     }
     /// Negotiate under a topology decision computed once for the whole session.
     ///
-    /// A group plan overrides per-member timing: an explicit PTP choice is
-    /// downgraded when the group chose NTP (WAC's whole-plan downgrade), and an
-    /// explicit NTP choice cannot split a PTP group. Automatic transport also
-    /// stays on the realtime stream when the group chose NTP, because buffered
-    /// audio is a PTP-only transport. A one-member plan changes nothing: single
-    /// receivers keep their characterized behaviour.
+    /// `timingProtocol` is a per-SETUP plist field, so per-member timing is
+    /// protocol-legal. AirFlash forbids it as a **design decision**, mirroring
+    /// the reference implementation: WAC keeps exactly one `Timing` in its
+    /// calibration plan and asserts `snapshot.Timing == plan.Timing` at runtime
+    /// (a mismatch invalidates the telemetry run). The group plan therefore
+    /// governs every member: a member whose solo answer would be NTP (a solo
+    /// Apple TV) is negotiated as a PTP participant under a PTP group and told
+    /// to follow the sender's group clock.
+    ///
+    /// A group plan overrides per-member timing: an explicit PTP or NTP choice
+    /// cannot split the group (WAC has no per-member setting at all), and
+    /// automatic transport stays on the realtime stream when the group chose
+    /// NTP, because buffered audio is a PTP-only transport. A one-member plan
+    /// changes nothing: single receivers keep their characterized behaviour.
     pub fn negotiate_planned(
         &self,
         plan: TimingPlan,
@@ -439,6 +446,10 @@ impl CompatFingerprint {
                 // an explicit sender-PTP request cannot reintroduce a second
                 // clock domain.
                 Timing::Ptp if group_ntp => false,
+                // A PTP group plan governs explicit PTP too. That is the only
+                // way a solo-NTP member (Apple TV) is accepted as a PTP
+                // participant; its own model no longer vetoes the group clock.
+                Timing::Ptp if plan.is_group() => true,
                 Timing::Ptp => {
                     let advertised =
                         self.ptp_expected() == Some(true) || self.airplay2() || inherited_ptp;
@@ -449,8 +460,9 @@ impl CompatFingerprint {
                     true
                 }
                 // A group plan of PTP means every member's evidence supports it;
-                // an explicit NTP request is the exception the session folds into
-                // the plan before SETUP, so the group still has one clock domain.
+                // an explicit NTP request is overridden by the group decision so
+                // the group still has one clock domain. A single-member plan
+                // keeps the explicit NTP choice.
                 Timing::Ntp if plan.is_group() => plan.timing() == Timing::Ptp,
                 Timing::Ntp => false,
             }
@@ -917,7 +929,7 @@ mod tests {
         );
     }
     #[test]
-    fn group_timing_keeps_one_conservative_clock_domain() {
+    fn group_timing_keeps_one_ptp_clock_domain() {
         let homepod = TimingEvidence {
             airplay2: true,
             model: Some("AudioAccessory5,1"),
@@ -953,13 +965,24 @@ mod tests {
         );
         assert_eq!(select_timing(&[appletv], Codec::Auto), Timing::Ntp);
         assert_eq!(select_timing(&[unknown_ap1], Codec::Auto), Timing::Ntp);
-        // All members AirPlay 2: PTP, exactly as before.
+        // Amended by Q33: every multi-device AirPlay 2 group is PTP, whatever
+        // the members would decide on their own.
         assert_eq!(
             select_timing(&[homepod, homepod], Codec::Auto),
             Timing::Ptp
         );
         assert_eq!(
             select_timing(&[unknown_ap2, unknown_ap2], Codec::Auto),
+            Timing::Ptp
+        );
+        // Mixed HomePod + Apple TV: the Apple TV solo answer is NTP, but the
+        // `n > 1` branch makes the whole group PTP.
+        assert_eq!(
+            select_timing(&[homepod, appletv], Codec::Auto),
+            Timing::Ptp
+        );
+        assert_eq!(
+            select_timing(&[appletv, unknown_ap2], Codec::Auto),
             Timing::Ptp
         );
         // One member without AirPlay 2 evidence downgrades the whole group.
@@ -971,10 +994,12 @@ mod tests {
             select_timing(&[homepod, unknown_ap1], Codec::Auto),
             Timing::Ntp
         );
-        // Inside the AirPlay 2 branch the conservative member wins.
+        // Codec is not part of AirFlash's characterized solo table: a HomePod
+        // stays PTP even when the session asks for PCM (WAC's `n == 1 &&
+        // allHomePod && isPcm -> NTP` branch is deliberately not adopted).
         assert_eq!(
-            select_timing(&[homepod, appletv], Codec::Auto),
-            Timing::Ntp
+            select_timing(&[homepod], Codec::Pcm),
+            Timing::Ptp
         );
     }
 
@@ -996,7 +1021,7 @@ mod tests {
         let formats = Formats {
             realtime: Some((1 << 18) | (1 << 20)),
             buffered: Some(1 << 18),
-            ..Default::default()
+            features: Some(AIRPLAY2_BIT),
         };
         let ap2 = CompatFingerprint::from_evidence(
             formats,
@@ -1066,6 +1091,75 @@ mod tests {
                 .is_err()
         );
     }
+    #[test]
+    fn a_ptp_group_negotiates_a_solo_ntp_member_as_a_ptp_follower() {
+        let formats = Formats {
+            realtime: Some((1 << 18) | (1 << 20)),
+            buffered: Some(1 << 18),
+            features: Some(AIRPLAY2_BIT),
+        };
+        let homepod = CompatFingerprint::from_evidence(
+            formats,
+            &Profile::default(),
+            &[],
+            Some("AudioAccessory5,1"),
+            None,
+            Some("366.0"),
+        );
+        let appletv = CompatFingerprint::from_evidence(
+            formats,
+            &Profile::default(),
+            &[],
+            Some("AppleTV6,2"),
+            None,
+            Some("366.0"),
+        );
+        assert!(homepod.airplay2() && appletv.airplay2());
+        // Solo, the Apple TV is NTP.
+        assert_eq!(
+            TimingPlan::single(&appletv, Codec::Auto).timing(),
+            Timing::Ntp
+        );
+        // In a mixed group every member runs PTP, and the Apple TV is a PTP
+        // participant even though its own answer said NTP.
+        let plan = TimingPlan::select(
+            &[homepod.timing_evidence(), appletv.timing_evidence()],
+            Codec::Auto,
+        );
+        assert_eq!(plan.timing(), Timing::Ptp);
+        let auto = Profile {
+            codec: Codec::Auto,
+            transport: Transport::Realtime,
+            timing: Timing::Auto,
+            ..Default::default()
+        };
+        let compat = appletv.negotiate_planned(plan, &auto, 44100, false).unwrap();
+        assert!(compat.uses_ptp());
+        assert_eq!(compat.timing_protocol(), "PTP");
+        // The group decision also governs explicit per-member requests: neither
+        // NTP nor PTP may split it (the Apple TV model otherwise vetoes PTP).
+        for timing in [Timing::Ntp, Timing::Ptp] {
+            let profile = Profile {
+                timing,
+                ..auto.clone()
+            };
+            let compat = appletv
+                .negotiate_planned(plan, &profile, 44100, false)
+                .unwrap();
+            assert!(compat.uses_ptp(), "group plan must govern {timing:?}");
+        }
+        // A one-member plan still rejects an Apple TV that forces PTP.
+        let forced = Profile {
+            timing: Timing::Ptp,
+            ..auto
+        };
+        assert!(
+            appletv
+                .negotiate_planned(TimingPlan::single(&appletv, Codec::Auto), &forced, 44100, false)
+                .is_err()
+        );
+    }
+
     #[test]
     fn mono_routing_duplicates_only_the_assigned_channel() {
         let pcm = [0x12, 0x34, 0xfe, 0xdc, 0, 1, 0, 2];

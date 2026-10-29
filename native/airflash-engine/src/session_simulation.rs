@@ -26,6 +26,9 @@ struct Mock {
     methods: Arc<Mutex<Vec<String>>>,
     /// `timingProtocol` of every session SETUP, in order.
     setups: Arc<Mutex<Vec<String>>>,
+    /// Whether that SETUP carried `timingPeerInfo` (i.e. the member joined the
+    /// sender's PTP domain) instead of a `timingPort` (plain NTP).
+    timing_peers: Arc<Mutex<Vec<bool>>>,
     stop: Arc<AtomicBool>,
     worker: thread::JoinHandle<()>,
 }
@@ -53,7 +56,27 @@ fn quiet_wav() -> std::path::PathBuf {
     path
 }
 fn mock(ip: &str, buffered: bool, alac: bool, channel: Channel, offset: i32, ap2: bool) -> Mock {
-    mock_with_cancel(ip, buffered, alac, channel, offset, ap2, None)
+    mock_with_model(
+        ip,
+        buffered,
+        alac,
+        channel,
+        offset,
+        ap2,
+        Some("AudioAccessory5,1"),
+    )
+}
+/// Same as [`mock`], but `/info` reports the given model (or none).
+fn mock_with_model(
+    ip: &str,
+    buffered: bool,
+    alac: bool,
+    channel: Channel,
+    offset: i32,
+    ap2: bool,
+    model: Option<&'static str>,
+) -> Mock {
+    mock_with_cancel_and_model(ip, buffered, alac, channel, offset, ap2, model, None)
 }
 fn mock_with_cancel(
     ip: &str,
@@ -62,6 +85,28 @@ fn mock_with_cancel(
     channel: Channel,
     offset: i32,
     ap2: bool,
+    cancel_on_stream: Option<Cancellation>,
+) -> Mock {
+    mock_with_cancel_and_model(
+        ip,
+        buffered,
+        alac,
+        channel,
+        offset,
+        ap2,
+        Some("AudioAccessory5,1"),
+        cancel_on_stream,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn mock_with_cancel_and_model(
+    ip: &str,
+    buffered: bool,
+    alac: bool,
+    channel: Channel,
+    offset: i32,
+    ap2: bool,
+    model: Option<&'static str>,
     cancel_on_stream: Option<Cancellation>,
 ) -> Mock {
     let control = TcpListener::bind((ip, 0)).unwrap();
@@ -100,13 +145,15 @@ fn mock_with_cancel(
     let anchor = Arc::new(Mutex::new(None));
     let methods = Arc::new(Mutex::new(Vec::new()));
     let setups = Arc::new(Mutex::new(Vec::new()));
+    let timing_peers = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
-    let (out, key_out, anchor_out, method_out, setup_out, done) = (
+    let (out, key_out, anchor_out, method_out, setup_out, timing_peer_out, done) = (
         packets.clone(),
         key.clone(),
         anchor.clone(),
         methods.clone(),
         setups.clone(),
+        timing_peers.clone(),
         stop.clone(),
     );
     let worker = thread::spawn(move || {
@@ -138,16 +185,15 @@ fn mock_with_cancel(
             ),
         );
         if ap2 {
-            // AirPlay 2 needs bit 40 *and* a modern firmware; the model keeps a
-            // single HomePod-like member on its real PTP expectation.
+            // AirPlay 2 needs bit 40 *and* a modern firmware; the model decides
+            // the solo timing answer and can be overridden per mock member.
             info.insert(
                 "sourceVersion".into(),
                 plist::Value::String("366.0".into()),
             );
-            info.insert(
-                "model".into(),
-                plist::Value::String("AudioAccessory5,1".into()),
-            );
+            if let Some(model) = model {
+                info.insert("model".into(), plist::Value::String(model.into()));
+            }
         }
         info.insert("initialVolume".into(), plist::Value::Real(-15.0));
         let info = plist::Value::Dictionary(info);
@@ -175,6 +221,10 @@ fn mock_with_cancel(
                 let d = body.as_dictionary().unwrap();
                 if let Some(timing) = d.get("timingProtocol").and_then(plist::Value::as_string) {
                     setup_out.lock().unwrap().push(timing.to_owned());
+                    timing_peer_out
+                        .lock()
+                        .unwrap()
+                        .push(d.contains_key("timingPeerInfo"));
                 }
                 if let Some(streams) = d.get("streams") {
                     if let Some(cancel) = &cancel_on_stream {
@@ -324,6 +374,7 @@ fn mock_with_cancel(
         anchor,
         methods,
         setups,
+        timing_peers,
         stop,
         worker,
     }
@@ -618,16 +669,87 @@ fn an_airplay2_group_keeps_ptp_on_every_member() {
             .any(|event| event["code"] == "group_timing_divergence")
     );
 }
+/// Q33: a mixed HomePod + Apple TV group is PTP, and the Apple TV joins the
+/// sender's PTP domain even though its solo answer is NTP.
+#[test]
+fn a_mixed_homepod_and_apple_tv_group_runs_one_ptp_clock_domain() {
+    let mut left = mock("127.0.0.2", false, false, Channel::Left, 0, true);
+    let mut right = mock_with_model(
+        "127.0.0.3",
+        false,
+        false,
+        Channel::Right,
+        0,
+        true,
+        Some("AppleTV6,2"),
+    );    left.peer.receiver_id = "homepod".into();
+    right.peer.receiver_id = "appletv".into();
+    left.peer.profile.timing = Timing::Auto;
+    right.peer.profile.timing = Timing::Auto;
+    let path = quiet_wav();
+    let options:ProbeOptions=serde_json::from_value(serde_json::json!({"peers":[],"source":"wav","duration_ms":400,"gain":0.1,"latency_ms":200,"wav_path":path,"group_mode":"software_stereo","handshake_only":true})).unwrap();
+    let options = ProbeOptions {
+        peers: vec![left.peer.clone(), right.peer.clone()],
+        ..options
+    };
+    let clock = crate::clock::Clock::new();
+    let timer = crate::clock::PtpMaster::from_sockets(
+        vec![left.peer.host, right.peer.host],
+        vec![],
+        clock.clone(),
+        UdpSocket::bind("127.0.0.1:0").unwrap(),
+        UdpSocket::bind("127.0.0.1:0").unwrap(),
+    )
+    .unwrap();
+    let events = Mutex::new(Vec::new());
+    let eq = crate::equalizer::Control::new(options.equalizer, 44100).unwrap();
+    let outcome = run_session(
+        options,
+        Cancellation::default(),
+        Arc::new(AtomicU32::new(0.1f32.to_bits())),
+        crate::volume::Control::default(),
+        eq,
+        |event| events.lock().unwrap().push(event),
+        (clock, Some(timer)),
+    );
+    std::fs::remove_file(path).unwrap();
+    left.stop.store(true, Ordering::Relaxed);
+    right.stop.store(true, Ordering::Relaxed);
+    left.worker.join().unwrap();
+    right.worker.join().unwrap();
+    outcome.unwrap();
+    // Both members are configured with the group PTP decision. The Apple TV
+    // also receives timingPeerInfo (the sender's clock), not an NTP port.
+    assert_eq!(*left.setups.lock().unwrap(), ["PTP"]);
+    assert_eq!(*right.setups.lock().unwrap(), ["PTP"]);
+    assert_eq!(*left.timing_peers.lock().unwrap(), [true]);
+    assert_eq!(*right.timing_peers.lock().unwrap(), [true]);
+    let events = events.lock().unwrap();
+    let negotiated: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "negotiated")
+        .collect();
+    assert_eq!(negotiated.len(), 2);
+    assert!(
+        negotiated.iter().all(|event| event["timing"] == "ptp"),
+        "the Apple TV must join the group PTP clock, not stay on NTP"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event"] == "warning" && event["code"] == "group_timing_divergence"),
+        "a uniform group PTP plan must not emit a user-facing warning"
+    );
+}
 /// The bug fix: one member without bit40 makes the whole group NTP.
 #[test]
-fn one_member_without_airplay2_downgrades_the_whole_group_and_warns_once() {
+fn one_member_without_airplay2_downgrades_the_whole_group_without_a_warning() {
     let mut left = mock("127.0.0.2", false, false, Channel::Left, 0, true);
     let mut right = mock("127.0.0.3", false, false, Channel::Right, 0, false);
     left.peer.receiver_id = "left".into();
     right.peer.receiver_id = "right".into();
     left.peer.profile.timing = Timing::Auto;
     right.peer.profile.timing = Timing::Auto;
-    let right_host = right.peer.host.to_string();
     let path = quiet_wav();
     let options:ProbeOptions=serde_json::from_value(serde_json::json!({"peers":[],"source":"wav","duration_ms":400,"gain":0.1,"latency_ms":200,"wav_path":path,"group_mode":"software_stereo","handshake_only":true})).unwrap();
     let options = ProbeOptions {
@@ -664,18 +786,12 @@ fn one_member_without_airplay2_downgrades_the_whole_group_and_warns_once() {
         negotiated.iter().all(|event| event["timing"] == "ntp"),
         "one member without AirPlay 2 must not leave its partner on PTP"
     );
-    let warnings: Vec<_> = events
-        .iter()
-        .filter(|event| event["code"] == "group_timing_divergence")
-        .collect();
-    assert_eq!(warnings.len(), 1, "exactly one warning per group setup");
-    let warning = warnings[0];
-    assert_eq!(warning["event"], "warning");
-    assert_eq!(warning["channel"], "setup");
-    assert_eq!(warning["recovered"], true);
-    assert_eq!(warning["host"], right_host);
-    let message = warning["message"].as_str().unwrap();
-    assert!(message.contains("left"), "{message}");
-    assert!(message.contains("right"), "{message}");
-    assert!(message.contains("forced NTP"), "{message}");
+    // Q33: this is still a valid group decision, not a user-facing warning.
+    // The evidence summary goes to the engine log only.
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event"] == "warning" && event["code"] == "group_timing_divergence"),
+        "group_timing_divergence must not use the user-facing warning channel"
+    );
 }

@@ -570,67 +570,89 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
 不是裸毫秒常数）、Q7（漂移上限口径）、Q13（`DATA_DISCONTINUITY` 判伪的额外条件）、
 Q24（同上）。
 
-## P2-13b 组内时钟域（已完成）
+## P2-13b / P2-13c 组内时钟域（已完成，Q33 修正）
 
 `native/airflash-engine/src/profile.rs`、`src/session.rs`、
 `src/receiver_capabilities.rs`、`src/session_simulation.rs`、
 `tests/compat_profile.rs`
 
-- **缺陷**：`Member::connect()` 在每个成员自己的 `/info` 之后各调一次
+- **缺陷（P2-13b）**：`Member::connect()` 在每个成员自己的 `/info` 之后各调一次
   `CompatProfile::derive()`（内部是单成员协商），于是立体声对的两个成员可能
   一个拿到 PTP、一个拿到 NTP。实际触发是「一个成员有 bit40、另一个没有」：
   有 bit40 的按 AP2 走 PTP，没有的退回 NTP，同一组出现两个时钟域。WAC 的
   `CreateTopologyPlan` 不是这样做的，它先汇总整组再给统一结论。
-- **整组规则**（`profile::select_timing`）：
-  - 空组 → NTP（不会发生，防御性默认）；
-  - 单成员 → 完全沿用 97 行表刻画的单机行为（`solo_timing()`），PTP/NTP 不变；
-  - 多成员：任一成员没有 AirPlay 2 证据（bit40 且
-    `srcvers >= 354.54.6`）→ **整组 NTP**，这是本次修的 bug；
-  - 都在 AP2 分支内 → 取成员中最保守的结论：任一成员单机应为 NTP
-    （例如 solo Apple TV）→ 整组 NTP；否则整组 PTP。一个组只允许一个时钟域。
-- **只算一次、所有成员共用**：新增 `TimingEvidence`、`TimingPlan` 与
-  `CompatFingerprint::negotiate_planned(plan, …)`。`session.rs` 的 `run_stream`
-  改成两阶段：先对全部成员做 `/info` 探测（失败仍按原逻辑重试一次），用整组
-  指纹算 `select_timing`，再给每个成员用同一个 `TimingPlan` 做 SETUP；成员
-  自己的 `profile.timing` 不再能制造分裂——显式 NTP 请求会在 SETUP 前被折进
-  组计划（组整体 NTP），组计划 NTP 时显式 PTP 被降级（WAC 的整组降级），
-  `Transport::Auto` 在组 NTP 下只能选 Realtime（buffered 是 PTP-only），显式
-  Buffered 或 `follow_receiver_clock` 在组 NTP 下直接报错，而不是悄悄开第二
-  个时钟域。单成员走 `TimingPlan::single`，`Timing::Inherit` 仍用
+- **整组规则（Q33 修正后，`profile::select_timing`）**：
+
+  | 场景 | 结果 |
+  | --- | --- |
+  | 空组 | NTP（不会发生，防御性默认） |
+  | 单成员 | 完全沿用 97 行表刻画的单机行为（`solo_timing()`），PTP/NTP 不变 |
+  | 任一成员没有 AirPlay 2 证据（bit40 且 `srcvers >= 354.54.6`） | **整组 NTP** |
+  | 多成员且全部有 AP2 证据（HomePod 组 / Mixed Apple / 未知厂商 AP2 组） | **整组 PTP，无一例外** |
+
+  「Apple TV 单机 = NTP」只在 `n == 1` 分支成立；一旦进多设备，成员的单机
+  答案不再参与整组决策，Apple TV 必须作为 PTP follower 加入发送端的时钟域。
+  这是 P2-13c 相对 P2-13b「组内取最保守」的修正：旧规则会把 Mixed Apple
+  group 错误地压到 NTP，和 WAC 的 `n > 1` 分支相反。
+- **只算一次、所有成员共用**：`TimingEvidence`、`TimingPlan` 与
+  `CompatFingerprint::negotiate_planned(plan, …)` 不变。`session.rs` 的
+  `run_stream` 仍是两阶段：先对全部成员做 `/info` 探测（失败仍按原逻辑重试
+  一次），用整组指纹算 `select_timing`，再给每个成员用同一个 `TimingPlan`
+  做 SETUP。P2-13c 移除了「任一成员显式 NTP 就把整组折到 NTP」的预处理：
+  组计划 PTP 时，显式 NTP/PTP 都由组决定覆盖，成员照常收到
+  `timingProtocol=PTP`、`timingPeerInfo`、`SETPEERS`，加入发送端的 PTP 域；
+  组计划 NTP 时显式 PTP 被降级、`Transport::Auto` 只能选 Realtime
+  （buffered 是 PTP-only），显式 Buffered 或 `follow_receiver_clock` 在组
+  NTP 下直接报错。单成员走 `TimingPlan::single`，`Timing::Inherit` 仍用
   `inherited_ptp`，行为与改造前一致。
-- **共享决策函数**：`receiver_capabilities::choices()` 也改为
-  `TimingPlan::single(fingerprint, codec)` + `negotiate_planned()`，预判与运行时
-  调用同一个 `select_timing`。预判输入仍只有 `supportedFormats` + 对端
-  `features`（没有 model/srcvers），因此 IPC 的 `selected_timing` 输出没有变化，
-  97 行表全绿。
-- **分歧告警**：组 SETUP 前若成员指纹/请求不一致，只发一条
-  `{"event":"warning","code":"group_timing_divergence","channel":"setup",
-  "host":<起因成员>,"recovered":true,"message":"…"}`，消息里列出每个成员的
-  `receiver_id`（缺省用 IP）、是否 AirPlay 2、单独会选什么、用户请求什么，
-  以及最终强制的 PTP/NTP。一次组建立只发一次，不在每个成员或每个包重复。
-  注意：桌面端 `SessionController` 会丢弃 `startedAt == 0` 之前的 warning，
-  这条告警在真实 UI 上是否可见没有验证（见下）。
-- **测试**：`session_simulation.rs` 的 mock 新增 `ap2` 开关（bit40 +
-  `sourceVersion 366.0` + `AudioAccessory5,1`）并记录每次 SETUP 的
-  `timingProtocol`；新增「全 AP2 → 两人都 PTP」「一人缺 bit40 → 两人都 NTP，
-  且告警恰好一次并点名两个成员」两个握手级测试；原来刻意跑两个时钟域的
-  mixed-transport 测试改为同一 PTP 时钟域（第二个成员也接一个假 PTP
-  responder，`SETPEERS` 后方法序列相应变为 4 项），传输仍保持 buffered+realtime
-  混合。`tests/compat_profile.rs` 在 97 行之外追加组规则与
-  `negotiate_planned` 的断言。Rust 全量：lib 181 passed + 1 ignored，main 2，
-  集成测试 33（其中 soak 1 ignored），共 216 passed / 2 ignored。
+- **Apple TV 进组即 PTP follower（P2-13c）**：`negotiate_planned` 在
+  `plan.is_group()` 时先认组计划，再考虑成员自己的 `timing` 请求；组 PTP
+  下 Apple TV 的型号（`ptp_expected() == Some(false)`）不再能否决 PTP。
+  对应 WAC `GroupPtpDiagnosis` 的硬要求：组计划是 PTP 时，诊断对**每一个
+  成员**都要求 `PtpOffset` 直方图且 ≥30 个样本；一台还在走 NTP 的 Apple TV
+  不可能产出这个量。AF 侧的证据是 SETUP 里该成员带 `timingPeerInfo`（而不是
+  `timingPort`）并执行 `SETPEERS`/`ptp.activate`，`session_simulation` 的
+  mock 现在逐成员记录这一点。
+- **`timingProtocol` 是设计选择，不是协议限制**：`timingProtocol` 在协议层是
+  每次 SETUP 的 plist 字段，所以「每成员不同 timing」在协议上合法；AF 禁止
+  它是**设计决定**，对齐 WAC 的运行时断言
+  （`snapshot.Timing == plan.Timing`，不一致即判整份遥测无效）。这段说明已
+  写进 `negotiate_planned` 的文档注释，避免以后有人误以为协议强制一组一域。
+- **分歧告警降级（P2-13c）**：`group_timing_warning` 改名为
+  `group_timing_diagnostic`，不再发 `{"event":"warning", ...}`，只把
+  `group_timing_divergence: <每个成员的 receiver_id/IP、是否 AP2、单机会选
+  什么、显式请求什么>; forced PTP/NTP for the whole group` 写到引擎 stderr
+  日志。桌面端 `SessionController` 的 `warning` 通道因此完全看不到它，
+  「SETUP 前 `startedAt == 0` 被丢弃」的问题也随之消失。内容仍保留在日志与
+  诊断导出里；一条组建立最多一行，不按成员或按包重复。
+- **预判（`receiver_capabilities`）不变**：`choices()` 仍用
+  `TimingPlan::single(fingerprint, codec)`，输入仍只有 `supportedFormats` +
+  对端 `features`（没有 model/srcvers），IPC 的 `selected_timing` 输出没有
+  变化。它是**单接收器**答案：一台 Apple TV 的预判仍显示 `ntp`，而实际加入
+  多设备组时运行时会按组计划给它 PTP；组时钟不在这条 per-receiver IPC 响应
+  里，统一在 `session::run_stream` 决定。代码注释已写明这个边界。
+- **测试**：`session_simulation.rs` 的 mock 新增 model 覆盖与
+  `timingPeerInfo` 记录；新增「Mixed HomePod + Apple TV 全 AP2 → 两人都
+  PTP，且 Apple TV 的 SETUP 带 timingPeerInfo」「一人缺 bit40 → 两人都 NTP，
+  且不发用户可见 warning」两个握手级测试；原全 AP2 HomePod 组测试保持。
+  `tests/compat_profile.rs` 的 97 行表一行没改，另追加组规则（HomePod 组 /
+  通用 AP2 组 / Mixed Apple 组 / 缺 bit40 降级 / 单机不变）与
+  `negotiate_planned` 的断言。Rust 全量：lib 203（202 passed + 1 ignored），
+  main 2，集成测试 34 passed（soak 1 ignored），共 238 passed / 2 ignored。
 - **没验证/没做的**：
-  - 没有真机，也没有抓包确认「AP1 + AP2 组」在真实接收器上接受整组 NTP；
-    老 HomePod 对 PTP 的偏好只在模拟器里成立。
-  - 混合 HomePod + Apple TV 的组按本次「保守取 NTP」实现；WAC 报告里
-    Mixed Apple group 是 PTP。两者不一致，记入 Q33 待答复。
+  - 没有真机，也没有抓包确认：一台真实 Apple TV 加入 PTP 组后是否真的作为
+    PTP follower 跟发送端时钟（`timingPeerInfo` 被接受、PTP offset 样本
+    ≥30）；这是 Q33 之后最关键的未知项。
+  - 没有真机确认「AP1 + AP2 组」在真实接收器上接受整组 NTP；老 HomePod 对
+    PTP 的偏好只在模拟器里成立。WAC 的证据支持整组走 Classic RAOP/NTP，
+    但真机是否出声仍未验证。
   - `/info` 的 `name` 仅作为 model 缺失/为 `Unknown` 时的兜底；没有真实
     `/info` 样本证明各型号的 `name` 字符串，也没有真机验证。
+  - Q33 的 `n == 1 && allHomePod && isPcm -> NTP` 分支没有采用：AF 的 97 行
+    表把 HomePod 单机（含 PCM）刻画为 PTP，且本次约束要求单机行为不变。
+    两者不一致，记入 Q38 待答复。
   - 组 NTP 下 `follow_receiver_clock` 直接失败（无法既跟随接收器 PTP 又整组
     NTP），UI 目前只按用户设置下发，未做提前禁用/提示。
-  - 桌面端可能丢弃 SETUP 前（`startedAt == 0`）的这条 warning，实际 UI 是否
-    展示未验证；若要保证可见，需要桌面端放宽 warning 过滤或延后到
-    `streaming` 后重发，本次未改桌面端。
 
 ## P3-2 桌面半：TXT 能力标注与门禁错误分类（已完成）
 

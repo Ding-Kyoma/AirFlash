@@ -2051,6 +2051,34 @@ MFi 设备今天仍会显示通用 fault。要让这条分类真正可用，需�
 
 ---
 
+### Q38. 单机 HomePod + PCM 该 PTP 还是 NTP？ `[待答复]`
+
+P2-13c 按 Q33 修正了多设备组：全部成员有 AP2 证据的多设备组一律 PTP，
+Mixed Apple group 不再被压到 NTP；单成员行为则按要求保持不变，97 行表征表
+仍全绿。但 Q33 的 `CreateTopologyPlan` 分支表里还有一条
+`n == 1 && allHomePod && isPcm → NTP`（HomePod solo PCM）。AF 现在的
+`select_timing` 完全不看 codec：单机 HomePod（`AudioAccessory*` / `HomePod*`
+型号，或没有型号但 bit40 + `srcvers >= 354.54.6`）即使 `Codec::Pcm` 也返回
+PTP；97 行表里 `realtime: PCM_44, codec: auto` 行同样是 PTP。本次约束同时
+要求「单成员行为与今天逐字节一致」和「97 行表保持全绿」，所以 P2-13c 没有
+实现 WAC 的这条 PCM 分支，只在单测里明确断言现状仍是 PTP。
+
+需要确认：
+
+1. **是否要采用 WAC 的 `HomePod solo (PCM) → NTP`**？如果采用，是只对能
+   识别为 HomePod 的型号/名称生效，还是对所有「单机 AP2 且最终 codec 为
+   PCM」的接收器生效？WAC 的 `allHomePod` 是型号/名称判定，未知型号走的是
+   最后一条 `n == 1 → AirPlay 2 receiver → PTP`，两者不冲突。
+2. **判定依据是请求的 `Codec::Pcm` 还是协商后的实际 codec**？AF 的
+   `Codec::Auto` 对 HomePod 通常选 ALAC，但接收器只支持 PCM 时会退到 PCM；
+   WAC 的 `isPcm` 看的是最终 codec。若按最终 codec 判定，`Codec::Auto`
+   也可能落入 NTP 分支。
+3. **如果采用，97 行表怎么处理**？是保持 97 行不变、只在表外追加
+   「HomePod + PCM → NTP」断言，还是允许新增/修改表行（会改变「97 行」这个
+   计数基线）？
+
+---
+
 ## 答复区
 
 > 已在每条条目下方就地回填（`> **答复**`）。下面是需要**优先改代码**的 4 条，按影响排序。

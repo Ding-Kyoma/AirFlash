@@ -33,6 +33,12 @@ pub struct Capabilities {
 /// purpose: capability prediction has always been made from formats and the
 /// peer's own feature word alone, and adding the model would change the values
 /// reported over IPC.
+///
+/// This is a per-receiver answer, so every plan is a one-member plan and the
+/// output stays the characterized solo timing. The session runtime may override
+/// it for a group: Q33 makes every multi-device AirPlay 2 group PTP, including
+/// an Apple TV whose solo prediction is NTP. Group timing is not part of this
+/// per-receiver IPC response; it is decided once in `session::run_stream`.
 pub fn choices(fingerprint: &CompatFingerprint, evidence: &Profile) -> Vec<ProfileChoice> {
     let mut result = Vec::new();
     for rate in [44100, 48000] {
