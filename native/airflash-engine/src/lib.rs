@@ -9,6 +9,7 @@ pub mod receiver_capabilities;
 pub mod rtp;
 pub mod rtsp;
 pub mod session;
+pub mod servo;
 
 #[cfg(windows)]
 pub mod wasapi;

@@ -1177,6 +1177,8 @@ fn send_packets(
             telemetry.observe_lateness(late.as_secs_f64() * 1000.0);
             if let Some(source) = &live {
                 telemetry.capture_age.observe(source.sample_age_ms());
+                // Slow outer loop: sustained lateness trims the capture resampler.
+                source.report_lateness(late.as_secs_f64() * 1000.0);
             }
             if options.duration_ms > 0 {
                 schedule.recover(now, false)?;
@@ -1430,6 +1432,13 @@ fn sample_capture(
         telemetry.capture_glitches += metrics
             .discontinuities
             .saturating_sub(previous.discontinuities);
+        let servo = source.servo_metrics();
+        telemetry.servo_engagements = servo.engagements;
+        telemetry.servo_releases = servo.releases;
+        telemetry.servo_step_resets = servo.steps;
+        telemetry.servo_correction_ms = servo.correction_ppm / 1000.0;
+        telemetry.servo_filtered_ms = servo.filtered_ms;
+        telemetry.servo_drift_ppb = source.drift_ppb();
         let underruns = metrics
             .underrun_packets
             .saturating_sub(previous.underrun_packets);
