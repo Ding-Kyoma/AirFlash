@@ -61,6 +61,7 @@
   "Real-time · 120 ms": "Echtzeit · 120 ms",
   "Normal · 200 ms": "Normal · 200 ms",
   "Buffered · 500 ms": "Gepuffert · 500 ms",
+  "Adaptive · shortest safe lead": "Adaptiv · kürzeste sichere Vorlaufzeit",
   "Custom": "Benutzerdefiniert",
   "Custom · {0} ms": "Benutzerdefiniert · {0} ms",
   "Latency settings": "Latenzeinstellungen",
