@@ -14,10 +14,10 @@
 
 | 命令 | 结果 |
 | --- | --- |
-| `cargo test --manifest-path native/airflash-engine/Cargo.toml --locked` | 123 lib + 各集成测试全部通过 |
+| `cargo test --manifest-path native/airflash-engine/Cargo.toml --locked` | 152 lib + 26 集成通过（2 个硬件/长稳用例仍 ignore） |
 | `cargo clippy --all-targets -- -D warnings` | 无告警 |
 | `pwsh scripts/build-native.ps1 -Check` | 通过（含 release 构建与兼容性审计） |
-| `pwsh scripts/dotnet.ps1 test AirFlash.sln` | 435 通过 |
+| `pwsh scripts/dotnet.ps1 test AirFlash.sln` | 457 通过 |
 | `uv run pytest` / `uv run ruff check .` | 141 通过 / 无问题 |
 
 ---
@@ -260,18 +260,57 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   `member_setup_retry` 警告再重连；仍然失败才把 `setup` 错误上抛，由上面的
   RAII 负责回滚。
 
+## P3-8 捕获自愈（已完成）
+
+`native/airflash-engine/src/live.rs`、`applications.rs`、`session.rs`
+
+- **重开端点而不是结束会话**：绑定抽成可重跑的 `bind_target()`。应用进程退出、
+  端点失效（`AUDCLNT_E_DEVICE_INVALIDATED`）、读写错误、或判断端点不再产出时，
+  丢掉旧 COM 对象、重新绑定，并在同一个采集线程继续。连续 3 次重绑失败才把
+  `ended` 置真，交回 `run_live` 重开端点或进入 standby——与改造前「结束会话、
+  桌面重连」的最终行为一致，只是把恢复提前到了进程内。
+- **重绑不丢已编码音频**：只清空重采样器的输入队列与 `input_times`、`reset()`
+  重采样器，`state.frames` 原样保留；`boundary_pending` 置位并累加
+  `discontinuities`。真正的 WASAPI 断流仍按 P1-7 的「清队列」处理，两档不混。
+- **多实例**：应用目标按可执行文件路径抓取所有根实例（上限 4），解码后按时间戳
+  网格在采样级相加，再进同一个重采样器。IPC 请求带 pid+started_at 时，只要该实例
+  还活着就只抓它；它退出后才回到按路径抓取。路径不同的进程永不附加；同 pid、
+  不同 `started_at`（PID 复用）不会被当成原实例。
+- **无声检测只做探测**：只有本会话已经发生过真断点或成功重绑，连续 ≥2 秒全零 /
+  `SILENT` 才允许探测；每 60 秒最多一次，非静音音频一回来立即恢复探测额度。
+  只是还没开始播放（从未断过）不会触发。无包超过 2 秒仍只做原来的
+  `GetNextPacketSize` 存活检查，出错才按 `endpoint_lost` 重绑。
+- **指标**：`capture_metrics` 新增 `rebinds`、`rebind_failures`、
+  `capture_instances`、`silent_probes`、`last_rebind_reason`；全部带 serde
+  默认值，旧桌面端忽略新键即可。
+- **警告**：`capture_process_exited` / `capture_endpoint_reopened`
+  （`recovered:true`）与 `capture_rebind_failed` / `capture_rebind_exhausted`
+  （`recovered:false`），由 `session.rs` 用现有 `warning` 形状发出，只在状态
+  变化时发，不在每个包上发。
+- 测试：重绑预算（连续失败耗尽、成功清零）、静音探测（2 秒门限、60 秒限速、
+  无断点不探测、非静音恢复额度）、实例选择（pinned / 全路径 / PID 复用 / 上限）、
+  状态级重绑保留 `state.frames`、混音网格与静音补洞、设备失效分类。
+- **没做/没验证**：没有真机，也没有两个应用同时发声的离线环境，跨进程 QPC 基准
+  是否逐样本对齐只能按「同一引擎时钟」假设（见 Q28）；没有做
+  `IAudioEndpointVolume` 静音识别，「用户把系统音量拉到 0」仍可能被当成静音，
+  靠 60 秒限速兜底；没有改 RTP/RTSP/编码路径。进程退出靠 50 ms 轮询 + 250 ms
+  退避发现，未做事件驱动的退出通知。
+
 ## 还没做
 
 | 项目 | 现状 | 备注 |
 | --- | --- | --- |
 | P1-10 标定流程 | 未开始 | 需要真机测延迟/丢包，按报告是「用户自助标定」 |
 | P2-13 兼容 profile | 未开始 | 把散落的 if 收成 `CompatBehavior`，按 `srcvers`/`model` 指纹选择 |
+| P2-12 热加入 | 未做 | 目前只做组创建与成员重试，运行中增删成员未实现 |
 | P3-3 抢占检测 | 未开始 | 按 Q18 用「未预期 TEARDOWN + 随后重新 announce」组合特征 |
 | P3-4 MRP 隧道 | 未开始 | 大工程 |
 | P3-5 经典 RAOP / 初代 AirPlay | 未开始 | 大工程 |
+| P3-6 `bufferStream` | 未开始 | 报告建议暂缓：弱网才有收益，改造成本大 |
+| P3-9 AAC-ELD / OPUS | 未开始 | 需要接收端能力探测与编码器验证 |
 | P0-4 封面（`image/jpeg`） | 未做 | 尺寸/格式约束需要设备确认，见 Q10；失败也不能干扰音频 |
 | P0-3 帧级 `interval_correction` | 未做 | 见上文，现用连续重采样代替 |
-| 采集进程退出后自动重开 | 部分 | 现在引擎结束会话、由桌面端重连；进程内自愈未做 |
+| §12.3 会话摘要 | 未做 | 每次会话结束输出一行 JSON/CSV 的汇总尚未实现 |
 | 音量事件（音箱旋钮/遥控器） | 部分 | 事件里的 `volume` 已解析并转发，但还没写回设备音量状态 |
 
 ## 按答复待返工（下一轮）
