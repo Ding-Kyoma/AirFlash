@@ -1,5 +1,11 @@
 # AirFlash × WinAirCast 改进进度
 
+> **2026-10-29 更新**：你已经在 `QUESTIONS.md` 里答复了 Q1–Q26。答复里标
+> `[已否决]` 的三条（Q8/Q12/Q21 关于运行中改 lead、Q26 的 QoS 路线）会推翻本节
+> 的部分实现，**下一轮按答复返工**，清单见文末「按答复待返工」。其余条目
+> （Q1/Q3/Q4/Q5/Q9/Q10/Q11/Q14/Q15/Q16/Q18–Q20/Q22/Q23/Q25）与我们已落地的做法
+> 一致，只是数值口径的微调。
+
 对照 `REPORT-WinAirCast-vs-AirFlash.md` 的优先级清单逐项推进。本文件只记录
 「已经落地并跑过验证」的内容、判定依据，以及还没做的部分，避免把设计意图
 写成既成事实。
@@ -151,13 +157,50 @@
 
 ---
 
+## P1-6 / P3-7 BMCA（只做到「看得见」，没有切换角色）
+
+`clock.rs`
+
+- 新增 `BmcaDataset`（`priority1`、`clockClass`、`accuracy`、`variance`、`priority2`、
+  grandmaster identity、`stepsRemoved`）与 `parse_announce()`，按 IEEE 1588 的比较
+  顺序 `compare()`；`BmcaDataset::local(clock_id)` 是我们自己广播的数据集
+  （priority1=96、class=248，故意偏松，让真正的 grandmaster 赢）。
+- 跟随方收到 Announce 时记录对端数据集，快照里新增
+  `bmca_priority1/clock_class/priority2/grandmaster/steps_removed` 与
+  `better_master`，`clock_status` 每秒带出，便于判断「谁该当 master」。
+- **没有做**主动让位（role switch）。原因：中途换时钟会移动所有成员的
+  timeline，`SETRATEANCHORTIME` 也要重发；在没有第二台 HomePod 可验证的情况下
+  自动切换的风险高于收益。数据已经全部采到，切换留给确认后的下一轮（Q27）。
+
+---
+
 ## 还没做
 
 | 项目 | 现状 | 备注 |
 | --- | --- | --- |
 | P0-4 封面（`image/jpeg`） | 未做 | 尺寸/格式约束需要设备确认，见 Q10；失败也不能干扰音频 |
-| P1-6 / P3-7 BMCA | 未开始 | 只在多 HomePod 时才有意义，需要真实设备验证 |
+| P1-6 / P3-7 BMCA 主动让位 | 半成品 | 数据集与比较已完成，切换角色未做，见 Q27 |
 | P3-2 TXT 预测（bit40 + `srcvers`） | 未开始 | 发现逻辑在 C#，需要确认 HomePod 上报的 TXT 字段 |
 | P3-3 抢占检测 | 未开始 | 依赖元数据事件 |
 | 采集进程退出后自动重开 | 部分 | 现在引擎结束会话、由桌面端重连；进程内自愈未做 |
 | 音量事件（音箱旋钮/遥控器） | 部分 | 事件里的 `volume` 已解析并转发，但还没写回设备音量状态 |
+
+## 按答复待返工（下一轮）
+
+按 `QUESTIONS.md` 的答复，下面几处已经落地的实现需要改，标 **[否决]** 的是
+方向性错误：
+
+| 项 | 现在 | 按答复应改成 |
+| --- | --- | --- |
+| **[否决]** P0-2 运行中改 lead（Q8/Q21） | `set_lead` 通过 `MediaSchedule.shift` 移动时间轴起点，`base_ns` 跟着动 | **lead 与 `base_ns` 解耦**：改 lead 只改本地发送提前量，协议窗口与 RTP 原点保持不变；上限取对端 `latencyMax` 而不是固定 2000 ms |
+| **[否决]** P2-11 QoS（Q26） | `setsockopt(IP_TOS)` 打 DSCP 46 | 改用 **qWAVE**：`QOSAddSocketToFlow` + `QOSTrafficTypeVoice`，失败时优雅退化 |
+| **[否决]** P0-4 SMTC 策略（Q12） | 2 s 轮询 + 300 ms 稳定窗 | 按答复改成事件驱动（SMTC 的 `MediaPropertiesChanged`/`TimelinePropertiesChanged`），进度策略按答复的阈值 |
+| P0-3 伺服常数（Q5/Q6） | 外层 kp=20 ppm/ms、ki=25 ppm/(ms·s)、上限 300 ppm | `correction_ppb = filtered_ns / 20`、夹 **±50 ppm**；我们 ±500 ppm 的重采样量程够用，缺的是增益与死区 |
+| P0-2 自适应判据（Q22） | 一分钟 3 次时间线恢复 | 保留该策略层，但**必须叠加 p99 迟到**，否则对慢性迟到不敏感 |
+| P3-1 遥控命令（Q25） | 解析 RTSP 事件里的 `mrCommand` | 同时接受 `SendInput` + `VK_MEDIA_*` 的输入事件路径 |
+| P1-9 事件通道（Q16/Q25） | EOF 后整条会话重启 | 按答复的重建策略细化（不重建音频链路） |
+| P1-6/P3-7 BMCA（Q17，部分确认） | 数据集比较已做，未让位 | 等 Q27 的答复再定是否切换角色 |
+
+数值微调但方向已确认的：Q2（budget 用「该发多少包 vs 实际发了多少包」折算，
+不是裸毫秒常数）、Q7（漂移上限口径）、Q13（`DATA_DISCONTINUITY` 判伪的额外条件）、
+Q24（同上）。
