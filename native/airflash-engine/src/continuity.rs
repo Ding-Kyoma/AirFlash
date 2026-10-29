@@ -266,6 +266,22 @@ mod tests {
         );
     }
     #[test]
+    fn splice_ramp_is_five_milliseconds() {
+        // `telemetry::LEAD_SHIFT_RESET_US` is this ramp length: a lead shift the
+        // splice can cover is inaudible and is not a timeline reset (Q44 §二).
+        for rate in [44_100, 48_000] {
+            let splice = Splice::new(rate);
+            assert_eq!(splice.length, rate / 200);
+            // `rate / 200` is 5 ms rounded down to a whole frame: 240 frames at
+            // 48 kHz, 220 frames (4.99 ms) at 44.1 kHz.
+            let micros = u64::from(splice.length) * 1_000_000 / u64::from(rate);
+            assert!(
+                (4_900..=5_000).contains(&micros),
+                "the ramp must stay about 5 ms at {rate} Hz, got {micros} us"
+            );
+        }
+    }
+    #[test]
     fn gain_changes_ramp_without_resetting_music() {
         let mut s = Splice::new(48000);
         for _ in 0..241 {

@@ -275,44 +275,125 @@ impl TimelineResets {
 }
 
 /// A lead shift of at least this many microseconds is a timeline reset. Smaller
-/// adjustments only move the lead-shift counters (Q43 §二).
-pub const LEAD_SHIFT_RESET_US: u64 = 1_000;
+/// adjustments only move the lead-shift counters (Q44 §二).
+///
+/// The number is the length of AirFlash's own continuity splice ramp:
+/// `continuity::Splice` ramps over `rate / 200` frames, about 5 ms (5.0 ms at
+/// 48 kHz, 4.99 ms at 44.1 kHz). A shift the ramp can cover is inaudible, so it
+/// is activity rather than a timeline event.
+/// It is deliberately not sub-millisecond: the IPC lead request is whole
+/// milliseconds, so a 1 ms threshold always fires and makes `lead_shift_count`
+/// and `latency_change` the same number. Microsecond precision is kept as an
+/// internal invariant, not as a product capability.
+pub const LEAD_SHIFT_RESET_US: u64 = 5_000;
+
+/// The rate-ratio inputs for one successful re-anchor (Q44 §一).
+///
+/// A binary "did anything move" test turns one incidental Wi-Fi loss into a
+/// transport fault. Comparing against the sender's own steady state instead makes
+/// a link that always loses a couple of packets per second normal for that link,
+/// and only a spike above it a fault.
+///
+/// Retransmit requests are a weaker signal than underruns: a retransmitted packet
+/// was lost but probably recovered, while an underrun means the playout buffer ran
+/// dry and the listener heard it. So one underrun is enough evidence, while
+/// retransmits also need an absolute minimum.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RtpBaseline {
+    /// Steady-state retransmit-request rate over the long window, events/second.
+    pub steady_rtx_per_s: f64,
+    /// Steady-state concealed-underflow rate over the long window, events/second.
+    pub steady_underrun_per_s: f64,
+    /// Actual retransmit-request increment inside the pre-stall window.
+    pub pre_stall_rtx: u32,
+    /// Actual concealed-underflow increment inside the pre-stall window.
+    pub pre_stall_underrun: u32,
+}
+
+impl RtpBaseline {
+    /// How far above the steady baseline counts as transport degradation.
+    ///
+    /// Three times is a starting point, not a constant to defend: once there are
+    /// enough session-summary rows, calibrate it from the observed distribution
+    /// (Q44 §一).
+    pub const RATIO_THRESHOLD: f64 = 3.0;
+    /// Floor for the denominator, in events/second. A clean link has a steady rate
+    /// of zero; without the floor one lost packet would divide by zero and look
+    /// like an infinite spike.
+    pub const RATE_FLOOR_PER_S: f64 = 0.05;
+    /// Minimum retransmit requests in the pre-stall window. Together with the
+    /// ratio this stops a single incidental loss on an otherwise clean link from
+    /// filling the bucket.
+    pub const MIN_RTX: u32 = 3;
+    /// One concealed underrun is already audible, so its absolute minimum is one.
+    pub const MIN_UNDERRUN: u32 = 1;
+
+    pub fn rtx_ratio(&self) -> f64 {
+        f64::from(self.pre_stall_rtx) / self.steady_rtx_per_s.max(Self::RATE_FLOOR_PER_S)
+    }
+
+    pub fn underrun_ratio(&self) -> f64 {
+        f64::from(self.pre_stall_underrun) / self.steady_underrun_per_s.max(Self::RATE_FLOOR_PER_S)
+    }
+
+    /// Whether the RTP side degraded enough to call the stall a transport fault.
+    /// Underruns have their own line because one is enough to be audible.
+    pub fn transport_bad(&self) -> bool {
+        (self.rtx_ratio() > Self::RATIO_THRESHOLD && self.pre_stall_rtx >= Self::MIN_RTX)
+            || (self.underrun_ratio() > Self::RATIO_THRESHOLD
+                && self.pre_stall_underrun >= Self::MIN_UNDERRUN)
+    }
+}
 
 /// RTP-side evidence used to separate a transport failure from a local sender
-/// stall when a successful re-anchor absorbs a missed deadline (Q43 §三).
+/// stall when a successful re-anchor absorbs a missed deadline (Q43 §三, Q44 §一).
 ///
-/// The send thread can miss a deadline because the network stalled or because
-/// the thread itself was descheduled. The cheap discriminator is whether the RTP
-/// counters moved in the window leading into the stall: retransmit requests
-/// (receivers asking for missing packets) and concealed capture underruns.
+/// The send thread can miss a deadline because the network stalled or because the
+/// thread itself was descheduled. The cheap discriminator is whether the RTP
+/// counters spiked in the second leading into the stall, compared with the
+/// sender's own steady state over the last
+/// [`STEADY_WINDOW`](Self::STEADY_WINDOW): retransmit requests (receivers asking
+/// for missing packets) and concealed capture underruns.
 ///
 /// The send loop samples the cumulative counters at most once per
 /// [`SAMPLE_INTERVAL`](Self::SAMPLE_INTERVAL). At a re-anchor the oldest sample
-/// still inside [`WINDOW`](Self::WINDOW) is the baseline, so the comparison
-/// covers roughly the second before the stall.
+/// still inside [`WINDOW`](Self::WINDOW) is the pre-stall baseline, and the oldest
+/// sample still inside the steady window is the long baseline. The steady rate is
+/// measured up to the start of the pre-stall window, not up to now: a spike must
+/// not be diluted by its own baseline (3x over the last second of a 30 s window
+/// would otherwise read as 2.8x).
 ///
 /// Why "before": retransmit requests are only drained when the send loop runs, so
 /// requests that arrive *during* the stall are counted after it ends. They are not
-/// evidence for this re-anchor, and [`reset`](Self::reset) clears the ring after
-/// each re-anchor so they cannot be attributed to the next one either.
+/// evidence for this re-anchor. [`reset`](Self::reset) starts a new pre-stall
+/// window after every re-anchor, so the backlog drained on resume cannot be blamed
+/// on the next stall either. The steady samples survive a re-anchor: a stall must
+/// not throw away the baseline that says what normal loss looks like for this link.
 ///
 /// This is a heuristic, not a proof: loss up to a second before a purely local
-/// stall still looks like transport movement, and a stall longer than the window
-/// leaves no baseline at all. The fallback is [`TimelineResetReason::SenderStall`],
-/// the conservative direction — a missed transport failure costs one stall sample,
-/// while a false confirmed failure would poison the only drift signal.
+/// stall still counts as pre-stall movement, and a stall longer than the window
+/// leaves no pre-stall baseline at all. The fallback is
+/// [`TimelineResetReason::SenderStall`], the conservative direction — a missed
+/// transport failure costs one stall sample, while a false confirmed failure would
+/// poison the only drift signal.
 #[derive(Debug, Default)]
 pub struct RtpEvidence {
+    /// Cumulative-counter samples, oldest first.
     samples: VecDeque<(Instant, u64, u64)>,
+    /// Start of the current pre-stall window; `None` before the first re-anchor.
+    pre_stall_since: Option<Instant>,
 }
 
 impl RtpEvidence {
-    /// How far back a successful re-anchor looks for movement.
+    /// How far back a successful re-anchor looks for the pre-stall increment.
     pub const WINDOW: Duration = Duration::from_secs(1);
+    /// How far back the steady baseline is measured.
+    pub const STEADY_WINDOW: Duration = Duration::from_secs(30);
     /// Minimum spacing between samples; the send loop iterates every packet.
     pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
-    /// Two seconds of history at `SAMPLE_INTERVAL`.
-    const MAX_SAMPLES: usize = 8;
+    /// [`STEADY_WINDOW`](Self::STEADY_WINDOW) at `SAMPLE_INTERVAL`, plus the
+    /// sample that starts the window.
+    const MAX_SAMPLES: usize = 121;
 
     /// Record the cumulative counters, throttled to `SAMPLE_INTERVAL`.
     pub fn sample(&mut self, now: Instant, rtx_req: u64, underruns: u64) {
@@ -329,33 +410,56 @@ impl RtpEvidence {
         }
     }
 
-    /// Whether retransmit requests or concealed underruns rose between the oldest
-    /// sample inside the window and `now`.
-    pub fn moved(&self, now: Instant, rtx_req: u64, underruns: u64) -> bool {
-        let Some((_, base_rtx, base_underruns)) = self
+    /// The pre-stall and steady-state windows for `now`, or `None` when there is
+    /// no sample inside the pre-stall window: a stall longer than the window, or
+    /// the very first loop iteration. The caller then falls back to
+    /// [`TimelineResetReason::SenderStall`].
+    pub fn baseline(&self, now: Instant, rtx_req: u64, underruns: u64) -> Option<RtpBaseline> {
+        let pre = self.samples.iter().find(|(at, _, _)| {
+            self.pre_stall_since.is_none_or(|since| *at > since)
+                && now.saturating_duration_since(*at) <= Self::WINDOW
+        })?;
+        let steady = self
             .samples
             .iter()
-            .find(|(at, _, _)| now.saturating_duration_since(*at) <= Self::WINDOW)
-        else {
-            return false;
-        };
-        rtx_req > *base_rtx || underruns > *base_underruns
+            .find(|(at, _, _)| now.saturating_duration_since(*at) <= Self::STEADY_WINDOW)?;
+        let steady_seconds = pre
+            .0
+            .saturating_duration_since(steady.0)
+            .as_secs_f64()
+            .max(0.001);
+        Some(RtpBaseline {
+            steady_rtx_per_s: pre.1.saturating_sub(steady.1) as f64 / steady_seconds,
+            steady_underrun_per_s: pre.2.saturating_sub(steady.2) as f64 / steady_seconds,
+            pre_stall_rtx: u32::try_from(rtx_req.saturating_sub(pre.1)).unwrap_or(u32::MAX),
+            pre_stall_underrun: u32::try_from(underruns.saturating_sub(pre.2))
+                .unwrap_or(u32::MAX),
+        })
     }
 
-    /// The bucket a successful re-anchor belongs to (Q43 §三).
+    /// The bucket a successful re-anchor belongs to (Q43 §三, Q44 §一).
     pub fn reset_reason(&self, now: Instant, rtx_req: u64, underruns: u64) -> TimelineResetReason {
-        if self.moved(now, rtx_req, underruns) {
-            TimelineResetReason::ConfirmedTransportFailure
-        } else {
-            TimelineResetReason::SenderStall
+        match self.baseline(now, rtx_req, underruns) {
+            Some(baseline) if baseline.transport_bad() => {
+                TimelineResetReason::ConfirmedTransportFailure
+            }
+            _ => TimelineResetReason::SenderStall,
         }
     }
 
-    /// Forget the pre-stall baseline after a re-anchor, so the RTCP requests that
-    /// piled up during this stall cannot make the next re-anchor look like a
-    /// transport failure.
-    pub fn reset(&mut self) {
-        self.samples.clear();
+    /// Start a new pre-stall window after a re-anchor, without throwing away the
+    /// long steady baseline. The retransmit requests that piled up during this
+    /// stall are drained on the same send-loop iteration, right after the
+    /// re-anchor; the next sample (taken after that drain) becomes the new
+    /// baseline, so the backlog cannot make the next re-anchor look like a
+    /// transport failure. A stall inside the next sampling interval has no
+    /// pre-stall baseline and therefore falls back to `sender_stall`.
+    ///
+    /// The drain from an earlier stall stays in the steady window. It is genuine
+    /// observed retransmission pressure, and counting it can only raise the
+    /// denominator, i.e. make the discriminator more conservative.
+    pub fn reset(&mut self, now: Instant) {
+        self.pre_stall_since = Some(now);
     }
 }
 
@@ -375,6 +479,13 @@ pub struct SessionTelemetry {
     pub reanchored: u64,
     /// Signed shift applied by the most recent re-anchor (positive = timeline advanced).
     pub reanchor_shift_us: i64,
+    /// Retransmit requests drained on the first send-loop iteration after a
+    /// stall: how loud the stalls were, not how many there were. A high
+    /// `sender_stall` with a near-zero drained count means the receiver's buffer
+    /// absorbed them and nothing was audible (Q44 §一).
+    pub stall_rtx_drained: u64,
+    /// Largest single-stall [`stall_rtx_drained`](Self::stall_rtx_drained).
+    pub stall_rtx_drained_max: u64,
     /// Timeline expiries that still require a fresh session (should stay near zero).
     pub expired: u64,
     /// Underruns while real media was playing; these are audible without concealment.
@@ -396,9 +507,10 @@ pub struct SessionTelemetry {
     pub servo_filtered_ms: f64,
     pub servo_drift_ppb: f64,
     pub lead_extra_ms: f64,
-    /// Applied adaptive-lead adjustments, including the sub-millisecond ones.
-    /// These are deliberately *not* reset buckets: they describe the ladder
-    /// twitching, which is not a timeline reset (Q43 §二).
+    /// Applied adaptive-lead adjustments of any size. These are deliberately
+    /// *not* reset buckets: they describe the ladder twitching, which is not a
+    /// timeline reset. Only shifts at least as long as the splice ramp also move
+    /// `latency_change` (Q44 §二).
     pub lead_shift_count: u64,
     /// Signed sum of every applied lead shift, in microseconds. Positive means
     /// the timeline was delayed (more lead held at the receiver).
@@ -439,19 +551,29 @@ impl SessionTelemetry {
         self.timeline_resets.record(reason);
         self.last_timeline_reset_reason = Some(reason);
     }
-    /// Account for one applied adaptive-lead shift (Q43 §二).
+    /// Account for one applied adaptive-lead shift (Q44 §二).
     ///
     /// Every shift moves `lead_shift_count` / `lead_shift_total_us`, but only a
-    /// shift of at least [`LEAD_SHIFT_RESET_US`] is a `latency_change` reset. The
-    /// adaptive ladder nudges the lead by fractions of a millisecond; counting
-    /// those as resets would turn `latency_change` into the largest bucket and
-    /// drown `confirmed_transport_failure`.
+    /// shift of at least [`LEAD_SHIFT_RESET_US`] (the splice ramp) is a
+    /// `latency_change` reset. The adaptive ladder nudges the lead by whole
+    /// milliseconds; counting all of them as resets would make `latency_change`
+    /// equal to `lead_shift_count` and drown `confirmed_transport_failure`.
     pub fn record_lead_shift(&mut self, applied_us: i64) {
         self.lead_shift_count = self.lead_shift_count.saturating_add(1);
         self.lead_shift_total_us = self.lead_shift_total_us.saturating_add(applied_us);
         if applied_us.unsigned_abs() >= LEAD_SHIFT_RESET_US {
             self.record_timeline_reset(TimelineResetReason::LatencyChange);
         }
+    }
+    /// Account for the retransmit drain a stall caused (Q44 §一).
+    ///
+    /// `drained` is the increment the first `service_retransmits` call after the
+    /// re-anchor observed. A zero drain is healthy: the receiver's buffer covered
+    /// the gap. The per-stall maximum is kept separately because "fifty stalls of
+    /// one packet" and "two stalls of five hundred" are different problems.
+    pub fn record_stall_drain(&mut self, drained: u64) {
+        self.stall_rtx_drained = self.stall_rtx_drained.saturating_add(drained);
+        self.stall_rtx_drained_max = self.stall_rtx_drained_max.max(drained);
     }
     pub fn snapshot(&self) -> Value {
         json!({
@@ -462,6 +584,8 @@ impl SessionTelemetry {
             "timeline_gap_filled": self.gap_filled,
             "timeline_reanchored": self.reanchored,
             "timeline_reanchor_shift_us": self.reanchor_shift_us,
+            "stall_rtx_drained": self.stall_rtx_drained,
+            "stall_rtx_drained_max": self.stall_rtx_drained_max,
             "timeline_expired": self.expired,
             "underruns_active": self.underruns_active,
             "underruns_idle": self.underruns_idle,
@@ -504,13 +628,15 @@ pub fn next_session_epoch() -> u64 {
 /// `timeline_resets_<reason>` columns are flat so a spreadsheet `SUM` keeps per
 /// cause, and `last_timeline_reset_reason` records the most recent one.
 ///
-/// Layout (31 columns): the 19 scalar fields, then the eleven reset buckets in
+/// Layout (33 columns): the 21 scalar fields, then the eleven reset buckets in
 /// [`TimelineResetReason::ALL`] declaration order, then the last-reason label.
 /// The two lead-shift fields sit next to `applied_lead_ms` because they describe
 /// the same adaptive ladder; they are counters, not reset buckets, and every
-/// shift moves them while only a >= 1 ms shift increments
-/// `timeline_resets_latency_change`.
-pub const SUMMARY_COLUMNS: [&str; 31] = [
+/// shift moves them while only a >= 5 ms shift (the splice ramp) increments
+/// `timeline_resets_latency_change`. The two stall-severity fields sit next to
+/// `reanchored` for the same reason: `reanchored` says how often the sender
+/// stalled, they say how loud each stall was.
+pub const SUMMARY_COLUMNS: [&str; 33] = [
     "session_id",
     "topology",
     "codec",
@@ -524,6 +650,8 @@ pub const SUMMARY_COLUMNS: [&str; 31] = [
     "underruns",
     "gap_filled",
     "reanchored",
+    "stall_rtx_drained",
+    "stall_rtx_drained_max",
     "servo_engagements",
     "baseline_resets",
     "mean_lateness_ms",
@@ -569,6 +697,10 @@ pub struct SessionSummary {
     pub underruns: u64,
     pub gap_filled: u64,
     pub reanchored: u64,
+    /// Retransmit requests drained after stalls: how loud they were.
+    pub stall_rtx_drained: u64,
+    /// Largest single-stall drain.
+    pub stall_rtx_drained_max: u64,
     pub servo_engagements: u64,
     pub baseline_resets: u64,
     pub mean_lateness_ms: f64,
@@ -605,6 +737,8 @@ impl SessionSummary {
             "underruns": self.underruns,
             "gap_filled": self.gap_filled,
             "reanchored": self.reanchored,
+            "stall_rtx_drained": self.stall_rtx_drained,
+            "stall_rtx_drained_max": self.stall_rtx_drained_max,
             "servo_engagements": self.servo_engagements,
             "baseline_resets": self.baseline_resets,
             "mean_lateness_ms": self.mean_lateness_ms,
@@ -640,6 +774,8 @@ impl SessionSummary {
             self.underruns.to_string(),
             self.gap_filled.to_string(),
             self.reanchored.to_string(),
+            self.stall_rtx_drained.to_string(),
+            self.stall_rtx_drained_max.to_string(),
             self.servo_engagements.to_string(),
             self.baseline_resets.to_string(),
             format!("{:.3}", self.mean_lateness_ms),
@@ -931,6 +1067,8 @@ mod tests {
             underruns: 2,
             gap_filled: 11,
             reanchored: 3,
+            stall_rtx_drained: 12,
+            stall_rtx_drained_max: 7,
             servo_engagements: 4,
             baseline_resets: 1,
             mean_lateness_ms: 1.234,
@@ -1017,42 +1155,104 @@ mod tests {
         );
     }
 
+    /// Feed `seconds` of a steady rate at the sampling interval. One counter tick
+    /// per `ticks_per_second` is spread over the four samples of each second.
+    fn feed_steady(evidence: &mut RtpEvidence, t0: Instant, seconds: u64, per_second: u64) {
+        for i in 0..=seconds * 4 {
+            evidence.sample(
+                t0 + Duration::from_millis(250 * i),
+                i * per_second / 4,
+                0,
+            );
+        }
+    }
+
     #[test]
-    fn a_successful_reanchor_is_a_transport_failure_only_when_rtp_counters_moved() {
+    fn a_steady_baseline_absorbs_a_small_pre_stall_increment() {
         let t0 = Instant::now();
-        let at = t0 + Duration::from_millis(900);
-        // Clean RTP before the stall: the thread missed its own deadline.
-        let mut clean = RtpEvidence::default();
-        clean.sample(t0, 5, 1);
-        clean.sample(t0 + Duration::from_millis(500), 5, 1);
-        assert!(!clean.moved(at, 5, 1));
-        assert_eq!(clean.reset_reason(at, 5, 1), TimelineResetReason::SenderStall);
-        // Retransmit requests rose: the receiver was already missing packets.
-        let mut rtx = RtpEvidence::default();
-        rtx.sample(t0, 5, 1);
-        rtx.sample(t0 + Duration::from_millis(500), 7, 1);
-        assert_eq!(
-            rtx.reset_reason(at, 7, 1),
-            TimelineResetReason::ConfirmedTransportFailure
+        // 2 rtx/s for 30 s is this link's normal loss; a binary "did anything
+        // move" test would have called the next stall a transport failure.
+        let mut evidence = RtpEvidence::default();
+        feed_steady(&mut evidence, t0, 30, 2);
+        let now = t0 + Duration::from_millis(30_500);
+        evidence.sample(now, 63, 0);
+        let baseline = evidence.baseline(now, 63, 0).expect("window exists");
+        assert!(
+            baseline.pre_stall_rtx >= 1,
+            "the old binary test would have fired: {baseline:?}"
         );
-        // Concealed capture underruns alone are also RTP-side evidence.
-        let mut underruns = RtpEvidence::default();
-        underruns.sample(t0, 5, 1);
-        underruns.sample(t0 + Duration::from_millis(500), 5, 4);
-        assert_eq!(
-            underruns.reset_reason(at, 5, 4),
-            TimelineResetReason::ConfirmedTransportFailure
+        assert!(
+            (baseline.steady_rtx_per_s - 2.0).abs() < 0.2,
+            "steady rate must describe the link, got {baseline:?}"
         );
-        // Neither bucket is the other.
-        assert_eq!(clean.reset_reason(at, 5, 1), TimelineResetReason::SenderStall);
-        assert_ne!(
-            clean.reset_reason(at, 5, 1),
+        assert!(
+            baseline.rtx_ratio() <= RtpBaseline::RATIO_THRESHOLD,
+            "a normal increment must stay inside the ratio: {baseline:?}"
+        );
+        assert!(!baseline.transport_bad(), "{baseline:?}");
+        assert_eq!(
+            evidence.reset_reason(now, 63, 0),
+            TimelineResetReason::SenderStall
+        );
+    }
+
+    #[test]
+    fn a_clear_spike_above_the_steady_rate_is_a_transport_failure() {
+        let t0 = Instant::now();
+        let mut evidence = RtpEvidence::default();
+        feed_steady(&mut evidence, t0, 30, 1);
+        let now = t0 + Duration::from_millis(30_750);
+        // Eleven requests in the pre-stall window against a 1/s steady rate.
+        evidence.sample(now, 40, 0);
+        let baseline = evidence.baseline(now, 40, 0).expect("window exists");
+        assert_eq!(baseline.pre_stall_rtx, 11);
+        assert!(baseline.steady_rtx_per_s < 1.5, "{baseline:?}");
+        assert!(baseline.rtx_ratio() > RtpBaseline::RATIO_THRESHOLD);
+        assert!(baseline.transport_bad(), "{baseline:?}");
+        assert_eq!(
+            evidence.reset_reason(now, 40, 0),
             TimelineResetReason::ConfirmedTransportFailure
         );
     }
 
     #[test]
-    fn rtp_evidence_needs_a_fresh_baseline_and_is_cleared_after_a_reanchor() {
+    fn one_underrun_is_transport_evidence_while_one_rtx_is_not() {
+        let t0 = Instant::now();
+        // A clean link: the denominator is zero, so the ratio floor applies and
+        // the absolute minimums decide.
+        let mut underruns = RtpEvidence::default();
+        feed_steady(&mut underruns, t0, 30, 0);
+        let now = t0 + Duration::from_millis(30_250);
+        underruns.sample(now, 0, 1);
+        let baseline = underruns.baseline(now, 0, 1).expect("window exists");
+        assert_eq!(baseline.pre_stall_rtx, 0);
+        assert_eq!(baseline.pre_stall_underrun, 1);
+        assert!(
+            baseline.underrun_ratio() > RtpBaseline::RATIO_THRESHOLD,
+            "{baseline:?}"
+        );
+        assert!(baseline.transport_bad(), "{baseline:?}");
+        assert_eq!(
+            underruns.reset_reason(now, 0, 1),
+            TimelineResetReason::ConfirmedTransportFailure
+        );
+        // The same single event on the retransmit side is only a lost packet:
+        // rtx needs an absolute minimum of three as well as the ratio.
+        let mut rtx = RtpEvidence::default();
+        feed_steady(&mut rtx, t0, 30, 0);
+        rtx.sample(now, 1, 0);
+        let baseline = rtx.baseline(now, 1, 0).expect("window exists");
+        assert_eq!(baseline.pre_stall_rtx, 1);
+        assert!(baseline.rtx_ratio() > RtpBaseline::RATIO_THRESHOLD);
+        assert!(!baseline.transport_bad(), "{baseline:?}");
+        assert_eq!(
+            rtx.reset_reason(now, 1, 0),
+            TimelineResetReason::SenderStall
+        );
+    }
+
+    #[test]
+    fn rtp_evidence_needs_a_pre_stall_sample_and_keeps_the_steady_window() {
         let t0 = Instant::now();
         let mut evidence = RtpEvidence::default();
         // No sample at all: the conservative answer is a local stall.
@@ -1060,46 +1260,75 @@ mod tests {
             evidence.reset_reason(t0, 9, 9),
             TimelineResetReason::SenderStall
         );
-        evidence.sample(t0, 1, 0);
-        // Samples closer than SAMPLE_INTERVAL are throttled away, so the t0
-        // sample stays the baseline; unchanged counters report no movement.
-        evidence.sample(t0 + Duration::from_millis(100), 1, 0);
-        assert!(!evidence.moved(t0 + Duration::from_millis(100), 1, 0));
-        // A sample outside the window is not a baseline either.
-        assert!(!evidence.moved(t0 + Duration::from_millis(1500), 5, 5));
-        evidence.sample(t0 + Duration::from_millis(1500), 1, 0);
-        assert!(evidence.moved(t0 + Duration::from_millis(2000), 2, 0));
-        // The ring is cleared after a re-anchor, so requests that piled up during
-        // the stall cannot make the next re-anchor look like a transport failure.
-        evidence.reset();
+        feed_steady(&mut evidence, t0, 30, 1);
+        // A stall longer than the pre-stall window leaves no baseline.
+        let far = t0 + Duration::from_millis(31_600);
+        assert!(evidence.baseline(far, 40, 0).is_none());
         assert_eq!(
-            evidence.reset_reason(t0 + Duration::from_millis(2100), 9, 9),
+            evidence.reset_reason(far, 40, 0),
             TimelineResetReason::SenderStall
+        );
+        // A re-anchor starts a new pre-stall window: samples at or before it are
+        // not a baseline, so a stall inside the next sample interval has none.
+        let now = t0 + Duration::from_millis(30_000);
+        evidence.reset(now);
+        assert!(
+            evidence
+                .baseline(now + Duration::from_millis(100), 31, 0)
+                .is_none()
+        );
+        // The long steady samples survive the re-anchor: once a post-reset sample
+        // exists, the link's normal rate is still known.
+        let later = t0 + Duration::from_millis(30_500);
+        evidence.sample(later, 31, 0);
+        let baseline = evidence.baseline(later, 31, 0).expect("window exists");
+        assert!(
+            (baseline.steady_rtx_per_s - 1.0).abs() < 0.2,
+            "{baseline:?}"
         );
     }
 
     #[test]
-    fn only_a_full_millisecond_lead_shift_is_a_latency_change_reset() {
+    fn stall_severity_counts_the_total_and_the_worst_single_stall() {
         let mut telemetry = SessionTelemetry::new();
-        telemetry.record_lead_shift(999);
-        telemetry.record_lead_shift(1);
-        assert_eq!(telemetry.lead_shift_count, 2);
-        assert_eq!(telemetry.lead_shift_total_us, 1_000);
+        assert_eq!(telemetry.stall_rtx_drained, 0);
+        assert_eq!(telemetry.stall_rtx_drained_max, 0);
+        telemetry.record_stall_drain(3);
+        telemetry.record_stall_drain(9);
+        // A stall the receiver's buffer absorbed adds nothing but a count.
+        telemetry.record_stall_drain(0);
+        assert_eq!(telemetry.stall_rtx_drained, 12);
+        assert_eq!(telemetry.stall_rtx_drained_max, 9);
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot["stall_rtx_drained"], json!(12));
+        assert_eq!(snapshot["stall_rtx_drained_max"], json!(9));
+    }
+
+    #[test]
+    fn only_a_shift_at_least_as_long_as_the_splice_ramp_is_a_latency_change_reset() {
+        // The ramp is 5 ms (`continuity::Splice` uses `rate / 200`), so a 3 ms
+        // shift is inaudible and must not be a timeline reset.
+        assert_eq!(LEAD_SHIFT_RESET_US, 5_000);
+        let mut telemetry = SessionTelemetry::new();
+        telemetry.record_lead_shift(3_000);
+        assert_eq!(telemetry.lead_shift_count, 1);
+        assert_eq!(telemetry.lead_shift_total_us, 3_000);
         assert_eq!(
             telemetry.timeline_resets.latency_change, 0,
-            "sub-millisecond noise must not fill the reset bucket"
+            "3 ms is inside the 5 ms splice ramp"
         );
-        telemetry.record_lead_shift(1_000);
-        telemetry.record_lead_shift(-1_000);
-        assert_eq!(telemetry.lead_shift_count, 4);
-        assert_eq!(telemetry.lead_shift_total_us, 1_000);
+        telemetry.record_lead_shift(5_000);
+        assert_eq!(telemetry.timeline_resets.latency_change, 1);
+        telemetry.record_lead_shift(-7_000);
         assert_eq!(telemetry.timeline_resets.latency_change, 2);
+        assert_eq!(telemetry.lead_shift_count, 3);
+        assert_eq!(telemetry.lead_shift_total_us, 1_000);
         assert_eq!(
             telemetry.last_timeline_reset_reason,
             Some(TimelineResetReason::LatencyChange)
         );
         let snapshot = telemetry.snapshot();
-        assert_eq!(snapshot["lead_shift_count"], json!(4));
+        assert_eq!(snapshot["lead_shift_count"], json!(3));
         assert_eq!(snapshot["lead_shift_total_us"], json!(1_000));
     }
 
@@ -1117,7 +1346,13 @@ mod tests {
         assert_eq!(fields.len(), SUMMARY_COLUMNS.len());
         for (column, value) in SUMMARY_COLUMNS.iter().zip(&fields) {
             if column.starts_with("timeline_resets_")
-                || matches!(*column, "lead_shift_count" | "lead_shift_total_us")
+                || matches!(
+                    *column,
+                    "lead_shift_count"
+                        | "lead_shift_total_us"
+                        | "stall_rtx_drained"
+                        | "stall_rtx_drained_max"
+                )
             {
                 assert_eq!(*value, "0", "{column} must be zero");
             }
@@ -1211,6 +1446,8 @@ mod tests {
                 "underruns" => assert_eq!(fields[index], "2"),
                 "gap_filled" => assert_eq!(fields[index], "11"),
                 "reanchored" => assert_eq!(fields[index], "3"),
+                "stall_rtx_drained" => assert_eq!(fields[index], "12"),
+                "stall_rtx_drained_max" => assert_eq!(fields[index], "7"),
                 "servo_engagements" => assert_eq!(fields[index], "4"),
                 "baseline_resets" => assert_eq!(fields[index], "1"),
                 "mean_lateness_ms" => assert_eq!(fields[index], "1.234"),

@@ -1051,9 +1051,10 @@ impl MediaSchedule {
     /// timeline stays consistent. Returns the signed change actually applied, in
     /// microseconds, clamped to the same ceiling as a re-anchor.
     ///
-    /// Microseconds (not milliseconds) are what let the session distinguish an
-    /// audible lead change from a sub-millisecond nudge: only the former is a
-    /// `latency_change` reset (Q43 §二).
+    /// Microseconds are an internal invariant, not a product capability: the IPC
+    /// request is whole milliseconds. The session counts every applied shift, and
+    /// only a shift at least as long as the 5 ms splice ramp is a
+    /// `latency_change` reset (Q44 §二).
     pub fn add_shift_us(&mut self, delta_us: i64) -> i64 {
         let before = self.shift;
         let target = if delta_us >= 0 {
