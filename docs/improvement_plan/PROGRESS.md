@@ -349,7 +349,7 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   `select_timing`（单成员 `TimingPlan`），但输入不变，所以 IPC 里
   `selected_timing` 的取值与改造前完全一致。
 
-## P3-3 抢占识别（WAC 模型 + `statusFlags` 位定义 + Q32 死锁修复 + Q34 busy/存活，已完成）
+## P3-3 抢占识别（WAC 模型 + `statusFlags` 位定义 + Q32 死锁修复 + Q34 busy/存活 + Q42 存活升级，已完成）
 
 `native/airflash-engine/src/preemption.rs`（重写）、`rtsp.rs`、`transport.rs`、
 `session.rs`、桌面状态与文案
@@ -383,22 +383,60 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   | 置位 | `true` | `OursActive` | **不回收**：`FallThrough`，走原来的非抢占路径 |
   | 置位 | `false` | `BusyElsewhere` | 二次确认后进入退避队列（3/6/12/24/60 s，封顶 60 s），**永不放弃** |
   | 缺字段/类型错 | 任意 | `Unknown` | 立即回收（fail-open） |
-- **Q34 的第四维：TCP 存活探测**：`statusFlags` 只说明「接收器上有没有会话」，
-  不说明「那台设备还在不在」。新增 `ReceiverLiveness { Alive, Unknown, Dead }`，
-  由 `receiver_liveness(ip, port, 2s)` 对**控制端口**做一次裸
-  `TcpStream::connect_timeout`：接通即 `Alive`（拿到 socket 立刻丢弃，不发任何
-  RTSP 请求）；连接被拒或超时 ⇒ `Dead`；其他错误 ⇒ `Unknown`。`combine` 把它和
-  媒体健康组合：
-  | `media_healthy` | `ReceiverLiveness` | 判定 | 动作 |
+- **Q34 的第四维：TCP 存活探测（Q42 修正）**：`statusFlags` 只说明「接收器上有没有
+  会话」，不说明「那台设备还在不在」。`receiver_liveness(ip, port, 2s)` 对**控制端口**
+  做一次裸 `TcpStream::connect_timeout`（接通即 `Alive`，拿到 socket 立刻丢弃，不发
+  任何 RTSP 请求），结果按 Q42 分成**四态** `ReceiverLiveness { Alive, Refused,
+  Dead, Unknown }`：
+  | 探测结果 | 物理含义 | 状态 |
+  | --- | --- | --- |
+  | 接通 | 主机在、端口在服务 | `Alive` |
+  | RST 回来（`ConnectionRefused`） | **主机活着、协议栈在跑，只是那个端口没监听** | `Refused` |
+  | 超时 / `HostUnreachable` / `NetworkUnreachable` | 主机不响应 / 明确不可达 | `Dead` |
+  | 其他错误（防火墙、瞬时本机 socket 错误、IPv6 邻居发现失败…） | 既不能证明活也不能证明死 | `Unknown` |
+  Q42 更正了 Q34「被拒 ⇒ `Dead`」的说法：**收到 RST 是对端网络栈回应了我们**，那是
+  「活着但没在服务 AirPlay」，不是「关机」。动作上 `Refused` 与 `Dead` 一样都读不到
+  `statusFlags` ⇒ 同样 fail-open 回收，但**状态不合并**：日志里 `tcp_liveness` 分别是
+  `refused` 和 `dead`，排障时能区分「设备被我判死」和「设备拒连」。`combine` 的整张表：
+  | `media_healthy` | 存活状态 | 判定 | 动作 |
   | --- | --- | --- | --- |
   | `true` | `Alive` | `OursActive` | `FallThrough` |
   | `true` | `Unknown` | `OursActive` | `FallThrough`（保守，不打扰仍在播的会话） |
-  | `true` | `Dead` | `Gone` | 立即回收；`Dead` **永远不会**判成 `BusyElsewhere` |
-  | `false` | `Dead` | `Gone` | 立即回收 |
-  | `false` | `Alive`/`Unknown` | 回退 `classify` | 同上面的三分类 |
-  探测行和证据行都新增 `tcp_reachable`（bool，只有 `Alive` 为 `true`）与
-  `tcp_liveness`（`alive`/`unknown`/`dead`）；媒体健康时不再因为 `/info` 报错
-  就 fail-open 回收——那会把我们自己正在播的会话打断。
+  | `true` | `Dead` / `Refused` | `Gone` | 立即回收；**永远不会**判成 `BusyElsewhere` |
+  | `false` | `Dead` / `Refused` | `Gone` | 立即回收 |
+  | `false` | `Alive` / `Unknown` | 回退 `classify` | 同上面的三分类 |
+  媒体健康时不再因为 `/info` 报错就 fail-open 回收——那会把我们自己正在播的会话打断。
+- **Q42 的失联升级计时器：`Unknown` 有耐心上限，不枚举 errno**：`Unknown` 只是「暂时
+  不知道」，不是「永远算我的」。`LivenessTracker { consecutive_failures, last_ok }`
+  在每次探测后给出 `Verdict { Alive, Dead, Unknown }`：
+  `Alive` ⇒ 计数清零并刷新 `last_ok`；`Refused`/`Dead` ⇒ 直接 `Dead`；`Unknown` ⇒
+  计数 +1，达到 **`LIVENESS_PATIENCE = 3`**（连续 3 次什么也没证明的探测）就升级成
+  `Dead`，另有一条**墙钟兜底**：从第 2 次连续失败起，若距 `last_ok` 已超过
+  `LIVENESS_PATIENCE_WINDOW = 60 s` 也升级。**3 和 60 s 都是我们选的值**：Q42 只规定
+  「`Unknown` 必须有耐心上限」，代码示意里写的是 `>= 3 || now - last_ok > 60s`；我们
+  保留了这两条，但把墙钟那条限制成「至少第 2 次连续失败」，因为**长时间安静之后的一次
+  孤立异常**正是这条规则最不该惩罚的瞬时本机抖动（防火墙刷新、`WSAENOBUFS`、
+  路由表抖一下），一次错误就判死会打断本来正常的会话。
+  为了让这条计时器真能生效，判决未定时 `Tracker::await_liveness` 会在
+  `LIVENESS_RETRY = 3 s` 后再采一次样（否则反馈线程已经退出、不会再产生信号，一次
+  `Unknown` 就永远是唯一一次采样，耐心上限形同虚设）；采样循环有界——第 3 次必然
+  `Dead` 并回收。busy 队列和 yielding 终态不被这个计时器改写。效果：设备真关机/不可达
+  时约 6 s 就能回收，不再依赖 `MEDIA_HEALTH_WINDOW` 兜底（UDP 发送在关机后仍会「成功」，
+  那个窗口实际上永远不会过期）。
+- **Q42 的多接收器交叉校验：全失败 = 我自己的问题**：单看一台设备分不清「它关机了」
+  和「本机路由表/网卡/Wi-Fi 坏了」，但看整轮探测可以。`local_network_suspected(probes,
+  receivers)` 只在 **接收器数 > 1、本轮每个成员都被探测过、且所有探测都没证明主机回应**
+  时为真（`Alive`/`Refused` 都算「主机回应过」，所以**全拒连不是本机网络故障**——设备
+  活着，只是不在服务）。命中时这一轮**不把任何设备标成死**：每个成员的 `Dead` 判决被
+  降级成 `Verdict::Unknown`（健康媒体 ⇒ `OursActive` ⇒ 不回收），升级计数既不增加也不
+  清零（这不是关于这台设备的证据），也不排升级重采；日志发一条
+  `preemption_local_network`（带 `receivers` 和每台设备的原始 `probes`），探测行/证据行
+  带 `local_network_suspected: true`，剩下的事交给原有的媒体健康兜底。只探测到部分成员
+  的轮次不算「全失败」，那台设备的判决照常生效。
+- **UDP「发送成功」永远不是存活信号（Q42 §五）**：UDP 无连接，内核只把包交给网卡，没有
+  任何投递确认；ICMP port-unreachable 在 Windows 上默认异步且经常被丢弃。所以引擎**不**
+  把「UDP 发送成功」当作设备还活着的证据，存活判据只有 TCP 探测 + `MEDIA_HEALTH_WINDOW`
+  兜底；Q42 之后兜底不再是主力，主力是上面的升级计时器。
 - **busy 队列永不放弃（Q34 §四）**：删掉了 `BUSY_LIMIT`、
   `ProbeAction::ReclaimBusyExhausted` 和 `busy_exhausted` warning。确认的
   `BusyElsewhere` 只做一件事：按下一次退避间隔排探测
@@ -472,12 +510,13 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   | `Free` | 只排 500 ms 确认，不回收 | 两次一致才回收（算一次 takeover） |
   | `OursActive` | 不回收，`FallThrough` 到原非抢占路径 | 不做二次确认（不改变状态） |
   | `BusyElsewhere` | 只排 500 ms 确认 | 两次一致才按 3/6/12/24/60 s 退避再探；永不强制回收 |
-  | `Gone`（存活探测判定 `Dead`） | 立即回收 | 不做二次确认；不算 busy、不计 takeover |
+  | `Gone`（存活探测判定 `Dead`/`Refused`，或升级后的 `Unknown`） | 立即回收 | 不做二次确认；不算 busy、不计 takeover |
   | `Unknown` / `Err` / 超时 | 立即回收（fail-open） | 不做二次确认 |
 - **连续计数只数「真接管周期」+ 时间窗 + yielding（Q34 §四）**：
   `TakeoverCounter` 按接收器（IP）计数，每个 live 播放进程跨 reclaim 复用。
   `TAKEOVER_LIMIT=3`、`TAKEOVER_WINDOW=30s`、`PROBE_TIMEOUT=2s`、
-  `LIVENESS_TIMEOUT=2s` 和退避序列都是**我们选的值**，不是从 WAC 静态恢复的
+  `LIVENESS_TIMEOUT=2s`、`LIVENESS_PATIENCE=3`、`LIVENESS_PATIENCE_WINDOW=60s`、
+  `LIVENESS_RETRY=3s` 和退避序列都是**我们选的值**，不是从 WAC 静态恢复的
   常数。一次「回收→接管」周期只有在**回收真的建立成功后**才开始：`run_stream`
   在新会话 SETUP/RECORD 完成、开始发包前调用 `reclaim_succeeded(now)`，随后的
   确认 `Free` 才调用 `takeover(now)`，只有落在这 30 s 窗口内才 +1，否则（包括
@@ -517,21 +556,40 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
 - **可观测性**：`preemption_evidence` 行保留 WAC 的三项上下文
   （`policy`/`rtp_healthy`/`packets_prepared`）；`preemption_probe` 行现在也带
   这三项，并新增 `we_hold_session`、完整 64 位 `status_flags`（`0x%016x`）、
-  `stereo_partner_unreachable` 遥测位（只上报，不参与判定），以及 Q34 的
-  `tcp_reachable`（bool）和 `tcp_liveness`（`alive`/`unknown`/`dead`）——
-  证据行和探测行都写，方便把「设备不在」与「设备在但被别人占着」分开。
-  另外两个独立 warning code 让状态机不会静默循环：`preemption_probe_disagreement`
-  记录两次探测不一致（带 `first`/`second` 两个 outcome），`preempted`
-  （`reason="limit"`）记录让步；`busy_exhausted` 已随强制回收一起删除，
-  不存在「排队撞上限」这个事件了。
-- 测试（Rust 共 253 passed / 2 ignored：`--lib` 213 passed + 1 ignored、
-  `main` 2、集成 38）：
+  `stereo_partner_unreachable` 遥测位（只上报，不参与判定），以及 Q34/Q42 的
+  存活字段：`tcp_reachable`（bool，只有 `Alive` 为 `true`）、`tcp_liveness`
+  （**四态** `alive`/`refused`/`dead`/`unknown`，原始探测结果）、
+  `liveness_verdict`（升级/交叉校验后的判决 `alive`/`dead`/`unknown`）、
+  `liveness_failures`（连续未定次数）和 `local_network_suspected`（本轮全失败）——
+  证据行和探测行都写，方便把「设备不在」「设备拒连」「设备在但被别人占着」
+  「问题在本机」四种情况分开。另外三个独立 warning code 让状态机不会静默循环：
+  `preemption_probe_disagreement` 记录两次探测不一致（带 `first`/`second` 两个
+  outcome）、`preemption_local_network` 记录「多接收器本轮全失败，怀疑本机网络」
+  （带 `receivers` 和每台设备的原始 `probes`）、`preempted`（`reason="limit"`）
+  记录让步；`busy_exhausted` 已随强制回收一起删除，不存在「排队撞上限」这个事件了。
+- 测试（Rust 共 284 passed / 2 ignored：`--lib` 242 passed + 1 ignored、
+  `main` 2、集成 40）：
   - `preemption.rs` 表驱动单测：`combine` 的整张表（`media_healthy` ×
-    `Alive`/`Unknown`/`Dead`，含 `statusFlags` 缺省/0/活跃位变体）——
-    `Dead` 永远是 `Gone`/回收且**不是** `BusyElsewhere`，健康媒体 + `Alive`/
-    `Unknown` 是 `OursActive`，不健康才回退三分类；`ReceiverLiveness` 的
-    `name()`/`reachable()`（只有 `Alive` 为 true）；真实
-    `TcpStream::connect_timeout` 的 `Alive`/`Dead` 判定；
+    `Alive`/`Refused`/`Unknown`/`Dead`，含 `statusFlags` 缺省/0/活跃位变体）——
+    `Dead`/`Refused` 永远是 `Gone`/回收且**不是** `BusyElsewhere`，健康媒体 +
+    `Alive`/`Unknown` 是 `OursActive`，不健康才回退三分类；`ReceiverLiveness` 的
+    `name()`（四态）/`reachable()`（只有 `Alive` 为 true）/`host_answered()`
+    （`Alive`/`Refused` 为 true）；`liveness_from_error` 的 Q42 映射
+    （`ConnectionRefused` ⇒ `Refused`；`TimedOut`/`HostUnreachable`/
+    `NetworkUnreachable` ⇒ `Dead`；`ConnectionReset`/`NotConnected`/
+    `PermissionDenied`/`Other` ⇒ `Unknown`）；真实
+    `TcpStream::connect_timeout` 的 `Alive`/关闭端口判定；升级计时器：
+    `an_unknown_chain_escalates_to_dead_and_one_ok_resets_it`（3 次连续
+    `Unknown` 才 `Dead`、一次 `Alive` 清零并刷新 `last_ok`）、
+    `refused_and_dead_are_decided_without_waiting`、
+    `the_patience_window_only_escalates_after_a_second_failure`（60 s 墙钟条款
+    只从第 2 次连续失败起生效）、
+    `a_local_suspect_round_neither_counts_nor_resets_the_device_failures`、
+    `an_undecided_round_schedules_another_sample`（`await_liveness` 排
+    `LIVENESS_RETRY`，重复的相同样本不重复打印）、
+    `the_liveness_timer_never_cuts_a_busy_queue_short`（busy 退避/yielding 不被
+    改写）、`all_receivers_failing_in_one_round_is_a_local_problem`（全失败为真、
+    有一台 `Alive` 为假、全 `Refused` 为假、单台为假、少探一台为假）；
     `requeue_delay_is_the_exact_backoff_sequence`（3/6/12/24/60/60…）；
     `queueing_backs_off_forever_and_never_forces_a_reclaim`（一直 busy 也永远
     不 `Reclaim`）；`a_non_busy_verdict_resets_the_queue_backoff`；
@@ -547,8 +605,13 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
     一条新连接；同一置位位图在 `we_hold_session` 两种取值下分别是
     `OursActive` / `BusyElsewhere`；bit14+bit7 与 `1<<40` 高位不影响 `Free`；
     缺 `statusFlags` 为 `Unknown`；连接拒绝/静默超时为 `Err` 且判决为回收；
-    新增 Q34 集成测试：监听端口 ⇒ `Alive`、关闭端口 ⇒ `Dead`；
-    `Dead` + 健康媒体 ⇒ `Gone`/回收且任何 `statusFlags` 下都不是 busy；
+    Q34/Q42 存活集成测试：监听端口 ⇒ `Alive`、关闭端口 ⇒ `Refused`
+    （`the_liveness_probe_is_a_bare_tcp_connect_to_the_control_port`，10 s
+    超时避免把 RST 误读成超时）；`timeout_host_unreachable_and_network_unreachable_are_dead`
+    走同一个 `liveness_from_error`；`Refused`/`Dead` + 健康媒体 ⇒ `Gone`/回收且
+    任何 `statusFlags` 下都不是 busy；`an_unknown_chain_escalates_to_dead_and_one_ok_resets_it`
+    用 `Tracker` 走完整条升级链；`all_receivers_failing_at_once_is_a_local_problem_and_marks_none_dead`
+    断言两台同时失败 ⇒ `LocalSuspect`/`Unknown`/`OursActive`/不计数；
     `Unknown` + 健康媒体 ⇒ `OursActive`，不健康 ⇒ 回退 `Free`/`Unknown`。
   - `tests/continuity.rs`：运行中 `/feedback` 返回 401/403/454 时只把控制通道
     记为可重试的 `feedback_rejected`（不是 `authentication_failed` /
@@ -570,8 +633,22 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
     `Waiting`（busy），调度时间 = 确认时刻 + `requeue_delay(0)`，不回收、
     不出现 `busy_exhausted`/`preempted`；**`a_queueing_busy_receiver_never_reaches_the_yield`**：
     24 轮确认 busy（跨过 2 s 自愈窗）仍不 yield、不中毒、计数器为 0；
-    **`a_dead_control_port_reclaims_instead_of_a_generic_fault`**：TCP 被拒 ⇒
-    `gone`/回收、`tcp_reachable=false`、不计 takeover、无 `preempted`；
+    **`an_unreachable_control_port_reclaims_instead_of_a_generic_fault`**：真实关闭
+    端口 ⇒ `gone`/回收、`tcp_reachable=false`、`liveness_verdict=dead`、原始
+    `tcp_liveness` 是 `dead` 或 `refused`（取决于本机协议栈是回 RST 还是丢 SYN，
+    两者动作相同）、不计 takeover、无 `preempted`；
+    **`a_refused_control_port_is_logged_as_refused_and_never_as_dead`**：合成
+    `Refused` 轮次 ⇒ probe/evidence 行都是 `tcp_liveness=refused`、
+    `liveness_verdict=dead`、文案含 `refused`/`alive` 且**不含** `device is gone`、
+    仍然回收；
+    **`an_escalating_unknown_liveness_reclaims_after_the_patience_limit`**：健康
+    媒体 + 连续 `Unknown` 三轮，前两轮 `None` 且每轮排 `LIVENESS_RETRY`，第三轮
+    `Reclaimed`、`liveness_failures=3`、`liveness_verdict=dead`、不计 takeover；
+    **`a_group_wide_liveness_failure_does_not_mark_the_device_dead`**：全失败轮次
+    ⇒ `None`、不中毒、计数不变、不排重采，probe 行保留原始 `dead` 但
+    `liveness_verdict=unknown`、`local_network_suspected=true`、文案含
+    `local network`；**`the_local_network_warning_names_every_failed_probe`** 断言
+    `preemption_local_network` 的 `receivers`/`probes`/文案；
     缺字段（媒体不健康）⇒ fail-open 回收；`hitting_the_consecutive_limit_yields_with_reason_limit`
     用新计数 API 播种两个「成功回收后接管」周期，第 3 次触顶后断言
     `reason="limit"`、`suspended()`、`scheduled()=None`，且 1 s/60 s/1 h/24 h
@@ -589,12 +666,15 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   - RTP 健康与真接管：按 Q32 的无条件规则，UDP 发送仍「成功」时 bit17 会被判成
     `OursActive` 而不回收。真接管时 ICMP/端口关闭能否在多长时间内让
     `media_healthy` 变假、从而进入 busy 路径，未实测，见 Q34。
-  - TCP 存活探测的真机错误码（Q42，待答复）：Q34 只规定「被拒/超时 ⇒ `Dead`，
-    其他错误 ⇒ `Unknown`」。Windows 对同一子网内已关机/拔电的 HomePod 经常返回
-    `HostUnreachable`/`NetworkUnreachable`（10065/10051）而不是 refused/timeout；
-    按当前实现会落到 `Unknown`（保守 ⇒ `OursActive`），于是「设备关机」不会
-    回收，只能等媒体窗口自己过期。真机返回哪种错误、是否应把 host/network
-    unreachable 也算 `Dead`，未实测。
+  - TCP 存活探测的真机错误码（Q42 已答复）：现在不再依赖枚举 —— 只有
+    `TimedOut`/`HostUnreachable`/`NetworkUnreachable` 直接判 `Dead`，
+    `ConnectionRefused` 判 `Refused`，其余一律 `Unknown` 并由「连续 3 次或 60 s」
+    的升级计时器兜底，所以 Windows 具体返回哪个码都不影响「设备关机最终会被回收」。
+    真机上关机/拔电/路由器隔离分别返回哪个码仍未实测（Q42 §四的 PowerShell
+    四场景对照表还没跑），只是它不再决定行为。
+  - 升级计时器在真机上的时间尺度：`LIVENESS_PATIENCE=3` × `LIVENESS_RETRY=3 s`
+    约 6 s 判死，这个节奏对真实 Wi-Fi 抖动（AP 漫游、信道切换）是否过于激进，
+    未在真机验证；如果发现误回收，调大 `LIVENESS_PATIENCE` 或 `LIVENESS_RETRY`。
   - `ENDED_TRUST_WINDOW=2s`、`CONFIRM_DELAY=500ms`、退避 3/6/12/24/60 s、
     `TAKEOVER_LIMIT=3`、`TAKEOVER_WINDOW=30s`、`LIVENESS_TIMEOUT=2s` 都是
     **我们选的值**：2 s 与 WAC 的 gap window / 引擎 `MEDIA_HEALTH_WINDOW` 对齐，
@@ -605,10 +685,17 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   - 存活探测只证明「控制端口还在监听」：HomePod 在开机但 RTSP 服务异常、
     或中间防火墙只挡 UDP 时，`Alive` 仍可能把已失效的会话判成 `OursActive`。
     这种情况仍靠 `MEDIA_HEALTH_WINDOW` 兜底，未在真机验证。
+  - 「全失败 = 本机问题」的代价：如果用户真的**同时**把组里所有 HomePod 都关机/拔电，
+    每一轮探测都会是「全失败」，按 Q42 的规则我们不会回收任何一台，会一直往已经
+    没有接收器的组里发流，直到用户停止播放。这是用户明确要求的口径（多设备场景下
+    全失败优先怀疑本机），真机上「全部关机」与「本机断网」的分布未实测；如果实际
+    使用中这个假阴性比假阳性更烦，需要再和一个设备数/时间窗条件结合。
   - 没有抓包验证 HomePod 被接管时 `/info` 响应是否仍可读、是否要求认证、
     `statusFlags` 是否在接管瞬间变化。
-  - 立体声对中一个成员在探测时最多阻塞 2 s；本地测试未覆盖两台接收器同时
-    被接管的时序。
+  - 两阶段轮询让一轮里所有成员**先探测再决策**：N 台设备最坏要等 N ×
+    (`LIVENESS_TIMEOUT` + `PROBE_TIMEOUT`) = N × 4 s 才轮到最后一个成员的动作，
+    但这个等待只在控制面已经出现证据时发生（正常会话不探测），且本地测试只覆盖
+    单成员/模拟成员，未在真实双 HomePod 上测过时序。
 
 ## 还没做
 
