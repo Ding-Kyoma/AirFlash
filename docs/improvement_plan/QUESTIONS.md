@@ -2512,6 +2512,31 @@ P3-2b 按 Q36 把列表标注拆成四态，路由仍严格用 WAC 的布尔。`
 > | 漂移的唯一可靠信号 | **`confirmed_transport_failure`**（`rebuild_count > 0` 会同时命中换歌和调 lead） |
 > | `baseline_resets = ServoCounters.steps` | ✅ 对。建议加 `baseline_reset_max_step_ms` |
 
+### Q41. 已关机/不可达的 HomePod 在 Windows 上返回哪种 TCP 错误，应该算 `Dead` 吗？ `[待确认]`
+
+Q34 §四 要求用控制端口的裸 TCP connect 做存活探测：接通 ⇒ `Alive`，连接被拒/
+超时 ⇒ `Dead`，其他错误 ⇒ `Unknown`。P3-3e 已按这个规则实现
+（`preemption::ReceiverLiveness`，`TcpStream::connect_timeout`，超时
+`LIVENESS_TIMEOUT=2s`），并且 `Dead` + 健康媒体按 Q34 的表判 `Gone`/回收，
+`Unknown` + 健康媒体判 `OursActive`。
+
+离线测试只能在本机验证「监听端口 ⇒ `Alive`」「刚关闭的端口 ⇒ `Dead`」两行，
+验证不了真实局域网。已知 Windows 对同一子网内**已关机/拔电/被路由器隔离**的
+主机经常返回 `HostUnreachable`（WSAEHOSTUNREACH，10065）或
+`NetworkUnreachable`（10051，常见于本机路由表暂时失效），而不是
+`ConnectionRefused`/`TimedOut`；按当前实现这类错误全部落到 `Unknown`，于是
+「设备关机」在媒体健康时会被判成 `OursActive`，不会回收，只能等 UDP 侧
+`MEDIA_HEALTH_WINDOW` 自己过期（而 UDP 发送在接管/关机后经常仍然「成功」）。
+
+**需要确认**：
+1. 真机上把 HomePod 电源拔掉/关机后，从发送端对控制端口做 TCP connect，实际
+   返回哪一种错误？（refused / timeout / host-unreachable / network-unreachable
+   / 其他）
+2. `HostUnreachable`/`NetworkUnreachable` 是否应该像 refused/timeout 一样判
+   `Dead`？Q34 的「其他错误 ⇒ `Unknown`」是保守选择，代价是关机场景识别不到；
+   如果真机主要返回 host-unreachable，这条规则应扩成「能证明主机关机/不可达
+   的错误也算 `Dead`」，否则 Q34 的 `Dead` 分支在真机上几乎不可达。
+
 ---
 
 ## 答复区
