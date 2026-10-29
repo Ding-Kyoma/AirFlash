@@ -20,6 +20,7 @@ pub mod live;
 pub mod credentials;
 
 pub mod standby;
+pub mod telemetry;
 pub mod transport;
 pub mod volume;
 

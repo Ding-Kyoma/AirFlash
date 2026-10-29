@@ -594,8 +594,14 @@ impl Member {
         )?);
         Ok(())
     }
-    fn metrics(&self) -> Json {
-        json!({"host":self.peer.host, "codec":if self.selection.alac {"alac"}else{"pcm"},"transport":self.selection.transport,"timing":if self.selection.ptp{"ptp"}else{"ntp"},"channel":self.peer.profile.channel,"sync_offset_ms":self.peer.profile.sync_offset_ms,"qualification":"experimental","media":self.media.metrics(), "health":self.health.snapshot()})
+    fn metrics(&self, ptp: Option<&PtpMaster>) -> Json {
+        let clock = ptp.and_then(|timer| {
+            timer
+                .snapshots()
+                .into_iter()
+                .find(|snapshot| snapshot.host == self.peer.host)
+        });
+        json!({"id":if self.peer.receiver_id.is_empty() {self.peer.host.to_string()} else {self.peer.receiver_id.clone()}, "host":self.peer.host, "ip":self.peer.host, "active":!self.closed, "codec":if self.selection.alac {"alac"}else{"pcm"},"transport":self.selection.transport,"timing":if self.selection.ptp{"ptp"}else{"ntp"},"clock_role":if self.selection.ptp && self.peer.profile.follow_receiver_clock {"follow"} else if self.selection.ptp {"sender"} else {"ntp"},"channel":self.peer.profile.channel,"sync_offset_ms":self.peer.profile.sync_offset_ms,"qualification":"experimental","media":self.media.metrics(), "health":self.health.snapshot(), "ptp_offset_ns":clock.as_ref().and_then(|s| s.offset_ns), "ptp_offset_count":clock.as_ref().map(|s| s.exchanges), "ptp_ready":clock.as_ref().is_some_and(|s| s.ready), "ptp_phase":clock.as_ref().map(|s| s.phase)})
     }
     fn close(&mut self) {
         if self.closed {
@@ -1079,6 +1085,8 @@ fn send_packets(
     let duration = Duration::from_millis(options.duration_ms as u64);
     let mut schedule = MediaSchedule::new(start, rate);
     let mut packets = 0u64;
+    let mut telemetry = crate::telemetry::SessionTelemetry::new();
+    let mut capture_baseline: Option<crate::live::Metrics> = None;
     for member in members.iter_mut() {
         member.start_feedback(start)?;
     }
@@ -1166,6 +1174,10 @@ fn send_packets(
             }
             let late = now.saturating_duration_since(deadline);
             schedule.max_lateness_us = schedule.max_lateness_us.max(late.as_micros());
+            telemetry.observe_lateness(late.as_secs_f64() * 1000.0);
+            if let Some(source) = &live {
+                telemetry.capture_age.observe(source.sample_age_ms());
+            }
             let due = (late.as_nanos() * u128::from(rate) / 1_000_000_000 / FRAMES as u128) as u64;
             if options.duration_ms > 0 {
                 schedule.recover(now, false)?;
@@ -1241,9 +1253,19 @@ fn send_packets(
                     emit(clock_status(timer, &hosts, "streaming"));
                 }
                 if let Some(source) = &live {
+                    sample_capture(source, &mut capture_baseline, &mut telemetry);
                     emit(json!({"event":"capture_metrics","metrics":source.metrics()}));
                 }
-                emit(transport_metrics(members, &schedule));
+                let snapshot = transport_metrics(
+                    members,
+                    &schedule,
+                    &telemetry,
+                    common_latency,
+                    live.map(crate::live::Loopback::depth),
+                    ptp,
+                );
+                crate::telemetry::publish_diagnostics(snapshot.clone());
+                emit(snapshot);
                 next_metrics = now + Duration::from_secs(1);
             }
             // Every member gets new media before any member services retransmissions.
@@ -1319,6 +1341,7 @@ fn send_packets(
         }
     }
     if let Some(source) = &live {
+        sample_capture(source, &mut capture_baseline, &mut telemetry);
         emit(json!({"event":"capture_metrics","metrics":source.metrics()}));
     }
     for member in members.iter() {
@@ -1326,10 +1349,29 @@ fn send_packets(
             emit(notice);
         }
     }
-    emit(transport_metrics(members, &schedule));
-    emit(
-        json!({"event":"metrics","packets_per_member":packets,"frames":schedule.frames,"silence_packets":silence_packets,"max_send_lateness_us":schedule.max_lateness_us,"retransmits":members.iter().map(|m|m.media.metrics.retransmits_sent).sum::<u64>(),"ptp_packets_received":ptp.as_ref().map(|p|p.received.load(Ordering::Relaxed)),"measured_latency_ms":null,"qualified":false}),
+    let snapshot = transport_metrics(
+        members,
+        &schedule,
+        &telemetry,
+        common_latency,
+        live.map(crate::live::Loopback::depth),
+        ptp,
     );
+    crate::telemetry::publish_diagnostics(snapshot.clone());
+    emit(snapshot);
+    let mut summary = telemetry.snapshot();
+    if let Json::Object(ref mut fields) = summary {
+        fields.insert("event".into(), json!("metrics"));
+        fields.insert("packets_per_member".into(), json!(packets));
+        fields.insert("frames".into(), json!(schedule.frames));
+        fields.insert("silence_packets".into(), json!(silence_packets));
+        fields.insert("max_send_lateness_us".into(), json!(schedule.max_lateness_us));
+        fields.insert("retransmits".into(), json!(members.iter().map(|m|m.media.metrics.retransmits_sent).sum::<u64>()));
+        fields.insert("ptp_packets_received".into(), json!(ptp.as_ref().map(|p|p.received.load(Ordering::Relaxed))));
+        fields.insert("measured_latency_ms".into(), Json::Null);
+        fields.insert("qualified".into(), json!(false));
+    }
+    emit(summary);
     drop(volume_workers);
     for m in members.iter_mut() {
         m.close();
@@ -1337,8 +1379,62 @@ fn send_packets(
     outcome
 }
 
-fn transport_metrics(members: &[Member], schedule: &MediaSchedule) -> Json {
-    json!({"event":"transport_metrics","session_uptime_ms":schedule.start.elapsed().as_millis(),"sender_late_recoveries":schedule.recoveries,"skipped_packets":schedule.skipped_packets,"max_send_lateness_us":schedule.max_lateness_us,"members":members.iter().map(Member::metrics).collect::<Vec<_>>()})
+fn sample_capture(
+    source: &crate::live::Loopback,
+    baseline: &mut Option<crate::live::Metrics>,
+    telemetry: &mut crate::telemetry::SessionTelemetry,
+) {
+    let metrics = source.metrics();
+    if let Some(previous) = baseline {
+        telemetry.input_drops += metrics.dropped_frames.saturating_sub(previous.dropped_frames);
+        telemetry.capture_glitches += metrics
+            .discontinuities
+            .saturating_sub(previous.discontinuities);
+        let underruns = metrics
+            .underrun_packets
+            .saturating_sub(previous.underrun_packets);
+        if underruns > 0 {
+            // An underrun while the source has been quiet for a second is a
+            // keepalive gap, not a concealed music dropout.
+            let idle = metrics.last_audio_qpc_ns == 0
+                || crate::wasapi::qpc_ns().saturating_sub(metrics.last_audio_qpc_ns)
+                    > 1_000_000_000;
+            for _ in 0..underruns {
+                telemetry.underflow(if idle {
+                    crate::telemetry::UnderflowCause::IdleKeepalive
+                } else {
+                    crate::telemetry::UnderflowCause::ActiveMedia
+                });
+            }
+        }
+    }
+    *baseline = Some(metrics);
+}
+
+fn transport_metrics(
+    members: &[Member],
+    schedule: &MediaSchedule,
+    telemetry: &crate::telemetry::SessionTelemetry,
+    playout: Duration,
+    queue: Option<(usize, usize)>,
+    ptp: Option<&PtpMaster>,
+) -> Json {
+    let mut snapshot = telemetry.snapshot();
+    if let Json::Object(ref mut fields) = snapshot {
+        fields.insert("event".into(), json!("transport_metrics"));
+        fields.insert("session_uptime_ms".into(), json!(schedule.start.elapsed().as_millis()));
+        fields.insert("sender_late_recoveries".into(), json!(schedule.recoveries));
+        fields.insert("skipped_packets".into(), json!(schedule.skipped_packets));
+        fields.insert("max_send_lateness_us".into(), json!(schedule.max_lateness_us));
+        fields.insert(
+            "playout_ms".into(),
+            json!((playout.as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0),
+        );
+        fields.insert("queue_depth".into(), json!(queue.map(|q| q.0)));
+        fields.insert("queue_capacity".into(), json!(queue.map(|q| q.1)));
+        fields.insert("members".into(), json!(members.iter().map(|m| m.metrics(ptp)).collect::<Vec<_>>()));
+    }
+    snapshot
 }
 fn offset_time(base: u64, common: Duration, own: Duration, offset_ms: i32) -> Result<u64> {
     Ok(u64::try_from(

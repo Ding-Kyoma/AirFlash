@@ -238,6 +238,19 @@ impl Loopback {
         s.boundary_pending = true;
         s.metrics.last_discontinuity = Some("scheduler_recovery".into());
     }
+    /// Age of the oldest queued capture frame: how stale the audio about to be
+    /// sent already is. Feeds the `capture_age` telemetry histogram.
+    pub fn sample_age_ms(&self) -> f64 {
+        let s = self.state.lock().unwrap();
+        s.frames
+            .front()
+            .map_or(0.0, |f| qpc_ns().saturating_sub(f.qpc) as f64 / 1e6)
+    }
+    /// `(queued, capacity)` in source frames.
+    pub fn depth(&self) -> (usize, usize) {
+        let s = self.state.lock().unwrap();
+        (s.frames.len(), s.capacity)
+    }
     pub fn metrics(&self) -> Metrics {
         let s = self.state.lock().unwrap();
         let mut metrics = s.metrics.clone();

@@ -66,6 +66,7 @@ fn capabilities() -> Vec<&'static str> {
         "member_volume",
         "receiver_password",
         "standby_release",
+        "diagnostics",
     ];
     if airflash_engine::applications::supported() {
         values.push("application_capture");
@@ -512,6 +513,21 @@ fn main() {
                     drop(old);
                 }
                 send(&request.id, &request.session_id, json!({"event":"stopped"}));
+            }
+            "diag_summary" => {
+                // One-shot, redacted snapshot for issue reports: no host names,
+                // no credentials, no file paths beyond the engine's own version.
+                let latest = airflash_engine::telemetry::diagnostics();
+                send(
+                    &request.id,
+                    &request.session_id,
+                    json!({
+                        "event": "diag_summary",
+                        "engine_version": env!("CARGO_PKG_VERSION"),
+                        "qualification": "experimental",
+                        "session": latest,
+                    }),
+                );
             }
             _ => send(
                 &request.id,
