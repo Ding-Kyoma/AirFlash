@@ -347,5 +347,6 @@
   "This device only supports classic AirPlay. AirFlash cannot stream to it yet.": "此裝置僅支援經典 AirPlay，AirFlash 目前無法向其推流。",
   "This device requires a password or pairing that AirFlash could not complete. Pair it again in Receivers.": "此裝置需要密碼或配對，AirFlash 無法完成。請在「接收器」中重新配對。",
   "This device requires MFi authentication, which AirFlash cannot perform without Apple hardware.": "此裝置要求 MFi 認證，AirFlash 無法在沒有 Apple 硬體的情況下完成。",
-  "Could not reach the receiver over the network. Check that it is powered on and on the same network as this PC.": "無法透過網路連線接收器。請確認裝置已開機，並與本機處於同一網路。"
+  "Could not reach the receiver over the network. Check that it is powered on and on the same network as this PC.": "無法透過網路連線接收器。請確認裝置已開機，並與本機處於同一網路。",
+  "AirPlay 2 and classic AirPlay 1/RAOP devices cannot be grouped together. Please connect them separately.": "AirPlay 2 與經典 AirPlay 1/RAOP 裝置不能加入同一個群組，請分開連線。"
 }

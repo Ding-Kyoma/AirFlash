@@ -159,15 +159,45 @@ impl TimingEvidence<'_> {
         }
     }
 }
+/// A group whose members disagree on AirPlay 2 evidence has no legal clock
+/// domain: the reference implementation refuses to create it, so AirFlash
+/// refuses it too instead of downgrading the AirPlay 2 members to NTP.
+///
+/// WAC enforces the same rule at three independent layers -- UI selection
+/// (`:4410`), the member table (`AddMember` `:8316` and the bulk setter
+/// `:8404`) and the backend ("AirPlay 2 and classic RAOP cannot share one
+/// timing group") -- and surfaces `Device_MixedTimingGroupUnsupported`. Because
+/// a mixed group can never be created there, `CreateTopologyPlan`'s
+/// `Any(!SupportsAirPlay2)` only ever sees an all-classic group, i.e. it is
+/// semantically `All(!SupportsAirPlay2)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MixedTimingGroup;
+impl MixedTimingGroup {
+    /// Machine-readable fault code; the desktop maps it to one user message.
+    pub const CODE: &'static str = "mixed_timing_group";
+    /// WAC's `Device_MixedTimingGroupUnsupported` wording.
+    pub const MESSAGE: &'static str = "AirPlay 2 and classic AirPlay 1/RAOP devices cannot be grouped together. Please connect them separately.";
+}
+impl std::fmt::Display for MixedTimingGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(Self::MESSAGE)
+    }
+}
+impl std::error::Error for MixedTimingGroup {}
+
 /// WAC's `CreateTopologyPlan` timing decision, shared by capability prediction
 /// and the session runtime.
 ///
 /// `members` is the whole group; a single receiver is a one-element slice.
-/// - Any member without AirPlay 2 evidence downgrades the whole group to NTP
-///   (WAC's `Any(!SupportsAirPlay2)` branch, which drives Classic RAOP).
-/// - Every multi-device AirPlay 2 group runs PTP, with no exceptions. WAC picks
-///   that branch from the topology (`n > 1`), never from the members' solo
-///   answers: a HomePod group, a mixed HomePod + Apple TV group and an
+/// - A group must be homogeneous in AirPlay 2 routing evidence. WAC never lets
+///   a mixed group exist (three independent guards), so disagreement here is
+///   [`MixedTimingGroup`]: the group is refused before any SETUP rather than
+///   downgraded.
+/// - An all-classic group runs NTP (WAC's `Any(!SupportsAirPlay2)` branch,
+///   which can only ever mean "all members are classic").
+/// - Every all-AirPlay-2 multi-device group runs PTP, with no exceptions. WAC
+///   picks that branch from the topology (`n > 1`), never from the members'
+///   solo answers: a HomePod group, a mixed HomePod + Apple TV group and an
 ///   unknown-vendor AirPlay 2 group all return PTP. "Solo Apple TV is NTP"
 ///   only exists in the `n == 1` branch; inside a group the Apple TV is a PTP
 ///   follower so the group keeps a single clock domain.
@@ -177,23 +207,31 @@ impl TimingEvidence<'_> {
 /// `codec` is part of WAC's plan signature. AirFlash's characterized solo
 /// behaviour keeps a HomePod on PTP even for PCM, so the codec does not change
 /// the timing verdict here.
-pub fn select_timing(members: &[TimingEvidence<'_>], codec: Codec) -> Timing {
+pub fn select_timing(
+    members: &[TimingEvidence<'_>],
+    codec: Codec,
+) -> Result<Timing, MixedTimingGroup> {
     let _ = codec;
     let Some((first, rest)) = members.split_first() else {
-        return Timing::Ntp;
+        return Ok(Timing::Ntp);
     };
     if rest.is_empty() {
-        return first.solo_timing();
+        return Ok(first.solo_timing());
     }
-    // Stage one is a whole-group gate: one member without AirPlay 2 evidence
-    // turns the group into the Classic RAOP / NTP topology.
-    if members.iter().any(|member| !member.airplay2) {
-        return Timing::Ntp;
+    // One AirPlay 2 answer for the whole group. There is no "downgrade" branch:
+    // a group that mixes AirPlay 2 with classic devices is refused, because the
+    // downgraded group would still be half an AirPlay 2 session.
+    if rest.iter().any(|member| member.airplay2 != first.airplay2) {
+        return Err(MixedTimingGroup);
     }
-    // Stage two: every `n > 1` branch of `CreateTopologyPlan` returns PTP.
-    // Member solo answers are deliberately not folded in here -- the only solo
-    // answer that would say NTP is the Apple TV, and that branch is `n == 1`.
-    Timing::Ptp
+    if first.airplay2 {
+        // Every `n > 1` branch of `CreateTopologyPlan` returns PTP. Member solo
+        // answers are deliberately not folded in here -- the only solo answer
+        // that would say NTP is the Apple TV, and that branch is `n == 1`.
+        Ok(Timing::Ptp)
+    } else {
+        Ok(Timing::Ntp)
+    }
 }
 /// The already-computed timing decision for one session, plus how many receivers
 /// it covers.
@@ -212,12 +250,21 @@ impl TimingPlan {
         Self { timing, receivers }
     }
     /// One decision for the whole group (a single receiver is one member).
-    pub fn select(members: &[TimingEvidence<'_>], codec: Codec) -> Self {
-        Self::new(select_timing(members, codec), members.len())
+    ///
+    /// Fails with [`MixedTimingGroup`] when the members disagree on AirPlay 2
+    /// evidence: the caller refuses the group before any SETUP.
+    pub fn select(
+        members: &[TimingEvidence<'_>],
+        codec: Codec,
+    ) -> Result<Self, MixedTimingGroup> {
+        Ok(Self::new(select_timing(members, codec)?, members.len()))
     }
     /// The decision for one receiver, used by capability prediction.
     pub fn single(fingerprint: &CompatFingerprint, codec: Codec) -> Self {
-        Self::select(&[fingerprint.timing_evidence()], codec)
+        // A one-member slice can never disagree with itself.
+        let timing = select_timing(&[fingerprint.timing_evidence()], codec)
+            .expect("a one-member timing plan is never mixed");
+        Self::new(timing, 1)
     }
     pub fn timing(self) -> Timing {
         self.timing
@@ -929,7 +976,7 @@ mod tests {
         );
     }
     #[test]
-    fn group_timing_keeps_one_ptp_clock_domain() {
+    fn group_timing_keeps_one_clock_domain_and_refuses_mixed_groups() {
         let homepod = TimingEvidence {
             airplay2: true,
             model: Some("AudioAccessory5,1"),
@@ -956,51 +1003,71 @@ mod tests {
             name: None,
         };
 
-        assert_eq!(select_timing(&[], Codec::Auto), Timing::Ntp);
+        assert_eq!(select_timing(&[], Codec::Auto).unwrap(), Timing::Ntp);
         // One receiver keeps the exact behaviour the 97-row table characterizes.
-        assert_eq!(select_timing(&[homepod], Codec::Auto), Timing::Ptp);
+        assert_eq!(select_timing(&[homepod], Codec::Auto).unwrap(), Timing::Ptp);
         assert_eq!(
-            select_timing(&[homepod_without_ap2], Codec::Auto),
+            select_timing(&[homepod_without_ap2], Codec::Auto).unwrap(),
             Timing::Ptp
         );
-        assert_eq!(select_timing(&[appletv], Codec::Auto), Timing::Ntp);
-        assert_eq!(select_timing(&[unknown_ap1], Codec::Auto), Timing::Ntp);
+        assert_eq!(select_timing(&[appletv], Codec::Auto).unwrap(), Timing::Ntp);
+        assert_eq!(
+            select_timing(&[unknown_ap1], Codec::Auto).unwrap(),
+            Timing::Ntp
+        );
         // Amended by Q33: every multi-device AirPlay 2 group is PTP, whatever
         // the members would decide on their own.
         assert_eq!(
-            select_timing(&[homepod, homepod], Codec::Auto),
+            select_timing(&[homepod, homepod], Codec::Auto).unwrap(),
             Timing::Ptp
         );
         assert_eq!(
-            select_timing(&[unknown_ap2, unknown_ap2], Codec::Auto),
+            select_timing(&[unknown_ap2, unknown_ap2], Codec::Auto).unwrap(),
             Timing::Ptp
         );
         // Mixed HomePod + Apple TV: the Apple TV solo answer is NTP, but the
         // `n > 1` branch makes the whole group PTP.
         assert_eq!(
-            select_timing(&[homepod, appletv], Codec::Auto),
+            select_timing(&[homepod, appletv], Codec::Auto).unwrap(),
             Timing::Ptp
         );
         assert_eq!(
-            select_timing(&[appletv, unknown_ap2], Codec::Auto),
+            select_timing(&[appletv, unknown_ap2], Codec::Auto).unwrap(),
             Timing::Ptp
         );
-        // One member without AirPlay 2 evidence downgrades the whole group.
+        // An all-classic group runs NTP. WAC's `Any(!SupportsAirPlay2)` can only
+        // ever see this case because mixed groups never get created.
         assert_eq!(
-            select_timing(&[homepod, homepod_without_ap2], Codec::Auto),
+            select_timing(&[homepod_without_ap2, unknown_ap1], Codec::Auto).unwrap(),
             Timing::Ntp
         );
+        // A mixed group is refused, never downgraded (Q39). It does not matter
+        // which member sorts first.
+        for members in [
+            [homepod, homepod_without_ap2],
+            [homepod_without_ap2, homepod],
+            [homepod, unknown_ap1],
+            [unknown_ap1, appletv],
+        ] {
+            assert_eq!(
+                select_timing(&members, Codec::Auto),
+                Err(MixedTimingGroup),
+                "{members:?}"
+            );
+        }
         assert_eq!(
-            select_timing(&[homepod, unknown_ap1], Codec::Auto),
-            Timing::Ntp
+            MixedTimingGroup::CODE,
+            "mixed_timing_group",
+            "the desktop maps this exact code"
+        );
+        assert!(
+            MixedTimingGroup::MESSAGE.contains("Please connect them separately."),
+            "the message tells the user what to do"
         );
         // Codec is not part of AirFlash's characterized solo table: a HomePod
         // stays PTP even when the session asks for PCM (WAC's `n == 1 &&
         // allHomePod && isPcm -> NTP` branch is deliberately not adopted).
-        assert_eq!(
-            select_timing(&[homepod], Codec::Pcm),
-            Timing::Ptp
-        );
+        assert_eq!(select_timing(&[homepod], Codec::Pcm).unwrap(), Timing::Ptp);
     }
 
     #[test]
@@ -1023,14 +1090,6 @@ mod tests {
             buffered: Some(1 << 18),
             features: Some(AIRPLAY2_BIT),
         };
-        let ap2 = CompatFingerprint::from_evidence(
-            formats,
-            &Profile::default(),
-            &[],
-            Some("AudioAccessory5,1"),
-            None,
-            Some("366.0"),
-        );
         let ap1 = CompatFingerprint::from_evidence(
             formats,
             &Profile::default(),
@@ -1039,10 +1098,13 @@ mod tests {
             None,
             None,
         );
+        // An all-classic group is the only group that runs NTP; a mixed group
+        // is refused (see `group_timing_keeps_one_clock_domain_and_refuses_mixed_groups`).
         let plan = TimingPlan::select(
-            &[ap2.timing_evidence(), ap1.timing_evidence()],
+            &[ap1.timing_evidence(), ap1.timing_evidence()],
             Codec::Auto,
-        );
+        )
+        .unwrap();
         assert_eq!(plan.timing(), Timing::Ntp);
         assert!(plan.is_group());
         let auto = Profile {
@@ -1053,7 +1115,7 @@ mod tests {
         };
         // The whole group converges on the NTP decision; automatic transport
         // cannot pick buffered audio, which is PTP-only.
-        for fingerprint in [&ap2, &ap1] {
+        for fingerprint in [&ap1, &ap1] {
             let compat = fingerprint
                 .negotiate_planned(plan, &auto, 44100, false)
                 .unwrap();
@@ -1068,14 +1130,14 @@ mod tests {
                 .unwrap()
                 .uses_ptp()
         );
-        // An explicit sender-PTP request cannot split a group that the
-        // fingerprints (or another member's NTP request) forced to NTP.
+        // An explicit sender-PTP request cannot split an all-classic group that
+        // the whole-group decision put on NTP.
         let forced_ptp = Profile {
             timing: Timing::Ptp,
             ..auto.clone()
         };
         assert!(
-            !ap2.negotiate_planned(plan, &forced_ptp, 44100, false)
+            !ap1.negotiate_planned(plan, &forced_ptp, 44100, false)
                 .unwrap()
                 .uses_ptp()
         );
@@ -1087,7 +1149,7 @@ mod tests {
             ..auto
         };
         assert!(
-            ap2.negotiate_planned(plan, &buffered, 44100, false)
+            ap1.negotiate_planned(plan, &buffered, 44100, false)
                 .is_err()
         );
     }
@@ -1125,7 +1187,8 @@ mod tests {
         let plan = TimingPlan::select(
             &[homepod.timing_evidence(), appletv.timing_evidence()],
             Codec::Auto,
-        );
+        )
+        .unwrap();
         assert_eq!(plan.timing(), Timing::Ptp);
         let auto = Profile {
             codec: Codec::Auto,

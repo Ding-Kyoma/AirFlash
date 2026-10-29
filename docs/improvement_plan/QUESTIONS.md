@@ -2539,6 +2539,37 @@ Q34 §四 要求用控制端口的裸 TCP connect 做存活探测：接通 ⇒ `
 
 ---
 
+### Q41. 混组拒绝之后，桌面要不要再加一层「选择时就不让混」？ `[待答复]`
+
+P2-13d 按 Q39 把引擎改成**拒绝**混组：`profile::select_timing` 在成员 AirPlay 2
+证据不一致时返回 `Err(MixedTimingGroup)`，`session.rs` 的 `run_stream` 在全部
+`/info` 探测之后、任何 SETUP 之前返回非重试
+`Fault { code: "mixed_timing_group", channel: "setup" }`，桌面 `GateFailure`
+把该 code 映射到与 `Device_MixedTimingGroupUnsupported` 同义的三语文案。
+
+WAC 是在**三层**各拒一次（`Calibration_MixedTransport` 的 UI 选择守卫
+`:4410`、`AddMember` `:8316` / 批量设置 `:8404` 的成员表守卫、后端再次拒绝）。
+AF 目前只有**引擎**这一层是权威的：桌面没有在发起会话前检查
+`receiver.Peers` 的 `SupportsAirPlay2` 是否同质，用户仍可先选中
+HomePod + 经典 RAOP 设备、点连接，再看到一条错误。需要确认：
+
+1. 桌面是否也要照 WAC `:4410` 加 UI 层守卫（选中混组时直接提示「请仅选择一种
+   设备类型」并阻止发起）？还是保持「引擎拒绝 + 本地化错误文案」这一层就够，
+   把引擎路径当防御性检查？如果加，桌面检查与引擎检查会不会形成两处权威、
+   以后容易不一致？
+2. 如果要加，判定用路由布尔 `AirPlayRouting.SupportsAirPlay2`（bit40 +
+   `srcvers`，即 WAC 的 `SupportsAirPlay2`）还是按列表四态
+   （`ClaimsAirPlay2Outdated` 也算非 AP2）？两者对
+   `ClaimsAirPlay2Outdated` 的路由结果一致（都是 false），但用户看到的
+   提示可能不同（"分开连接" vs "固件过旧"）。
+3. 单成员组（`IsGroup == false` 或 `Peers.Count == 1`）和手工添加的接收器
+   是否适用这条 UI 守卫？单机行为要求不变，所以守卫必须只在
+   `Peers.Count > 1` 时生效。
+
+> **答复**：（待答复）
+
+---
+
 ## 答复区
 
 > 已在每条条目下方就地回填（`> **答复**`）。下面是需要**优先改代码**的 4 条，按影响排序。

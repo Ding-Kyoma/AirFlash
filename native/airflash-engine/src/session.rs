@@ -912,6 +912,31 @@ fn probe_member(
     }
 }
 
+/// The member a group-level fault should name.
+///
+/// A refused group has no single failing receiver. Pointing at the first member
+/// whose AirPlay 2 evidence differs from the group's first member gives
+/// diagnostics the concrete device that disagrees, deterministically.
+fn mixed_group_host(
+    peers: &[Peer],
+    fingerprints: &[crate::profile::CompatFingerprint],
+) -> String {
+    let Some(reference) = fingerprints
+        .first()
+        .map(crate::profile::CompatFingerprint::airplay2)
+    else {
+        return String::new();
+    };
+    let index = fingerprints
+        .iter()
+        .position(|fingerprint| fingerprint.airplay2() != reference)
+        .unwrap_or(0);
+    peers
+        .get(index)
+        .map(|peer| peer.host.to_string())
+        .unwrap_or_default()
+}
+
 /// The internal diagnostic for one group setup, never a user-facing warning.
 ///
 /// Q33: the reference implementation has one timing plan per group and asserts
@@ -922,9 +947,11 @@ fn probe_member(
 /// member, its AirPlay 2 evidence, its solo answer and its explicit request)
 /// survives in the engine log and in diagnostic exports.
 ///
-/// It reports when member evidence disagrees or when an explicit per-member
-/// request is overridden by the group plan. Both are expected inputs to the
-/// one-plan design; the line exists to explain why the group chose what it did.
+/// It reports when a member's solo answer differs from the group plan or when
+/// an explicit per-member request is overridden. Both are expected inputs to
+/// the one-plan design. AirPlay 2 evidence is homogeneous by construction --
+/// `TimingPlan::select` refuses a mixed group before this point (Q39) -- so the
+/// line never explains a whole-group downgrade.
 fn group_timing_diagnostic(
     peers: &[Peer],
     fingerprints: &[crate::profile::CompatFingerprint],
@@ -938,19 +965,23 @@ fn group_timing_diagnostic(
         .iter()
         .map(crate::profile::CompatFingerprint::timing_evidence)
         .collect();
+    debug_assert!(
+        evidence
+            .windows(2)
+            .all(|pair| pair[0].airplay2 == pair[1].airplay2),
+        "mixed groups are refused before the plan exists"
+    );
     let solos: Vec<_> = evidence
         .iter()
         .map(|evidence| evidence.solo_timing())
         .collect();
-    let airplay2: Vec<_> = evidence.iter().map(|evidence| evidence.airplay2).collect();
-    let evidence_disagrees = airplay2.windows(2).any(|pair| pair[0] != pair[1])
-        || solos.windows(2).any(|pair| pair[0] != pair[1]);
+    let solo_answers_disagree = solos.windows(2).any(|pair| pair[0] != pair[1]);
     let settings_forced = peers.iter().any(|peer| match peer.profile.timing {
         Timing::Ntp => plan.timing() != Timing::Ntp,
         Timing::Ptp => plan.timing() != Timing::Ptp,
         _ => false,
     });
-    if !evidence_disagrees && !settings_forced {
+    if !solo_answers_disagree && !settings_forced {
         return None;
     }
     let label = |peer: &Peer| {
@@ -989,7 +1020,7 @@ fn group_timing_diagnostic(
         })
         .collect();
     Some(format!(
-        "group_timing_divergence: {}; forced {} for the whole group",
+        "group_timing_plan: {}; one {} clock domain for the group",
         described.join(", "),
         if plan.timing() == Timing::Ptp {
             "PTP"
@@ -1373,16 +1404,30 @@ fn run_stream(
     // One topology decision for the whole group. `select_timing` already
     // implements every branch of WAC's `CreateTopologyPlan`; per-member
     // settings are folded in by `negotiate_planned`, never by changing the
-    // plan here. In particular an explicit NTP request cannot downgrade an
-    // AirPlay 2 group: the only whole-group downgrade is a member without
-    // AirPlay 2 evidence (handled inside `select_timing`).
-    let plan = crate::profile::TimingPlan::new(
-        crate::profile::select_timing(&evidence, codec),
-        probes.len(),
-    );
-    // Q33: a group has exactly one plan, so a timing split is a planning bug,
-    // not a runtime risk. Keep the evidence summary as an internal debug log;
-    // it must never reach the desktop's user-facing `warning` channel.
+    // plan here.
+    //
+    // Q39: a group whose members disagree on AirPlay 2 evidence is refused
+    // here, after the `/info` probes and before any SETUP. WAC never creates
+    // such a group (UI selection, member table and backend each refuse it), so
+    // silently downgrading the AirPlay 2 members to NTP would ship the exact
+    // "half an AirPlay 2 session" failure it refuses to ship.
+    let plan = match crate::profile::TimingPlan::select(&evidence, codec) {
+        Ok(plan) => plan,
+        Err(mixed) => {
+            return Err(Fault::new(
+                mixed_group_host(&options.peers, &fingerprints),
+                "setup",
+                crate::profile::MixedTimingGroup::CODE,
+                false,
+                mixed,
+            )
+            .into());
+        }
+    };
+    // Q33: a group has exactly one plan, so differences between a member's solo
+    // answer and the group plan are expected inputs, not a runtime risk. Keep
+    // the evidence summary as an internal debug log; it must never reach the
+    // desktop's user-facing `warning` channel.
     if let Some(diagnostic) = group_timing_diagnostic(&options.peers, &fingerprints, plan) {
         eprintln!("{diagnostic}");
     }
@@ -2505,7 +2550,7 @@ mod tests {
             ..Default::default()
         };
         let advertised = Profile::default();
-        let ap2 = CompatFingerprint::from_evidence(
+        let homepod = CompatFingerprint::from_evidence(
             formats,
             &advertised,
             &[],
@@ -2513,31 +2558,43 @@ mod tests {
             None,
             Some("366.0"),
         );
-        let ap1 = CompatFingerprint::from_evidence(
+        // Both members are AirPlay 2 (a legal group); only their solo answers
+        // differ, which the group plan resolves to PTP.
+        let appletv = CompatFingerprint::from_evidence(
             formats,
             &advertised,
             &[],
-            Some("AudioAccessory5,1"),
+            Some("AppleTV6,2"),
             None,
-            None,
+            Some("366.0"),
         );
         let peers: Vec<Peer> = serde_json::from_value(json!([
             {"receiver_id": "left", "host": "127.0.0.2", "profile": {"timing": "auto"}},
             {"receiver_id": "right", "host": "127.0.0.3", "profile": {"timing": "auto"}},
         ]))
         .unwrap();
-        let plan = TimingPlan::select(&[ap2.timing_evidence(), ap1.timing_evidence()], Codec::Auto);
-        let line = group_timing_diagnostic(&peers, &[ap2.clone(), ap1], plan).unwrap();
+        let plan = TimingPlan::select(
+            &[homepod.timing_evidence(), appletv.timing_evidence()],
+            Codec::Auto,
+        )
+        .unwrap();
+        let line =
+            group_timing_diagnostic(&peers, &[homepod.clone(), appletv], plan).unwrap();
         // The content that used to ride on the warning is still available, but
-        // as a plain string written to the engine log.
-        assert!(line.starts_with("group_timing_divergence:"));
+        // as a plain string written to the engine log. It explains the group
+        // plan, never a downgrade.
+        assert!(line.starts_with("group_timing_plan:"));
         assert!(line.contains("left") && line.contains("right"), "{line}");
-        assert!(line.contains("forced NTP for the whole group"), "{line}");
-        // A consistent group has no diagnostic at all.
-        let ap2_plan =
-            TimingPlan::select(&[ap2.timing_evidence(), ap2.timing_evidence()], Codec::Auto);
+        assert!(line.contains("one PTP clock domain for the group"), "{line}");
+        assert!(!line.contains("forced"), "{line}");
+        // A group whose members agree on everything has no diagnostic at all.
+        let homepod_plan = TimingPlan::select(
+            &[homepod.timing_evidence(), homepod.timing_evidence()],
+            Codec::Auto,
+        )
+        .unwrap();
         assert_eq!(
-            group_timing_diagnostic(&peers, &[ap2.clone(), ap2], ap2_plan),
+            group_timing_diagnostic(&peers, &[homepod.clone(), homepod], homepod_plan),
             None
         );
     }
