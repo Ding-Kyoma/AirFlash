@@ -100,6 +100,13 @@
 Q16 的原话是「off = 冻结 correction，不是计时拆会话」——10 秒这个数是我们自己
 的耐心上限，不是 WAC 的。
 
+**事件通道有限次重建（Q16 #2）**：多设备策略是「保留共享 RTP，除非媒体面失败」，
+所以我们只在**事件通道**上重连：`Member` 记住 `event_addr` 与密钥，事件通道
+降级后最多重建 3 次、每次间隔 2 秒，成功则 `clear_degraded()` 并发
+`event_channel_rebuilt`（`recovered: true`），失败只发警告。音频链路全程不动。
+Q16 #1 提到的「加密 RTSP 不能中途换密钥」对我们不适用：AF 用的是同一把
+`Events-*` 密钥，重开连接不需要重新配对。
+
 ## P3-1 `mrCommand` 解析与执行（已完成）
 
 `native/airflash-engine/src/events.rs`、`AirFlash.Core/RemoteCommand.cs`、

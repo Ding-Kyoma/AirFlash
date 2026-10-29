@@ -330,6 +330,13 @@ struct Member {
     session_started: bool,
     /// True while the timeline is running on a frozen PTP offset.
     clock_frozen: bool,
+    /// Where and with which key the event channel is opened, so it can be rebuilt
+    /// without touching the media stream (the reference implementation keeps the
+    /// shared RTP alive in multi-device sessions).
+    event_addr: Option<SocketAddr>,
+    event_key: Vec<u8>,
+    event_rebuilds: u8,
+    next_event_rebuild: Instant,
 }
 impl Member {
     #[allow(clippy::too_many_arguments)]
@@ -433,6 +440,10 @@ impl Member {
             closed: false,
             session_started: false,
             clock_frozen: false,
+            event_addr: None,
+            event_key: secret.to_vec(),
+            event_rebuilds: 0,
+            next_event_rebuild: Instant::now(),
         };
         // RAII owns the connection before SETUP so partial handshakes are torn down too.
         let sender_id = "02:57:32:41:50:01";
@@ -476,6 +487,7 @@ impl Member {
             .plist()?;
         member.session_started = true;
         let event_port = get_port(&response, "eventPort")?;
+        member.event_addr = Some(SocketAddr::new(peer.host, event_port));
         member.events = Some(EventWorker::connect(
             SocketAddr::new(peer.host, event_port),
             &secret,
@@ -1154,7 +1166,7 @@ fn send_packets(
                     emit(event);
                 }
             }
-            for member in members.iter() {
+            for member in members.iter_mut() {
                 for notice in member.health.notices() {
                     emit(notice);
                 }
@@ -1165,6 +1177,41 @@ fn send_packets(
                 member
                     .health
                     .check_control(member.media.media_healthy(Instant::now(), MEDIA_HEALTH_WINDOW))?;
+                // The event channel can be reopened on the same key while audio keeps
+                // flowing, so a dead event channel costs metadata and buttons only
+                // until the next attempt. Bounded, because a receiver that refuses
+                // the channel will refuse it forever.
+                if let Some(fault) = member.health.control_degraded()
+                    && fault.channel == "events"
+                    && member.event_rebuilds < MAX_EVENT_REBUILDS
+                    && Instant::now() >= member.next_event_rebuild
+                    && let Some(addr) = member.event_addr
+                {
+                    member.event_rebuilds += 1;
+                    member.next_event_rebuild = Instant::now() + EVENT_REBUILD_INTERVAL;
+                    match EventWorker::connect(addr, &member.event_key, member.health.clone()) {
+                        Ok(worker) => {
+                            member.events = Some(worker);
+                            member.health.clear_degraded();
+                            emit(json!({
+                                "event": "warning",
+                                "host": member.peer.host.to_string(),
+                                "channel": "events",
+                                "code": "event_channel_rebuilt",
+                                "recovered": true,
+                                "message": "Event channel reopened",
+                            }));
+                        }
+                        Err(error) => emit(json!({
+                            "event": "warning",
+                            "host": member.peer.host.to_string(),
+                            "channel": "events",
+                            "code": "event_channel_rebuild_failed",
+                            "recovered": false,
+                            "message": error.to_string(),
+                        })),
+                    }
+                }
             }
             if let Some(timer) = &ptp {
                 // PTP silence is not an immediate fault: the last offset keeps
@@ -1622,6 +1669,10 @@ const MEDIA_HEALTH_WINDOW: Duration = Duration::from_secs(2);
 /// implementation freezes drift correction on PTP silence instead of ending the
 /// session; ten seconds is our own patience limit before we do end it.
 const CLOCK_FREEZE_GRACE: Duration = Duration::from_secs(10);
+/// Event-channel rebuild budget. Each attempt is a fresh TCP connection with the
+/// same key; audio is never touched.
+const MAX_EVENT_REBUILDS: u8 = 3;
+const EVENT_REBUILD_INTERVAL: Duration = Duration::from_secs(2);
 fn offset_time(base: u64, common: Duration, own: Duration, offset_ms: i32) -> Result<u64> {
     Ok(u64::try_from(
         base as i128 + common.as_nanos() as i128 - own.as_nanos() as i128
@@ -1729,6 +1780,10 @@ mod tests {
             closed: false,
             session_started: true,
             clock_frozen: false,
+            event_addr: None,
+            event_key: Vec::new(),
+            event_rebuilds: 0,
+            next_event_rebuild: Instant::now(),
         };
         (member, receiver, worker)
     }

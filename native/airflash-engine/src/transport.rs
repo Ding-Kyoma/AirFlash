@@ -178,6 +178,11 @@ impl Health {
     pub fn control_degraded(&self) -> Option<Fault> {
         self.0.lock().unwrap().degraded.clone()
     }
+    /// Forget a degraded control channel after it has been rebuilt. The media side
+    /// keeps running; only the verdict is cleared.
+    pub fn clear_degraded(&self) {
+        self.0.lock().unwrap().degraded = None;
+    }
     fn notice(&self, host: &str, channel: &str, code: &str, message: &str, recovered: bool) {
         let mut state = self.0.lock().unwrap();
         if state.notices.len() == 16 {
