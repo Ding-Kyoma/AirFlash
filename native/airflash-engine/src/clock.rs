@@ -59,8 +59,64 @@ fn tlv(data: &[u8]) -> Vec<u8> {
     out.extend(data);
     out
 }
-pub fn announce(clock: u64, seq: u16, ns: u64) -> Vec<u8> {
-    let mut p = header(11, 76, clock, seq, 0x0408, 0);
+/// The grandfather dataset an Announce carries, in the fields BMCA compares first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BmcaDataset {
+    pub priority1: u8,
+    pub clock_class: u8,
+    pub accuracy: u8,
+    pub variance: u16,
+    pub priority2: u8,
+    pub grandmaster: u64,
+    pub steps_removed: u16,
+}
+impl BmcaDataset {
+    /// IEEE 1588 orders datasets by priority1, class, accuracy, variance,
+    /// priority2 and grandmaster identity; `steps_removed` only breaks ties among
+    /// paths to the same grandmaster.
+    pub fn compare(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority1
+            .cmp(&other.priority1)
+            .then(self.clock_class.cmp(&other.clock_class))
+            .then(self.accuracy.cmp(&other.accuracy))
+            .then(self.variance.cmp(&other.variance))
+            .then(self.priority2.cmp(&other.priority2))
+            .then(self.grandmaster.cmp(&other.grandmaster))
+            .then(self.steps_removed.cmp(&other.steps_removed))
+    }
+    /// Our own dataset: a locally generated clock with a lax preference so a real
+    /// grandmaster wins, but a peer of equal rank does not cause a role flip.
+    pub fn local(clock_id: u64) -> Self {
+        Self {
+            priority1: 96,
+            clock_class: 248,
+            accuracy: 0xfe,
+            variance: 0xffff,
+            priority2: 128,
+            grandmaster: clock_id,
+            steps_removed: 0,
+        }
+    }
+}
+/// Parse the grandfather fields of an Announce message. Returns `None` for any
+/// other message type or a packet too short to contain them.
+pub fn parse_announce(packet: &[u8]) -> Option<BmcaDataset> {
+    // byte 0 low nibble is the message type, byte 1 is the PTP version (2).
+    if packet.len() < 64 || packet[0] & 0xf != 11 || packet[1] & 0xf != 2 {
+        return None;
+    }
+    Some(BmcaDataset {
+        priority1: packet[47],
+        clock_class: packet[48],
+        accuracy: packet[49],
+        variance: u16::from_be_bytes([packet[50], packet[51]]),
+        priority2: packet[52],
+        grandmaster: u64::from_be_bytes(packet[53..61].try_into().ok()?),
+        steps_removed: u16::from_be_bytes([packet[61], packet[62]]),
+    })
+}
+
+pub fn announce(clock: u64, seq: u16, ns: u64) -> Vec<u8> {    let mut p = header(11, 76, clock, seq, 0x0408, 0);
     timestamp(&mut p[34..44], ns);
     // Local oscillator; priority is a preference, not a claim of GPS accuracy.
     p[47] = 96;
@@ -128,6 +184,12 @@ struct PeerState {
     next_subscription: Option<Instant>,
     exchange_interval: Option<Duration>,
     packets: PacketSnapshot,
+    /// Grandfather dataset from the last Announce this peer sent, plus whether it
+    /// beats our own. Reported, not acted on: switching the clock role mid-session
+    /// would move every member's timeline, which is a bigger decision than a
+    /// comparison can make safely.
+    bmca: Option<BmcaDataset>,
+    better_master: bool,
 }
 const SAMPLE_LIFETIME: Duration = Duration::from_secs(2);
 const MAX_PENDING_SYNCS: usize = 32;
@@ -203,6 +265,14 @@ pub struct PeerSnapshot {
     pub phase: &'static str,
     pub packets: PacketSnapshot,
     pub exchange_timeout_ms: u128,
+    /// The peer's BMCA dataset, when it has sent an Announce.
+    pub bmca_priority1: Option<u8>,
+    pub bmca_clock_class: Option<u8>,
+    pub bmca_priority2: Option<u8>,
+    pub bmca_grandmaster: Option<u64>,
+    pub bmca_steps_removed: Option<u16>,
+    /// True when the peer's dataset outranks ours (IEEE 1588 comparison order).
+    pub better_master: bool,
 }
 #[derive(Clone, Copy)]
 struct Subscription {
@@ -507,6 +577,13 @@ fn followed_packet(s: &mut PeerState, data: &[u8], local_ns: u64, now: Instant, 
                 ..Default::default()
             };
         }
+        // Record the grandfather dataset so a better master is visible in the
+        // snapshot even though the role itself is not switched here.
+        if let Some(dataset) = parse_announce(data) {
+            s.bmca = Some(dataset);
+            s.better_master = dataset.compare(&BmcaDataset::local(own_id))
+                == std::cmp::Ordering::Less;
+        }
     }
     if s.source_id != Some(source) || s.source_port != Some(source_port) {
         s.reject("source_identity");
@@ -768,6 +845,12 @@ impl PtpMaster {
                 phase: s.phase(now),
                 packets: s.packets.clone(),
                 exchange_timeout_ms: s.exchange_timeout().as_millis(),
+                bmca_priority1: s.bmca.map(|b| b.priority1),
+                bmca_clock_class: s.bmca.map(|b| b.clock_class),
+                bmca_priority2: s.bmca.map(|b| b.priority2),
+                bmca_grandmaster: s.bmca.map(|b| b.grandmaster),
+                bmca_steps_removed: s.bmca.map(|b| b.steps_removed),
+                better_master: s.better_master,
             })
             .collect();
         result.sort_by_key(|s| s.host);
@@ -1184,10 +1267,65 @@ mod tests {
         assert!(unicast_grants(&bad, 8, 3).is_empty());
     }
     #[test]
+    fn announce_dataset_is_parsed_from_the_wire_and_matches_what_we_send() {
+        let id = 0x0102030405060708;
+        let packet = announce(id, 7, 0);
+        let dataset = parse_announce(&packet).unwrap();
+        // Our own Announce advertises a local oscillator with a lax preference.
+        assert_eq!(dataset.priority1, 96);
+        assert_eq!(dataset.clock_class, 248);
+        assert_eq!(dataset.priority2, 128);
+        assert_eq!(dataset.grandmaster, id);
+        assert_eq!(dataset.steps_removed, 0);
+        // Anything that is not an Announce is rejected rather than misparsed.
+        assert!(parse_announce(&sync_pair(id, 1, 0).0).is_none());
+        let mut short = packet.clone();
+        short.truncate(50);
+        assert!(parse_announce(&short).is_none());
+    }
+    #[test]
+    fn bmca_orders_by_priority_then_class_then_identity() {
+        let base = BmcaDataset::local(7);
+        // Lower priority1 wins, before anything else.
+        assert_eq!(
+            BmcaDataset { priority1: 10, ..base }.compare(&base),
+            std::cmp::Ordering::Less
+        );
+        // Equal priority1: a better clock class wins.
+        assert_eq!(
+            BmcaDataset { clock_class: 6, ..base }.compare(&base),
+            std::cmp::Ordering::Less
+        );
+        // Class, accuracy, variance and priority2 all tie: identity decides.
+        assert_eq!(
+            BmcaDataset { grandmaster: 1, ..base }.compare(&base),
+            std::cmp::Ordering::Less
+        );
+        // A dataset identical to ours is not "better", so no role flip.
+        assert_eq!(base.compare(&base), std::cmp::Ordering::Equal);
+        assert!(!(base.compare(&base) == std::cmp::Ordering::Less));
+        // steps_removed only breaks ties on the same path.
+        assert_eq!(
+            BmcaDataset { steps_removed: 3, ..base }.compare(&base),
+            std::cmp::Ordering::Greater
+        );
+    }
+    #[test]
+    fn a_receiver_announcing_a_grandmaster_outranks_our_local_clock() {
+        let own = BmcaDataset::local(0xaaaa);
+        // A HomePod advertising an Apple grandmaster (priority1 128) loses on the
+        // first field, so it does not get to take the role.
+        let homepod = BmcaDataset { priority1: 128, clock_class: 6, ..own };
+        assert_eq!(homepod.compare(&own), std::cmp::Ordering::Greater);
+        // A device with a better class and the same priority does.
+        let appliance = BmcaDataset { clock_class: 20, ..own };
+        assert_eq!(appliance.compare(&own), std::cmp::Ordering::Less);
+    }
+
+    #[test]
     fn wire_clock_and_lengths() {
         let id = 0x1234567812345678;
-        let (s, f) = sync_pair(id, 65535, 1234567890);
-        assert_eq!(&s[20..28], &id.to_be_bytes());
+        let (s, f) = sync_pair(id, 65535, 1234567890);        assert_eq!(&s[20..28], &id.to_be_bytes());
         assert_eq!(s.len(), 44);
         assert_eq!(f.len(), 96);
         assert_eq!(&f[34..44], &[0, 0, 0, 0, 0, 1, 13, 251, 56, 210]);

@@ -151,12 +151,29 @@
 
 ---
 
+## P1-6 / P3-7 BMCA（只做到「看得见」，没有切换角色）
+
+`clock.rs`
+
+- 新增 `BmcaDataset`（`priority1`、`clockClass`、`accuracy`、`variance`、`priority2`、
+  grandmaster identity、`stepsRemoved`）与 `parse_announce()`，按 IEEE 1588 的比较
+  顺序 `compare()`；`BmcaDataset::local(clock_id)` 是我们自己广播的数据集
+  （priority1=96、class=248，故意偏松，让真正的 grandmaster 赢）。
+- 跟随方收到 Announce 时记录对端数据集，快照里新增
+  `bmca_priority1/clock_class/priority2/grandmaster/steps_removed` 与
+  `better_master`，`clock_status` 每秒带出，便于判断「谁该当 master」。
+- **没有做**主动让位（role switch）。原因：中途换时钟会移动所有成员的
+  timeline，`SETRATEANCHORTIME` 也要重发；在没有第二台 HomePod 可验证的情况下
+  自动切换的风险高于收益。数据已经全部采到，切换留给确认后的下一轮（Q27）。
+
+---
+
 ## 还没做
 
 | 项目 | 现状 | 备注 |
 | --- | --- | --- |
 | P0-4 封面（`image/jpeg`） | 未做 | 尺寸/格式约束需要设备确认，见 Q10；失败也不能干扰音频 |
-| P1-6 / P3-7 BMCA | 未开始 | 只在多 HomePod 时才有意义，需要真实设备验证 |
+| P1-6 / P3-7 BMCA 主动让位 | 半成品 | 数据集与比较已完成，切换角色未做，见 Q27 |
 | P3-2 TXT 预测（bit40 + `srcvers`） | 未开始 | 发现逻辑在 C#，需要确认 HomePod 上报的 TXT 字段 |
 | P3-3 抢占检测 | 未开始 | 依赖元数据事件 |
 | 采集进程退出后自动重开 | 部分 | 现在引擎结束会话、由桌面端重连；进程内自愈未做 |

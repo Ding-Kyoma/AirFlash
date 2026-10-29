@@ -322,6 +322,31 @@ WAC 的进程回环走 `INCLUDE_TARGET_PROCESS_TREE`，AirFlash 现在是 `AUTOC
 
 **需要确认**：WAC 用的是 qWAVE 还是 `IP_TOS`？如果 qWAVE，`QOSFlowRate` / `ServiceType` 之类的参数它怎么填？
 
+### Q27. BMCA 让位要不要做、怎么做？`[阻塞后续实现]`
+
+我们已经按 IEEE 1588 解析并比较了 Announce 的 `(priority1, clockClass, accuracy,
+variance, priority2, grandmasterIdentity, stepsRemoved)`，快照里能看出对端是否
+「比我们更有资格当 master」（`better_master`）。**但还没有真的让位**，因为切换会
+移动所有成员的 timeline，还要重发 `SETRATEANCHORTIME`，在没有第二台 HomePod
+可验证时风险大于收益。
+
+**我们暂定**：保持「我们是 master」不变，只在 `clock_status` 里暴露比较结果。
+
+**需要确认**：
+
+1. WAC 在发现更好的 master 时会真的让位吗？让位时机是「收到第一个更好的
+   Announce」还是「连续 N 个」？N 是多少？
+2. 让位过程中音频会断吗？WAC 是「停止发 Announce + 重新 SUBSCRIBE 对端
+   Sync/Follow_Up」，还是先建新时钟再切？
+3. 立体声对里两只 HomePod 各自 Announce 不同 grandmaster 时，WAC 怎么处理
+   （取较优的一方？还是坚持自己的时钟以保证两只是同一时间轴）？
+4. `stepsRemoved` 在 WAC 的比较里到底参不参与？（标准里只在同一 grandmaster
+   的路径间使用）
+
+---
+
+## 答复区
+
 ## 答复区
 
 > 在这里写你的答复，或新建 `ANSWERS.md` 引用编号即可。我们会在下一轮把结论回填到上面对应条目，并同步修改实现。
