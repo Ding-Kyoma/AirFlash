@@ -30,9 +30,20 @@
 //!
 //! A group-wide cross-check closes the last ambiguous case: when **every**
 //! receiver of a multi-receiver session fails its probe in the same round, the
-//! common cause is our own side (routing table, interface, Wi-Fi), not several
-//! devices dying at once, so no device is marked dead
-//! ([`local_network_suspected`]).
+//! common cause could be our own side (routing table, interface, Wi-Fi) — or the
+//! user really did switch every device off. Q46 turns that guess into a
+//! judgement with a control group: the same round probes the **default
+//! gateway**, which shares our local path but not our receivers' power state.
+//!
+//! | gateway | all receivers failed | conclusion |
+//! | --- | --- | --- |
+//! | answered (a connect or an RST) | yes | the devices really are gone: reclaim |
+//! | silent | yes | our own network: mark nothing dead |
+//! | not discoverable | yes | mark nothing dead, but time-boxed by [`GATEWAY_FALLBACK_WINDOW`] |
+//!
+//! [`judge_all_failed`] is the whole rule. A failed gateway probe is never
+//! evidence about a receiver: it only chooses between "the devices are gone" and
+//! "our network is gone" (see [`GatewayReachability`]).
 //!
 //! The bit values are recovered from the reference implementation (Q31 answer):
 //! `ReceiverStatusFlags.ReceiverSessionActive = 131072 (0x20000, bit 17)`,
@@ -95,27 +106,34 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Q42's escalation timer: how many **consecutive** non-definitive liveness
-/// probes are tolerated before the receiver counts as gone. Three is our
-/// choice — Q42 only fixed the shape ("`Unknown` must have a patience limit"),
-/// not the number:
+/// probes are tolerated before the receiver counts as gone. Q42 only fixed the
+/// shape ("`Unknown` must have a patience limit"), not the number; Q46 fixed the
+/// budget — a genuine power-off must be reclaimed in roughly **15 s**, and 6 s
+/// is too short for a Wi-Fi client that is re-associating:
 ///
-/// - one or two failures are exactly what a transient local hiccup looks like
-///   (a firewall refresh, `WSAENOBUFS`, a routing-table blip), and the whole
-///   point of not enumerating errno is to survive those;
-/// - three independent control-port probes with no success in between is no
-///   longer a hiccup, and with [`LIVENESS_RETRY`] it is reached in about 6 s —
-///   far quicker than waiting for the media-health backstop, which never fires
-///   while UDP sends keep "succeeding";
-/// - Q42's own sketch escalates at `>= 3`.
-pub const LIVENESS_PATIENCE: u32 = 3;
+/// - cross-AP re-association plus DHCP takes 5–15 s, and a DFS channel switch
+///   can take up to 60 s; five samples leave room for the common case without
+///   waiting anywhere near the DFS worst case;
+/// - the gap between the first and the fifth failure is
+///   `(LIVENESS_PATIENCE - 1) × LIVENESS_RETRY = 4 × 3 s = 12 s`, plus the
+///   deciding probe itself (at most [`LIVENESS_TIMEOUT`]) — about 12–14 s, i.e.
+///   the ~15 s Q46 asked for; a powered-off LAN device normally fails after its
+///   ARP lookup (`HostUnreachable`, ~1 s), so 15 s is the realistic order;
+/// - a chain that short is still far quicker than the media-health backstop,
+///   which never fires while UDP sends keep "succeeding";
+/// - early is the *audible* mistake (the session is rebuilt), late only costs a
+///   few seconds of a stream nobody is receiving — so the direction of the
+///   trade-off is deliberately conservative.
+pub const LIVENESS_PATIENCE: u32 = 5;
 
 /// The wall-clock half of Q42's escalation timer: a receiver that has not been
 /// proved alive for this long is treated as gone once a **second** consecutive
-/// non-definitive probe confirms it is not a one-off. Our choice: 60 s matches
-/// the longest busy-queue interval, so even a slow probe cadence cannot keep an
-/// undecided receiver alive forever. A single `Unknown` never escalates on this
-/// clause alone — one anomalous error after a long quiet period is precisely the
-/// transient case the rule must not punish.
+/// non-definitive probe confirms it is not a one-off. Q46 confirmed the narrowed
+/// shape and left the number to us: 60 s matches the longest busy-queue
+/// interval, and it is deliberately **not** the power-off budget — that is
+/// [`LIVENESS_PATIENCE`] × [`LIVENESS_RETRY`]. This clause only catches
+/// *sparse* failures (one every 40 s never reaches the consecutive limit) while
+/// leaving a single anomalous error after a quiet hour alone.
 pub const LIVENESS_PATIENCE_WINDOW: Duration = Duration::from_secs(60);
 
 /// How long to wait before re-sampling a receiver whose liveness probe was
@@ -123,9 +141,36 @@ pub const LIVENESS_PATIENCE_WINDOW: Duration = Duration::from_secs(60);
 /// `Unknown` would be the only sample the tracker ever sees (the next probe is
 /// only scheduled by fresh control-plane evidence, and a dead feedback worker
 /// produces no more), so the patience limit could never be reached. It is the
-/// first busy-queue backoff step, and the loop is bounded — the third unknown
-/// escalates to `Dead` and reclaims.
+/// first busy-queue backoff step and it also paces the re-evaluation of Q46's
+/// all-failed suppression; the loop is bounded — the fifth unknown escalates to
+/// `Dead` and reclaims.
+///
+/// Q46 floats a growing interval (3 → 4 → 6 → 9 → 13 s) as a cheaper way to
+/// spend the same patience. Not taken: it would spread five samples over ~35 s
+/// and blow the 15 s power-off budget the same answer asks for. Probe cost is
+/// already bounded by the sample count, not by the interval.
 pub const LIVENESS_RETRY: Duration = Duration::from_secs(3);
+
+/// The ports Q46's gateway reference probe tries, in order. The reference only
+/// needs **any** answer — a completed handshake and a returned RST are equally
+/// good proof that the gateway's stack is on our path — so the first common
+/// port with a listener (or a reject) settles it. 443 comes first because a
+/// router that serves HTTPS has it open; 80 is the fallback for routers whose
+/// admin page is plain HTTP.
+pub const GATEWAY_PROBE_PORTS: [u16; 2] = [443, 80];
+
+/// How long each gateway reference probe may take. It is half
+/// [`LIVENESS_TIMEOUT`]: a gateway is one hop away, and the reference probe must
+/// not dominate the all-failed round it is part of.
+pub const GATEWAY_PROBE_TIMEOUT: Duration = Duration::from_millis(1_000);
+
+/// Q46's last resort when no default route can be discovered at all: keep
+/// suppressing the all-failed round for this long, then stop. The gateway is the
+/// judgement; time is only the fallback for "there is no reference to probe".
+/// 60 s matches the busy-queue ceiling and is long enough that a transient
+/// routing-table hole does not reclaim every receiver.
+pub const GATEWAY_FALLBACK_WINDOW: Duration = Duration::from_secs(60);
+
 
 /// The queueing backoff for a confirmed `BusyElsewhere` verdict: 3 s, 6 s,
 /// 12 s, 24 s, then 60 s forever. This is a queue, never a failure retry: a
@@ -360,10 +405,13 @@ impl Verdict {
 pub enum LivenessSample {
     /// The control-port probe answered (or failed) on its own.
     Probe(ReceiverLiveness),
-    /// Every receiver of the group failed in the same round, so the common cause
-    /// is far more likely local than N devices dying at once (Q42). This is not
-    /// evidence about this receiver: the verdict is `Unknown`, the escalation
-    /// counter is neither advanced nor reset, and no re-probe is scheduled.
+    /// Every receiver of the group failed in the same round **and the gateway
+    /// reference did not answer**, so the common cause is our own network rather
+    /// than N devices dying at once (Q42 + Q46). This is not evidence about this
+    /// receiver: the verdict is `Unknown`, the escalation counter is neither
+    /// advanced nor reset. The caller re-probes after [`LIVENESS_RETRY`] to
+    /// re-evaluate the reference — a recovered gateway must end the suppression
+    /// (and, with no gateway at all, the fallback clock has to keep ticking).
     LocalSuspect,
 }
 
@@ -445,23 +493,241 @@ impl LivenessTracker {
     }
 }
 
-/// Q42's group-wide cross-check: "in a multi-receiver session, all failing
-/// probes at once means the problem is local".
+/// Q42's group-wide premise: in a multi-receiver session, all failing probes at
+/// once is a symptom of our own side, not of several devices dying in the same
+/// instant.
 ///
-/// It is the one judgement that needs no errno knowledge — our own routing
-/// table, interface or Wi-Fi cannot be told apart from several devices dying at
-/// the same instant by looking at one receiver, but it can by looking at the
-/// whole round. The rule deliberately requires evidence about **every**
-/// receiver: a single receiver failing is that receiver's problem, and a member
-/// that was not probed this round leaves the round inconclusive (its own
-/// verdict then stands). A `Refused` probe proves the host answered, so an
-/// all-refused round is *not* a local network failure — the devices are alive
-/// and simply not serving.
-pub fn local_network_suspected(probes: &[ReceiverLiveness], receivers: usize) -> bool {
+/// It is the one observation that needs no errno knowledge. It deliberately
+/// requires evidence about **every** receiver: a single receiver failing is that
+/// receiver's problem, and a member that was not probed this round leaves the
+/// round inconclusive (its own verdict then stands). A `Refused` probe proves
+/// the host answered, so an all-refused round is *not* a local network failure —
+/// the devices are alive and simply not serving.
+///
+/// Q46 adds the control group this observation was missing: see
+/// [`judge_all_failed`].
+pub fn all_receivers_failed(probes: &[ReceiverLiveness], receivers: usize) -> bool {
     receivers > 1
         && probes.len() == receivers
         && probes.iter().all(|probed| !probed.host_answered())
 }
+
+/// Whether the reference host (the default gateway) answered.
+///
+/// Q46's control group is deliberately about *answering*, not about serving
+/// anything: a completed TCP handshake and an RST both prove the gateway's
+/// network stack is reachable from this machine, which is exactly the
+/// independent evidence the all-failed round needs. A gateway probe is never
+/// turned into a [`ReceiverLiveness`] and never reaches a [`Tracker`]: "the
+/// reference did not answer" says something about our network, not about a
+/// receiver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayReachability {
+    /// The gateway answered (a completed connect or a returned RST).
+    Answered,
+    /// Nothing answered on any probed port: either the gateway is off or our
+    /// own interface/route is. Both are "our network", never a dead receiver.
+    Silent,
+}
+
+impl GatewayReachability {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Answered => "reachable",
+            Self::Silent => "unreachable",
+        }
+    }
+}
+
+/// The verdict of Q46's all-failed rule for one full polling round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllFailed {
+    /// Not every receiver of a multi-receiver session failed this round: each
+    /// receiver's own verdict stands.
+    NotAllFailed,
+    /// Every receiver failed **and the gateway answered**. The common cause
+    /// cannot be our network, so the devices really are gone: the per-receiver
+    /// `Dead` verdicts stand and the receivers are reclaimed (Q46).
+    DevicesGone,
+    /// Every receiver failed **and the gateway did not answer**. Our own
+    /// routing/interface/Wi-Fi is the common cause: nothing is marked dead.
+    LocalNetwork,
+    /// Every receiver failed and there is no default route to probe. Suppress,
+    /// but only until [`GATEWAY_FALLBACK_WINDOW`] elapses (Q46's last resort).
+    LocalNetworkUnproven,
+    /// Every receiver failed, no default route was discoverable, and the
+    /// fallback window elapsed: stop suppressing so a genuine power-off cannot
+    /// keep a stream alive forever.
+    FallbackExpired,
+}
+
+impl AllFailed {
+    /// Whether the group-wide rule suppresses the per-receiver `Dead` verdicts.
+    pub fn suppress(self) -> bool {
+        matches!(self, Self::LocalNetwork | Self::LocalNetworkUnproven)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::NotAllFailed => "not_all_failed",
+            Self::DevicesGone => "devices_gone",
+            Self::LocalNetwork => "local_network",
+            Self::LocalNetworkUnproven => "local_network_unproven",
+            Self::FallbackExpired => "fallback_expired",
+        }
+    }
+}
+
+/// Q46's judgement with a control group. When every receiver failed, the same
+/// round probes the default gateway, which shares our local path but not the
+/// receivers' power state:
+///
+/// ```text
+/// all receivers failed + gateway answered  => DevicesGone       (reclaim)
+/// all receivers failed + gateway silent    => LocalNetwork     (suppress)
+/// all receivers failed + no default route  => LocalNetworkUnproven
+///                                            until GATEWAY_FALLBACK_WINDOW,
+///                                            then FallbackExpired (reclaim)
+/// ```
+///
+/// `all_failed_for` is how long the current all-failed episode has lasted. It is
+/// only consulted when no gateway could be discovered; when the gateway answers,
+/// time is irrelevant — the reference is the judgement, the clock is the
+/// fallback.
+pub fn judge_all_failed(
+    probes: &[ReceiverLiveness],
+    receivers: usize,
+    gateway: Option<GatewayReachability>,
+    all_failed_for: Option<Duration>,
+) -> AllFailed {
+    if !all_receivers_failed(probes, receivers) {
+        return AllFailed::NotAllFailed;
+    }
+    match gateway {
+        Some(GatewayReachability::Answered) => AllFailed::DevicesGone,
+        Some(GatewayReachability::Silent) => AllFailed::LocalNetwork,
+        None if all_failed_for.is_some_and(|held| held >= GATEWAY_FALLBACK_WINDOW) => {
+            AllFailed::FallbackExpired
+        }
+        None => AllFailed::LocalNetworkUnproven,
+    }
+}
+
+/// The default route's next hop (IPv4), read from the OS routing table — no
+/// configuration knob, no guessed `192.168.1.1`.
+///
+/// Q46 suggests `GetAdaptersAddresses(FirstGatewayAddress)` or
+/// `GetIpForwardTable`. The engine does not enable the `windows` crate's
+/// `Win32_NetworkManagement_IpHelper` feature, so this calls the documented
+/// `GetIpForwardTable` export of `iphlpapi.dll` directly: one syscall, and it
+/// answers exactly "which next hop would Windows use for a destination that is
+/// not on-link". It is the same interface the receivers are reached over, which
+/// is what makes it a control group rather than a second guess.
+///
+/// Returns `None` when there is no IPv4 default route at all (Wi-Fi
+/// disconnected, IPv6-only, IPv4 stack disabled, or a non-Windows build).
+/// Q46's time-boxed fallback then applies — it never invents a default.
+///
+/// The table is caller-allocated: the null-buffer call only reports the required
+/// size, and the second call fills our buffer, so it is released by dropping the
+/// `Vec`. (`FreeIpForwardTable` exists for buffers the API allocated itself; it
+/// is deliberately not used here.)
+#[cfg(windows)]
+pub fn default_gateway() -> Option<IpAddr> {
+    // `MIB_IPFORWARDROW` (ipmib.h): fourteen DWORDs. IPv4 addresses are stored
+    // in network byte order, i.e. their in-memory bytes are already the octets.
+    const ROW_BYTES: usize = 14 * 4;
+    const DEST: usize = 0;
+    const MASK: usize = 4;
+    const NEXT_HOP: usize = 12;
+    const METRIC: usize = 36;
+    const NO_ERROR: u32 = 0;
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+    #[link(name = "iphlpapi")]
+    unsafe extern "system" {
+        fn GetIpForwardTable(table: *mut u8, size: *mut u32, order: i32) -> u32;
+    }
+
+    let mut size = 0u32;
+    // SAFETY: the null buffer + size out-parameter is the documented sizing
+    // call; the API writes nothing else.
+    let status = unsafe { GetIpForwardTable(std::ptr::null_mut(), &mut size, 0) };
+    if status != ERROR_INSUFFICIENT_BUFFER || size < 4 {
+        return None;
+    }
+    let mut buffer = vec![0u8; size as usize];
+    // SAFETY: `buffer` is at least `size` bytes, which the sizing call reported
+    // as enough for the whole table.
+    let status = unsafe { GetIpForwardTable(buffer.as_mut_ptr(), &mut size, 0) };
+    if status != NO_ERROR {
+        return None;
+    }
+    let rows = u32::from_ne_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
+    let fits = (buffer.len() - 4) / ROW_BYTES;
+    let mut best: Option<(u32, [u8; 4])> = None;
+    for index in 0..rows.min(fits) {
+        let row = &buffer[4 + index * ROW_BYTES..4 + (index + 1) * ROW_BYTES];
+        let is_zero = |field: usize| row[field..field + 4].iter().all(|byte| *byte == 0);
+        // The default route is destination 0.0.0.0/0. A zero next hop is an
+        // on-link route, not a gateway.
+        if !is_zero(DEST) || !is_zero(MASK) || is_zero(NEXT_HOP) {
+            continue;
+        }
+        let metric = u32::from_ne_bytes([
+            row[METRIC],
+            row[METRIC + 1],
+            row[METRIC + 2],
+            row[METRIC + 3],
+        ]);
+        let next_hop = [
+            row[NEXT_HOP],
+            row[NEXT_HOP + 1],
+            row[NEXT_HOP + 2],
+            row[NEXT_HOP + 3],
+        ];
+        // Several default routes only happen on a multi-homed machine; the one
+        // with the lowest route metric is the one the OS prefers.
+        if best.is_none_or(|(best_metric, _)| metric < best_metric) {
+            best = Some((metric, next_hop));
+        }
+    }
+    best.map(|(_, octets)| IpAddr::V4(std::net::Ipv4Addr::from(octets)))
+}
+
+/// No routing-table lookup outside Windows: the engine only runs on Windows,
+/// and inventing a default gateway here would be the fake the rule must never
+/// use. Q46's time-boxed fallback applies instead.
+#[cfg(not(windows))]
+pub fn default_gateway() -> Option<IpAddr> {
+    None
+}
+
+/// Probe the reference host on the given ports: the first answer wins, and only
+/// "nothing answered at all" is [`GatewayReachability::Silent`]. A refused
+/// connection is an answer (the RST proves the stack is there), which is why
+/// this reuses the same [`ReceiverLiveness::host_answered`] dimension as the
+/// receiver probe instead of a boolean "connected".
+pub fn reference_reachability(
+    ip: IpAddr,
+    ports: &[u16],
+    timeout: Duration,
+) -> GatewayReachability {
+    for port in ports {
+        if receiver_liveness(ip, *port, timeout).host_answered() {
+            return GatewayReachability::Answered;
+        }
+    }
+    GatewayReachability::Silent
+}
+
+/// Discover the default gateway and probe it once. `None` means there is no
+/// default route to use as a reference (Q46's fallback then applies); it is
+/// deliberately not the same value as a silent gateway.
+pub fn probe_default_gateway(timeout: Duration) -> Option<GatewayReachability> {
+    default_gateway().map(|gateway| reference_reachability(gateway, &GATEWAY_PROBE_PORTS, timeout))
+}
+
 
 /// What a live `GET /info` probe could tell us.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1049,13 +1315,15 @@ impl Tracker {
         self.liveness.consecutive_failures()
     }
 
-    /// Q42's timer needs repeated samples. After an undecided (`Unknown`) round
-    /// ask for the next liveness probe at [`LIVENESS_RETRY`]; otherwise a single
-    /// `Unknown` would be the only sample this tracker ever sees (the next probe
-    /// is otherwise only scheduled by fresh control-plane evidence, and a dead
-    /// feedback worker produces no more), so the patience limit could never be
-    /// reached. It never overrides a busy queue or the terminal yielded state,
-    /// and it is bounded: the third unknown escalates to `Dead`.
+    /// Q42's timer needs repeated samples. After an undecided (`Unknown`) or
+    /// locally suppressed round ask for the next liveness probe at
+    /// [`LIVENESS_RETRY`]; otherwise a single sample would be the only one this
+    /// tracker ever sees (the next probe is otherwise only scheduled by fresh
+    /// control-plane evidence, and a dead feedback worker produces no more), so
+    /// the patience limit could never be reached and Q46's gateway reference
+    /// could never be re-evaluated. It never overrides a busy queue or the
+    /// terminal yielded state, and it is bounded: the fifth unknown escalates to
+    /// `Dead`.
     pub fn await_liveness(&mut self, now: Instant) {
         if self.suspended || self.queueing() {
             return;
@@ -1650,38 +1918,46 @@ mod tests {
     fn an_unknown_chain_escalates_to_dead_and_one_ok_resets_it() {
         let base = Instant::now();
         let mut liveness = LivenessTracker::new(base);
+        for step in 1..LIVENESS_PATIENCE {
+            assert_eq!(
+                liveness.observe(ReceiverLiveness::Unknown, at(base, u64::from(step) * 1_000)),
+                Verdict::Unknown,
+                "failure {step} is still only 'temporarily unknown'"
+            );
+            assert_eq!(liveness.consecutive_failures(), step);
+        }
         assert_eq!(
-            liveness.observe(ReceiverLiveness::Unknown, at(base, 1_000)),
-            Verdict::Unknown,
-            "one failed probe is still only 'temporarily unknown'"
-        );
-        assert_eq!(
-            liveness.observe(ReceiverLiveness::Unknown, at(base, 2_000)),
-            Verdict::Unknown
-        );
-        assert_eq!(liveness.consecutive_failures(), 2);
-        assert_eq!(
-            liveness.observe(ReceiverLiveness::Unknown, at(base, 3_000)),
+            liveness.observe(
+                ReceiverLiveness::Unknown,
+                at(base, u64::from(LIVENESS_PATIENCE) * 1_000)
+            ),
             Verdict::Dead,
-            "the patience limit is three consecutive unknowns"
+            "the patience limit is LIVENESS_PATIENCE consecutive unknowns"
         );
         assert_eq!(liveness.consecutive_failures(), LIVENESS_PATIENCE);
         // One successful probe resets the counter and the clock...
+        let alive = u64::from(LIVENESS_PATIENCE + 1) * 1_000;
         assert_eq!(
-            liveness.observe(ReceiverLiveness::Alive, at(base, 4_000)),
+            liveness.observe(ReceiverLiveness::Alive, at(base, alive)),
             Verdict::Alive
         );
         assert_eq!(liveness.consecutive_failures(), 0);
-        assert_eq!(liveness.last_ok(), at(base, 4_000));
+        assert_eq!(liveness.last_ok(), at(base, alive));
         // ...so the chain has to start over.
-        for elapsed in 5..7 {
+        for extra in 1..LIVENESS_PATIENCE {
             assert_eq!(
-                liveness.observe(ReceiverLiveness::Unknown, at(base, elapsed * 1_000)),
+                liveness.observe(
+                    ReceiverLiveness::Unknown,
+                    at(base, alive + u64::from(extra) * 1_000)
+                ),
                 Verdict::Unknown
             );
         }
         assert_eq!(
-            liveness.observe(ReceiverLiveness::Unknown, at(base, 7_000)),
+            liveness.observe(
+                ReceiverLiveness::Unknown,
+                at(base, alive + u64::from(LIVENESS_PATIENCE) * 1_000)
+            ),
             Verdict::Dead
         );
     }
@@ -1726,24 +2002,130 @@ mod tests {
     }
 
     #[test]
-    fn all_receivers_failing_in_one_round_is_a_local_problem() {
+    fn the_all_failed_rule_needs_the_gateway_reference() {
+        use GatewayReachability as G;
         use ReceiverLiveness as L;
-        // Every receiver produced no evidence of life: the common cause is our
-        // own side, not several devices dying at once.
-        assert!(local_network_suspected(&[L::Dead, L::Unknown], 2));
-        assert!(local_network_suspected(&[L::Dead, L::Dead, L::Unknown], 3));
+        // Every receiver produced no evidence of life.
+        let all_failed = [L::Dead, L::Unknown];
+        assert!(all_receivers_failed(&all_failed, 2));
+        assert!(all_receivers_failed(&[L::Dead, L::Dead, L::Unknown], 3));
         // One alive receiver proves the local network works: the failure
         // belongs to the device that failed.
-        assert!(!local_network_suspected(&[L::Dead, L::Alive], 2));
+        assert!(!all_receivers_failed(&[L::Dead, L::Alive], 2));
         // A returned RST proves the host answered, so an all-refused round is
         // not a local routing failure.
-        assert!(!local_network_suspected(&[L::Refused, L::Refused], 2));
-        assert!(!local_network_suspected(&[L::Refused, L::Dead], 2));
+        assert!(!all_receivers_failed(&[L::Refused, L::Refused], 2));
+        assert!(!all_receivers_failed(&[L::Refused, L::Dead], 2));
         // A single receiver can never be "all failed": that is its own problem.
-        assert!(!local_network_suspected(&[L::Dead], 1));
+        assert!(!all_receivers_failed(&[L::Dead], 1));
         // A member that was not probed this round leaves the round inconclusive.
-        assert!(!local_network_suspected(&[L::Dead], 2));
-        assert!(!local_network_suspected(&[], 2));
+        assert!(!all_receivers_failed(&[L::Dead], 2));
+        assert!(!all_receivers_failed(&[], 2));
+
+        // Q46: the gateway decides what "all failed" means.
+        assert_eq!(
+            judge_all_failed(&all_failed, 2, Some(G::Answered), None),
+            AllFailed::DevicesGone,
+            "a reachable gateway + all receivers failed = the devices really are gone"
+        );
+        assert!(!AllFailed::DevicesGone.suppress());
+        assert_eq!(
+            judge_all_failed(&all_failed, 2, Some(G::Silent), None),
+            AllFailed::LocalNetwork,
+            "a silent gateway + all receivers failed = our own network"
+        );
+        assert!(AllFailed::LocalNetwork.suppress());
+        // No reference at all: Q46's fallback is time-boxed, not a guess.
+        assert_eq!(
+            judge_all_failed(&all_failed, 2, None, Some(Duration::from_secs(1))),
+            AllFailed::LocalNetworkUnproven
+        );
+        assert!(AllFailed::LocalNetworkUnproven.suppress());
+        assert_eq!(
+            judge_all_failed(
+                &all_failed,
+                2,
+                None,
+                Some(GATEWAY_FALLBACK_WINDOW - Duration::from_millis(1))
+            ),
+            AllFailed::LocalNetworkUnproven,
+            "the fallback window has not elapsed yet"
+        );
+        assert_eq!(
+            judge_all_failed(&all_failed, 2, None, Some(GATEWAY_FALLBACK_WINDOW)),
+            AllFailed::FallbackExpired,
+            "no reference and the window elapsed: suppression must end"
+        );
+        assert!(!AllFailed::FallbackExpired.suppress());
+        // The rule never fires when it should not, whatever the gateway said.
+        assert_eq!(
+            judge_all_failed(&[L::Dead, L::Alive], 2, Some(G::Silent), None),
+            AllFailed::NotAllFailed,
+            "one reachable receiver proves the network path to the group"
+        );
+        assert_eq!(
+            judge_all_failed(&[L::Dead], 1, Some(G::Silent), None),
+            AllFailed::NotAllFailed
+        );
+        assert_eq!(
+            judge_all_failed(&[L::Dead], 2, Some(G::Silent), None),
+            AllFailed::NotAllFailed,
+            "a partially probed round is inconclusive"
+        );
+        // Two receivers failing a *refused* probe are alive; the gateway state
+        // is irrelevant because the round is not "all failed" at all.
+        assert_eq!(
+            judge_all_failed(&[L::Refused, L::Dead], 2, Some(G::Silent), None),
+            AllFailed::NotAllFailed
+        );
+        assert_eq!(AllFailed::NotAllFailed.name(), "not_all_failed");
+        assert_eq!(AllFailed::DevicesGone.name(), "devices_gone");
+        assert_eq!(AllFailed::LocalNetwork.name(), "local_network");
+        assert_eq!(
+            AllFailed::LocalNetworkUnproven.name(),
+            "local_network_unproven"
+        );
+        assert_eq!(AllFailed::FallbackExpired.name(), "fallback_expired");
+        assert_eq!(GatewayReachability::Answered.name(), "reachable");
+        assert_eq!(GatewayReachability::Silent.name(), "unreachable");
+    }
+
+    #[test]
+    fn a_gateway_probe_is_judged_by_answering_not_by_serving() {
+        // A listening port answers (the connect completes)...
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        assert_eq!(
+            reference_reachability(address.ip(), &[address.port()], PROBE_TIMEOUT),
+            GatewayReachability::Answered
+        );
+        let (socket, _) = listener.accept().unwrap();
+        drop(socket);
+        drop(listener);
+        // ...and a closed port still answers (the RST proves the stack is
+        // there), which is what makes "refused" usable as a reference.
+        assert_eq!(
+            reference_reachability(address.ip(), &[address.port()], Duration::from_secs(10)),
+            GatewayReachability::Answered
+        );
+        // A silent address answers on no port: only then is the reference
+        // "unreachable". TEST-NET-1 is never routed, so this is a timeout on
+        // every stack that honours its routing table.
+        assert_eq!(
+            reference_reachability(
+                "192.0.2.1".parse().unwrap(),
+                &[9, 10],
+                Duration::from_millis(200)
+            ),
+            GatewayReachability::Silent
+        );
+        // The discovery itself never invents a gateway: it is either a real
+        // next hop from the routing table or nothing at all.
+        if let Some(gateway) = default_gateway() {
+            assert!(gateway.is_ipv4(), "the IPv4 table yields an IPv4 hop");
+            assert!(!gateway.is_unspecified());
+            assert!(!gateway.is_loopback());
+        }
     }
 
     #[test]
@@ -1765,16 +2147,25 @@ mod tests {
             1,
             "a local round neither advances nor resets the device counter"
         );
-        // The device's own chain still needs its two remaining failures.
+        // The device's own chain still needs its remaining failures.
+        for step in 2..LIVENESS_PATIENCE {
+            assert_eq!(
+                tracker
+                    .observe_liveness(
+                        LivenessSample::Probe(ReceiverLiveness::Unknown),
+                        at(base, u64::from(step) * 1_000)
+                    )
+                    .verdict,
+                Verdict::Unknown,
+                "failure {step} is below the patience limit"
+            );
+        }
         assert_eq!(
             tracker
-                .observe_liveness(LivenessSample::Probe(ReceiverLiveness::Unknown), at(base, 2_000))
-                .verdict,
-            Verdict::Unknown
-        );
-        assert_eq!(
-            tracker
-                .observe_liveness(LivenessSample::Probe(ReceiverLiveness::Unknown), at(base, 3_000))
+                .observe_liveness(
+                    LivenessSample::Probe(ReceiverLiveness::Unknown),
+                    at(base, u64::from(LIVENESS_PATIENCE) * 1_000)
+                )
                 .verdict,
             Verdict::Dead
         );

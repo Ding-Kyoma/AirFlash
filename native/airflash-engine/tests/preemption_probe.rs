@@ -368,13 +368,46 @@ fn an_unknown_chain_escalates_to_dead_and_one_ok_resets_it() {
 }
 
 #[test]
-fn all_receivers_failing_at_once_is_a_local_problem_and_marks_none_dead() {
-    // Two receivers, both probes failed in the same round. Q42: the common
-    // cause is our own routing/interface, so no device is marked dead and the
-    // healthy session keeps playing.
-    let probes = [ReceiverLiveness::Dead, ReceiverLiveness::Unknown];
-    assert!(preemption::local_network_suspected(&probes, 2));
+fn a_reachable_gateway_turns_the_all_failed_round_into_a_reclaim() {
+    // Q46's control group: the gateway answered, so our own network is fine and
+    // every failing receiver really is gone. The per-device verdict stands, and
+    // healthy media cannot keep a session with a device that is not there.
+    let probes = [ReceiverLiveness::Dead, ReceiverLiveness::Dead];
+    let judgement = preemption::judge_all_failed(
+        &probes,
+        2,
+        Some(preemption::GatewayReachability::Answered),
+        None,
+    );
+    assert_eq!(judgement, preemption::AllFailed::DevicesGone);
+    assert!(!judgement.suppress());
     for probe in probes {
+        let mut tracker = preemption::Tracker::default();
+        let note = tracker.observe_liveness(LivenessSample::Probe(probe), Instant::now());
+        assert_eq!(note.verdict, Verdict::Dead, "the device is marked dead");
+        let outcome = preemption::combine(true, note.verdict.liveness(), None, true);
+        assert_eq!(outcome, ProbeOutcome::Gone);
+        assert_eq!(action_for(outcome), ProbeAction::Reclaim);
+        assert_ne!(outcome, ProbeOutcome::BusyElsewhere);
+    }
+}
+
+#[test]
+fn a_silent_gateway_suppresses_the_all_failed_round_and_marks_none_dead() {
+    // Same all-failed round, but nothing answered on the gateway either: the
+    // common cause is our own routing/interface. Every receiver's `Dead` is
+    // downgraded to `Unknown`, nothing is counted against the device, and
+    // healthy media keeps the session.
+    let probes = [ReceiverLiveness::Dead, ReceiverLiveness::Unknown];
+    let judgement = preemption::judge_all_failed(
+        &probes,
+        2,
+        Some(preemption::GatewayReachability::Silent),
+        Some(Duration::from_secs(3)),
+    );
+    assert_eq!(judgement, preemption::AllFailed::LocalNetwork);
+    assert!(judgement.suppress());
+    for _ in probes {
         let mut tracker = preemption::Tracker::default();
         let note = tracker.observe_liveness(LivenessSample::LocalSuspect, Instant::now());
         assert_eq!(
@@ -393,24 +426,154 @@ fn all_receivers_failing_at_once_is_a_local_problem_and_marks_none_dead() {
             "healthy media + unknown liveness keeps our session"
         );
         assert_eq!(action_for(ProbeOutcome::OursActive), ProbeAction::FallThrough);
-        // The raw probe still says what the socket said.
-        assert!(!probe.reachable());
     }
     // One receiver failing is that receiver's problem, never "all failed".
-    assert!(!preemption::local_network_suspected(
+    assert!(!preemption::all_receivers_failed(
         &[ReceiverLiveness::Dead],
         1
     ));
     // One live receiver proves the local network works.
-    assert!(!preemption::local_network_suspected(
+    assert!(!preemption::all_receivers_failed(
         &[ReceiverLiveness::Dead, ReceiverLiveness::Alive],
         2
     ));
     // A refusal proves the host answered: an all-refused round is not local.
-    assert!(!preemption::local_network_suspected(
+    assert!(!preemption::all_receivers_failed(
         &[ReceiverLiveness::Refused, ReceiverLiveness::Refused],
         2
     ));
+    assert_eq!(
+        preemption::judge_all_failed(
+            &[ReceiverLiveness::Refused, ReceiverLiveness::Dead],
+            2,
+            Some(preemption::GatewayReachability::Silent),
+            None
+        ),
+        preemption::AllFailed::NotAllFailed,
+        "a refused host answered, so the round is not all-failed"
+    );
+}
+
+#[test]
+fn a_failed_gateway_probe_is_never_a_dead_receiver() {
+    // The reference probe fails for real (a blackholed address is the closest
+    // stand-in for "the gateway did not answer" without touching the LAN).
+    let reference = preemption::reference_reachability(
+        "192.0.2.1".parse().unwrap(),
+        &[9],
+        Duration::from_millis(200),
+    );
+    assert_eq!(reference, preemption::GatewayReachability::Silent);
+    // That failure only selects "our network" for the group; it never becomes a
+    // per-receiver sample, never advances the escalation counter and never
+    // produces a `Dead` verdict on its own.
+    let judgement = preemption::judge_all_failed(
+        &[ReceiverLiveness::Dead, ReceiverLiveness::Dead],
+        2,
+        Some(reference),
+        None,
+    );
+    assert_eq!(judgement, preemption::AllFailed::LocalNetwork);
+    let mut tracker = preemption::Tracker::default();
+    let note = tracker.observe_liveness(LivenessSample::LocalSuspect, Instant::now());
+    assert_eq!(note.verdict, Verdict::Unknown);
+    assert_eq!(tracker.liveness_failures(), 0);
+    // With healthy media the receiver is still ours, so no reclaim happens on a
+    // round where only the *reference* failed.
+    assert_eq!(
+        preemption::combine(true, note.verdict.liveness(), None, true),
+        ProbeOutcome::OursActive
+    );
+    // And a failed reference cannot fake a dead receiver through `combine`
+    // either: nothing in that path consumes it.
+    assert_ne!(
+        preemption::combine(true, ReceiverLiveness::Dead, None, true),
+        ProbeOutcome::OursActive
+    );
+}
+
+#[test]
+fn a_power_off_is_reclaimed_in_about_fifteen_seconds() {
+    // The ambiguous half of a genuine power-off: the OS keeps reporting errors
+    // that prove neither life nor death (a dropped SYN, a firewall rule, a
+    // stack that answers neither way), so only the escalation timer can end it.
+    // Q46's budget is about 15 s, and the gateway answered in every round, so
+    // the all-failed rule never suppresses the count.
+    let base = Instant::now();
+    let mut now = base;
+    let mut tracker = preemption::Tracker::default();
+    let mut verdict = Verdict::Unknown;
+    for _ in 0..preemption::LIVENESS_PATIENCE {
+        let judgement = preemption::judge_all_failed(
+            &[ReceiverLiveness::Unknown, ReceiverLiveness::Unknown],
+            2,
+            Some(preemption::GatewayReachability::Answered),
+            None,
+        );
+        assert_eq!(judgement, preemption::AllFailed::DevicesGone);
+        verdict = tracker
+            .observe_liveness(
+                LivenessSample::Probe(ReceiverLiveness::Unknown),
+                now,
+            )
+            .verdict;
+        if verdict == Verdict::Dead {
+            break;
+        }
+        tracker.await_liveness(now);
+        now += preemption::LIVENESS_RETRY;
+    }
+    assert_eq!(verdict, Verdict::Dead, "a genuine power-off must be reclaimed");
+    let elapsed = now.saturating_duration_since(base);
+    assert!(
+        elapsed <= Duration::from_secs(15),
+        "the reclaim must stay inside Q46's ~15 s budget, took {elapsed:?}"
+    );
+    assert!(
+        elapsed >= preemption::LIVENESS_RETRY * (preemption::LIVENESS_PATIENCE - 1),
+        "and it must not declare a device dead before the patience is spent, took {elapsed:?}"
+    );
+    assert_eq!(elapsed, Duration::from_secs(12));
+}
+
+#[test]
+fn a_roaming_client_is_not_declared_dead() {
+    // Cross-AP re-association: four undecided probes, then the device answers
+    // again. That is inside the patience (five), so it is not a death and the
+    // counter starts over.
+    let base = Instant::now();
+    let mut tracker = preemption::Tracker::default();
+    let mut now = base;
+    for step in 0..preemption::LIVENESS_PATIENCE - 1 {
+        let note = tracker.observe_liveness(
+            LivenessSample::Probe(ReceiverLiveness::Unknown),
+            now,
+        );
+        assert_eq!(
+            note.verdict,
+            Verdict::Unknown,
+            "failure {step} of a roam is still temporary"
+        );
+        tracker.await_liveness(now);
+        now += preemption::LIVENESS_RETRY;
+    }
+    let back = tracker.observe_liveness(LivenessSample::Probe(ReceiverLiveness::Alive), now);
+    assert_eq!(back.verdict, Verdict::Alive, "the roam finished");
+    assert_eq!(tracker.liveness_failures(), 0);
+    assert_eq!(
+        preemption::combine(true, back.verdict.liveness(), None, true),
+        ProbeOutcome::OursActive
+    );
+    // The next blip starts from zero again.
+    assert_eq!(
+        tracker
+            .observe_liveness(
+                LivenessSample::Probe(ReceiverLiveness::Unknown),
+                now + preemption::LIVENESS_RETRY
+            )
+            .verdict,
+        Verdict::Unknown
+    );
 }
 
 #[test]
