@@ -130,6 +130,7 @@ fn short_retry_accepts_an_earlier_outstanding_grant_and_renews_short_leases() {
     followed_packet(&mut state, &grant, 0, now, 7);
     assert_eq!(state.received_grants, 1);
     state.offset = Some(0.0);
+    state.offset_at = Some(start);
     for millis in [0, 125, 250] {
         state.exchanged(start + Duration::from_millis(millis));
     }
@@ -307,8 +308,10 @@ fn stale_pair_cannot_rewind_the_sync_offset_or_exchange_streak() {
     let stale = 1_000_000_000u64;
     let later = start + Duration::from_millis(125);
     let (sync, follow) = sync_pair(8, 1, (stale as i128 + receiver_offset) as u64);
-    followed_packet(&mut state, &sync, stale + 10_000, later, 7);
-    followed_packet(&mut state, &follow, stale + 20_000, later, 7);
+    // Both packets arrive after the newer pair, so local receive timestamps
+    // alone cannot identify this older source sequence.
+    followed_packet(&mut state, &sync, newest + 125_010_000, later, 7);
+    followed_packet(&mut state, &follow, newest + 125_020_000, later, 7);
     assert_eq!(state.exchanges, 1);
     assert_eq!(
         state.sync_pair.map(|sample| sample.received),
@@ -344,10 +347,150 @@ fn follower_locks_from_sync_pairs_when_delay_responses_stay_unusable() {
     assert_eq!(state.exchanges, 3);
     assert_eq!(state.packets.rejected, 3);
     assert!(state.offset.is_none(), "no delay response was accepted");
-    assert_eq!(state.offset_source(), Some("sync"));
-    let negative_rtt = state.packets.last_round_trip_ns.expect("round trip recorded");
+    let now = start + Duration::from_millis(250);
+    assert_eq!(state.offset_source(now), Some("sync"));
+    let negative_rtt = state
+        .packets
+        .last_round_trip_ns
+        .expect("round trip recorded");
     assert!(negative_rtt < 0.0, "contradictory timestamps");
-    let offset = state.effective_offset().expect("sync offset");
+    let offset = state.effective_offset(now).expect("sync offset");
     assert!((offset - receiver_offset as f64).abs() < 200_000.0);
+    assert!(state.ready(start + Duration::from_millis(250)));
+}
+
+#[test]
+fn expired_delay_offset_tracks_fresh_syncs_and_recovers_without_stale_smoothing() {
+    fn respond(state: &mut PeerState, seq: u16, local: u64, remote: u64, at: Instant) {
+        state.delay = Some((seq, local + 200_000));
+        state.delay_age = Some(at);
+        let mut response = header(9, 54, 8, seq, 0x0408, 0);
+        timestamp(&mut response[34..44], remote);
+        response[44..52].copy_from_slice(&7u64.to_be_bytes());
+        response[52..54].copy_from_slice(&0x8005u16.to_be_bytes());
+        followed_packet(state, &response, local + 400_000, at, 7);
+    }
+
+    let start = Instant::now();
+    let mut state = follower(start);
+    let initial_offset = 5_000_000_000u64;
+    // Simulate one minute of 100 ppm clock drift, with ongoing Sync pairs but
+    // only the first delay response usable. Rejected responses cannot renew it.
+    for seq in 0..483u16 {
+        let at = start + Duration::from_millis(u64::from(seq) * 125);
+        let local = 1_000_000_000 + u64::from(seq) * 125_000_000;
+        let drift = u64::from(seq) * 12_500;
+        let (sync, follow) = sync_pair(8, seq, local + initial_offset + drift);
+        followed_packet(&mut state, &sync, local + 90_000, at, 7);
+        followed_packet(&mut state, &follow, local + 95_000, at, 7);
+        if seq % 8 == 0 {
+            let remote = if seq == 0 {
+                local + initial_offset + 290_000
+            } else {
+                17
+            };
+            respond(&mut state, seq, local, remote, at);
+        }
+        if seq < 16 {
+            assert_eq!(state.offset_source(at), Some("delay"));
+            assert_eq!(state.effective_offset(at), Some(initial_offset as f64));
+        } else {
+            assert_eq!(state.offset_source(at), Some("sync"));
+            assert_eq!(state.effective_offset(at), state.sync_offset);
+        }
+    }
+    let now = start + Duration::from_millis(482 * 125);
+    let current_offset = initial_offset as f64 + 482.0 * 12_500.0;
+    assert!(state.ready(now));
+    assert_eq!(state.packets.last_rejection, Some("round_trip"));
+    assert!((state.effective_offset(now).unwrap() - current_offset).abs() < 200_000.0);
+
+    // Once delay responses recover, the old measurement must not bias the new
+    // estimate or cause a false offset jump that clears the healthy Sync streak.
+    let seq = 483;
+    let at = start + Duration::from_millis(u64::from(seq) * 125);
+    let local = 1_000_000_000 + u64::from(seq) * 125_000_000;
+    let recovered_offset = initial_offset + u64::from(seq) * 12_500;
+    let (sync, follow) = sync_pair(8, seq, local + recovered_offset);
+    followed_packet(&mut state, &sync, local + 90_000, at, 7);
+    followed_packet(&mut state, &follow, local + 95_000, at, 7);
+    respond(
+        &mut state,
+        seq,
+        local,
+        local + recovered_offset + 290_000,
+        at,
+    );
+    assert_eq!(state.offset_source(at), Some("delay"));
+    assert_eq!(state.effective_offset(at), Some(recovered_offset as f64));
+    assert_eq!(state.jitter_ns, None);
+    assert!(state.ready(at));
+}
+
+#[test]
+fn delayed_sync_after_its_follow_up_cannot_rewind_a_newer_pair() {
+    for (older, newer) in [(1, 2), (u16::MAX, 0)] {
+        let start = Instant::now();
+        let mut state = follower(start);
+        let offset = 5_000_000_000;
+        let (old_sync, old_follow) = sync_pair(8, older, 1_000_000_000 + offset);
+        followed_packet(&mut state, &old_follow, 1_000_090_000, start, 7);
+        let (sync, follow) = sync_pair(8, newer, 1_125_000_000 + offset);
+        let at = start + Duration::from_millis(125);
+        followed_packet(&mut state, &sync, 1_125_090_000, at, 7);
+        followed_packet(&mut state, &follow, 1_125_095_000, at, 7);
+        let offset_before = state.sync_offset;
+        followed_packet(
+            &mut state,
+            &old_sync,
+            1_250_090_000,
+            start + Duration::from_millis(250),
+            7,
+        );
+        assert_eq!(state.sync_pair.unwrap().sequence, newer);
+        assert_eq!(state.sync_offset, offset_before);
+        assert_eq!(state.last, Some(at));
+        assert_eq!(state.exchanges, 1);
+    }
+}
+
+#[test]
+fn sync_sequence_wrap_and_restart_after_timeout_can_reach_readiness() {
+    let start = Instant::now();
+    let mut state = follower(start);
+    for (seq, millis) in [
+        (u16::MAX, 0),
+        (0, 125),
+        (1, 250),
+        (0, 4000),
+        (1, 4125),
+        (2, 4250),
+    ] {
+        let at = start + Duration::from_millis(millis);
+        let local = 1_000_000_000 + millis * 1_000_000;
+        let (sync, follow) = sync_pair(8, seq, local + 1_000_000);
+        followed_packet(&mut state, &sync, local + 90_000, at, 7);
+        followed_packet(&mut state, &follow, local + 95_000, at, 7);
+        if millis == 250 || millis == 4250 {
+            assert_eq!(state.exchanges, 3);
+            assert!(state.ready(at));
+        } else if millis == 4000 {
+            assert_eq!(state.exchanges, 1);
+            assert!(!state.ready(at));
+        }
+    }
+}
+
+#[test]
+fn older_exchange_instants_cannot_refresh_or_inflate_readiness() {
+    let start = Instant::now();
+    let mut state = PeerState::default();
+    state.exchanged(start);
+    state.exchanged(start + Duration::from_millis(125));
+    state.exchanged(start + Duration::from_millis(50));
+    assert_eq!(state.exchanges, 2);
+    assert_eq!(state.last, Some(start + Duration::from_millis(125)));
+    assert!(!state.ready(start + Duration::from_millis(250)));
+    state.exchanged(start + Duration::from_millis(250));
     assert!(state.ready(start + Duration::from_millis(250)));
 }

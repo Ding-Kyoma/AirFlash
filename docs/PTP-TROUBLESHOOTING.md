@@ -26,15 +26,17 @@ Pdelay_Req 2, Follow_Up 8, Delay_Resp 9, Announce 11 and Signaling 12.
 
 `offset_source` reports which exchange produced the receiver-to-local offset.
 `sync` means a complete Sync/Follow_Up pair supplied it; that estimate omits the
-path delay, which is sub-millisecond on a local network. `delay` means a matching
-delay response refined it by measuring the round trip. A receiver that answers
-the sync exchange but never supplies a consistent delay response therefore still
-reaches `ready` with `offset_source=sync`.
+path delay. `delay` means a matching delay response refined it by measuring the
+round trip. That measurement remains preferred for two seconds after the last
+accepted delay response; after it expires, current Sync pairs supply the offset
+and `offset_source` returns to `sync`. Rejected responses do not extend this
+period. A receiver that answers the sync exchange but never supplies a consistent
+delay response therefore still reaches `ready` with `offset_source=sync`.
 
 A rejected delay response is recorded in `packets.last_rejection` with the
 computed round trip in `packets.last_round_trip_ns`. `round_trip` means the
-receiver's delay and sync timestamps disagree by more than 250 ms; the sample is
-discarded and the sync-derived offset stays in use. Report that number together
+computed round trip is outside the accepted 0–250 ms range; the sample is
+discarded without refreshing the delay measurement. Report that number together
 with the receiver model when a `sync`-sourced offset behaves incorrectly.
 
 `network` counters include datagrams rejected before peer validation.
