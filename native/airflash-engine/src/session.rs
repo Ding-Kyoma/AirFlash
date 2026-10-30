@@ -44,6 +44,8 @@ fn default_sample_rate() -> u32 {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProbeOptions {
+    #[serde(skip)]
+    pub sound_glow: crate::sound_glow::Control,
     pub peers: Vec<Peer>,
     #[serde(default)]
     pub wav_path: PathBuf,
@@ -325,6 +327,7 @@ struct Member {
     media: MediaTransport,
     uri: String,
     remote_control: u16,
+    rtsp_session: Option<String>,
     ready: bool,
     closed: bool,
     session_started: bool,
@@ -417,6 +420,7 @@ impl Member {
             media: MediaTransport::new(packetizer, audio, control, SocketAddr::new(peer.host, 0))?,
             uri,
             remote_control: 0,
+            rtsp_session: None,
             ready: false,
             closed: false,
             session_started: false,
@@ -455,12 +459,17 @@ impl Member {
         emit(
             json!({"event":"phase","host":peer.host,"phase":"setup_session","timing":options.timing}),
         );
-        let response = member
-            .conn
-            .lock()
-            .unwrap()
-            .plist_request("SETUP", &member.uri, &dictionary(setup))?
-            .plist()?;
+        let response =
+            member
+                .conn
+                .lock()
+                .unwrap()
+                .plist_request("SETUP", &member.uri, &dictionary(setup))?;
+        member.rtsp_session = response
+            .headers
+            .get("session")
+            .map(|s| s.split(';').next().unwrap_or(s).trim().to_owned());
+        let response = response.plist()?;
         member.session_started = true;
         let event_port = get_port(&response, "eventPort")?;
         member.events = Some(EventWorker::connect(
@@ -518,16 +527,22 @@ impl Member {
         emit(
             json!({"event":"phase","host":peer.host,"phase":"setup_audio","requested_latency_ms":options.latency_ms}),
         );
-        let response = member
-            .conn
-            .lock()
-            .unwrap()
-            .plist_request(
-                "SETUP",
-                &member.uri,
-                &dictionary(vec![("streams", Value::Array(vec![stream]))]),
-            )?
-            .plist()?;
+        let response = member.conn.lock().unwrap().plist_request(
+            "SETUP",
+            &member.uri,
+            &dictionary(vec![("streams", Value::Array(vec![stream]))]),
+        )?;
+        if let Some(session) = response.headers.get("session") {
+            member.rtsp_session = Some(
+                session
+                    .split(';')
+                    .next()
+                    .unwrap_or(session)
+                    .trim()
+                    .to_owned(),
+            );
+        }
+        let response = response.plist()?;
         let stream = response
             .as_dictionary()
             .and_then(|d| d.get("streams"))
@@ -1082,6 +1097,28 @@ fn send_packets(
     for member in members.iter_mut() {
         member.start_feedback(start)?;
     }
+    let positions = members
+        .iter()
+        .map(|m| {
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::sound_glow::position(m.media.packetizer.seq, m.media.packetizer.timestamp),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let glow_worker = crate::sound_glow::Worker::start(
+        members
+            .iter()
+            .zip(&positions)
+            .map(|(m, position)| crate::sound_glow::Peer {
+                host: m.peer.host.to_string(),
+                uri: m.uri.clone(),
+                session: m.rtsp_session.clone(),
+                connection: m.conn.clone(),
+                position: position.clone(),
+            })
+            .collect(),
+        options.sound_glow.clone(),
+    )?;
     let volume_peers = members
         .iter()
         .map(|m| (m.peer.host.to_string(), m.uri.clone(), m.conn.clone()))
@@ -1115,6 +1152,18 @@ fn send_packets(
                 if standby.should_pause(now, source.last_audio(), started_ns) {
                     return Ok(StreamEnd::Silence(now));
                 }
+            }
+            for event in glow_worker.events.try_iter() {
+                emit(event);
+            }
+            for (member, position) in members.iter().zip(&positions) {
+                position.store(
+                    crate::sound_glow::position(
+                        member.media.packetizer.seq,
+                        member.media.packetizer.timestamp,
+                    ),
+                    Ordering::Release,
+                );
             }
             for worker in &volume_workers {
                 for event in worker.events.try_iter() {
@@ -1330,6 +1379,7 @@ fn send_packets(
     emit(
         json!({"event":"metrics","packets_per_member":packets,"frames":schedule.frames,"silence_packets":silence_packets,"max_send_lateness_us":schedule.max_lateness_us,"retransmits":members.iter().map(|m|m.media.metrics.retransmits_sent).sum::<u64>(),"ptp_packets_received":ptp.as_ref().map(|p|p.received.load(Ordering::Relaxed)),"measured_latency_ms":null,"qualified":false}),
     );
+    drop(glow_worker);
     drop(volume_workers);
     for m in members.iter_mut() {
         m.close();
@@ -1428,6 +1478,7 @@ mod tests {
             media,
             uri: "rtsp://127.0.0.1/test".into(),
             remote_control: 0,
+            rtsp_session: None,
             ready: true,
             closed: false,
             session_started: true,
@@ -1445,6 +1496,7 @@ mod tests {
     fn silence_release(software: bool) {
         let options: ProbeOptions = serde_json::from_value(json!({"peers":[{"host":"127.0.0.1"}],"source":"loopback","duration_ms":0,"latency_ms":120,"gain":0.0})).unwrap();
         let options = ProbeOptions {
+            sound_glow: crate::sound_glow::Control::default(),
             group_mode: if software {
                 "software_stereo"
             } else {
@@ -1670,6 +1722,7 @@ mod tests {
     #[test]
     fn unsafe_probe_rejected() {
         let mut o = ProbeOptions {
+            sound_glow: crate::sound_glow::Control::default(),
             peers: vec![Peer {
                 receiver_id: String::new(),
                 host: "127.0.0.1".parse().unwrap(),

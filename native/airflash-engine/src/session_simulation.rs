@@ -300,6 +300,7 @@ fn cancelling_second_member_stream_setup_tears_down_both_without_sending_audio()
     wav.finalize().unwrap();
     let options: ProbeOptions = serde_json::from_value(serde_json::json!({"peers":[],"source":"wav","duration_ms":400,"gain":0.1,"latency_ms":200,"wav_path":path,"group_mode":"software_stereo","handshake_only":true})).unwrap();
     let options = ProbeOptions {
+        sound_glow: crate::sound_glow::Control::default(),
         peers: vec![left.peer.clone(), right.peer.clone()],
         ..options
     };
@@ -386,6 +387,7 @@ fn mixed_transports_share_sample_timeline_route_channels_and_close_together() {
     wav.finalize().unwrap();
     let options:ProbeOptions=serde_json::from_value(serde_json::json!({"peers":[],"source":"wav","duration_ms":400,"gain":0.1,"latency_ms":200,"wav_path":path,"group_mode":"software_stereo"})).unwrap();
     let options = ProbeOptions {
+        sound_glow: crate::sound_glow::Control::default(),
         peers: vec![left.peer.clone(), right.peer.clone()],
         ..options
     };

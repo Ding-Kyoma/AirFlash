@@ -8,6 +8,35 @@ namespace AirFlash.Tests;
 public sealed class SessionTests
 {
     [Fact]
+    public async Task SoundGlowIsOptInAndReceiverRejectionDoesNotFailAudioSession()
+    {
+        var process = new FakeConnection();
+        var logs = new ConcurrentQueue<string>();
+        await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), logs.Enqueue,
+            Fast with { Read = SessionTiming.Default.Read });
+        await Assert.ThrowsAsync<InvalidOperationException>(() => controller.SendSoundGlowTestAsync("red"));
+        await Assert.ThrowsAsync<ArgumentException>(() => controller.SendSoundGlowTestAsync("rainbow"));
+        await controller.StartAsync(Pod(), Settings());
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.DoesNotContain(process.Commands, c => c.Command == "set_sound_glow");
+        await controller.SendSoundGlowTestAsync("red");
+        await controller.SendSoundGlowTestAsync("blue");
+        var commands = process.Commands.Where(c => c.Command == "set_sound_glow").ToArray();
+        Assert.Equal(2, commands.Length);
+        Assert.Equal("red", commands[0].Parameters.Text("palette"));
+        Assert.Equal("blue", commands[1].Parameters.Text("palette"));
+        Assert.True(commands[1].Parameters.Integer("sequence") > commands[0].Parameters.Integer("sequence"));
+        var feedback = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
+        controller.SoundGlowFeedback += item => feedback.TrySetResult(item);
+        process.EmitData(new { @event = "sound_glow_result", accepted = false, part = "metadata", message = "415 Unsupported Media Type" });
+        var item = await feedback.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(item.Boolean("accepted"));
+        Assert.Equal(PlaybackState.Streaming, controller.Snapshot.State);
+        Assert.Contains(logs, line => line.Contains("415 Unsupported Media Type"));
+        await controller.StopAsync();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => controller.SendSoundGlowTestAsync("green"));
+    }
+    [Fact]
     public async Task ClockStartupFailureRetainsPerPeerDiagnosticsAndEnginePathInLog()
     {
         var process = new FakeConnection(autoReady: false);

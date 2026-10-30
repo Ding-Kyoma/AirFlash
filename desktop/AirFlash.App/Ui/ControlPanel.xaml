@@ -44,6 +44,7 @@
         <Button Grid.Column="2" Style="{StaticResource IconButton}" ToolTip="{loc:Text 'Quit'}" AutomationProperties.Name="{loc:Text 'Quit'}" Click="OnQuit" Margin="0,0,0,0"><Viewbox Width="18" Height="18"><Path Data="M 10,3 L 3,3 3,21 10,21 M 8,12 L 22,12 M 17,7 L 22,12 17,17" Stroke="{DynamicResource TextBrush}" StrokeThickness="1.6" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"/></Viewbox></Button>
       </Grid>
       <StackPanel Grid.Row="1">
+      <Button Content="Sound Glow Test · 灯效实验" Click="OnSoundGlowTest" HorizontalAlignment="Left" Margin="0,0,0,10"/>
       <Border Padding="10" CornerRadius="6" Background="{DynamicResource TintBrush}" Margin="0,0,0,12" Visibility="{Binding Notice, Converter={StaticResource NonEmpty}}">
         <TextBlock Text="{Binding Notice}" Style="{StaticResource Hint}"/>
       </Border>
