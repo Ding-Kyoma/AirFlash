@@ -18,6 +18,28 @@ public sealed record SessionTiming(TimeSpan Connect, TimeSpan Read, TimeSpan Pin
 public sealed class SessionController(IEngineFactory factory, IAudioService audio, Action<string>? log = null, SessionTiming? timing = null) : IAsyncDisposable
 {
     private readonly SemaphoreSlim _serial = new(1, 1);
+    private long _soundGlowSequence;
+    public event Action<JsonElement>? SoundGlowFeedback;
+    public async Task SendSoundGlowTestAsync(string palette)
+    {
+        if (palette is not ("metadata_only" or "red" or "blue" or "green"))
+            throw new ArgumentException("Unknown test palette.", nameof(palette));
+        await _serial.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            IEngineConnection connection; string session; CancellationToken cancellation;
+            lock (_sync)
+            {
+                if (_snapshot.State != PlaybackState.Streaming || _connection is null || _sessionId is null || _lifetime is null)
+                    throw new InvalidOperationException("请先连接 HomePod 并开始播放 / Start streaming first.");
+                connection = _connection; session = _sessionId; cancellation = _lifetime.Token;
+            }
+            var sequence = Interlocked.Increment(ref _soundGlowSequence);
+            await connection.SendAsync(session, "set_sound_glow", new { sequence, palette }, cancellation).ConfigureAwait(false);
+            log?.Invoke($"Sound Glow test requested: sequence={sequence}; palette={palette}");
+        }
+        finally { _serial.Release(); }
+    }
     private readonly SemaphoreSlim _audioWriter = new(1, 1);
     private readonly object _sync = new();
     private readonly SessionTiming _timing = timing ?? SessionTiming.Default;
@@ -515,6 +537,12 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         if (wait <= TimeSpan.Zero) throw new TimeoutException(L.Get("Timed out connecting to the audio device."));
                         var item = await ReadEventAsync(connection, session, wait, cancellation).ConfigureAwait(false);
                         var kind = item.Text("event");
+                        if (kind.StartsWith("sound_glow_", StringComparison.Ordinal))
+                        {
+                            log?.Invoke("Sound Glow: " + item.GetRawText());
+                            SoundGlowFeedback?.Invoke(item.Clone());
+                            continue;
+                        }
                         if (kind == "error") throw new EngineFailure(EngineNotice.Parse(item));
                         if (kind == "stopped") throw new IOException(L.Get("The audio session ended unexpectedly."));
                         if (kind == "negotiated")

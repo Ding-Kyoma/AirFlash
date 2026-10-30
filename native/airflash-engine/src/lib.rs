@@ -25,3 +25,5 @@ pub mod volume;
 
 #[cfg(windows)]
 pub mod applications;
+
+pub mod sound_glow;

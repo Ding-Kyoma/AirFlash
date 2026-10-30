@@ -13,6 +13,15 @@ namespace AirFlash.App.Ui;
 public partial class ControlPanel : Window
 {
     private readonly AppViewModel _viewModel;
+    private SoundGlowWindow? _soundGlowWindow;
+    private void OnSoundGlowTest(object sender, RoutedEventArgs args)
+    {
+        if (_soundGlowWindow is null) {
+            _soundGlowWindow = new SoundGlowWindow(_viewModel);
+            _soundGlowWindow.Closed += (_, _) => _soundGlowWindow = null;
+        }
+        _soundGlowWindow.Show(); _soundGlowWindow.Activate();
+    }
     private bool _allowClose;
     private bool _placing;
     private DispatcherOperation? _placement;

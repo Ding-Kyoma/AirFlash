@@ -44,6 +44,7 @@ struct Running {
     gain: std::sync::Arc<std::sync::atomic::AtomicU32>,
     pending_pin: Option<std::sync::mpsc::Sender<zeroize::Zeroizing<String>>>,
     gain_limit: f64,
+    sound_glow: airflash_engine::sound_glow::Control,
     volume: airflash_engine::volume::Control,
     standby: airflash_engine::standby::Control,
     equalizer: Option<(airflash_engine::equalizer::Control, u32)>,
@@ -66,6 +67,7 @@ fn capabilities() -> Vec<&'static str> {
         "member_volume",
         "receiver_password",
         "standby_release",
+        "sound_glow_test",
     ];
     if airflash_engine::applications::supported() {
         values.push("application_capture");
@@ -188,7 +190,7 @@ fn main() {
             "hello" => send(
                 &request.id,
                 &request.session_id,
-                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"experimental","live_loopback":true,"capabilities":capabilities(),"commands":["hello","get_receiver_capabilities","list_applications","start","probe","stop","set_gain","set_equalizer","set_standby","set_device_volume","pair","pair_pin"],"production_ready":false}),
+                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"experimental","live_loopback":true,"capabilities":capabilities(),"commands":["hello","get_receiver_capabilities","list_applications","start","probe","stop","set_gain","set_sound_glow","set_equalizer","set_standby","set_device_volume","pair","pair_pin"],"production_ready":false}),
             ),
             "get_receiver_capabilities" => {
                 let result = (|| -> anyhow::Result<_> {
@@ -299,6 +301,7 @@ fn main() {
                     airflash_engine::equalizer::Control::new(options.equalizer, rate).unwrap();
                 let worker_equalizer = equalizer.clone();
                 let live_equalizer = (request.command == "start").then_some((equalizer, rate));
+                let sound_glow = options.sound_glow.clone();
                 let worker = thread::spawn(move || {
                     let emit = |e| send(&request.id, &request.session_id, e);
                     if let Err(error) = probe_with_all_controls(
@@ -320,6 +323,7 @@ fn main() {
                     gain,
                     pending_pin: None,
                     gain_limit,
+                    sound_glow,
                     volume,
                     standby,
                     equalizer: live_equalizer,
@@ -359,6 +363,29 @@ fn main() {
                         );
                     }
                 }
+            }
+            "set_sound_glow" => {
+                let result = (|| -> anyhow::Result<()> {
+                    let command: airflash_engine::sound_glow::Command =
+                        serde_json::from_value(request.params)?;
+                    let active = running
+                        .as_ref()
+                        .filter(|r| r.id == request.session_id && r.equalizer.is_some())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("sound glow test requires an active live session")
+                        })?;
+                    active.sound_glow.set(command)
+                })();
+                send(
+                    &request.id,
+                    &request.session_id,
+                    match result {
+                        Ok(()) => json!({"event":"sound_glow_queued"}),
+                        Err(error) => {
+                            json!({"event":"sound_glow_error","message":error.to_string()})
+                        }
+                    },
+                );
             }
             "set_equalizer" => {
                 send(
@@ -501,6 +528,7 @@ fn main() {
                     gain: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
                     pending_pin: Some(tx),
                     gain_limit: 0.0,
+                    sound_glow: airflash_engine::sound_glow::Control::default(),
                     volume: airflash_engine::volume::Control::default(),
                     standby: airflash_engine::standby::Control::default(),
                     equalizer: None,
@@ -540,6 +568,7 @@ mod tests {
             gain: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             pending_pin: None,
             gain_limit: 1.0,
+            sound_glow: airflash_engine::sound_glow::Control::default(),
             volume: airflash_engine::volume::Control::default(),
             standby: airflash_engine::standby::Control::default(),
             equalizer: Some((Control::new(Settings::default(), rate).unwrap(), rate)),
