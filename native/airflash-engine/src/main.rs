@@ -204,15 +204,10 @@ fn main() {
                         !peers.is_empty() && peers.len() <= 2,
                         "capability query requires one or two receivers"
                     );
-                    peers
-                        .iter()
-                        .map(|peer| {
-                            airflash_engine::receiver_capabilities::query(
-                                peer,
-                                Cancellation::default(),
-                            )
-                        })
-                        .collect::<anyhow::Result<Vec<_>>>()
+                    airflash_engine::receiver_capabilities::query_group(
+                        &peers,
+                        Cancellation::default(),
+                    )
                 })();
                 match result {
                     Ok(members) => send(
@@ -223,7 +218,7 @@ fn main() {
                     Err(error) => send(
                         &request.id,
                         &request.session_id,
-                        json!({"event":"error","message":error.to_string()}),
+                        airflash_engine::transport::error_event(&error),
                     ),
                 }
             }
@@ -291,6 +286,8 @@ fn main() {
                 if let Some(old) = running.take() {
                     drop(old);
                 }
+                airflash_engine::session::reset_lead();
+                airflash_engine::metadata::global().clear();
                 let cancel = Cancellation::default();
                 let worker_cancel = cancel.clone();
                 let session = request.session_id.clone();
@@ -400,40 +397,57 @@ fn main() {
                 }
             }
             "set_now_playing" => {
-                // Desktop metadata (title/artist/album/position) is forwarded to every
-                // receiver as SET_PARAMETER by the session's metadata worker.
-                let now: airflash_engine::metadata::NowPlaying =
-                    serde_json::from_value(request.params.clone()).unwrap_or_default();
-                let sequence = NEXT_METADATA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                airflash_engine::metadata::global().set(sequence, now);
-                send(
-                    &request.id,
-                    &request.session_id,
-                    json!({"event":"metadata_accepted","sequence":sequence}),
-                );
+                let result = (|| -> anyhow::Result<_> {
+                    anyhow::ensure!(
+                        running.as_ref().is_some_and(|r| r.id == request.session_id
+                            && r.equalizer.is_some()
+                            && !r.cancel.is_cancelled()),
+                        "metadata session is no longer active"
+                    );
+                    let now: airflash_engine::metadata::NowPlaying =
+                        serde_json::from_value(request.params)?;
+                    anyhow::ensure!(
+                        [&now.title, &now.artist, &now.album, &now.genre]
+                            .iter()
+                            .all(|text| text.len() <= 4096),
+                        "metadata text is too long"
+                    );
+                    let sequence = NEXT_METADATA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    airflash_engine::metadata::global().set(sequence, now);
+                    Ok(sequence)
+                })();
+                let event = match result {
+                    Ok(sequence) => json!({"event":"metadata_accepted","sequence":sequence}),
+                    Err(error) => json!({"event":"metadata_error","message":error.to_string()}),
+                };
+                send(&request.id, &request.session_id, event);
             }
             "set_lead" => {
-                // Adaptive latency: shift the live timeline instead of restarting.
-                let requested = request
-                    .params
-                    .get("ms")
-                    .or_else(|| request.params.get("lead_ms"))
-                    .and_then(Value::as_i64);
-                match requested {
-                    Some(ms) => {
-                        airflash_engine::session::request_lead(ms);
-                        send(
-                            &request.id,
-                            &request.session_id,
-                            json!({"event":"lead_requested","ms":airflash_engine::session::requested_lead()}),
-                        );
-                    }
-                    None => send(
-                        &request.id,
-                        &request.session_id,
-                        json!({"event":"error","message":"set_lead needs an integer ms"}),
-                    ),
-                }
+                let result = (|| -> anyhow::Result<_> {
+                    anyhow::ensure!(
+                        running.as_ref().is_some_and(|r| r.id == request.session_id
+                            && r.equalizer.is_some()
+                            && !r.cancel.is_cancelled()),
+                        "lead session is no longer active"
+                    );
+                    let ms = request
+                        .params
+                        .get("ms")
+                        .or_else(|| request.params.get("lead_ms"))
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| anyhow::anyhow!("set_lead needs an integer ms"))?;
+                    anyhow::ensure!(
+                        (0..=airflash_engine::session::MAX_LEAD_MS).contains(&ms),
+                        "lead must be 0..2000 ms"
+                    );
+                    airflash_engine::session::request_lead(ms);
+                    Ok(ms)
+                })();
+                let event = match result {
+                    Ok(ms) => json!({"event":"lead_requested","ms":ms}),
+                    Err(error) => json!({"event":"lead_error","message":error.to_string()}),
+                };
+                send(&request.id, &request.session_id, event);
             }
             "pair_pin" => {
                 if let Some(r) = running.as_ref().filter(|r| r.id == request.session_id) {
@@ -561,9 +575,8 @@ fn main() {
                 // One-shot, redacted snapshot for issue reports: hosts and paths
                 // become stable pseudonyms, credentials are dropped, and every
                 // counter keeps its value.
-                let latest = airflash_engine::telemetry::redact(
-                    &airflash_engine::telemetry::diagnostics(),
-                );
+                let latest =
+                    airflash_engine::telemetry::redact(&airflash_engine::telemetry::diagnostics());
                 send(
                     &request.id,
                     &request.session_id,

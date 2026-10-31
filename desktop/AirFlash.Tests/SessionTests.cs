@@ -7,6 +7,122 @@ namespace AirFlash.Tests;
 
 public sealed class SessionTests
 {
+    [Theory]
+    [InlineData("realtime", true)]
+    [InlineData("buffered", false)]
+    public async Task AdaptiveLatencyUsesTheNegotiatedProfileAndResetsAfterStandby(string transport, bool shouldRaise)
+    {
+        var process = new FakeConnection { ReceiverCapabilityResponse = new { @event = "receiver_capabilities",
+            members = new[] { new { receiver_id = "a", host = "127.0.0.1", port = 7000, known = true,
+                profiles = new[] { new { codec = "auto", transport = "auto", timing = "auto", sample_rate = 44100,
+                    selected_codec = transport == "buffered" ? "alac" : "pcm", selected_transport = transport, selected_timing = "ptp" } } } } } };
+        await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast with { Read = TimeSpan.FromSeconds(10) });
+        var settings = Settings(); settings.LatencyMode = "adaptive";
+        await controller.StartAsync(Pod(), settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var initial = transport == "buffered" ? 50 : 60;
+        Assert.Equal(initial, process.Commands.Single(c => c.Command == "start").Parameters.Integer("latency_ms"));
+        process.EmitData(new { @event = "negotiated", receiver_id = "a", codec = transport == "buffered" ? "alac" : "pcm", transport, timing = "ptp" });
+        for (var i = 0; i < 3; i++) process.EmitData(new { @event = "warning", code = "timeline_reanchored", recovered = true });
+        process.EmitData(new { @event = "capture_metrics", metrics = new { underrun_packets = 42 } });
+        await Until(() => controller.Snapshot.Metrics?.Underruns == 42);
+        if (shouldRaise)
+        {
+            Assert.Equal(20, Assert.Single(process.Commands, c => c.Command == "set_lead").Parameters.Integer("ms"));
+            process.EmitData(new { @event = "lead_changed", applied_ms = 20 });
+            await Until(() => controller.Snapshot.TargetLatency == 80);
+        }
+        else Assert.DoesNotContain(process.Commands, c => c.Command == "set_lead");
+        process.Emit("standby"); process.Emit("resuming"); process.Emit("streaming");
+        process.EmitData(new { @event = "capture_metrics", metrics = new { underrun_packets = 43 } });
+        await Until(() => controller.Snapshot.Metrics?.Underruns == 43);
+        Assert.Equal(initial, controller.Snapshot.TargetLatency);
+    }
+    [Theory]
+    [InlineData("normal", "adaptive", true, true)]
+    [InlineData("adaptive", "custom", true, false)]
+    [InlineData("adaptive", null, false, false)]
+    public async Task AdaptiveLeadUsesDeviceOverrideAndFreshIntervalMetrics(string global, string? device, bool interval, bool shouldRaise)
+    {
+        var process = new FakeConnection();
+        await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast with { Read = TimeSpan.FromSeconds(10) });
+        var settings = Settings(); settings.LatencyMode = global;
+        settings.Options("a").LatencyMode = device;
+        settings.Options("a").CustomBufferMs = 400;
+        await controller.StartAsync(Pod(), settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        process.EmitData(new { @event = "negotiated", receiver_id = "a", codec = "alac", transport = "realtime", timing = "ptp" });
+        for (var i = 0; i < 10; i++)
+            process.EmitData(new { @event = "transport_metrics", lateness = new { p99_ms = 8.0 },
+                lateness_interval = interval ? new { p99_ms = 8.0 } : null, session_uptime_ms = i * 1000 });
+        await Until(() => controller.Snapshot.Diagnostics?.Transport?.SessionUptimeMs == 9000);
+        if (shouldRaise)
+        {
+            await Until(() => process.Commands.Any(c => c.Command == "set_lead"));
+            Assert.Equal(10, process.Commands.Single(c => c.Command == "set_lead").Parameters.Integer("ms"));
+            Assert.Equal(50, controller.Snapshot.TargetLatency);
+            process.EmitData(new { @event = "lead_changed", applied_ms = 10 });
+            await Until(() => controller.Snapshot.TargetLatency == 60);
+            for (var i = 0; i < 20; i++)
+                process.EmitData(new { @event = "warning", code = "timeline_reanchored", recovered = true });
+            process.EmitData(new { @event = "capture_metrics", metrics = new { underrun_packets = 42 } });
+            await Until(() => controller.Snapshot.Metrics?.Underruns == 42);
+            Assert.Single(process.Commands, c => c.Command == "set_lead");
+        }
+        else Assert.DoesNotContain(process.Commands, c => c.Command == "set_lead");
+    }
+    [Fact]
+    public async Task AdaptiveLeadDoesNotCarryAcrossPlaybackRuns()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection();
+        await using var controller = new SessionController(new FakeFactory(first, second), new FakeAudio(), timing: Fast with { Read = TimeSpan.FromSeconds(10) });
+        var settings = Settings(); settings.LatencyMode = "adaptive";
+        await controller.StartAsync(Pod(), settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        first.EmitData(new { @event = "lead_changed", applied_ms = 50 });
+        await Until(() => controller.Snapshot.TargetLatency == 100);
+        await controller.StopAsync();
+        await controller.StartAsync(Pod(), settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.Equal(50, controller.Snapshot.TargetLatency);
+        Assert.DoesNotContain(second.Commands, c => c.Command == "set_lead");
+    }
+    [Fact]
+    public async Task DiagnosticsUseThePlayingEngineWithoutCompetingForItsReader()
+    {
+        var process = new FakeConnection();
+        var factory = new FakeFactory(process);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast with { Read = TimeSpan.FromSeconds(10) });
+        await controller.StartAsync(Pod(), Settings());
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var export = DiagnosticExport.SnapshotAsync(controller);
+        await Until(() => process.Commands.Any(c => c.Command == "diag_summary"));
+        process.EmitData(new { @event = "capture_metrics", metrics = new { underrun_packets = 7 } });
+        process.EmitData(new { @event = "diag_summary", session = new { packets = 1234 } });
+        var result = await export.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1234, result!.Value.GetProperty("session").Integer("packets"));
+        Assert.Equal(1, factory.OpenCount);
+        Assert.Equal(7, controller.Snapshot.Metrics!.Underruns);
+        Assert.Equal(PlaybackState.Streaming, controller.Snapshot.State);
+    }
+    [Fact]
+    public async Task DiagnosticsWithoutPlaybackDoNotSpawnAnEmptyEngine()
+    {
+        var factory = new FakeFactory();
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        Assert.Null(await DiagnosticExport.SnapshotAsync(controller));
+        Assert.Equal(0, factory.OpenCount);
+    }
+    [Fact]
+    public async Task MetadataCollectedBeforeConnectingIsSentWhenPlaybackStarts()
+    {
+        var process = new FakeConnection();
+        await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast);
+        await controller.PublishNowPlayingAsync(new("Song", "Artist", "", "", true, 10000, 1000));
+        await controller.StartAsync(Pod(), Settings());
+        await Until(() => process.Commands.Any(c => c.Command == "set_now_playing"));
+        Assert.Equal("Song", process.Commands.Single(c => c.Command == "set_now_playing").Parameters.Text("title"));
+    }
     [Fact]
     public async Task ClockStartupFailureRetainsPerPeerDiagnosticsAndEnginePathInLog()
     {

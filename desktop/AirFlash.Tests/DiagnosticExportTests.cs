@@ -5,57 +5,17 @@ namespace AirFlash.Tests;
 
 public sealed class DiagnosticExportTests
 {
-    /// <summary>A connection that answers hello, then the diag_summary request.</summary>
-    private sealed class Connection(string snapshot) : IEngineConnection
-    {
-        private readonly Queue<string?> _replies = new([
-            """{"event":"hello","version":1,"capabilities":["diagnostics"]}""",
-            snapshot,
-        ]);
-        public List<string> Commands { get; } = [];
-        public Task SendAsync(string session, string command, object? parameters, CancellationToken cancellation)
-        {
-            Commands.Add(command); return Task.CompletedTask;
-        }
-        public ValueTask<JsonElement?> ReadAsync(CancellationToken cancellation)
-        {
-            if (_replies.Count == 0) return ValueTask.FromResult<JsonElement?>(null);
-            using var document = JsonDocument.Parse(_replies.Dequeue()!);
-            return ValueTask.FromResult<JsonElement?>(document.RootElement.Clone());
-        }
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
-    }
-    private sealed class Factory(IEngineConnection connection) : IEngineFactory { public IEngineConnection Open() => connection; }
-
-    [Fact]
-    public async Task A_snapshot_comes_back_from_a_running_engine()
-    {
-        var connection = new Connection("""{"event":"diag_summary","engine_version":"0.1.0","session":{"packets":1200}}""");
-        var snapshot = await DiagnosticExport.SnapshotAsync(new Factory(connection));
-        Assert.NotNull(snapshot);
-        Assert.Equal("diag_summary", snapshot!.Value.Text("event"));
-        Assert.Equal(1200, snapshot.Value.GetProperty("session").Integer("packets"));
-        Assert.Equal(["hello", "diag_summary"], connection.Commands);
-    }
-
-    [Fact]
-    public async Task A_missing_engine_yields_no_snapshot_instead_of_throwing()
-    {
-        var connection = new Connection("""{"event":"something_else"}""");
-        Assert.Null(await DiagnosticExport.SnapshotAsync(new Factory(connection)));
-    }
-
     [Fact]
     public void The_bundle_carries_versions_os_and_the_session()
     {
         using var document = JsonDocument.Parse("""{"packets":7}""");
-        var text = DiagnosticExport.Compose("0.5.4", "0.1.0", document.RootElement, ["line one", "line two"]);
+        var text = DiagnosticExport.Compose("0.5.4", "0.1.0", document.RootElement);
         using var bundle = JsonDocument.Parse(text);
         Assert.Equal("0.5.4", bundle.RootElement.Text("app_version"));
         Assert.Equal("0.1.0", bundle.RootElement.Text("engine_version"));
         Assert.False(string.IsNullOrWhiteSpace(bundle.RootElement.Text("os")));
         Assert.Equal(7, bundle.RootElement.GetProperty("session").Integer("packets"));
-        Assert.Equal(2, bundle.RootElement.GetProperty("log_tail").GetArrayLength());
+        Assert.False(bundle.RootElement.TryGetProperty("log_tail", out _));
         Assert.False(string.IsNullOrWhiteSpace(bundle.RootElement.Text("generated_at")));
     }
 

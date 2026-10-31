@@ -3,10 +3,10 @@
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <OutputType Condition="'$(AirFlashConsole)' == 'true'">Exe</OutputType>
-    <!-- The Windows 10 2004 contract is what exposes SMTC (Now Playing) to a
-         desktop process; net10.0-windows alone has no WinRT projections. -->
+    <!-- Compile against the WinRT projections while retaining the Windows 10
+         1809 minimum supported by SMTC and the existing desktop application. -->
     <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
-    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
     <UseWPF>true</UseWPF>
     <AssemblyName>AirFlash</AssemblyName>
     <RootNamespace>AirFlash.App</RootNamespace>

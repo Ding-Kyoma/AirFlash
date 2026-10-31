@@ -80,9 +80,8 @@ public sealed class SettingsStore : ISettingsStore
                 settings.ReceiverAliases = settings.ReceiverAliases.Where(p => ReceiverIdentity.IsBroadcast(p.Key) && !string.IsNullOrWhiteSpace(p.Value) && ReceiverIdentity.IsBroadcast(p.Value))
                     .GroupBy(p => ReceiverIdentity.Normalize(p.Key)).ToDictionary(g => g.Key, g => ReceiverIdentity.Normalize(g.First().Value), StringComparer.Ordinal);
                 if (settings.Validate() is { } error) throw new JsonException(L.Format("Configuration contains invalid values: {0}", error));
-                // A config written before schema 5 was legal under the old rules;
-                // each saved pair must be checked once, with live TXT evidence,
-                // before the file may claim the new version (Q45).
+                // Preserve the existing backup and migration bookkeeping while
+                // acknowledging legacy pairs without splitting user configuration.
                 _mixedMigrationPending = version < AppSettings.CurrentSchemaVersion
                     && settings.SoftwareGroups.Any(group => group.MixedInvariantVersion < AppSettings.CurrentSchemaVersion);
                 // A schema-4 file with no saved pair has nothing to migrate, so a

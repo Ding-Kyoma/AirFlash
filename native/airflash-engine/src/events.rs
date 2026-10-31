@@ -61,9 +61,11 @@ impl RemoteCommand {
     }
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name.trim().to_ascii_lowercase().as_str() {
-            "play" | "playpause" | "play_pause" => Self::Play,
+            "play" => Self::Play,
             "pause" => Self::Pause,
-            "toggle" | "toggleplaypause" | "toggle_play_pause" => Self::TogglePlayPause,
+            "toggle" | "playpause" | "play_pause" | "toggleplaypause" | "toggle_play_pause" => {
+                Self::TogglePlayPause
+            }
             "stop" => Self::Stop,
             "next" | "nexttrack" | "next_track" => Self::NextTrack,
             "previous" | "previoustrack" | "previous_track" | "prev" => Self::PreviousTrack,
@@ -238,12 +240,15 @@ mod tests {
             let mut dict = Dictionary::new();
             dict.insert(key.into(), Value::String("playpause".into()));
             let parsed = parse(&binary(dict));
-            assert_eq!(parsed.commands, vec![RemoteCommand::Play]);
-            assert_eq!(parsed.source, Some(match key {
-                "command" => "command",
-                "cmd" => "cmd",
-                _ => "action",
-            }));
+            assert_eq!(parsed.commands, vec![RemoteCommand::TogglePlayPause]);
+            assert_eq!(
+                parsed.source,
+                Some(match key {
+                    "command" => "command",
+                    "cmd" => "cmd",
+                    _ => "action",
+                })
+            );
         }
     }
 
@@ -252,10 +257,7 @@ mod tests {
         let mut dict = Dictionary::new();
         dict.insert(
             "command".into(),
-            Value::Array(vec![
-                Value::String("next".into()),
-                Value::Integer(5.into()),
-            ]),
+            Value::Array(vec![Value::String("next".into()), Value::Integer(5.into())]),
         );
         assert_eq!(
             parse(&binary(dict)).commands,

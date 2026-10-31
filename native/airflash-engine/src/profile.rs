@@ -90,18 +90,26 @@ pub fn is_airplay2(features: Option<u64>, source_version: Option<&str>) -> bool 
     features & AIRPLAY2_BIT != 0 && version_at_least(source_version, AIRPLAY2_MIN_VERSION)
 }
 fn version_at_least(version: Option<&str>, minimum: (u64, u64, u64)) -> bool {
-    let Some(version) = version else {
-        return false;
-    };
-    let mut parts = version
-        .split('.')
-        .map(|part| part.parse::<u64>().unwrap_or(0));
-    let parsed = (
-        parts.next().unwrap_or(0),
-        parts.next().unwrap_or(0),
-        parts.next().unwrap_or(0),
-    );
-    parsed >= minimum
+    parse_version(version).is_some_and(|v| (v[0], v[1], v[2]) >= minimum)
+}
+fn parse_version(version: Option<&str>) -> Option<[u64; 4]> {
+    let parts: Vec<_> = version?.trim().split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let mut result = [0; 4];
+    for (index, part) in parts.iter().take(4).enumerate() {
+        let part = part.trim();
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let number = part.parse::<u64>().ok()?;
+        if number > i32::MAX as u64 {
+            return None;
+        }
+        result[index] = number;
+    }
+    Some(result)
 }
 /// PTP is a topology decision, not a feature bit: a HomePod keeps its own
 /// grandmaster and needs PTP, while a standalone Apple TV runs on NTP. `None`
@@ -142,7 +150,7 @@ fn ptp_expectation(model: Option<&str>, name: Option<&str>) -> Option<bool> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimingEvidence<'a> {
     /// AirPlay 2 evidence: feature bit 40 *and* firmware >= 354.54.6.
-    pub airplay2: bool,
+    pub airplay2: Option<bool>,
     pub model: Option<&'a str>,
     pub name: Option<&'a str>,
 }
@@ -154,22 +162,14 @@ impl TimingEvidence<'_> {
         match ptp_expectation(self.model, self.name) {
             Some(true) => Timing::Ptp,
             Some(false) => Timing::Ntp,
-            None if self.airplay2 => Timing::Ptp,
+            None if self.airplay2 == Some(true) => Timing::Ptp,
             None => Timing::Ntp,
         }
     }
 }
-/// A group whose members disagree on AirPlay 2 evidence has no legal clock
-/// domain: the reference implementation refuses to create it, so AirFlash
-/// refuses it too instead of downgrading the AirPlay 2 members to NTP.
-///
-/// WAC enforces the same rule at three independent layers -- UI selection
-/// (`:4410`), the member table (`AddMember` `:8316` and the bulk setter
-/// `:8404`) and the backend ("AirPlay 2 and classic RAOP cannot share one
-/// timing group") -- and surfaces `Device_MixedTimingGroupUnsupported`. Because
-/// a mixed group can never be created there, `CreateTopologyPlan`'s
-/// `Any(!SupportsAirPlay2)` only ever sees an all-classic group, i.e. it is
-/// semantically `All(!SupportsAirPlay2)`.
+/// Conflicting known AirPlay 2 and classic evidence cannot share one clock
+/// domain. Missing or malformed firmware evidence stays unknown and alone must
+/// not cause a mixed-group refusal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MixedTimingGroup;
 impl MixedTimingGroup {
@@ -221,10 +221,12 @@ pub fn select_timing(
     // One AirPlay 2 answer for the whole group. There is no "downgrade" branch:
     // a group that mixes AirPlay 2 with classic devices is refused, because the
     // downgraded group would still be half an AirPlay 2 session.
-    if rest.iter().any(|member| member.airplay2 != first.airplay2) {
+    let yes = members.iter().any(|m| m.airplay2 == Some(true));
+    let no = members.iter().any(|m| m.airplay2 == Some(false));
+    if yes && no {
         return Err(MixedTimingGroup);
     }
-    if first.airplay2 {
+    if yes || !no && members.iter().any(|m| m.solo_timing() == Timing::Ptp) {
         // Every `n > 1` branch of `CreateTopologyPlan` returns PTP. Member solo
         // answers are deliberately not folded in here -- the only solo answer
         // that would say NTP is the Apple TV, and that branch is `n == 1`.
@@ -253,10 +255,7 @@ impl TimingPlan {
     ///
     /// Fails with [`MixedTimingGroup`] when the members disagree on AirPlay 2
     /// evidence: the caller refuses the group before any SETUP.
-    pub fn select(
-        members: &[TimingEvidence<'_>],
-        codec: Codec,
-    ) -> Result<Self, MixedTimingGroup> {
+    pub fn select(members: &[TimingEvidence<'_>], codec: Codec) -> Result<Self, MixedTimingGroup> {
         Ok(Self::new(select_timing(members, codec)?, members.len()))
     }
     /// The decision for one receiver, used by capability prediction.
@@ -346,7 +345,7 @@ impl CompatFingerprint {
     /// Exactly the evidence the shared topology decision reads.
     pub fn timing_evidence(&self) -> TimingEvidence<'_> {
         TimingEvidence {
-            airplay2: self.airplay2(),
+            airplay2: self.airplay2_evidence(),
             model: self.model.as_deref(),
             name: self.name.as_deref(),
         }
@@ -355,6 +354,14 @@ impl CompatFingerprint {
     /// read by the reference implementation and decides nothing here.
     pub fn airplay2(&self) -> bool {
         is_airplay2(self.features, self.source_version.as_deref())
+    }
+    pub fn airplay2_evidence(&self) -> Option<bool> {
+        let features = self.features?;
+        if features & AIRPLAY2_BIT == 0 {
+            return Some(false);
+        }
+        let version = parse_version(self.source_version.as_deref())?;
+        Some((version[0], version[1], version[2]) >= AIRPLAY2_MIN_VERSION)
     }
     /// Model-based timing expectation; `None` means the model is unknown.
     pub fn ptp_expected(&self) -> Option<bool> {
@@ -479,10 +486,7 @@ impl CompatFingerprint {
                 profile.timing != Timing::Ntp,
                 "following a receiver clock requires PTP timing"
             );
-            ensure!(
-                !group_ntp,
-                "following a receiver clock requires PTP timing"
-            );
+            ensure!(!group_ntp, "following a receiver clock requires PTP timing");
             true
         } else {
             match profile.timing {
@@ -498,8 +502,10 @@ impl CompatFingerprint {
                 // participant; its own model no longer vetoes the group clock.
                 Timing::Ptp if plan.is_group() => true,
                 Timing::Ptp => {
-                    let advertised =
-                        self.ptp_expected() == Some(true) || self.airplay2() || inherited_ptp;
+                    let advertised = self.ptp_expected() == Some(true)
+                        || self.airplay2()
+                        || self.airplay2_evidence().is_none()
+                        || inherited_ptp;
                     ensure!(
                         self.ptp_expected() != Some(false) && advertised,
                         "PTP timing is not advertised"
@@ -676,6 +682,48 @@ impl Formats {
 mod tests {
     use super::*;
     #[test]
+    fn firmware_parsing_agrees_with_desktop_and_missing_evidence_stays_unknown() {
+        for (version, expected) in [
+            ("354.54.6", true),
+            ("354.54.5", false),
+            ("366.0", true),
+            ("354", false),
+            ("355", false),
+            (" 354.54.6 ", true),
+            ("354.54.x", false),
+            ("366.bad", false),
+            ("354.54.6.1.2", true),
+            ("354.54.6.bad", false),
+        ] {
+            assert_eq!(
+                is_airplay2(Some(AIRPLAY2_BIT), Some(version)),
+                expected,
+                "{version}"
+            );
+        }
+        let info = CompatFingerprint::from_evidence(
+            Formats {
+                features: Some(AIRPLAY2_BIT),
+                ..Default::default()
+            },
+            &Profile::default(),
+            &[],
+            Some("AudioAccessory5,1"),
+            None,
+            None,
+        );
+        assert_eq!(info.airplay2_evidence(), None);
+        let known = TimingEvidence {
+            airplay2: Some(true),
+            model: Some("AudioAccessory6,1"),
+            name: None,
+        };
+        assert_eq!(
+            select_timing(&[known, info.timing_evidence()], Codec::Auto).unwrap(),
+            Timing::Ptp
+        );
+    }
+    #[test]
     fn extended_formats_take_precedence_and_forced_profiles_never_fall_back() {
         let mut extended = plist::Dictionary::new();
         extended.insert(
@@ -850,10 +898,17 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            CompatFingerprint::from_evidence(formats, &auto, &[], Some("AudioAccessory5,1"), None, None)
-                .negotiate(&auto, 44100, false)
-                .unwrap()
-                .uses_ptp()
+            CompatFingerprint::from_evidence(
+                formats,
+                &auto,
+                &[],
+                Some("AudioAccessory5,1"),
+                None,
+                None
+            )
+            .negotiate(&auto, 44100, false)
+            .unwrap()
+            .uses_ptp()
         );
         // An Apple TV on the same settings is NTP, and forcing PTP is rejected.
         assert!(
@@ -911,16 +966,30 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !CompatFingerprint::from_evidence(quiet, &auto, &[], Some("Speaker9,9"), None, Some("366.0"))
-                .negotiate(&auto, 44100, false)
-                .unwrap()
-                .uses_ptp()
+            !CompatFingerprint::from_evidence(
+                quiet,
+                &auto,
+                &[],
+                Some("Speaker9,9"),
+                None,
+                Some("366.0")
+            )
+            .negotiate(&auto, 44100, false)
+            .unwrap()
+            .uses_ptp()
         );
         assert!(
-            !CompatFingerprint::from_evidence(quiet, &auto, &[], Some("Speaker9,9"), None, Some("366.0"))
-                .negotiate(&auto, 44100, true)
-                .unwrap()
-                .uses_ptp()
+            !CompatFingerprint::from_evidence(
+                quiet,
+                &auto,
+                &[],
+                Some("Speaker9,9"),
+                None,
+                Some("366.0")
+            )
+            .negotiate(&auto, 44100, true)
+            .unwrap()
+            .uses_ptp()
         );
     }
     #[test]
@@ -978,27 +1047,27 @@ mod tests {
     #[test]
     fn group_timing_keeps_one_clock_domain_and_refuses_mixed_groups() {
         let homepod = TimingEvidence {
-            airplay2: true,
+            airplay2: Some(true),
             model: Some("AudioAccessory5,1"),
             name: None,
         };
         let homepod_without_ap2 = TimingEvidence {
-            airplay2: false,
+            airplay2: Some(false),
             model: Some("AudioAccessory5,1"),
             name: None,
         };
         let appletv = TimingEvidence {
-            airplay2: true,
+            airplay2: Some(true),
             model: Some("AppleTV6,2"),
             name: None,
         };
         let unknown_ap2 = TimingEvidence {
-            airplay2: true,
+            airplay2: Some(true),
             model: None,
             name: None,
         };
         let unknown_ap1 = TimingEvidence {
-            airplay2: false,
+            airplay2: Some(false),
             model: None,
             name: None,
         };
@@ -1072,14 +1141,26 @@ mod tests {
 
     #[test]
     fn name_evidence_only_fills_a_missing_or_unknown_model() {
-        assert_eq!(ptp_expectation(None, Some("Living Room HomePod")), Some(true));
-        assert_eq!(ptp_expectation(Some("Unknown"), Some("Apple TV")), Some(false));
-        assert_eq!(ptp_expectation(Some("AppleTV6,2"), Some("HomePod")), Some(false));
+        assert_eq!(
+            ptp_expectation(None, Some("Living Room HomePod")),
+            Some(true)
+        );
+        assert_eq!(
+            ptp_expectation(Some("Unknown"), Some("Apple TV")),
+            Some(false)
+        );
+        assert_eq!(
+            ptp_expectation(Some("AppleTV6,2"), Some("HomePod")),
+            Some(false)
+        );
         assert_eq!(
             ptp_expectation(Some("AudioAccessory5,1"), Some("Apple TV")),
             Some(true)
         );
-        assert_eq!(ptp_expectation(Some("ThirdPartySpeaker"), Some("HomePod")), None);
+        assert_eq!(
+            ptp_expectation(Some("ThirdPartySpeaker"), Some("HomePod")),
+            None
+        );
         assert_eq!(ptp_expectation(None, None), None);
     }
 
@@ -1096,15 +1177,12 @@ mod tests {
             &[],
             Some("AudioAccessory5,1"),
             None,
-            None,
+            Some("354.54.5"),
         );
         // An all-classic group is the only group that runs NTP; a mixed group
         // is refused (see `group_timing_keeps_one_clock_domain_and_refuses_mixed_groups`).
-        let plan = TimingPlan::select(
-            &[ap1.timing_evidence(), ap1.timing_evidence()],
-            Codec::Auto,
-        )
-        .unwrap();
+        let plan = TimingPlan::select(&[ap1.timing_evidence(), ap1.timing_evidence()], Codec::Auto)
+            .unwrap();
         assert_eq!(plan.timing(), Timing::Ntp);
         assert!(plan.is_group());
         let auto = Profile {
@@ -1196,7 +1274,9 @@ mod tests {
             timing: Timing::Auto,
             ..Default::default()
         };
-        let compat = appletv.negotiate_planned(plan, &auto, 44100, false).unwrap();
+        let compat = appletv
+            .negotiate_planned(plan, &auto, 44100, false)
+            .unwrap();
         assert!(compat.uses_ptp());
         assert_eq!(compat.timing_protocol(), "PTP");
         // The group decision also governs explicit per-member requests: neither
@@ -1218,7 +1298,12 @@ mod tests {
         };
         assert!(
             appletv
-                .negotiate_planned(TimingPlan::single(&appletv, Codec::Auto), &forced, 44100, false)
+                .negotiate_planned(
+                    TimingPlan::single(&appletv, Codec::Auto),
+                    &forced,
+                    44100,
+                    false
+                )
                 .is_err()
         );
     }

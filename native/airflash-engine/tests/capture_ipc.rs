@@ -115,6 +115,28 @@ fn absent_application_keeps_reporting_and_live_settings_and_stop_remain_availabl
         metrics += usize::from(event["event"] == "capture_metrics");
     }
     assert!(waiting);
+    for (command, params, expected) in [
+        ("set_lead", json!({"ms":"invalid"}), "lead_error"),
+        (
+            "set_now_playing",
+            json!({"position_ms":-1}),
+            "metadata_error",
+        ),
+        (
+            "set_now_playing",
+            json!({"title":"Song","position_ms":1000}),
+            "metadata_accepted",
+        ),
+    ] {
+        write(&mut input, command, params);
+        loop {
+            let event = read();
+            assert_ne!(event["event"], "error", "{event}");
+            if event["event"] == expected {
+                break;
+            }
+        }
+    }
     write(
         &mut input,
         "set_standby",

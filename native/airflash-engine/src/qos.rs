@@ -15,7 +15,7 @@
 fn qwave_handle() -> Option<*mut core::ffi::c_void> {
     use std::sync::OnceLock;
     use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::NetworkManagement::QoS::{QOSCreateHandle, QOS_VERSION};
+    use windows::Win32::NetworkManagement::QoS::{QOS_VERSION, QOSCreateHandle};
     static QWAVE: OnceLock<Option<usize>> = OnceLock::new();
     (*QWAVE.get_or_init(|| unsafe {
         let version = QOS_VERSION {
@@ -34,7 +34,9 @@ fn qwave_handle() -> Option<*mut core::ffi::c_void> {
 pub fn mark_audio_socket(socket: &std::net::UdpSocket) -> bool {
     use std::os::windows::io::AsRawSocket;
     use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::NetworkManagement::QoS::{QOSAddSocketToFlow, QOSTrafficTypeVoice};
+    use windows::Win32::NetworkManagement::QoS::{
+        QOS_NON_ADAPTIVE_FLOW, QOSAddSocketToFlow, QOSTrafficTypeVoice,
+    };
     use windows::Win32::Networking::WinSock::SOCKET;
     let Some(handle) = qwave_handle() else {
         return false;
@@ -46,7 +48,7 @@ pub fn mark_audio_socket(socket: &std::net::UdpSocket) -> bool {
             SOCKET(socket.as_raw_socket() as usize),
             None,
             QOSTrafficTypeVoice,
-            Some(0),
+            Some(QOS_NON_ADAPTIVE_FLOW),
             &raw mut flow,
         )
     }
@@ -65,6 +67,7 @@ mod tests {
         // Whether the QoS service is available is not something a test can assert;
         // the contract is that marking is safe, idempotent and never panics.
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.connect("127.0.0.1:9").unwrap();
         super::mark_audio_socket(&socket);
         super::mark_audio_socket(&socket);
     }

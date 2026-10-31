@@ -1,6 +1,6 @@
 //! Read-only /info queries and the same profile negotiation used by playback.
 use crate::{
-    profile::{Codec, CompatFingerprint, Formats, Profile, Timing, TimingPlan, Transport},
+    profile::{Codec, CompatFingerprint, Profile, Timing, TimingPlan, Transport},
     rtsp::{Cancellation, Connection},
     session::Peer,
 };
@@ -29,17 +29,16 @@ pub struct Capabilities {
 ///
 /// The fingerprint comes from the same `/info` parse playback uses, and the
 /// timing answer comes from the same shared `select_timing` decision the session
-/// runtime uses. The fingerprint carries no model/firmware evidence here on
-/// purpose: capability prediction has always been made from formats and the
-/// peer's own feature word alone, and adding the model would change the values
-/// reported over IPC.
-///
-/// This is a per-receiver answer, so every plan is a one-member plan and the
-/// output stays the characterized solo timing. The session runtime may override
-/// it for a group: Q33 makes every multi-device AirPlay 2 group PTP, including
-/// an Apple TV whose solo prediction is NTP. Group timing is not part of this
-/// per-receiver IPC response; it is decided once in `session::run_stream`.
+/// runtime uses. Solo choices use the full model/firmware evidence; group queries
+/// enumerate every member under the shared group timing plan.
 pub fn choices(fingerprint: &CompatFingerprint, evidence: &Profile) -> Vec<ProfileChoice> {
+    choices_planned(fingerprint, evidence, None)
+}
+fn choices_planned(
+    fingerprint: &CompatFingerprint,
+    evidence: &Profile,
+    group: Option<TimingPlan>,
+) -> Vec<ProfileChoice> {
     let mut result = Vec::new();
     for rate in [44100, 48000] {
         for (codec_name, codec) in [
@@ -47,7 +46,7 @@ pub fn choices(fingerprint: &CompatFingerprint, evidence: &Profile) -> Vec<Profi
             ("pcm", Codec::Pcm),
             ("alac", Codec::Alac),
         ] {
-            let plan = TimingPlan::single(fingerprint, codec);
+            let plan = group.unwrap_or_else(|| TimingPlan::single(fingerprint, codec));
             for (transport_name, transport) in [
                 ("auto", Transport::Auto),
                 ("realtime", Transport::Realtime),
@@ -94,25 +93,146 @@ pub fn choices(fingerprint: &CompatFingerprint, evidence: &Profile) -> Vec<Profi
     result
 }
 pub fn query(peer: &Peer, cancellation: Cancellation) -> Result<Capabilities> {
-    let mut connection = Connection::connect(
-        std::net::SocketAddr::new(peer.host, peer.port),
-        cancellation,
-    )?;
-    let info = connection.request("GET", "/info", &[], &[])?.plist()?;
-    let fingerprint =
-        CompatFingerprint::from_formats(Formats::parse(&info), &peer.profile, &peer.codecs);
-    Ok(Capabilities {
-        receiver_id: peer.receiver_id.clone(),
-        host: peer.host,
-        port: peer.port,
-        known: fingerprint.advertises_audio(),
-        profiles: choices(&fingerprint, &peer.profile),
-    })
+    Ok(query_group(std::slice::from_ref(peer), cancellation)?.remove(0))
+}
+pub fn query_group(peers: &[Peer], cancellation: Cancellation) -> Result<Vec<Capabilities>> {
+    let mut fingerprints = Vec::new();
+    for peer in peers {
+        let mut connection = Connection::connect(
+            std::net::SocketAddr::new(peer.host, peer.port),
+            cancellation.clone(),
+        )?;
+        let info = connection.request("GET", "/info", &[], &[])?.plist()?;
+        fingerprints.push(CompatFingerprint::from_info(
+            &info,
+            &peer.profile,
+            &peer.codecs,
+        ));
+    }
+    let evidence: Vec<_> = fingerprints
+        .iter()
+        .map(CompatFingerprint::timing_evidence)
+        .collect();
+    let plan = TimingPlan::select(&evidence, Codec::Auto).map_err(|error| {
+        crate::transport::Fault::new(
+            "",
+            "setup",
+            crate::profile::MixedTimingGroup::CODE,
+            false,
+            error,
+        )
+    })?;
+    Ok(peers
+        .iter()
+        .zip(&fingerprints)
+        .map(|(peer, fingerprint)| Capabilities {
+            receiver_id: peer.receiver_id.clone(),
+            host: peer.host,
+            port: peer.port,
+            known: fingerprint.advertises_audio(),
+            profiles: choices_planned(fingerprint, &peer.profile, Some(plan)),
+        })
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::Formats;
+
+    fn info_peer(model: &str, version: Option<&str>) -> (Peer, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut info = plist::Dictionary::new();
+        info.insert("model".into(), plist::Value::String(model.into()));
+        info.insert(
+            "features".into(),
+            plist::Value::Integer(crate::profile::AIRPLAY2_BIT.into()),
+        );
+        if let Some(version) = version {
+            info.insert("sourceVersion".into(), plist::Value::String(version.into()));
+        }
+        let mut formats = plist::Dictionary::new();
+        formats.insert(
+            "audioStream".into(),
+            plist::Value::Integer(
+                (crate::rtp::audio_format(true, 44100) | crate::rtp::audio_format(false, 44100))
+                    .into(),
+            ),
+        );
+        info.insert("supportedFormats".into(), plist::Value::Dictionary(formats));
+        let mut body = Vec::new();
+        plist::Value::Dictionary(info)
+            .to_writer_binary(&mut body)
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).unwrap() > 0);
+            write!(
+                socket,
+                "RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            socket.write_all(&body).unwrap();
+        });
+        (
+            Peer {
+                receiver_id: model.into(),
+                host: address.ip(),
+                port: address.port(),
+                codecs: vec![],
+                profile: Profile {
+                    codec: Codec::Auto,
+                    timing: Timing::Auto,
+                    transport: Transport::Auto,
+                    ..Default::default()
+                },
+            },
+            worker,
+        )
+    }
+    #[test]
+    fn queries_keep_full_model_firmware_and_group_evidence() {
+        let (tv, server) = info_peer("AppleTV6,2", Some("366.0"));
+        let solo = query(&tv, Cancellation::default()).unwrap();
+        server.join().unwrap();
+        assert!(
+            solo.profiles
+                .iter()
+                .any(|p| p.codec == "auto" && p.timing == "auto" && p.selected_timing == "ntp")
+        );
+        assert!(!solo.profiles.iter().any(|p| p.timing == "ptp"));
+        let (pod, pod_server) = info_peer("AudioAccessory5,1", Some("366.0"));
+        let (tv, tv_server) = info_peer("AppleTV6,2", Some("366.0"));
+        let group = query_group(&[pod, tv], Cancellation::default()).unwrap();
+        for member in group {
+            assert!(
+                member
+                    .profiles
+                    .iter()
+                    .any(|p| p.codec == "auto" && p.timing == "auto" && p.selected_timing == "ptp")
+            );
+            assert!(member.profiles.iter().any(|p| p.timing == "ptp"));
+        }
+        pod_server.join().unwrap();
+        tv_server.join().unwrap();
+        let (known, a) = info_peer("AudioAccessory5,1", Some("366.0"));
+        let (unknown, b) = info_peer("AudioAccessory6,1", None);
+        assert_eq!(
+            query_group(&[known, unknown], Cancellation::default())
+                .unwrap()
+                .len(),
+            2
+        );
+        a.join().unwrap();
+        b.join().unwrap();
+    }
 
     /// Capability prediction works from the parsed formats plus the peer's own
     /// evidence, exactly like `query` does.

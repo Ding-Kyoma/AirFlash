@@ -10,17 +10,21 @@ public sealed class RemoteCommandTests
     [Fact]
     public void Commands_map_to_the_matching_media_keys()
     {
-        Assert.Equal(0xB3, new RemoteCommand("play").VirtualKey);
-        Assert.Equal(0xB3, new RemoteCommand("pause").VirtualKey);
+        Assert.Null(new RemoteCommand("play").VirtualKey);
+        Assert.Null(new RemoteCommand("pause").VirtualKey);
         Assert.Equal(0xB3, new RemoteCommand("toggle").VirtualKey);
         Assert.Equal(0xB2, new RemoteCommand("stop").VirtualKey);
         Assert.Equal(0xB0, new RemoteCommand("next").VirtualKey);
-        Assert.Equal(0xB0, new RemoteCommand("shuffle_next").VirtualKey);
+        Assert.Null(new RemoteCommand("shuffle_next").VirtualKey);
+        Assert.Null(new RemoteCommand("repeat_next").VirtualKey);
         Assert.Equal(0xB1, new RemoteCommand("previous").VirtualKey);
         Assert.Null(new RemoteCommand("volume_up").VirtualKey);
         Assert.Null(new RemoteCommand("mute").VirtualKey);
         Assert.Null(new RemoteCommand("something_new").VirtualKey);
     }
+    [Fact]
+    public void Input_layout_matches_the_native_union_without_injecting_keys()
+        => Assert.Equal(IntPtr.Size == 8 ? 40 : 28, AirFlash.App.Input.MediaKeys.InputSize);
 
     [Fact]
     public void An_event_body_becomes_one_command_per_entry()

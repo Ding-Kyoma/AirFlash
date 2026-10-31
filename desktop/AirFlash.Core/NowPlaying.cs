@@ -53,7 +53,7 @@ public sealed class NowPlayingPump(INowPlayingSource source, Func<long>? clock =
             return null;
         }
         var now = _clock();
-        if (!_hasPending || _pending != sample)
+        if (!_hasPending || _pending is null || !SameTrackState(_pending, sample))
         {
             // A new value must survive the settle window before it is trusted.
             _pending = sample;
@@ -67,9 +67,12 @@ public sealed class NowPlayingPump(INowPlayingSource source, Func<long>? clock =
         }
         if (!ShouldPublish(sample)) return null;
         _lastPublished = sample;
-        _hasPending = false;
         return sample;
     }
+    private static bool SameTrackState(NowPlaying left, NowPlaying right)
+        => left.Title == right.Title && left.Artist == right.Artist
+        && left.Album == right.Album && left.Genre == right.Genre
+        && left.Playing == right.Playing && left.DurationMs == right.DurationMs;
     private bool ShouldPublish(NowPlaying sample)
     {
         if (_lastPublished is not { } last) return true;

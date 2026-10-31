@@ -15,6 +15,19 @@ namespace AirFlash.App.Metadata;
 public sealed class SmtcNowPlayingSource(Action<string>? log = null) : INowPlayingSource
 {
     private GlobalSystemMediaTransportControlsSessionManager? _manager;
+    public async Task ExecuteAsync(RemoteCommand command, CancellationToken cancellation)
+    {
+        try
+        {
+            _manager ??= await GlobalSystemMediaTransportControlsSessionManager.RequestAsync().AsTask(cancellation).ConfigureAwait(false);
+            var session = _manager.GetCurrentSession();
+            if (session is null) return;
+            if (command.Name == "play") await session.TryPlayAsync().AsTask(cancellation).ConfigureAwait(false);
+            else if (command.Name == "pause") await session.TryPauseAsync().AsTask(cancellation).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+        catch (Exception error) { log?.Invoke($"Remote media command failed: {error.Message}"); }
+    }
     public async Task<NowPlaying?> ReadAsync(CancellationToken cancellation)
     {
         try
@@ -32,8 +45,8 @@ public sealed class SmtcNowPlayingSource(Action<string>? log = null) : INowPlayi
                 properties.AlbumTitle ?? "",
                 properties.Genres?.FirstOrDefault() ?? "",
                 playing,
-                (long)timeline.EndTime.TotalMilliseconds,
-                (long)timeline.Position.TotalMilliseconds);
+                Math.Max(0, (long)(timeline.EndTime - timeline.StartTime).TotalMilliseconds),
+                Math.Max(0, (long)(timeline.Position - timeline.StartTime).TotalMilliseconds));
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception error)

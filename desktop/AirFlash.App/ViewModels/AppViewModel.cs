@@ -7,7 +7,6 @@ namespace AirFlash.App.ViewModels;
 public sealed class AppViewModel : ObservableObject, IAsyncDisposable
 {
     private readonly ISettingsStore _store;
-    private readonly IEngineFactory _factory;
     private readonly IDiscoveryService _discovery;
     private readonly IAutostart _autostart;
     private readonly IAudioService _audio;
@@ -45,6 +44,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public SessionController Session { get; }
     public NowPlayingPump NowPlaying { get; }
     private readonly CancellationTokenSource _nowPlayingStop;
+    private readonly Task _nowPlayingWork;
     public ObservableCollection<ReceiverViewModel> Receivers { get; } = [];
     public IReadOnlyList<Receiver> AllReceivers => _known.Values.Concat(SoftwareStereo.Resolve(_known.Values, _settings)).OrderBy(r => r.Name, StringComparer.CurrentCultureIgnoreCase).ToArray();
     public AppSettings Settings => _settings;
@@ -115,7 +115,6 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         RetryEngineCommand = new(() => _engine?.InitializeAsync() ?? Task.CompletedTask, ShowError, () => EngineFailed && !_closing);
         if (_engine is not null) _engine.Changed += EngineChanged;
         _store = store; _discovery = discovery; _autostart = autostart; _audio = audio; _dispatcher = dispatcher;
-        _factory = factory;
         Applications = applications ?? new ApplicationCatalog(factory);
         Endpoints = new(audio, dispatcher);
         Endpoints.DevicesChanged += OnEndpointsChangedAsync;
@@ -126,16 +125,22 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         Session.Changed += SessionChanged;
         // A receiver's own buttons arrive as transport commands; forward them to the
         // media keys so the app that is playing reacts, without touching the stream.
+        _nowPlayingStop = new();
+        var nowPlayingSource = new AirFlash.App.Metadata.SmtcNowPlayingSource(AppPaths.Log);
         Session.RemoteCommandReceived += command =>
         {
+            if (command.Name is "play" or "pause")
+            {
+                _ = nowPlayingSource.ExecuteAsync(command, _nowPlayingStop.Token);
+                return;
+            }
             if (command.VirtualKey is not { } key) return;
             _dispatcher.BeginInvoke(() => AirFlash.App.Input.MediaKeys.Press(key, AppPaths.Log));
         };
         // Now Playing is polled from SMTC and pushed only when it actually changed;
         // the engine turns it into the receiver's SET_PARAMETER payloads.
-        NowPlaying = new NowPlayingPump(new AirFlash.App.Metadata.SmtcNowPlayingSource(AppPaths.Log), log: AppPaths.Log);
-        _nowPlayingStop = new();
-        _ = Task.Run(() => NowPlaying.RunAsync(now => _ = Session.PublishNowPlayingAsync(now), _nowPlayingStop.Token));
+        NowPlaying = new NowPlayingPump(nowPlayingSource, log: AppPaths.Log);
+        _nowPlayingWork = Task.Run(() => NowPlaying.RunAsync(now => _ = Session.PublishNowPlayingAsync(now, _nowPlayingStop.Token), _nowPlayingStop.Token));
         _discovery.Changed += list => _dispatcher.BeginInvoke(() => OnDiscovered(list));
         _discovery.Failed += message => _dispatcher.BeginInvoke(() => ShowError(new IOException(message)));
         _discovery.RunningChanged += running => _dispatcher.BeginInvoke(() =>
@@ -331,12 +336,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         ScheduleAutoConnect();
     }
     /// <summary>
-    /// Q45 one-time migration. The stored config version decides whether the
-    /// legacy split may run at all, but heterogeneity can only be proven with
-    /// TXT evidence, so the pass runs on the discovery catalog. Once every saved
-    /// pair is discharged (or split) the store persists schema 5 and this can
-    /// never run again; a TXT change after that is runtime drift and is never
-    /// auto-modified. Missing evidence leaves the pair pending, not split.
+    /// Acknowledge the current group invariant while preserving saved pairs.
+    /// Incompatible pairs stay visible and can only be split by the user.
     /// </summary>
     private async Task MigrateMixedGroupsAsync(IReadOnlyList<Receiver> catalog)
     {
@@ -630,32 +631,22 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         ResetCompleted?.Invoke();
     }
     public string Diagnostics() => $"AirFlash {AppPaths.DisplayVersion} / WPF\n" + L.Format("Engine: {0}\nStatus: {1}\n{2}\nLocal p95: {3}\nQueue age: {4}\nUnderruns: {5}; drops: {6}\nEnd-to-end latency: not measured", EngineVersion, StatusTitle, StatusDetail, MonitorLatency, MonitorQueue, MonitorUnderruns, MonitorDrops) + "\n" + System.Text.Json.JsonSerializer.Serialize(_snapshot.Diagnostics, AppSettings.JsonOptions);
-    /// <summary>Write a redacted diagnostic bundle into the log folder and open it.
-    /// The engine's own snapshot arrives pseudonymised; the log tail is included
-    /// as-is, so the user can see exactly what would be shared.</summary>
+    /// <summary>Write the current engine's redacted diagnostic bundle into the log folder.</summary>
     public async Task<string> ExportDiagnosticsAsync()
     {
-        var snapshot = await DiagnosticExport.SnapshotAsync(_factory).ConfigureAwait(false);
-        var tail = LogTail(80);
-        var bundle = DiagnosticExport.Compose(AppPaths.DisplayVersion, EngineVersion, snapshot, tail);
+        var snapshot = await DiagnosticExport.SnapshotAsync(Session).ConfigureAwait(false);
+        var bundle = DiagnosticExport.Compose(AppPaths.DisplayVersion, EngineVersion, snapshot);
         var path = DiagnosticExport.Write(AppPaths.LogDirectory, bundle);
         AppPaths.Log($"Diagnostics exported to {path}");
         return path;
-    }
-    private static IEnumerable<string> LogTail(int lines)
-    {
-        try
-        {
-            var file = Path.Combine(AppPaths.LogDirectory, $"wpf-{DateTime.Today:yyyy-MM-dd}.log");
-            return File.Exists(file) ? File.ReadLines(file).TakeLast(lines).ToArray() : [];
-        }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { return []; }
     }
     public ValueTask DisposeAsync() => new(_disposeTask ??= DisposeCoreAsync());
     private async Task DisposeCoreAsync()
     {
         _closing = true; _volumeTimer.Stop(); _autoTimer.Stop(); _startupDiscoveryTimer.Stop(); _discoverySearchTimer.Stop(); _discovery.Dispose();
         _nowPlayingStop.Cancel();
+        await _nowPlayingWork;
+        _nowPlayingStop.Dispose();
         if (_engine is not null) _engine.Changed -= EngineChanged;
         await _startup;
         Endpoints.Dispose();

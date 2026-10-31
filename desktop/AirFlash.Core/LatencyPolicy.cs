@@ -87,7 +87,7 @@ public sealed class LatenessWatch(double thresholdMs = 3.0, int samples = 10)
     /// <summary>Feed one sample. Returns true at most once per streak.</summary>
     public bool Observe(double? p99Ms)
     {
-        if (p99Ms is not { } value || value < thresholdMs)
+        if (p99Ms is not { } value || !double.IsFinite(value) || value < thresholdMs)
         {
             _streak = 0;
             return false;

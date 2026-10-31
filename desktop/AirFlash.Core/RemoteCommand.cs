@@ -16,9 +16,9 @@ public sealed record RemoteCommand(string Name, double? Volume = null, string? H
     /// equivalent media key (volume and mute are handled by the app, not the OS).</summary>
     public int? VirtualKey => Name switch
     {
-        "play" or "pause" or "toggle" => 0xB3,   // VK_MEDIA_PLAY_PAUSE
+        "toggle" => 0xB3,                       // VK_MEDIA_PLAY_PAUSE
         "stop" => 0xB2,                          // VK_MEDIA_STOP
-        "next" or "shuffle_next" or "repeat_next" => 0xB0, // VK_MEDIA_NEXT_TRACK
+        "next" => 0xB0,                         // VK_MEDIA_NEXT_TRACK
         "previous" => 0xB1,                      // VK_MEDIA_PREV_TRACK
         _ => null,
     };

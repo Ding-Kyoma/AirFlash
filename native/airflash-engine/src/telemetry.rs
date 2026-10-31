@@ -231,9 +231,7 @@ impl TimelineResets {
             TimelineResetReason::UserSeek => &mut self.user_seek,
             TimelineResetReason::ReceiverRejectedFlush => &mut self.receiver_rejected_flush,
             TimelineResetReason::SessionRestart => &mut self.session_restart,
-            TimelineResetReason::ConfirmedTransportFailure => {
-                &mut self.confirmed_transport_failure
-            }
+            TimelineResetReason::ConfirmedTransportFailure => &mut self.confirmed_transport_failure,
             TimelineResetReason::SilenceResume => &mut self.silence_resume,
             TimelineResetReason::LatencyChange => &mut self.latency_change,
             TimelineResetReason::Flush => &mut self.flush,
@@ -300,10 +298,8 @@ pub const LEAD_SHIFT_RESET_US: u64 = 5_000;
 /// fraction is volume- and bitrate-independent, so a low-bitrate stream is not
 /// judged by how few packets it sends per second.
 ///
-/// Retransmit requests are a weaker signal than underruns: a retransmitted packet
-/// was lost but probably recovered, while an underrun means the playout buffer ran
-/// dry and the listener heard it. So one underrun is enough evidence, while
-/// retransmits also need an absolute minimum.
+/// Retransmit packet counts are network evidence. Capture underruns are retained
+/// for diagnostics, but describe sender starvation and never prove network loss.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RtpBaseline {
     /// The span the steady window actually covers: from its oldest sample to the
@@ -337,9 +333,8 @@ impl RtpBaseline {
     /// enough session-summary rows, calibrate it from the observed distribution
     /// (Q44 §一).
     pub const RATIO_THRESHOLD: f64 = 3.0;
-    /// Shortest trustworthy baseline. 250 ms carries ~90 packets and 1 s ~350 at
-    /// 44.1 kHz ALAC; 10 s carries ~3500, which is the first length where the
-    /// loss fraction is stable enough to compare against (Q47 §二).
+    /// Shortest baseline used by the relative heuristic. At 44.1 kHz with
+    /// 352-frame packets this covers about 1253 packets, independent of codec.
     pub const MIN_BASELINE: Duration = Duration::from_secs(10);
     /// Minimum retransmit requests in the pre-stall window. Together with the
     /// ratio this stops a single incidental loss on an otherwise clean link from
@@ -399,20 +394,12 @@ impl RtpBaseline {
     pub fn transport_bad(&self) -> bool {
         let rtx_bad = if self.relative_rtx() {
             self.pre_stall_rtx >= Self::MIN_RTX
-                && self.rtx_fraction()
-                    > self.steady_rtx_fraction() * Self::RATIO_THRESHOLD
+                && self.rtx_fraction() > self.steady_rtx_fraction() * Self::RATIO_THRESHOLD
         } else {
             self.pre_stall_rtx >= Self::ABS_RTX_BAD
         };
-        let underrun_bad = if self.relative_underrun() {
-            self.pre_stall_underrun >= Self::MIN_UNDERRUN
-                && self.underrun_fraction()
-                    > self.steady_underrun_fraction() * Self::RATIO_THRESHOLD
-        } else {
-            // One concealed underrun is audible whatever the baseline says.
-            self.pre_stall_underrun >= Self::MIN_UNDERRUN
-        };
-        rtx_bad || underrun_bad
+        // Capture starvation is not evidence of a network transport failure.
+        rtx_bad
     }
 }
 
@@ -433,8 +420,8 @@ struct RtpSample {
 /// thread itself was descheduled. The cheap discriminator is whether the RTP
 /// counters spiked in the second leading into the stall, compared with the
 /// sender's own steady state over the last
-/// [`STEADY_WINDOW`](Self::STEADY_WINDOW): retransmit requests (receivers asking
-/// for missing packets) and concealed capture underruns.
+/// [`STEADY_WINDOW`](Self::STEADY_WINDOW): requested retransmit packets. Capture
+/// underruns are sampled separately as evidence of sender starvation.
 ///
 /// The send loop samples the cumulative counters at most once per
 /// [`SAMPLE_INTERVAL`](Self::SAMPLE_INTERVAL). At a re-anchor the oldest sample
@@ -466,6 +453,7 @@ pub struct RtpEvidence {
     samples: VecDeque<RtpSample>,
     /// Start of the current pre-stall window; `None` before the first re-anchor.
     pre_stall_since: Option<Instant>,
+    started: Option<Instant>,
 }
 
 impl RtpEvidence {
@@ -481,11 +469,14 @@ impl RtpEvidence {
 
     /// Record the cumulative counters, throttled to `SAMPLE_INTERVAL`.
     pub fn sample(&mut self, now: Instant, rtx_req: u64, underruns: u64, packets_sent: u64) {
-        if self.samples.back().is_some_and(|sample| {
-            now.saturating_duration_since(sample.at) < Self::SAMPLE_INTERVAL
-        }) {
+        if self
+            .samples
+            .back()
+            .is_some_and(|sample| now.saturating_duration_since(sample.at) < Self::SAMPLE_INTERVAL)
+        {
             return;
         }
+        self.started.get_or_insert(now);
         self.samples.push_back(RtpSample {
             at: now,
             rtx_req,
@@ -516,7 +507,8 @@ impl RtpEvidence {
             .samples
             .iter()
             .find(|sample| now.saturating_duration_since(sample.at) <= Self::STEADY_WINDOW)?;
-        let count = |now: u64, then: u64| u32::try_from(now.saturating_sub(then)).unwrap_or(u32::MAX);
+        let count =
+            |now: u64, then: u64| u32::try_from(now.saturating_sub(then)).unwrap_or(u32::MAX);
         Some(RtpBaseline {
             // Measured, not assumed: a re-anchor can skip samples, and a session
             // younger than the steady window covers less than 30 s.
@@ -539,7 +531,16 @@ impl RtpEvidence {
         packets_sent: u64,
     ) -> TimelineResetReason {
         match self.baseline(now, rtx_req, underruns, packets_sent) {
-            Some(baseline) if baseline.transport_bad() => {
+            Some(baseline)
+                if if self
+                    .started
+                    .is_some_and(|at| now.saturating_duration_since(at) < RtpBaseline::MIN_BASELINE)
+                {
+                    baseline.pre_stall_rtx >= 200
+                } else {
+                    baseline.transport_bad()
+                } =>
+            {
                 TimelineResetReason::ConfirmedTransportFailure
             }
             _ => TimelineResetReason::SenderStall,
@@ -572,6 +573,7 @@ pub struct StallDrain {
     /// re-anchor closed it early. A capped value must not enter a distribution;
     /// it is counted as an "undrainable stall" instead.
     pub capped: bool,
+    pub queue_overflow: bool,
 }
 
 /// The fixed 250 ms window that measures one stall's drain (Q47 §三).
@@ -579,9 +581,8 @@ pub struct StallDrain {
 /// `service_retransmits` accepts at most 16 requests per send-loop iteration, so
 /// the drain seen on the single iteration after a re-anchor saturates at 16: a
 /// 50 ms hiccup and a 2 s stall both read 16, and the field stops measuring
-/// severity exactly when severity matters. Accumulating over 250 ms lets roughly
-/// 80 iterations × 16 requests through, far more than any realistic backlog (a
-/// 2 s stall at 350 packets/s queues ~700), so `drained` becomes a measurement.
+/// severity exactly when severity matters. Accumulate serviced packets across
+/// 250 ms and inspect the actual pending queue and dropped requests at close.
 ///
 /// A second re-anchor inside the window does not merge the two stalls: the older
 /// window closes early as `capped` and the newer one starts fresh. "Known lower
@@ -591,34 +592,40 @@ pub struct StallDrain {
 pub struct StallDrainWindow {
     opened: Instant,
     base: u64,
-    last: u64,
+    base_drops: u64,
+    drops: u64,
 }
 
 impl StallDrainWindow {
-    /// Long enough for ~80 send-loop iterations at the 350 packets/s media rate,
-    /// short enough that two independent stalls are rarely inside one window.
+    /// About 31 send-loop iterations at 44.1 kHz with 352-frame packets.
     pub const WINDOW: Duration = Duration::from_millis(250);
 
     /// Open a window at `now`, with the cumulative retransmit counter as it stands
     /// before the first drain that follows the re-anchor.
-    pub fn open(now: Instant, total: u64) -> Self {
+    pub fn open(now: Instant, total: u64, queue_drops: u64) -> Self {
         Self {
             opened: now,
             base: total,
-            last: total,
+            base_drops: queue_drops,
+            drops: queue_drops,
         }
     }
 
     /// Feed the cumulative counter after a `service_retransmits` call. Returns
     /// `Some` exactly once, when `WINDOW` has elapsed; the caller then drops the
-    /// window. Requests still being served on the final iteration mean the queue
-    /// may not be empty, so that drain is reported capped.
-    pub fn observe(&mut self, now: Instant, total: u64) -> Option<StallDrain> {
+    /// window. A pending queue or dropped requests make the result a lower bound.
+    pub fn observe(
+        &mut self,
+        now: Instant,
+        total: u64,
+        pending: usize,
+        queue_drops: u64,
+    ) -> Option<StallDrain> {
+        self.drops = queue_drops;
         if now.saturating_duration_since(self.opened) < Self::WINDOW {
-            self.last = total;
             return None;
         }
-        Some(self.finish(total, total > self.last))
+        Some(self.finish(total, pending > 0 || self.drops > self.base_drops))
     }
 
     /// Close early because another re-anchor happened inside the window. Two
@@ -629,16 +636,17 @@ impl StallDrainWindow {
     }
 
     /// Close because the session ended before the window elapsed. Same rule as
-    /// the deadline: requests still being served on the last iteration mean the
-    /// count is a lower bound.
-    pub fn close(self, total: u64) -> StallDrain {
-        self.finish(total, total > self.last)
+    /// the deadline: pending or dropped requests make the count a lower bound.
+    pub fn close(mut self, total: u64, pending: usize, queue_drops: u64) -> StallDrain {
+        self.drops = queue_drops;
+        self.finish(total, pending > 0 || self.drops > self.base_drops)
     }
 
     fn finish(self, total: u64, capped: bool) -> StallDrain {
         StallDrain {
             drained: u32::try_from(total.saturating_sub(self.base)).unwrap_or(u32::MAX),
             capped,
+            queue_overflow: self.drops > self.base_drops,
         }
     }
 }
@@ -676,6 +684,7 @@ pub struct SessionTelemetry {
     /// window early. Counts "stalls that could not be drained", which is more
     /// telling than any average (Q47 §三).
     pub stall_rtx_drained_capped: u64,
+    pub stall_rtx_queue_overflows: u64,
     /// Timeline expiries that still require a fresh session (should stay near zero).
     pub expired: u64,
     /// Underruns while real media was playing; these are audible without concealment.
@@ -710,6 +719,7 @@ pub struct SessionTelemetry {
     /// The most recent cause, `None` when the timeline was never reset.
     pub last_timeline_reset_reason: Option<TimelineResetReason>,
     pub lateness: Histogram,
+    pub lateness_interval: Histogram,
     pub capture_age: Histogram,
     pub rtx_gap: Histogram,
 }
@@ -723,6 +733,7 @@ impl SessionTelemetry {
     pub fn observe_lateness(&mut self, late_ms: f64) {
         self.packets += 1;
         self.lateness.observe(late_ms);
+        self.lateness_interval.observe(late_ms);
         if late_ms > 0.5 {
             self.late_packets += 1;
         } else {
@@ -768,12 +779,13 @@ impl SessionTelemetry {
         self.stall_rtx_drained = self
             .stall_rtx_drained
             .saturating_add(u64::from(drain.drained));
+        if drain.queue_overflow {
+            self.stall_rtx_queue_overflows += 1;
+        }
         if drain.capped {
             self.stall_rtx_drained_capped = self.stall_rtx_drained_capped.saturating_add(1);
         } else {
-            self.stall_rtx_drained_max = self
-                .stall_rtx_drained_max
-                .max(u64::from(drain.drained));
+            self.stall_rtx_drained_max = self.stall_rtx_drained_max.max(u64::from(drain.drained));
         }
     }
     pub fn snapshot(&self) -> Value {
@@ -788,6 +800,8 @@ impl SessionTelemetry {
             "stall_rtx_drained": self.stall_rtx_drained,
             "stall_rtx_drained_max": self.stall_rtx_drained_max,
             "stall_rtx_drained_capped": self.stall_rtx_drained_capped,
+            "stall_rtx_queue_overflows": self.stall_rtx_queue_overflows,
+            "sender_starved": self.underruns_active > 0,
             "timeline_expired": self.expired,
             "underruns_active": self.underruns_active,
             "underruns_idle": self.underruns_idle,
@@ -811,6 +825,7 @@ impl SessionTelemetry {
                 "drift_ppb": round3(self.servo_drift_ppb),
             },
             "lateness": self.lateness.snapshot(),
+            "lateness_interval": self.lateness_interval.snapshot(),
             "capture_age": self.capture_age.snapshot(),
             "retransmit_gap": self.rtx_gap.snapshot(),
         })
@@ -1126,7 +1141,11 @@ fn flush_token(
     if token.is_empty() {
         return;
     }
-    if is_ipv4(token) || is_mac(token) {
+    if is_ipv4(token)
+        || is_mac(token)
+        || token.parse::<std::net::IpAddr>().is_ok()
+        || token.parse::<std::net::SocketAddr>().is_ok()
+    {
         out.push_str(&pseudonym(token, names));
     } else {
         out.push_str(token);
@@ -1160,11 +1179,29 @@ fn is_mac(token: &str) -> bool {
 fn is_identity_key(key: &str) -> bool {
     matches!(
         key,
-        "host" | "ip" | "address" | "addr" | "mac" | "deviceid" | "receiver_id" | "id" | "path"
+        "host"
+            | "ip"
+            | "address"
+            | "addr"
+            | "mac"
+            | "deviceid"
+            | "receiver_id"
+            | "id"
+            | "path"
+            | "message"
+            | "error"
+            | "title"
+            | "artist"
+            | "album"
+            | "genre"
     )
 }
 fn looks_like_path(text: &str) -> bool {
-    text.len() > 3 && (text.contains(":\\") || text.starts_with("\\\\") || text.starts_with("/home/") || text.starts_with("/Users/"))
+    text.len() > 3
+        && (text.contains(":\\")
+            || text.starts_with("\\\\")
+            || text.starts_with("/home/")
+            || text.starts_with("/Users/"))
 }
 fn pseudonym(text: &str, names: &mut std::collections::BTreeMap<String, String>) -> String {
     if let Some(existing) = names.get(text) {
@@ -1202,7 +1239,10 @@ mod tests {
         assert_eq!(redacted["secret"], json!("[redacted]"));
         // The same host keeps one pseudonym; a second host gets a different one.
         assert_eq!(redacted["members"][0]["host"], redacted["members"][0]["ip"]);
-        assert_ne!(redacted["members"][0]["host"], redacted["members"][1]["host"]);
+        assert_ne!(
+            redacted["members"][0]["host"],
+            redacted["members"][1]["host"]
+        );
         assert_eq!(redacted["members"][1]["send_errors"], json!(3));
     }
 
@@ -1298,11 +1338,7 @@ mod tests {
             assert_eq!(resets.total(), 1, "{reason:?} must not count twice");
             for other in TimelineResetReason::ALL {
                 if other != reason {
-                    assert_eq!(
-                        resets.field(other),
-                        0,
-                        "{reason:?} leaked into {other:?}"
-                    );
+                    assert_eq!(resets.field(other), 0, "{reason:?} leaked into {other:?}");
                 }
             }
             assert_eq!(resets.field(reason), 1);
@@ -1442,8 +1478,7 @@ mod tests {
             .expect("window exists");
         assert!(baseline.pre_stall_rtx >= 11, "{baseline:?}");
         assert!(
-            baseline.rtx_fraction()
-                > baseline.steady_rtx_fraction() * RtpBaseline::RATIO_THRESHOLD,
+            baseline.rtx_fraction() > baseline.steady_rtx_fraction() * RtpBaseline::RATIO_THRESHOLD,
             "{baseline:?}"
         );
         assert!(baseline.transport_bad(), "{baseline:?}");
@@ -1454,7 +1489,7 @@ mod tests {
     }
 
     #[test]
-    fn one_underrun_is_transport_evidence_while_one_rtx_is_not() {
+    fn capture_starvation_is_not_network_evidence() {
         let t0 = Instant::now();
         // A link that never concealed has no relative underrun baseline, so the
         // absolute rule decides: one concealed underrun is already audible.
@@ -1468,10 +1503,10 @@ mod tests {
         assert_eq!(baseline.pre_stall_rtx, 0);
         assert_eq!(baseline.pre_stall_underrun, 1);
         assert!(!baseline.relative_underrun(), "{baseline:?}");
-        assert!(baseline.transport_bad(), "{baseline:?}");
+        assert!(!baseline.transport_bad(), "{baseline:?}");
         assert_eq!(
             underruns.reset_reason(now, 0, 1, sent + 350),
-            TimelineResetReason::ConfirmedTransportFailure
+            TimelineResetReason::SenderStall
         );
         // A single retransmit request on a clean link is only a lost packet: on
         // the absolute path the count needs 30.
@@ -1599,8 +1634,7 @@ mod tests {
         // test would fire, but it must not be used.
         let mut short = baseline(Duration::from_secs(5), 2, 1750, 3, 350);
         assert!(
-            short.rtx_fraction()
-                > short.steady_rtx_fraction() * RtpBaseline::RATIO_THRESHOLD,
+            short.rtx_fraction() > short.steady_rtx_fraction() * RtpBaseline::RATIO_THRESHOLD,
             "the relative test would have fired: {short:?}"
         );
         assert!(!short.relative_rtx(), "{short:?}");
@@ -1658,15 +1692,18 @@ mod tests {
         telemetry.record_stall_drain(StallDrain {
             drained: 3,
             capped: false,
+            queue_overflow: false,
         });
         telemetry.record_stall_drain(StallDrain {
             drained: 9,
             capped: false,
+            queue_overflow: false,
         });
         // A stall the receiver's buffer absorbed adds nothing but a count.
         telemetry.record_stall_drain(StallDrain {
             drained: 0,
             capped: false,
+            queue_overflow: false,
         });
         assert_eq!(telemetry.stall_rtx_drained, 12);
         assert_eq!(telemetry.stall_rtx_drained_max, 9);
@@ -1675,6 +1712,7 @@ mod tests {
         telemetry.record_stall_drain(StallDrain {
             drained: 40,
             capped: true,
+            queue_overflow: false,
         });
         assert_eq!(telemetry.stall_rtx_drained, 52);
         assert_eq!(telemetry.stall_rtx_drained_max, 9);
@@ -1686,9 +1724,36 @@ mod tests {
     }
 
     #[test]
+    fn queue_occupancy_and_overflow_define_capping_not_the_last_increment() {
+        let now = Instant::now();
+        let end = now + StallDrainWindow::WINDOW;
+        let mut empty = StallDrainWindow::open(now, 0, 12);
+        let exact = empty.observe(end, 40, 0, 12).unwrap();
+        assert!(
+            !exact.capped,
+            "a final arriving request may already be fully drained"
+        );
+        let mut pending = StallDrainWindow::open(now, 0, 12);
+        assert!(pending.observe(end, 0, 1, 12).unwrap().capped);
+        let mut overflow = StallDrainWindow::open(now, 0, 12);
+        let result = overflow.observe(end, 40, 0, 13).unwrap();
+        assert!(result.queue_overflow && result.capped);
+    }
+    #[test]
+    fn exported_messages_and_socket_addresses_do_not_reveal_the_network() {
+        let raw = json!({"packets":7,"message":"failed at C:\\Users\\Person\\track with password=secret-value",
+            "detail":"connect 192.168.10.2:7000 or fe80::1234", "host":"192.168.10.2"});
+        let value = redact(&raw);
+        let text = value.to_string();
+        for secret in ["Person", "secret-value", "192.168.10.2", "fe80::1234"] {
+            assert!(!text.contains(secret), "{text}");
+        }
+        assert_eq!(value["packets"], 7);
+    }
+    #[test]
     fn a_long_stall_drains_past_sixteen_requests_within_the_window() {
         let start = Instant::now();
-        let mut window = StallDrainWindow::open(start, 1_000);
+        let mut window = StallDrainWindow::open(start, 1_000, 0);
         // A 2 s stall at ~350 packets/s leaves ~700 requests queued. At the 16
         // requests `service_retransmits` accepts per iteration that is 44
         // iterations, far inside the 250 ms window. The old first-drain field
@@ -1697,7 +1762,7 @@ mod tests {
         let mut closed = None;
         for i in 1..=250 {
             total += if i <= 44 { 16 } else { 0 };
-            if let Some(drain) = window.observe(start + Duration::from_millis(i), total) {
+            if let Some(drain) = window.observe(start + Duration::from_millis(i), total, 0, 0) {
                 closed = Some((i, drain));
                 break;
             }
@@ -1715,12 +1780,12 @@ mod tests {
     #[test]
     fn a_stall_still_draining_at_the_deadline_is_reported_capped() {
         let start = Instant::now();
-        let mut window = StallDrainWindow::open(start, 0);
+        let mut window = StallDrainWindow::open(start, 0, 0);
         let mut total = 0;
         let mut drain = None;
         for i in 1..=250 {
             total += 16;
-            if let Some(closed) = window.observe(start + Duration::from_millis(i), total) {
+            if let Some(closed) = window.observe(start + Duration::from_millis(i), total, 1, 0) {
                 drain = Some(closed);
                 break;
             }
@@ -1736,10 +1801,10 @@ mod tests {
     #[test]
     fn a_second_reanchor_closes_the_window_capped_instead_of_merging() {
         let start = Instant::now();
-        let mut first = StallDrainWindow::open(start, 0);
+        let mut first = StallDrainWindow::open(start, 0, 0);
         assert!(
             first
-                .observe(start + Duration::from_millis(10), 500)
+                .observe(start + Duration::from_millis(10), 500, 0, 0)
                 .is_none()
         );
         // Another re-anchor at 100 ms: the first stall closes early as a lower
@@ -1749,18 +1814,19 @@ mod tests {
             first_drain,
             StallDrain {
                 drained: 500,
-                capped: true
+                capped: true,
+                queue_overflow: false
             }
         );
         // The second window starts from the counter as it stands, so the first
         // stall's drain is not counted twice and the two windows never merge.
-        let mut second = StallDrainWindow::open(start + Duration::from_millis(100), 500);
+        let mut second = StallDrainWindow::open(start + Duration::from_millis(100), 500, 0);
         let mut total = 500;
         let mut second_drain = None;
         for i in 1..=250 {
             total += 8;
             if let Some(closed) =
-                second.observe(start + Duration::from_millis(100 + i), total)
+                second.observe(start + Duration::from_millis(100 + i), total, 0, 0)
             {
                 second_drain = Some(closed);
                 break;
@@ -1836,7 +1902,11 @@ mod tests {
             sink.lock().unwrap().push(event)
         });
         let emitted = events.lock().unwrap();
-        assert_eq!(emitted.len(), 1, "a clean session emits exactly one summary");
+        assert_eq!(
+            emitted.len(),
+            1,
+            "a clean session emits exactly one summary"
+        );
         assert_eq!(emitted[0]["event"], json!("session_summary"));
         assert_eq!(
             emitted[0]["last_timeline_reset_reason"],
@@ -1887,14 +1957,20 @@ mod tests {
         assert_eq!(SessionSummary::csv_header(), SUMMARY_COLUMNS.join(","));
         // The nine reason columns are present, in the enum's declared order, and
         // the retired bare count is gone.
-        let header: Vec<_> = SessionSummary::csv_header().split(',').map(str::to_owned).collect();
+        let header: Vec<_> = SessionSummary::csv_header()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
         let expected: Vec<_> = TimelineResetReason::ALL
             .iter()
             .map(|reason| format!("timeline_resets_{}", reason.name()))
             .collect();
         let start = SUMMARY_COLUMNS.len() - 1 - expected.len();
         assert_eq!(&header[start..start + expected.len()], expected.as_slice());
-        assert_eq!(header[SUMMARY_COLUMNS.len() - 1], "last_timeline_reset_reason");
+        assert_eq!(
+            header[SUMMARY_COLUMNS.len() - 1],
+            "last_timeline_reset_reason"
+        );
         assert!(!header.iter().any(|column| column == "rebuild_count"));
 
         let row = summary.csv_row();
@@ -1942,7 +2018,14 @@ mod tests {
             }
         }
         // No host, MAC, path or secret can survive the numeric/enumerated shape.
-        for forbidden in ["127.0.0.1", "192.168.", "C:\\", "/home/", "02:57:32", "secret"] {
+        for forbidden in [
+            "127.0.0.1",
+            "192.168.",
+            "C:\\",
+            "/home/",
+            "02:57:32",
+            "secret",
+        ] {
             assert!(!row.contains(forbidden), "CSV leaked {forbidden}: {row}");
         }
     }

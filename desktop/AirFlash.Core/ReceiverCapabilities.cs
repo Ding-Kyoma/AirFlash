@@ -65,6 +65,8 @@ public sealed class ReceiverCapabilityCatalog(IEngineFactory factory) : IReceive
         }
         await connection.SendAsync(session, "get_receiver_capabilities", new { peers }, cancellation).ConfigureAwait(false);
         var response = await connection.ReadAsync(cancellation).ConfigureAwait(false) ?? throw new IOException(L.Get("Could not query receiver capabilities."));
+        if (response.Number("version") == 1 && response.Text("session_id") == session && response.Text("event") == "error")
+            throw new EngineFailure(EngineNotice.Parse(response));
         if (response.Number("version") != 1 || response.Text("session_id") != session || response.Text("event") != "receiver_capabilities")
             throw new IOException(response.Text("message", L.Get("Could not query receiver capabilities.")));
         var members = response.GetProperty("members").Deserialize<ReceiverCapabilities[]>(AppSettings.JsonOptions) ?? [];

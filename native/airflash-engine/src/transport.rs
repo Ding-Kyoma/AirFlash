@@ -181,7 +181,7 @@ struct HealthState {
     /// Control-plane trouble that must not stop healthy media. RTSP/event feedback
     /// and the UDP RTP stream are independent; an AP roam that kills the control
     /// socket should not end playback that is still arriving.
-    degraded: Option<Fault>,
+    degraded: std::collections::BTreeMap<String, Fault>,
     notices: VecDeque<Value>,
     commands: crate::events::Inbox,
     /// Control-plane symptoms of a takeover. They are evidence only: the
@@ -225,29 +225,38 @@ impl Health {
     /// Record a control-plane fault without stopping the media stream.
     fn degrade(&self, fault: Fault) {
         let mut state = self.0.lock().unwrap();
-        if state.degraded.is_none() {
-            state.degraded = Some(fault);
-        }
+        state.degraded.entry(fault.channel.clone()).or_insert(fault);
     }
     /// Control-plane verdict: a degraded control channel only ends the session when
     /// the media side is unhealthy too, or when the receiver rejected our session
     /// outright (reconnecting is the only fix for that).
     pub fn check_control(&self, media_healthy: bool) -> Result<()> {
-        let degraded = self.0.lock().unwrap().degraded.clone();
-        match degraded {
-            Some(fault) if !media_healthy || matches!(fault.code.as_str(), "authentication_failed" | "session_rejected") => {
-                Err(fault.into())
-            }
-            _ => Ok(()),
+        let state = self.0.lock().unwrap();
+        if let Some(fault) = state.degraded.values().find(|fault| {
+            !media_healthy
+                || matches!(
+                    fault.code.as_str(),
+                    "authentication_failed" | "session_rejected"
+                )
+        }) {
+            return Err(fault.clone().into());
         }
+        Ok(())
     }
     pub fn control_degraded(&self) -> Option<Fault> {
-        self.0.lock().unwrap().degraded.clone()
+        self.0.lock().unwrap().degraded.values().next().cloned()
+    }
+    pub fn degraded_channel(&self, channel: &str) -> Option<Fault> {
+        self.0.lock().unwrap().degraded.get(channel).cloned()
     }
     /// Forget a degraded control channel after it has been rebuilt. The media side
     /// keeps running; only the verdict is cleared.
     pub fn clear_degraded(&self) {
-        self.0.lock().unwrap().degraded = None;
+        self.0.lock().unwrap().degraded.clear();
+    }
+    pub fn clear_degraded_channel(&self, channel: &str) {
+        let mut state = self.0.lock().unwrap();
+        state.degraded.remove(channel);
     }
     /// Record one control-plane symptom. Symptoms alone never end the session:
     /// the session thread drains them and probes the receiver's live status.
@@ -277,6 +286,14 @@ pub struct EventWorker {
 impl EventWorker {
     pub fn connect(addr: SocketAddr, key: &[u8], health: Health) -> Result<Self> {
         let stop = Cancellation::default();
+        Self::connect_with_stop(addr, key, health, stop)
+    }
+    pub fn connect_with_stop(
+        addr: SocketAddr,
+        key: &[u8],
+        health: Health,
+        stop: Cancellation,
+    ) -> Result<Self> {
         let mut connection = Connection::connect(addr, stop.clone())?;
         connection.encrypt(
             derive(key, "Events-Salt", "Events-Read-Encryption-Key"),
@@ -294,10 +311,16 @@ impl EventWorker {
         let worker = thread::Builder::new()
             .name("airplay-events".into())
             .spawn(move || {
+                // Clear the previous channel fault before this worker can record a
+                // new one; the caller must not erase an immediate reconnect failure.
+                health.clear_degraded_channel("events");
                 if let Err(error) = event_loop(&mut connection, &health, &done) {
                     if !done.is_cancelled() {
                         let fault = Fault::from_error(host, "events", &error);
-                        if matches!(fault.code.as_str(), "authentication_failed" | "session_rejected") {
+                        if matches!(
+                            fault.code.as_str(),
+                            "authentication_failed" | "session_rejected"
+                        ) {
                             health.fail(fault);
                         } else {
                             // Losing the event channel silences buttons and metadata;
@@ -403,7 +426,10 @@ impl FeedbackWorker {
                                 false,
                             );
                             health.degrade(fault);
-                        } else if matches!(fault.code.as_str(), "authentication_failed" | "session_rejected") {
+                        } else if matches!(
+                            fault.code.as_str(),
+                            "authentication_failed" | "session_rejected"
+                        ) {
                             health.fail(fault);
                         } else {
                             // Feedback is a health probe, not the audio path: keep
@@ -650,11 +676,10 @@ impl MediaTransport {
     ) -> Result<Self> {
         audio.set_nonblocking(true)?;
         control.set_nonblocking(true)?;
-        let qos_marked = crate::qos::mark_audio_socket(&audio);
         Ok(Self {
             buffered: None,
             packetizer,
-            metrics: MediaMetrics { qos_marked, ..Default::default() },
+            metrics: MediaMetrics::default(),
             audio,
             control,
             remote,
@@ -673,8 +698,11 @@ impl MediaTransport {
     pub fn control_port(&self) -> Result<u16> {
         Ok(self.control.local_addr()?.port())
     }
-    pub fn connect_audio(&self, address: SocketAddr) -> Result<()> {
-        Ok(self.audio.connect(address)?)
+    pub fn connect_audio(&mut self, address: SocketAddr) -> Result<()> {
+        self.audio.connect(address)?;
+        // With no explicit DestAddr, qWAVE requires an already connected socket.
+        self.metrics.qos_marked = crate::qos::mark_audio_socket(&self.audio);
+        Ok(())
     }
     pub fn connect_buffered(&mut self, address: SocketAddr) -> Result<()> {
         self.buffered = Some(crate::buffered::Sender::connect(address)?);
@@ -683,6 +711,9 @@ impl MediaTransport {
     }
     pub fn latency(&self) -> Duration {
         self.latency
+    }
+    pub fn supports_timeline_shift(&self) -> bool {
+        self.buffered.is_none()
     }
     /// Media health independent of the control channel: have we moved audio to the
     /// receiver recently?
@@ -702,6 +733,9 @@ impl MediaTransport {
     }
     pub fn reset_watchdog(&mut self, now: Instant) {
         self.last_success = now;
+    }
+    pub fn retransmit_pending(&self) -> usize {
+        self.pending.len()
     }
     pub fn metrics(&self) -> Value {
         let mut v = serde_json::to_value(&self.metrics).unwrap();
@@ -925,7 +959,9 @@ impl MediaSchedule {
         Duration::from_nanos(FRAMES as u64 * 1_000_000_000 / self.rate as u64)
     }
     pub fn deadline(&self) -> Instant {
-        self.start + self.shift + Duration::from_nanos(self.frames * 1_000_000_000 / self.rate as u64)
+        self.start
+            + self.shift
+            + Duration::from_nanos(self.frames * 1_000_000_000 / self.rate as u64)
     }
     /// The sync anchor moves with the timeline: callers add this to the session's
     /// base network time before publishing `networkTime`.
@@ -1030,13 +1066,16 @@ impl MediaSchedule {
     /// Slew the extra lead back to zero one frame per second whenever the sender
     /// is comfortably on time, so a re-anchor does not raise latency forever.
     pub fn relax(&mut self, now: Instant, late: Duration) {
+        self.relax_to(now, late, Duration::ZERO);
+    }
+    pub fn relax_to(&mut self, now: Instant, late: Duration, floor: Duration) {
         if self.shift.is_zero() || late >= self.frame_duration() {
             return;
         }
         if self.next_relax.is_some_and(|at| now < at) {
             return;
         }
-        self.shift = self.shift.saturating_sub(self.frame_duration());
+        self.shift = self.shift.saturating_sub(self.frame_duration()).max(floor);
         self.next_relax = Some(now + RELAX_INTERVAL);
     }
     /// Apply an operator-requested lead change (adaptive latency ladder) in whole
@@ -1080,6 +1119,75 @@ impl MediaSchedule {
 #[cfg(test)]
 mod schedule_tests {
     use super::*;
+    #[test]
+    fn an_immediately_closed_rebuilt_event_channel_keeps_its_new_fault() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || drop(listener.accept().unwrap()));
+        let health = Health::default();
+        health.degrade(Fault::new(
+            "127.0.0.1",
+            "events",
+            "old_event_fault",
+            true,
+            "old",
+        ));
+        health.degrade(Fault::new(
+            "127.0.0.1",
+            "feedback",
+            "feedback_timeout",
+            true,
+            "timeout",
+        ));
+        let connection = Connection::connect(address, Cancellation::default()).unwrap();
+        let worker = EventWorker::start(
+            connection,
+            address.ip().to_string(),
+            health.clone(),
+            Cancellation::default(),
+        )
+        .unwrap();
+        server.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while health
+            .degraded_channel("events")
+            .is_none_or(|f| f.code == "old_event_fault")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the new event failure must remain visible"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(health.degraded_channel("feedback").is_some());
+        drop(worker);
+    }
+    #[test]
+    fn rebuilding_events_preserves_independent_feedback_degradation() {
+        let health = Health::default();
+        health.degrade(Fault::new(
+            "127.0.0.1",
+            "events",
+            "event_closed",
+            true,
+            "closed",
+        ));
+        health.degrade(Fault::new(
+            "127.0.0.1",
+            "feedback",
+            "feedback_timeout",
+            true,
+            "timeout",
+        ));
+        health.clear_degraded_channel("events");
+        assert!(health.degraded_channel("events").is_none());
+        assert_eq!(
+            health.degraded_channel("feedback").unwrap().code,
+            "feedback_timeout"
+        );
+        assert!(health.check_control(true).is_ok());
+        assert!(health.check_control(false).is_err());
+    }
     #[test]
     fn control_plane_faults_keep_playing_while_media_is_healthy() {
         let health = Health::default();

@@ -4,6 +4,19 @@ namespace AirFlash.Tests;
 
 public sealed class NowPlayingTests
 {
+    [Fact]
+    public async Task Continuous_progress_does_not_restart_the_tag_settle_window()
+    {
+        var source = new Source();
+        long clock = 0;
+        var pump = new NowPlayingPump(source, () => clock);
+        source.Value = Track(position: 0);
+        Assert.Null(await pump.PollAsync(default));
+        clock = 2000; source.Value = Track(position: 2000);
+        Assert.Equal(2000, (await pump.PollAsync(default))!.PositionMs);
+        clock = 4000; source.Value = Track(position: 4000);
+        Assert.Equal(4000, (await pump.PollAsync(default))!.PositionMs);
+    }
     private sealed class Source : INowPlayingSource
     {
         public NowPlaying? Value;
@@ -70,9 +83,9 @@ public sealed class NowPlayingTests
 
         source.Value = Track(position: 12_000);
         now = 4_800;
-        await pump.PollAsync(CancellationToken.None);
-        now = 5_200;
         Assert.NotNull(await pump.PollAsync(CancellationToken.None));
+        now = 5_200;
+        Assert.Null(await pump.PollAsync(CancellationToken.None));
     }
 
     [Theory]

@@ -9,6 +9,41 @@ fn follower(now: Instant) -> PeerState {
     followed_packet(&mut state, &announce(8, 0, 0), 0, now, 7);
     state
 }
+#[test]
+fn a_sync_only_mapping_freezes_expires_and_never_survives_an_identity_change() {
+    let start = Instant::now();
+    let mut state = follower(start);
+    for seq in 0..3u16 {
+        let at = start + Duration::from_millis(u64::from(seq) * 125);
+        let local = 1_000_000_000 + u64::from(seq) * 125_000_000;
+        let (sync, follow) = sync_pair(8, seq, local + 5_000_000_000);
+        followed_packet(&mut state, &sync, local + 90_000, at, 7);
+        followed_packet(&mut state, &follow, local + 95_000, at, 7);
+    }
+    let last = start + Duration::from_millis(250);
+    assert!(state.offset_at.is_none(), "no Delay response was needed");
+    let (offset, frozen) = state.map_offset(last, Duration::from_secs(10)).unwrap();
+    assert!(!frozen);
+    assert_eq!(
+        state.map_offset(last + Duration::from_secs(3), Duration::from_secs(10)),
+        Some((offset, true))
+    );
+    assert_eq!(
+        state.map_offset(last + Duration::from_secs(11), Duration::from_secs(10)),
+        None
+    );
+    followed_packet(
+        &mut state,
+        &announce(9, 1, 0),
+        0,
+        last + Duration::from_secs(4),
+        7,
+    );
+    assert_eq!(
+        state.map_offset(last + Duration::from_secs(4), Duration::from_secs(10)),
+        None
+    );
+}
 
 #[test]
 fn reordered_pairs_preserve_sample_correction_and_reach_readiness() {
@@ -86,7 +121,11 @@ fn a_changed_announce_identity_is_timestamped_once_per_restart() {
     let mut state = follower(start);
     // The first Announce established the identity and is not a change.
     assert_eq!(state.identity_change_at(), None);
-    note_announce_identity(&mut state, &announce(9, 0, 0), start + Duration::from_secs(1));
+    note_announce_identity(
+        &mut state,
+        &announce(9, 0, 0),
+        start + Duration::from_secs(1),
+    );
     followed_packet(
         &mut state,
         &announce(9, 0, 0),
@@ -94,10 +133,17 @@ fn a_changed_announce_identity_is_timestamped_once_per_restart() {
         start + Duration::from_secs(1),
         7,
     );
-    assert_eq!(state.identity_change_at(), Some(start + Duration::from_secs(1)));
+    assert_eq!(
+        state.identity_change_at(),
+        Some(start + Duration::from_secs(1))
+    );
     assert_eq!(state.identity_changes, 1);
     // Repeating the same identity must not count again.
-    note_announce_identity(&mut state, &announce(9, 1, 0), start + Duration::from_secs(2));
+    note_announce_identity(
+        &mut state,
+        &announce(9, 1, 0),
+        start + Duration::from_secs(2),
+    );
     followed_packet(
         &mut state,
         &announce(9, 1, 0),
@@ -105,11 +151,21 @@ fn a_changed_announce_identity_is_timestamped_once_per_restart() {
         start + Duration::from_secs(2),
         7,
     );
-    assert_eq!(state.identity_change_at(), Some(start + Duration::from_secs(1)));
+    assert_eq!(
+        state.identity_change_at(),
+        Some(start + Duration::from_secs(1))
+    );
     assert_eq!(state.identity_changes, 1);
     // A second restart moves the timestamp.
-    note_announce_identity(&mut state, &announce(10, 0, 0), start + Duration::from_secs(3));
-    assert_eq!(state.identity_change_at(), Some(start + Duration::from_secs(3)));
+    note_announce_identity(
+        &mut state,
+        &announce(10, 0, 0),
+        start + Duration::from_secs(3),
+    );
+    assert_eq!(
+        state.identity_change_at(),
+        Some(start + Duration::from_secs(3))
+    );
     assert_eq!(state.identity_changes, 2);
 }
 

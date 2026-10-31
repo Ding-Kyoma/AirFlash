@@ -171,7 +171,6 @@ pub const GATEWAY_PROBE_TIMEOUT: Duration = Duration::from_millis(1_000);
 /// routing-table hole does not reclaim every receiver.
 pub const GATEWAY_FALLBACK_WINDOW: Duration = Duration::from_secs(60);
 
-
 /// The queueing backoff for a confirmed `BusyElsewhere` verdict: 3 s, 6 s,
 /// 12 s, 24 s, then 60 s forever. This is a queue, never a failure retry: a
 /// receiver that stays busy for an hour is polled once a minute and is never
@@ -708,11 +707,7 @@ pub fn default_gateway() -> Option<IpAddr> {
 /// connection is an answer (the RST proves the stack is there), which is why
 /// this reuses the same [`ReceiverLiveness::host_answered`] dimension as the
 /// receiver probe instead of a boolean "connected".
-pub fn reference_reachability(
-    ip: IpAddr,
-    ports: &[u16],
-    timeout: Duration,
-) -> GatewayReachability {
+pub fn reference_reachability(ip: IpAddr, ports: &[u16], timeout: Duration) -> GatewayReachability {
     for port in ports {
         if receiver_liveness(ip, *port, timeout).host_answered() {
             return GatewayReachability::Answered;
@@ -727,7 +722,6 @@ pub fn reference_reachability(
 pub fn probe_default_gateway(timeout: Duration) -> Option<GatewayReachability> {
     default_gateway().map(|gateway| reference_reachability(gateway, &GATEWAY_PROBE_PORTS, timeout))
 }
-
 
 /// What a live `GET /info` probe could tell us.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -833,7 +827,9 @@ pub fn combine(
 }
 
 fn status_flags(info: &Value) -> Option<u64> {
-    info.as_dictionary()?.get("statusFlags")?.as_unsigned_integer()
+    info.as_dictionary()?
+        .get("statusFlags")?
+        .as_unsigned_integer()
 }
 
 /// Parse one `/info` body. Kept separate from the socket so the classification
@@ -984,8 +980,8 @@ fn probe_infos(
     timeout: Duration,
     we_hold_session: bool,
 ) -> Result<ProbeReport> {
-    let mut connection =
-        Connection::connect(addr, cancel.clone()).with_context(|| format!("status probe {addr}"))?;
+    let mut connection = Connection::connect(addr, cancel.clone())
+        .with_context(|| format!("status probe {addr}"))?;
     connection.set_timeout(timeout)?;
     let message = connection
         .request("GET", "/info", &[], &[])
@@ -1128,7 +1124,9 @@ impl TakeoverCounters {
     }
 
     pub fn consecutive(&self, host: IpAddr) -> u32 {
-        self.counters.get(&host).map_or(0, TakeoverCounter::consecutive)
+        self.counters
+            .get(&host)
+            .map_or(0, TakeoverCounter::consecutive)
     }
 }
 
@@ -1234,6 +1232,11 @@ struct ProbeLog {
 }
 
 impl Tracker {
+    /// An explicit receiver TEARDOWN ends this association. Only a new Member
+    /// can establish another one; local UDP writes cannot renew ownership.
+    pub fn session_ended(&self) -> bool {
+        self.ended_at.is_some()
+    }
     pub fn observe(&mut self, signal: Signal, at: Instant) {
         const MAX_SIGNALS: usize = 8;
         if signal.ends_session() {
@@ -1810,10 +1813,7 @@ mod tests {
             }
         }
         // Unhealthy media: consult statusFlags exactly as before.
-        assert_eq!(
-            combine(false, L::Alive, Some(0), false),
-            ProbeOutcome::Free
-        );
+        assert_eq!(combine(false, L::Alive, Some(0), false), ProbeOutcome::Free);
         assert_eq!(
             combine(false, L::Alive, Some(active), false),
             ProbeOutcome::BusyElsewhere
@@ -1826,10 +1826,7 @@ mod tests {
             combine(false, L::Unknown, Some(active), false),
             ProbeOutcome::BusyElsewhere
         );
-        assert_eq!(
-            combine(false, L::Alive, None, false),
-            ProbeOutcome::Unknown
-        );
+        assert_eq!(combine(false, L::Alive, None, false), ProbeOutcome::Unknown);
         // Even with unhealthy media a dead receiver never becomes busy.
         assert_eq!(
             combine(false, L::Dead, Some(active), false),
@@ -1844,12 +1841,8 @@ mod tests {
         for liveness in [L::Dead, L::Refused] {
             for media_healthy in [true, false] {
                 for hold in [false, true] {
-                    let outcome = combine(
-                        media_healthy,
-                        liveness,
-                        Some(RECEIVER_SESSION_ACTIVE),
-                        hold,
-                    );
+                    let outcome =
+                        combine(media_healthy, liveness, Some(RECEIVER_SESSION_ACTIVE), hold);
                     assert_eq!(outcome, ProbeOutcome::Gone);
                     assert_eq!(action_for(outcome), ProbeAction::Reclaim);
                     assert_ne!(
@@ -2134,7 +2127,10 @@ mod tests {
         let mut tracker = Tracker::default();
         assert_eq!(
             tracker
-                .observe_liveness(LivenessSample::Probe(ReceiverLiveness::Unknown), at(base, 0))
+                .observe_liveness(
+                    LivenessSample::Probe(ReceiverLiveness::Unknown),
+                    at(base, 0)
+                )
                 .verdict,
             Verdict::Unknown
         );
@@ -2198,7 +2194,10 @@ mod tests {
         assert!(alive.log_changed);
         assert!(
             !tracker
-                .observe_liveness(LivenessSample::Probe(ReceiverLiveness::Alive), at(base, 12_000))
+                .observe_liveness(
+                    LivenessSample::Probe(ReceiverLiveness::Alive),
+                    at(base, 12_000)
+                )
                 .log_changed,
             "a repeated alive sample must not re-print the line"
         );
@@ -2324,9 +2323,7 @@ mod tests {
             Some(at(base, 0) + CONFIRM_DELAY),
             "exactly one confirmation probe, CONFIRM_DELAY later"
         );
-        assert!(!tracker.due(
-            at(base, 0) + CONFIRM_DELAY - Duration::from_millis(1)
-        ));
+        assert!(!tracker.due(at(base, 0) + CONFIRM_DELAY - Duration::from_millis(1)));
 
         let second = tracker.note_result(&free(), at(base, 0) + CONFIRM_DELAY);
         assert_eq!(
@@ -2680,9 +2677,7 @@ mod tests {
             "an agreeing confirmation is not a new log line"
         );
         assert!(
-            tracker
-                .note_result(&busy(), at(base, 4_000))
-                .log_changed,
+            tracker.note_result(&busy(), at(base, 4_000)).log_changed,
             "a different outcome is logged"
         );
         // The busy count is irrelevant to the log dedup.
@@ -2692,9 +2687,7 @@ mod tests {
                 .log_changed
         );
         assert!(
-            tracker
-                .note_result(&free(), at(base, 8_000))
-                .log_changed,
+            tracker.note_result(&free(), at(base, 8_000)).log_changed,
             "a later Free after a busy run is logged"
         );
     }

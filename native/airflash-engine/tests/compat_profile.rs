@@ -140,7 +140,6 @@ fn table() -> Vec<Row> {
         row!(model: Some("HomePod1,1"), features: Some(BIT40 | BIT41), version: Some("354.54.5"), legacy: &[1], expected: auto(true, false)),
         row!(model: Some("HomePod1,1"), features: Some(BIT40 | BIT41), version: Some("354.54.6"), legacy: &[1], expected: auto(true, true)),
         row!(model: Some("HomePod1,1"), features: Some(BIT40 | BIT41), version: Some("366.0"), legacy: &[1], expected: auto(true, true)),
-
         // AudioAccessory5,1: same PTP expectation as HomePod, same AirPlay 2 rule.
         row!(model: Some("AudioAccessory5,1"), features: None, version: None, legacy: &[], expected: auto(true, false)),
         row!(model: Some("AudioAccessory5,1"), features: None, version: Some("354.54.5"), legacy: &[], expected: auto(true, false)),
@@ -158,7 +157,6 @@ fn table() -> Vec<Row> {
         row!(model: Some("AudioAccessory5,1"), features: Some(BIT40 | BIT41), version: Some("354.54.5"), legacy: &[1], expected: auto(true, false)),
         row!(model: Some("AudioAccessory5,1"), features: Some(BIT40 | BIT41), version: Some("354.54.6"), legacy: &[1], expected: auto(true, true)),
         row!(model: Some("AudioAccessory5,1"), features: Some(BIT40 | BIT41), version: Some("366.0"), legacy: &[1], expected: auto(true, true)),
-
         // AppleTV6,2: a standalone Apple TV runs NTP even when it is fully
         // AirPlay 2 capable.
         row!(model: Some("AppleTV6,2"), features: None, version: None, legacy: &[], expected: auto(false, false)),
@@ -177,7 +175,6 @@ fn table() -> Vec<Row> {
         row!(model: Some("AppleTV6,2"), features: Some(BIT40 | BIT41), version: Some("354.54.5"), legacy: &[1], expected: auto(false, false)),
         row!(model: Some("AppleTV6,2"), features: Some(BIT40 | BIT41), version: Some("354.54.6"), legacy: &[1], expected: auto(false, true)),
         row!(model: Some("AppleTV6,2"), features: Some(BIT40 | BIT41), version: Some("366.0"), legacy: &[1], expected: auto(false, true)),
-
         // Unknown model: timing falls back to the AirPlay 2 evidence alone.
         row!(model: Some("ThirdPartySpeaker9,9"), features: None, version: None, legacy: &[], expected: auto(false, false)),
         row!(model: Some("ThirdPartySpeaker9,9"), features: None, version: Some("354.54.5"), legacy: &[], expected: auto(false, false)),
@@ -195,7 +192,6 @@ fn table() -> Vec<Row> {
         row!(model: Some("ThirdPartySpeaker9,9"), features: Some(BIT40 | BIT41), version: Some("354.54.5"), legacy: &[1], expected: auto(false, false)),
         row!(model: Some("ThirdPartySpeaker9,9"), features: Some(BIT40 | BIT41), version: Some("354.54.6"), legacy: &[1], expected: auto(true, true)),
         row!(model: Some("ThirdPartySpeaker9,9"), features: Some(BIT40 | BIT41), version: Some("366.0"), legacy: &[1], expected: auto(true, true)),
-
         // Stream selection: realtime first, buffered only when the realtime
         // stream cannot carry the asked-for codec/sample rate.
         row!(),
@@ -207,7 +203,6 @@ fn table() -> Vec<Row> {
         row!(codec: Codec::Alac, transport: Transport::Buffered, expected: Expected::Ok { alac: true, transport: Transport::Buffered, ptp: true, airplay2: true }),
         row!(buffered: Some(ALAC_48), transport: Transport::Buffered, expected: Expected::Err("requested codec/sample rate is not advertised for this stream")),
         row!(buffered: None, transport: Transport::Auto, expected: Expected::Ok { alac: true, transport: Transport::Realtime, ptp: true, airplay2: true }),
-
         // Legacy codec lists, with no supportedFormats at all.
         row!(model: None, features: None, version: None, legacy: &[0, 1], realtime: None, buffered: None, timing: Timing::Ntp, expected: Expected::Ok { alac: false, transport: Transport::Realtime, ptp: false, airplay2: false }),
         row!(model: None, features: None, version: None, legacy: &[1], realtime: None, buffered: None, timing: Timing::Ntp, expected: Expected::Ok { alac: true, transport: Transport::Realtime, ptp: false, airplay2: false }),
@@ -215,32 +210,26 @@ fn table() -> Vec<Row> {
         row!(model: None, features: None, version: None, legacy: &[2], realtime: None, buffered: None, timing: Timing::Ntp, expected: Expected::Err("requested codec is not advertised")),
         row!(model: None, features: None, version: None, legacy: &[0], realtime: None, buffered: None, codec: Codec::Alac, timing: Timing::Ntp, expected: Expected::Err("requested codec is not advertised")),
         row!(model: None, features: None, version: None, legacy: &[1], realtime: None, buffered: None, codec: Codec::Pcm, timing: Timing::Ntp, expected: Expected::Err("requested codec is not advertised")),
-
         // The offset guard runs before any format decision.
         row!(offset_ms: 501, expected: Expected::Err("sync offset must be -500..500 ms")),
-
         // Following the receiver clock is PTP by definition.
         row!(follow: true, expected: Expected::Ok { alac: true, transport: Transport::Realtime, ptp: true, airplay2: true }),
         row!(model: None, features: None, version: None, follow: true, expected: Expected::Ok { alac: true, transport: Transport::Realtime, ptp: true, airplay2: false }),
         row!(model: Some("AppleTV6,2"), follow: true, expected: Expected::Ok { alac: true, transport: Transport::Realtime, ptp: true, airplay2: true }),
         row!(follow: true, timing: Timing::Ntp, expected: Expected::Err("following a receiver clock requires PTP timing")),
-
         // Inherit simply keeps whatever the session already chose.
         row!(timing: Timing::Inherit, expected: Expected::Ok { alac: true, transport: Transport::Realtime, ptp: false, airplay2: true }),
         row!(timing: Timing::Inherit, inherited_ptp: true, expected: Expected::Ok { alac: true, transport: Transport::Realtime, ptp: true, airplay2: true }),
-
-        // Forced PTP still requires evidence, and never overrides a model that
-        // says NTP.
+        // Forced PTP tolerates missing evidence, as the stable release did, and
+        // never overrides a model that explicitly says NTP.
         row!(model: Some("AppleTV6,2"), timing: Timing::Ptp, expected: Expected::Err("PTP timing is not advertised")),
-        row!(model: None, features: None, version: None, timing: Timing::Ptp, expected: Expected::Err("PTP timing is not advertised")),
+        row!(model: None, features: None, version: None, timing: Timing::Ptp, expected: Expected::Ok { alac: true, transport: Transport::Realtime, ptp: true, airplay2: false }),
         row!(model: None, features: Some(BIT40), version: Some("366.0"), timing: Timing::Ptp, expected: Expected::Ok { alac: true, transport: Transport::Realtime, ptp: true, airplay2: true }),
         row!(model: None, features: Some(BIT40), version: Some("354.54.5"), timing: Timing::Ptp, inherited_ptp: true, expected: Expected::Ok { alac: true, transport: Transport::Realtime, ptp: true, airplay2: false }),
-
         // Buffered audio needs both ALAC and PTP.
         row!(timing: Timing::Ntp, transport: Transport::Buffered, codec: Codec::Alac, expected: Expected::Err("buffered audio requires PTP timing")),
         row!(model: Some("AppleTV6,2"), transport: Transport::Buffered, codec: Codec::Alac, expected: Expected::Err("buffered audio requires PTP timing")),
         row!(transport: Transport::Buffered, codec: Codec::Alac, expected: Expected::Ok { alac: true, transport: Transport::Buffered, ptp: true, airplay2: true }),
-
         // The discovery hint only fills a missing `/info` feature word.
         row!(model: None, features: None, hint: Some(BIT40), version: Some("366.0"), expected: Expected::Ok { alac: true, transport: Transport::Realtime, ptp: true, airplay2: true }),
         row!(model: None, features: Some(0), hint: Some(BIT40), version: Some("366.0"), expected: Expected::Ok { alac: true, transport: Transport::Realtime, ptp: false, airplay2: false }),
@@ -328,27 +317,27 @@ fn model_fingerprint_maps_to_its_timing_expectation() {
 #[test]
 fn group_plans_converge_on_one_clock_domain() {
     let homepod = TimingEvidence {
-        airplay2: true,
+        airplay2: Some(true),
         model: Some("AudioAccessory5,1"),
         name: None,
     };
     let homepod_without_ap2 = TimingEvidence {
-        airplay2: false,
+        airplay2: Some(false),
         model: Some("AudioAccessory5,1"),
         name: None,
     };
     let appletv = TimingEvidence {
-        airplay2: true,
+        airplay2: Some(true),
         model: Some("AppleTV6,2"),
         name: None,
     };
     let unknown_ap2 = TimingEvidence {
-        airplay2: true,
+        airplay2: Some(true),
         model: None,
         name: None,
     };
     let unknown_ap1 = TimingEvidence {
-        airplay2: false,
+        airplay2: Some(false),
         model: None,
         name: None,
     };
@@ -406,7 +395,7 @@ fn every_group_member_negotiates_the_shared_timing_decision() {
     );
     let ap1_info = info(
         Some("AudioAccessory5,1"),
-        None,
+        Some(0),
         None,
         Some(REALTIME),
         Some(BUFFERED_ALAC),
@@ -420,8 +409,8 @@ fn every_group_member_negotiates_the_shared_timing_decision() {
         ..Default::default()
     };
     // An all-classic group puts every member on NTP.
-    let plan = TimingPlan::select(&[ap1.timing_evidence(), ap1.timing_evidence()], Codec::Auto)
-        .unwrap();
+    let plan =
+        TimingPlan::select(&[ap1.timing_evidence(), ap1.timing_evidence()], Codec::Auto).unwrap();
     assert_eq!(plan.timing(), Timing::Ntp);
     for fingerprint in [&ap1, &ap1] {
         let compat = fingerprint
@@ -436,8 +425,8 @@ fn every_group_member_negotiates_the_shared_timing_decision() {
         Err(MixedTimingGroup)
     );
     // All AirPlay 2: every member stays on PTP.
-    let plan = TimingPlan::select(&[ap2.timing_evidence(), ap2.timing_evidence()], Codec::Auto)
-        .unwrap();
+    let plan =
+        TimingPlan::select(&[ap2.timing_evidence(), ap2.timing_evidence()], Codec::Auto).unwrap();
     assert_eq!(plan.timing(), Timing::Ptp);
     for fingerprint in [&ap2, &ap2] {
         assert!(
@@ -489,7 +478,12 @@ fn every_group_member_negotiates_the_shared_timing_decision() {
     );
     assert!(
         !appletv
-            .negotiate_planned(TimingPlan::single(&appletv, Codec::Auto), &profile, 44100, false)
+            .negotiate_planned(
+                TimingPlan::single(&appletv, Codec::Auto),
+                &profile,
+                44100,
+                false
+            )
             .unwrap()
             .uses_ptp()
     );

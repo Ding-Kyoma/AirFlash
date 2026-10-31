@@ -5,9 +5,8 @@
 //! which one a given firmware prefers, so this module sends the two that carry the
 //! information the display uses:
 //!
-//! - `text/parameters` with `progress: <start>/<position>/<duration>` in
-//!   milliseconds, where `<start>` is the render start expressed in the same clock
-//!   the stream is anchored to;
+//! - `text/parameters` with `progress: <start>/<current>/<end>` in
+//!   wrapping RTP sample timestamps, using the same clock as the audio stream;
 //! - `application/x-dmap-tagged` with a `mlit` item holding `minm` (title),
 //!   `asar` (artist), `asal` (album) and `asgn` (genre).
 //!
@@ -53,13 +52,20 @@ impl NowPlaying {
     pub fn is_empty(&self) -> bool {
         self.title.is_empty() && self.artist.is_empty() && self.album.is_empty()
     }
-    /// Largest clock jump that is still "the same track" for the display. Beyond
-    /// this the receiver is told to jump instead of being sent a new start time.
-    pub fn progress_body(&self, start_ms: u64) -> String {
-        format!(
-            "progress: {start_ms}/{}/{}\r\n",
-            self.position_ms, self.duration_ms
-        )
+    /// All three values use the current stream's wrapping 32-bit RTP sample clock.
+    pub fn progress_body(&self, current: u32, rate: u32, elapsed_ms: u64) -> String {
+        let position = self
+            .position_ms
+            .saturating_add(if self.playing { elapsed_ms } else { 0 });
+        let ticks =
+            |ms: u64| ((u128::from(ms) * u128::from(rate) / 1000) & u128::from(u32::MAX)) as u32;
+        let start = current.wrapping_sub(ticks(position));
+        let end = if self.duration_ms == 0 {
+            current
+        } else {
+            start.wrapping_add(ticks(self.duration_ms))
+        };
+        format!("progress: {start}/{current}/{end}\r\n")
     }
 }
 
@@ -97,15 +103,18 @@ pub struct Command {
 }
 
 #[derive(Clone, Default)]
-pub struct Control(Arc<Mutex<Option<(u64, NowPlaying)>>>);
+pub struct Control(Arc<Mutex<Option<(u64, NowPlaying, Instant)>>>);
 impl Control {
     pub fn set(&self, sequence: u64, now: NowPlaying) {
         let mut slot = self.0.lock().unwrap();
-        if slot.as_ref().is_none_or(|(old, _)| sequence >= *old) {
-            *slot = Some((sequence, now));
+        if slot.as_ref().is_none_or(|(old, _, _)| sequence >= *old) {
+            *slot = Some((sequence, now, Instant::now()));
         }
     }
-    fn latest(&self) -> Option<(u64, NowPlaying)> {
+    pub fn clear(&self) {
+        *self.0.lock().unwrap() = None;
+    }
+    fn latest(&self) -> Option<(u64, NowPlaying, Instant)> {
         self.0.lock().unwrap().clone()
     }
 }
@@ -124,13 +133,34 @@ pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(1500);
 
 pub type Peer = (String, String, Arc<Mutex<Connection>>);
 
+#[derive(Clone)]
+pub struct Timeline {
+    timestamp: Arc<std::sync::atomic::AtomicU32>,
+    rate: u32,
+}
+impl Timeline {
+    pub fn new(timestamp: u32, rate: u32) -> Self {
+        Self {
+            timestamp: Arc::new(std::sync::atomic::AtomicU32::new(timestamp)),
+            rate,
+        }
+    }
+    pub fn set(&self, timestamp: u32) {
+        self.timestamp
+            .store(timestamp, std::sync::atomic::Ordering::Release);
+    }
+    fn current(&self) -> u32 {
+        self.timestamp.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 pub struct Worker {
     stop: Cancellation,
     worker: Option<JoinHandle<()>>,
     pub events: mpsc::Receiver<Value>,
 }
 impl Worker {
-    pub fn start(peers: Vec<Peer>, control: Control) -> Result<Self> {
+    pub fn start(peers: Vec<Peer>, control: Control, timeline: Timeline) -> Result<Self> {
         ensure!(!peers.is_empty(), "metadata worker requires a receiver");
         let stop = Cancellation::default();
         let done = stop.clone();
@@ -139,60 +169,68 @@ impl Worker {
             .name("airplay-metadata".into())
             .spawn(move || {
                 let mut last: Option<(u64, NowPlaying, Instant)> = None;
-                let mut tags_sent: Option<(u64, Vec<u8>)> = None;
+                let mut tags_sent: Vec<Option<Vec<u8>>> = vec![None; peers.len()];
+                let mut progress_enabled = vec![true; peers.len()];
+                let mut tags_enabled = vec![true; peers.len()];
                 while !done.is_cancelled() {
-                    let Some((sequence, now)) = control.latest() else {
+                    let Some((sequence, now, sampled)) = control.latest() else {
                         thread::sleep(Duration::from_millis(100));
                         continue;
                     };
-                    let fresh = last
-                        .as_ref()
-                        .is_none_or(|(old, previous, at)| {
-                            *old != sequence
-                                && (previous != &now || at.elapsed() >= PROGRESS_INTERVAL)
-                        });
+                    let fresh = last.as_ref().is_none_or(|(old, previous, at)| {
+                        *old != sequence && (previous != &now || at.elapsed() >= PROGRESS_INTERVAL)
+                    });
                     if !fresh {
                         thread::sleep(Duration::from_millis(50));
                         continue;
                     }
                     let mut errors = Vec::new();
-                    let start_ms = start_of(&now);
                     let mut tags_updated = false;
-                    for (host, uri, connection) in &peers {
+                    for (index, (host, uri, connection)) in peers.iter().enumerate() {
                         if done.is_cancelled() {
                             return;
                         }
                         let mut connection = connection.lock().unwrap();
-                        // Progress first: a receiver that only understands one of
-                        // the two payloads still gets a moving display.
-                        if let Err(error) = connection.request(
-                            "SET_PARAMETER",
-                            uri,
-                            &[("Content-Type", "text/parameters".into())],
-                            now.progress_body(start_ms).as_bytes(),
-                        ) {
-                            errors.push(format!("{host}: progress: {error:#}"));
-                        }
-                        let tags = dmap_tags(&now);
-                        let unchanged = tags_sent
-                            .as_ref()
-                            .is_some_and(|(_, previous)| previous == &tags);
-                        if !tags.is_empty() && !unchanged {
+                        let current = timeline.current();
+                        let progress = now.progress_body(
+                            current,
+                            timeline.rate,
+                            sampled.elapsed().as_millis() as u64,
+                        );
+                        let stamp = ("RTP-Info", format!("rtptime={current}"));
+                        if progress_enabled[index] {
                             if let Err(error) = connection.request(
                                 "SET_PARAMETER",
                                 uri,
-                                &[("Content-Type", "application/x-dmap-tagged".into())],
+                                &[("Content-Type", "text/parameters".into()), stamp.clone()],
+                                progress.as_bytes(),
+                            ) {
+                                errors.push(format!("{host}: progress: {error:#}"));
+                                // A complete rejection is persistent for this session. An I/O
+                                // failure must not monopolise the shared control connection.
+                                progress_enabled[index] = false;
+                            }
+                        }
+                        let tags = dmap_tags(&now);
+                        if tags_enabled[index]
+                            && !tags.is_empty()
+                            && tags_sent[index].as_ref() != Some(&tags)
+                        {
+                            if let Err(error) = connection.request(
+                                "SET_PARAMETER",
+                                uri,
+                                &[("Content-Type", "application/x-dmap-tagged".into()), stamp],
                                 &tags,
                             ) {
                                 errors.push(format!("{host}: tags: {error:#}"));
+                                tags_enabled[index] = false;
                             } else {
+                                tags_sent[index] = Some(tags);
                                 tags_updated = true;
                             }
                         }
                     }
-                    if tags_updated {
-                        tags_sent = Some((sequence, dmap_tags(&now)));
-                    }
+
                     let _ = tx.try_send(json!({
                         "event": "metadata_sent",
                         "title": now.title,
@@ -212,24 +250,6 @@ impl Worker {
             events,
         })
     }
-}
-/// The receiver's progress line expects an absolute start time on the sender's
-/// clock; using the same base as the stream anchor keeps the bar aligned.
-fn now_ms() -> u64 {
-    #[cfg(windows)]
-    {
-        crate::wasapi::qpc_ns() / 1_000_000
-    }
-    #[cfg(not(windows))]
-    {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    }
-}
-fn start_of(now: &NowPlaying) -> u64 {
-    now_ms().saturating_sub(now.position_ms)
 }
 impl Drop for Worker {
     fn drop(&mut self) {
@@ -265,13 +285,10 @@ mod tests {
         let inner = &bytes[8..];
         // Three non-empty tags, in a fixed order, each with its own length.
         let mut offset = 0;
-        for (tag, value) in [
-            (b"minm", "Title"),
-            (b"asar", "Artist"),
-            (b"asal", "Album"),
-        ] {
+        for (tag, value) in [(b"minm", "Title"), (b"asar", "Artist"), (b"asal", "Album")] {
             assert_eq!(&inner[offset..offset + 4], tag);
-            let len = u32::from_be_bytes(inner[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let len =
+                u32::from_be_bytes(inner[offset + 4..offset + 8].try_into().unwrap()) as usize;
             assert_eq!(&inner[offset + 8..offset + 8 + len], value.as_bytes());
             offset += 8 + len;
         }
@@ -286,9 +303,29 @@ mod tests {
     }
 
     #[test]
-    fn progress_line_uses_milliseconds_and_crlf() {
-        let body = sample().progress_body(1_000);
-        assert_eq!(body, "progress: 1000/42000/240000\r\n");
+    fn progress_line_uses_wrapping_rtp_samples_and_crlf() {
+        let body = sample().progress_body(1_852_200, 44100, 0);
+        assert_eq!(body, "progress: 0/1852200/10584000\r\n");
+    }
+
+    #[test]
+    fn progress_wraps_at_the_selected_sample_rate_and_pause_stops_elapsed_time() {
+        let mut now = sample();
+        now.position_ms = 1_000;
+        now.duration_ms = 2_000;
+        let start = 10u32.wrapping_sub(72_000);
+        let end = start.wrapping_add(96_000);
+        assert_eq!(
+            now.progress_body(10, 48_000, 500),
+            format!("progress: {start}/10/{end}\r\n")
+        );
+        now.playing = false;
+        let start = 10u32.wrapping_sub(48_000);
+        let end = start.wrapping_add(96_000);
+        assert_eq!(
+            now.progress_body(10, 48_000, 500),
+            format!("progress: {start}/10/{end}\r\n")
+        );
     }
 
     #[test]
@@ -367,7 +404,12 @@ mod tests {
             "/stream".to_string(),
             Arc::new(Mutex::new(connection)),
         )];
-        let worker = Worker::start(peers, control.clone()).unwrap();
+        let worker = Worker::start(
+            peers,
+            control.clone(),
+            Timeline::new(42_000 * 441 / 10, 44100),
+        )
+        .unwrap();
         let first = received
             .recv_timeout(Duration::from_secs(2))
             .expect("progress payload");

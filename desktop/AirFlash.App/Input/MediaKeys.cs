@@ -20,7 +20,19 @@ internal static class MediaKeys
     [StructLayout(LayoutKind.Sequential)]
     private struct INPUT { public uint Type; public InputUnion Data; }
     [StructLayout(LayoutKind.Explicit)]
-    private struct InputUnion { [FieldOffset(0)] public KEYBDINPUT Keyboard; }
+    private struct InputUnion
+    {
+        [FieldOffset(0)] public KEYBDINPUT Keyboard;
+        [FieldOffset(0)] public MOUSEINPUT Mouse;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MOUSEINPUT
+    {
+        public int X, Y;
+        public uint MouseData, Flags, Time;
+        public IntPtr ExtraInfo;
+    }
+    internal static int InputSize => Marshal.SizeOf<INPUT>();
     [StructLayout(LayoutKind.Sequential)]
     private struct KEYBDINPUT
     {

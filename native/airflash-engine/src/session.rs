@@ -357,6 +357,32 @@ struct Member {
     preemption: preemption::Tracker,
     /// The receiver took this session over. Never send a TEARDOWN back to it.
     preempted: bool,
+    probe_task: Option<ProbeTask>,
+    event_task: Option<EventTask>,
+}
+struct ProbeTask {
+    stop: Cancellation,
+    worker: Option<JoinHandle<PreemptionRound>>,
+}
+impl Drop for ProbeTask {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+struct EventTask {
+    stop: Cancellation,
+    worker: Option<JoinHandle<Result<EventWorker>>>,
+}
+impl Drop for EventTask {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            self.stop.cancel();
+            let _ = worker.join();
+        }
+    }
 }
 /// Outcome of one preemption poll. Only `Yield` is a terminal fault; a
 /// confirmed takeover returns a reclaim signal so the live loop can open a
@@ -372,7 +398,6 @@ enum PreemptionPoll {
     /// A takeover was confirmed (or the probe failed open, or the busy queue
     /// was exhausted): end this attempt and reclaim the receiver on a fresh
     /// connection.
-    Reclaimed { consecutive: u32 },
     /// The consecutive limit was hit: stop reclaiming, non-retryable.
     Yield(Fault),
 }
@@ -413,6 +438,7 @@ struct RoundProbe {
 /// full all-failed round, because a gateway that comes back has to end the
 /// suppression and, with no gateway at all, the fallback clock only advances
 /// here.
+#[cfg(test)]
 struct AllFailedEpisode {
     /// Start of the current all-failed episode; `None` between episodes.
     since: Option<Instant>,
@@ -428,6 +454,7 @@ struct AllFailedEpisode {
     suppressing: bool,
 }
 
+#[cfg(test)]
 impl AllFailedEpisode {
     fn new() -> Self {
         Self {
@@ -466,16 +493,11 @@ impl AllFailedEpisode {
         }
         let reference = self.gateway.map(probe);
         let held = now.saturating_duration_since(since);
-        let judgement =
-            preemption::judge_all_failed(probes, receivers, reference, Some(held));
+        let judgement = preemption::judge_all_failed(probes, receivers, reference, Some(held));
         let suppress = judgement.suppress();
         let warning = if suppress && !self.suppressing {
             Some(preemption_local_network(
-                receivers,
-                probes,
-                judgement,
-                reference,
-                held,
+                receivers, probes, judgement, reference, held,
             ))
         } else {
             None
@@ -553,15 +575,8 @@ impl Member {
                 .map(|p| p.host)
                 .collect();
             let timer = PtpMaster::start_with_followers(peers, followers, clock.clone())?;
-            // BMCA runs here because it must: before RECORD there is no timeline and
-            // no audio, so yielding cannot be heard. A receiver that announces a
-            // lower priority1 becomes the master; silence or a worse dataset leaves
-            // us as master. This never re-runs mid-session.
-            let verdict = timer.negotiate(peer.host, BRMCA_NEGOTIATION_TIMEOUT);
-            if verdict.yield_master {
-                timer.yield_to(peer.host);
-            }
-            emit(json!({"event":"bmca_verdict","host":peer.host,"yielded":verdict.yield_master,"our_p1":verdict.our_p1,"remote_p1":verdict.remote_p1,"remote_is_master":verdict.remote_is_master,"probes":verdict.probes}));
+            // Timing is activated after SETPEERS below. Automatic role negotiation
+            // before activation cannot send probes; keep the configured clock role.
             *ptp = Some(timer);
         }
         let clock_id = compat.uses_ptp().then(|| ptp.as_ref().unwrap().clock_id);
@@ -623,6 +638,8 @@ impl Member {
             next_event_rebuild: Instant::now(),
             preemption: preemption::Tracker::default(),
             preempted: false,
+            probe_task: None,
+            event_task: None,
         };
         // RAII owns the connection before SETUP so partial handshakes are torn down too.
         let sender_id = "02:57:32:41:50:01";
@@ -800,28 +817,9 @@ impl Member {
         )?);
         Ok(())
     }
-    /// Drain control-plane evidence, then ask the receiver's live `statusFlags`
-    /// when a probe is due. Control symptoms never decide on their own:
-    /// - A `Free` or `BusyElsewhere` verdict is confirmed by one more probe
-    ///   after [`preemption::CONFIRM_DELAY`]; a disagreement never reclaims.
-    /// - `BusyElsewhere` queues another probe with exponential backoff and keeps
-    ///   the media loop alive. Queueing never gives up: a receiver that stays
-    ///   busy for an hour is probed once a minute and is never reclaimed for
-    ///   being busy (Q34).
-    /// - `Gone` (healthy media + a refused or failed TCP liveness probe)
-    ///   reclaims: the device is gone or is not serving us, not taken over.
-    ///   `Unknown` / probe error / timeout with unhealthy media reclaim
-    ///   immediately (fail-open).
-    /// - Only a confirmed `Free` is a genuine takeover cycle; the per-receiver
-    ///   counter decides whether it is another cycle or the sender must yield.
-    ///
-    /// One round is split in two so Q42's group-wide rule can run in between:
-    /// [`Self::prepare_preemption`] gathers every member's evidence and probe
-    /// without deciding anything, the caller applies
-    /// [`preemption::local_network_suspected`] across the whole group, and
-    /// [`Self::apply_preemption`] turns each round into an action. This
-    /// single-member wrapper keeps one-receiver paths and direct-call tests
-    /// unchanged.
+    /// Synchronous fixture wrapper around the asynchronous production probe.
+    /// Confirmed busy ownership yields; free or unreachable peers are ordinary
+    /// retryable transport faults, and healthy media survives auxiliary failures.
     #[cfg(test)]
     fn poll_preemption(
         &mut self,
@@ -830,106 +828,118 @@ impl Member {
         now: Instant,
         emit: &impl Fn(Json),
     ) -> (PreemptionPoll, bool) {
-        let round = self.prepare_preemption(cancel, now);
+        let mut round = self.prepare_preemption(cancel, now);
+        while round.probe.is_none() && self.probe_task.is_some() {
+            thread::sleep(Duration::from_millis(1));
+            round = self.prepare_preemption(cancel, now);
+        }
         self.apply_preemption(round, takeovers, now, emit, false)
     }
 
-    /// Phase 1 of one preemption round: drain the evidence, probe the control
-    /// port's liveness and — when a probe is due — the receiver's live
-    /// `statusFlags`. Nothing is decided here: Q42's group-wide rule needs the
-    /// whole group's liveness before any member may be called gone.
+    /// Drain completed probe results or start one bounded background round.
+    /// The sender never waits for a TCP connect or a receiver response here.
     fn prepare_preemption(&mut self, cancel: &Cancellation, now: Instant) -> PreemptionRound {
-        let media_healthy = self.media.media_healthy(now, MEDIA_HEALTH_WINDOW);
-        let signals = self.health.take_preemption_signals();
-        // The receiver-side liveness dimension Q34 recovered. It is probed once
-        // per evidence/probe round and reused for the evidence line, so the
-        // `tcp_reachable` diagnostic field costs one connect, not two.
-        let mut liveness = None;
-        if !signals.is_empty() {
-            for signal in &signals {
-                self.preemption.observe(*signal, now);
-            }
-            liveness = Some(preemption::receiver_liveness(
-                self.peer.host,
-                self.peer.port,
-                preemption::LIVENESS_TIMEOUT,
-            ));
-        }
-        if !self.preemption.due(now) || cancel.is_cancelled() {
-            // Evidence is still reported with the probe taken for it, but no
-            // verdict is due: nothing is fed to the escalation timer.
-            return PreemptionRound {
-                media_healthy,
-                signals,
-                evidence: liveness,
-                probe: None,
-            };
-        }
-        let liveness = liveness.unwrap_or_else(|| {
-            preemption::receiver_liveness(
-                self.peer.host,
-                self.peer.port,
-                preemption::LIVENESS_TIMEOUT,
-            )
-        });
-        // The dimension the receiver's session bit cannot give us: our own media
-        // is still flowing (or the ended conclusion is stale). Without it our own
-        // healthy session would look like "a session is active and we are
-        // reclaiming", i.e. a takeover of ourselves (Q31/Q32).
-        let we_hold_session = self.preemption.we_hold_session(media_healthy, now);
-        // A receiver that refused the connection or cannot be reached cannot
-        // answer `/info` either; probing it would only burn the RTSP timeout
-        // after the TCP probe already settled it. Q34's table turns that
-        // straight into `Gone` (a reclaim, never busy). Q42 keeps the two raw
-        // states apart in the log: refused is not dead.
-        let result = if matches!(
-            liveness,
-            preemption::ReceiverLiveness::Dead | preemption::ReceiverLiveness::Refused
-        ) {
-            Ok(preemption::ProbeReport {
-                outcome: preemption::ProbeOutcome::Gone,
-                status_flags: None,
-            })
-        } else {
-            let address = SocketAddr::new(self.peer.host, self.peer.port);
-            match preemption::probe_report(
-                address,
-                cancel,
-                preemption::PROBE_TIMEOUT,
-                we_hold_session,
-            ) {
-                Ok(report) => Ok(preemption::ProbeReport {
-                    // Q34's combine table: healthy media with a reachable (or
-                    // unproven) receiver is our session, whatever `/info` says.
-                    outcome: preemption::combine(
-                        media_healthy,
-                        liveness,
-                        report.status_flags,
-                        we_hold_session,
-                    ),
-                    status_flags: report.status_flags,
-                }),
-                // Healthy media outranks an auxiliary probe failure: the control
-                // channel is not the media path (Q34: feedback failure is not
-                // media failure). With unhealthy media the fail-open reclaim
-                // below still applies.
-                Err(_) if media_healthy => Ok(preemption::ProbeReport {
-                    outcome: preemption::combine(media_healthy, liveness, None, we_hold_session),
-                    status_flags: None,
-                }),
-                Err(error) => Err(error),
-            }
-        };
-        PreemptionRound {
-            media_healthy,
-            signals,
+        let healthy = self.media.media_healthy(now, MEDIA_HEALTH_WINDOW);
+        let empty = || PreemptionRound {
+            media_healthy: healthy,
+            signals: Vec::new(),
             evidence: None,
-            probe: Some(RoundProbe {
-                liveness,
-                result,
-                we_hold_session,
-            }),
+            probe: None,
+        };
+        if cancel.is_cancelled() {
+            return empty();
         }
+        if let Some(task) = &self.probe_task {
+            if !task
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.is_finished())
+            {
+                return empty();
+            }
+            let mut task = self.probe_task.take().unwrap();
+            return task
+                .worker
+                .take()
+                .unwrap()
+                .join()
+                .unwrap_or_else(|_| empty());
+        }
+        let signals = self.health.take_preemption_signals();
+        for signal in &signals {
+            self.preemption.observe(*signal, now);
+        }
+        if !self.preemption.due(now) {
+            return empty();
+        }
+        // A successful UDP send is local socket acceptance, not receiver playback.
+        // In particular it cannot contradict a receiver-initiated TEARDOWN.
+        let media_healthy =
+            self.media.media_healthy(now, MEDIA_HEALTH_WINDOW) && !self.preemption.session_ended();
+        let we_hold_session = !self.preemption.session_ended();
+        let host = self.peer.host;
+        let port = self.peer.port;
+        let stop = Cancellation::default();
+        let done = stop.clone();
+        let worker = thread::Builder::new()
+            .name("airplay-status-probe".into())
+            .spawn(move || {
+                let liveness =
+                    preemption::receiver_liveness(host, port, preemption::LIVENESS_TIMEOUT);
+                let result = if done.is_cancelled() {
+                    Err(crate::rtsp::WireError::Cancelled.into())
+                } else if matches!(
+                    liveness,
+                    preemption::ReceiverLiveness::Dead | preemption::ReceiverLiveness::Refused
+                ) {
+                    Ok(preemption::ProbeReport {
+                        outcome: preemption::ProbeOutcome::Gone,
+                        status_flags: None,
+                    })
+                } else {
+                    match preemption::probe_report(
+                        SocketAddr::new(host, port),
+                        &done,
+                        preemption::PROBE_TIMEOUT,
+                        we_hold_session,
+                    ) {
+                        Ok(report) => Ok(preemption::ProbeReport {
+                            outcome: preemption::combine(
+                                media_healthy,
+                                liveness,
+                                report.status_flags,
+                                we_hold_session,
+                            ),
+                            status_flags: report.status_flags,
+                        }),
+                        Err(_) if media_healthy => Ok(preemption::ProbeReport {
+                            outcome: preemption::ProbeOutcome::OursActive,
+                            status_flags: None,
+                        }),
+                        Err(error) => Err(error),
+                    }
+                };
+                PreemptionRound {
+                    media_healthy,
+                    signals,
+                    evidence: None,
+                    probe: Some(RoundProbe {
+                        liveness,
+                        result,
+                        we_hold_session,
+                    }),
+                }
+            });
+        match worker {
+            Ok(worker) => {
+                self.probe_task = Some(ProbeTask {
+                    stop,
+                    worker: Some(worker),
+                })
+            }
+            Err(_) => self.preemption.await_liveness(now),
+        }
+        empty()
     }
 
     /// Phase 2: feed the round through Q42's escalation rule and act on the
@@ -1001,76 +1011,102 @@ impl Member {
             emit(preemption_probe_disagreement(self, first, second));
         }
         match note.action {
-            // The first verdict would change state; wait for its one
-            // confirmation probe. The old control symptom must not decide while
-            // its verdict is being checked. A queued busy verdict is the same
-            // wait, with the backoff interval.
-            preemption::ProbeAction::Confirm
-            | preemption::ProbeAction::Requeue => (PreemptionPoll::Waiting, media_healthy),
-            // The active session on the receiver is ours: the control-plane
-            // symptom is something else, so take no preemption action and fall
-            // through to the existing health checks below.
+            preemption::ProbeAction::Confirm => (PreemptionPoll::Waiting, media_healthy),
+            preemption::ProbeAction::Requeue => {
+                let _ = takeovers.takeover(self.peer.host, now);
+                self.preempted = true;
+                if let Ok(mut connection) = self.conn.try_lock() {
+                    connection.poison();
+                }
+                self.preemption.suspend();
+                (
+                    PreemptionPoll::Yield(preemption_fault(
+                        self,
+                        preemption::ReclaimReason::Takeover,
+                        1,
+                    )),
+                    media_healthy,
+                )
+            }
             preemption::ProbeAction::FallThrough => {
-                // Q42's timer needs another sample while the verdict is still
-                // undecided. Without this the patience limit could never be
-                // reached: the feedback worker that produced the evidence is
-                // gone and would never schedule another probe. A local-suspect
-                // round is not this device's failure and does not move its
-                // counter, but it is re-probed too: Q46's gateway reference has
-                // to be re-evaluated (a recovered gateway ends the suppression)
-                // and its fallback clock only advances on full rounds.
                 if liveness.verdict == preemption::Verdict::Unknown {
                     self.preemption.await_liveness(now);
                 }
                 (PreemptionPoll::None, media_healthy)
             }
             preemption::ProbeAction::Reclaim => {
-                // Confirmed (or fail-open). The old encrypted control connection
-                // belongs to the session the receiver already ended; the reclaim
-                // must use a fresh connection, never this one (Q16).
                 self.preempted = true;
-                self.conn.lock().unwrap().poison();
-                if note.takeover {
-                    // Only a confirmed `Free` after our session ended is a
-                    // genuine takeover cycle (Q34 §四). Queueing, a dead device
-                    // and the fail-open paths never advance this counter.
-                    match takeovers.takeover(self.peer.host, now) {
-                        preemption::TakeoverVerdict::Reclaim { consecutive } => {
-                            emit(preemption_warning(
-                                self,
-                                preemption::ReclaimReason::Takeover,
-                                consecutive,
-                            ));
-                            (PreemptionPoll::Reclaimed { consecutive }, media_healthy)
-                        }
-                        preemption::TakeoverVerdict::Yield { consecutive } => {
-                            // `yielding` is terminal: drop every queued probe
-                            // before reporting, so nothing is due afterwards.
-                            self.preemption.suspend();
-                            emit(preemption_warning(
-                                self,
-                                preemption::ReclaimReason::Limit,
-                                consecutive,
-                            ));
-                            (
-                                PreemptionPoll::Yield(preemption_fault(
-                                    self,
-                                    preemption::ReclaimReason::Limit,
-                                    consecutive,
-                                )),
-                                media_healthy,
-                            )
-                        }
-                    }
-                } else {
-                    // A dead receiver or a fail-open probe is a reclaim, not a
-                    // takeover: no counter, no "another controller" warning.
-                    let consecutive = takeovers.consecutive(self.peer.host).max(1);
-                    (PreemptionPoll::Reclaimed { consecutive }, media_healthy)
+                if let Ok(mut connection) = self.conn.try_lock() {
+                    connection.poison();
                 }
+                self.preemption.suspend();
+                // A free or unreachable receiver is not evidence of another sender.
+                (
+                    PreemptionPoll::Yield(Fault::new(
+                        self.peer.host,
+                        "feedback",
+                        "peer_closed",
+                        true,
+                        "Receiver ended the current session; reconnect explicitly or use the configured transport retry",
+                    )),
+                    media_healthy,
+                )
             }
         }
     }
+    fn poll_event_rebuild(&mut self, emit: &impl Fn(Json)) {
+        if let Some(task) = &self.event_task {
+            if !task
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.is_finished())
+            {
+                return;
+            }
+            let mut task = self.event_task.take().unwrap();
+            match task.worker.take().unwrap().join() {
+                Ok(Ok(worker)) => {
+                    self.events = Some(worker);
+                    emit(
+                        json!({"event":"warning","host":self.peer.host,"channel":"events","code":"event_channel_rebuilt","recovered":true,"message":"Event channel reopened"}),
+                    );
+                }
+                _ => emit(
+                    json!({"event":"warning","host":self.peer.host,"channel":"events","code":"event_channel_rebuild_failed","recovered":false,"message":"Event channel could not be reopened"}),
+                ),
+            }
+        }
+        if self.health.degraded_channel("events").is_none()
+            || self.event_rebuilds >= MAX_EVENT_REBUILDS
+            || Instant::now() < self.next_event_rebuild
+        {
+            return;
+        }
+        let Some(addr) = self.event_addr else {
+            return;
+        };
+        self.event_rebuilds += 1;
+        self.next_event_rebuild = Instant::now() + EVENT_REBUILD_INTERVAL;
+        let key = zeroize::Zeroizing::new(self.event_key.clone());
+        let health = self.health.clone();
+        let old = self.events.take();
+        let stop = Cancellation::default();
+        let done = stop.clone();
+        if let Ok(worker) = thread::Builder::new()
+            .name("airplay-event-rebuild".into())
+            .spawn(move || {
+                drop(old);
+                done.check()?;
+                EventWorker::connect_with_stop(addr, &key, health, done)
+            })
+        {
+            self.event_task = Some(EventTask {
+                stop,
+                worker: Some(worker),
+            });
+        }
+    }
+
     fn metrics(&self, ptp: Option<&PtpMaster>) -> Json {
         let clock = ptp.and_then(|timer| {
             timer
@@ -1085,6 +1121,8 @@ impl Member {
             return;
         }
         self.closed = true;
+        self.probe_task.take();
+        self.event_task.take();
         self.feedback.take();
         // A receiver that took the session over must not receive a TEARDOWN from
         // the session it just displaced; the takeover already ended it.
@@ -1103,11 +1141,7 @@ impl Drop for Member {
 
 /// Probe one member's `/info`, retrying a transient connection failure exactly
 /// like the old single-phase connect did.
-fn probe_member(
-    peer: &Peer,
-    cancel: &Cancellation,
-    emit: &dyn Fn(Json),
-) -> Result<MemberProbe> {
+fn probe_member(peer: &Peer, cancel: &Cancellation, emit: &dyn Fn(Json)) -> Result<MemberProbe> {
     let mut attempt = 0;
     loop {
         match MemberProbe::connect(peer, cancel.clone(), emit) {
@@ -1134,10 +1168,7 @@ fn probe_member(
 /// A refused group has no single failing receiver. Pointing at the first member
 /// whose AirPlay 2 evidence differs from the group's first member gives
 /// diagnostics the concrete device that disagrees, deterministically.
-fn mixed_group_host(
-    peers: &[Peer],
-    fingerprints: &[crate::profile::CompatFingerprint],
-) -> String {
+fn mixed_group_host(peers: &[Peer], fingerprints: &[crate::profile::CompatFingerprint]) -> String {
     let Some(reference) = fingerprints
         .first()
         .map(crate::profile::CompatFingerprint::airplay2)
@@ -1226,7 +1257,7 @@ fn group_timing_diagnostic(
                 } else {
                     ""
                 },
-                if evidence.airplay2 {
+                if evidence.airplay2 == Some(true) {
                     "airplay2"
                 } else {
                     "no airplay2"
@@ -1844,10 +1875,21 @@ fn run_stream(
 fn rtp_totals(members: &[Member]) -> (u64, u64) {
     members.iter().fold((0, 0), |(rtx, sent), member| {
         (
-            rtx.saturating_add(member.media.metrics.retransmit_requests),
+            rtx.saturating_add(member.media.metrics.retransmit_requested_packets),
             sent.saturating_add(member.media.metrics.packets_sent),
         )
     })
+}
+
+fn rtp_queue_state(members: &[Member]) -> (usize, u64) {
+    members
+        .iter()
+        .fold((0usize, 0u64), |(pending, drops), member| {
+            (
+                pending.saturating_add(member.media.retransmit_pending()),
+                drops.saturating_add(member.media.metrics.retransmit_queue_drops),
+            )
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1934,9 +1976,12 @@ fn send_packets(
     } else {
         vec![crate::volume::Worker::start(volume_peers.clone(), volume)?]
     };
+    let metadata_timeline =
+        crate::metadata::Timeline::new(members[0].media.packetizer.timestamp, rate);
     let metadata_worker = crate::metadata::Worker::start(
         volume_peers,
         crate::metadata::global().clone(),
+        metadata_timeline.clone(),
     )
     .ok();
     let mut next_metrics = start + Duration::from_secs(1);
@@ -1945,7 +1990,10 @@ fn send_packets(
     // the microsecond reset comparison below) does not lose a remainder. This is
     // an internal invariant, not a promise of sub-millisecond lead control
     // (Q44 §二).
+    reset_lead();
+    let mutable_anchor = members.iter().all(|m| m.media.supports_timeline_shift());
     let mut applied_lead_us = 0i64;
+    let mut unsupported_lead = None;
     // RTP-side evidence for distinguishing a transport failure from a local
     // sender stall when a successful re-anchor absorbs a missed deadline (Q43,
     // Q44). The pre-stall window is compared against the sender's own steady
@@ -1969,7 +2017,7 @@ fn send_packets(
     // all-failed episode (not per round: a routing-table lookup every 3 s of an
     // outage would buy nothing) while its reachability is probed again on every
     // full round, so a recovered reference ends the suppression.
-    let mut all_failed = AllFailedEpisode::new();
+
     let outcome = (|| -> Result<StreamEnd> {
         while (options.duration_ms == 0 || start.elapsed() < duration) && !cancel.is_cancelled() {
             if let Some(source) = live {
@@ -1983,6 +2031,7 @@ fn send_packets(
                     return Ok(StreamEnd::Silence(now));
                 }
             }
+            metadata_timeline.set(members[0].media.packetizer.timestamp);
             for worker in &volume_workers {
                 for event in worker.events.try_iter() {
                     emit(event);
@@ -2001,57 +2050,15 @@ fn send_packets(
             for member in members.iter_mut() {
                 rounds.push(member.prepare_preemption(cancel, Instant::now()));
             }
-            let probed: Vec<_> = rounds
-                .iter()
-                .filter_map(|round| round.probe.as_ref().map(|probe| probe.liveness))
-                .collect();
-            // Q46: "all receivers failed" is only a judgement when the round
-            // has a control group. Probe the default gateway, which shares our
-            // local path but not the receivers' power state:
-            //   gateway answered + all failed => the devices really are gone;
-            //   gateway silent     + all failed => our own network, mark nothing
-            //                                      dead;
-            //   no default route   + all failed => suppress, but only for
-            //                                      GATEWAY_FALLBACK_WINDOW.
-            // A judgement needs every member probed in the same round; a
-            // partial round leaves each receiver's own verdict standing.
-            let (local_suspected, warning) = all_failed.observe(
-                &probed,
-                members.len(),
-                Instant::now(),
-                &preemption::default_gateway,
-                &|address| {
-                    preemption::reference_reachability(
-                        address,
-                        &preemption::GATEWAY_PROBE_PORTS,
-                        preemption::GATEWAY_PROBE_TIMEOUT,
-                    )
-                },
-            );
-            if let Some(event) = warning {
-                emit(event);
-            }
             for (member, round) in members.iter_mut().zip(rounds) {
                 for notice in member.health.notices() {
                     emit(notice);
                 }
-                let (preemption, media_healthy) = member.apply_preemption(
-                    round,
-                    takeovers,
-                    Instant::now(),
-                    emit,
-                    local_suspected,
-                );
+                let (preemption, media_healthy) =
+                    member.apply_preemption(round, takeovers, Instant::now(), emit, false);
                 let waiting = match preemption {
                     PreemptionPoll::None => false,
                     PreemptionPoll::Waiting => true,
-                    PreemptionPoll::Reclaimed { consecutive } => {
-                        return Err(preemption::Reclaim {
-                            host: member.peer.host,
-                            consecutive,
-                        }
-                        .into());
-                    }
                     PreemptionPoll::Yield(fault) => return Err(fault.into()),
                 };
                 member.health.check()?;
@@ -2068,37 +2075,7 @@ fn send_packets(
                 // flowing, so a dead event channel costs metadata and buttons only
                 // until the next attempt. Bounded, because a receiver that refuses
                 // the channel will refuse it forever.
-                if let Some(fault) = member.health.control_degraded()
-                    && fault.channel == "events"
-                    && member.event_rebuilds < MAX_EVENT_REBUILDS
-                    && Instant::now() >= member.next_event_rebuild
-                    && let Some(addr) = member.event_addr
-                {
-                    member.event_rebuilds += 1;
-                    member.next_event_rebuild = Instant::now() + EVENT_REBUILD_INTERVAL;
-                    match EventWorker::connect(addr, &member.event_key, member.health.clone()) {
-                        Ok(worker) => {
-                            member.events = Some(worker);
-                            member.health.clear_degraded();
-                            emit(json!({
-                                "event": "warning",
-                                "host": member.peer.host.to_string(),
-                                "channel": "events",
-                                "code": "event_channel_rebuilt",
-                                "recovered": true,
-                                "message": "Event channel reopened",
-                            }));
-                        }
-                        Err(error) => emit(json!({
-                            "event": "warning",
-                            "host": member.peer.host.to_string(),
-                            "channel": "events",
-                            "code": "event_channel_rebuild_failed",
-                            "recovered": false,
-                            "message": error.to_string(),
-                        })),
-                    }
-                }
+                member.poll_event_rebuild(emit);
             }
             if let Some(timer) = &ptp {
                 // PTP silence is not an immediate fault: the last offset keeps
@@ -2146,7 +2123,18 @@ fn send_packets(
             // anchor without rewriting the session's origin (a rewritten origin is
             // exactly what makes the receiver jump a segment).
             let ceiling = lead_ceiling(members);
-            let wanted = requested_lead().min(ceiling);
+            let requested = requested_lead();
+            if !mutable_anchor && requested != 0 && unsupported_lead != Some(requested) {
+                unsupported_lead = Some(requested);
+                emit(
+                    json!({"event":"lead_error","message":"Runtime lead changes require realtime UDP on every member"}),
+                );
+            }
+            let wanted = if mutable_anchor {
+                requested.min(ceiling)
+            } else {
+                0
+            };
             let wanted_us = wanted * 1_000;
             if wanted_us != applied_lead_us {
                 let applied_us = schedule.add_shift_us(wanted_us - applied_lead_us);
@@ -2160,7 +2148,9 @@ fn send_packets(
                     // are inaudible and would make `latency_change` equal
                     // `lead_shift_count` (Q44 §二).
                     telemetry.record_lead_shift(applied_us);
-                    emit(json!({"event":"lead_changed","channel":"scheduler","host":null,"requested_ms":wanted,"applied_ms":applied_lead_us / 1_000,"shift_us":applied_us,"ceiling_ms":ceiling,"shift_ms":round3(schedule.shift.as_secs_f64() * 1000.0)}));
+                    emit(
+                        json!({"event":"lead_changed","channel":"scheduler","host":null,"requested_ms":wanted,"applied_ms":applied_lead_us / 1_000,"shift_us":applied_us,"ceiling_ms":ceiling,"shift_ms":round3(schedule.shift.as_secs_f64() * 1000.0)}),
+                    );
                 }
             }
             let deadline = schedule.deadline();
@@ -2218,6 +2208,11 @@ fn send_packets(
                         );
                     }
                     crate::transport::LateAction::Reanchor => {
+                        if !mutable_anchor {
+                            telemetry.expired += 1;
+                            return Err(Fault::new("", "scheduler", "timeline_expired", true,
+                                "Buffered playback requires a fresh session anchor after a sender stall").into());
+                        }
                         // Over budget: move the whole timeline forward instead of
                         // tearing the session down. Sequence numbers and RTP
                         // timestamps stay untouched; only the rtptime→networkTime
@@ -2275,7 +2270,9 @@ fn send_packets(
                                 telemetry.record_stall_drain(window.close_early(rtp_req));
                             }
                             stall_drain = Some(crate::telemetry::StallDrainWindow::open(
-                                now, rtp_req,
+                                now,
+                                rtp_req,
+                                rtp_queue_state(members).1,
                             ));
                             telemetry.record_timeline_reset(reason);
                             recovery_left = 0;
@@ -2295,9 +2292,11 @@ fn send_packets(
             // unwind of an already-counted re-anchor, not a new timeline reset:
             // counting it would turn one stall into a stream of `latency_change`
             // events that nobody caused.
-            if applied_lead_us == 0 {
-                schedule.relax(now, late);
-            }
+            schedule.relax_to(
+                now,
+                late,
+                Duration::from_micros(applied_lead_us.max(0) as u64),
+            );
             if now >= next_sync {
                 for m in members.iter_mut() {
                     let local = offset_time(
@@ -2384,6 +2383,7 @@ fn send_packets(
                     ptp,
                 );
                 crate::telemetry::publish_diagnostics(snapshot.clone());
+                telemetry.lateness_interval = crate::telemetry::Histogram::default();
                 emit(snapshot);
                 next_metrics = now + Duration::from_secs(1);
             }
@@ -2423,7 +2423,8 @@ fn send_packets(
             // 16 requests, so measuring only the first drain after the re-anchor
             // saturates at 16 and stops saying anything about severity.
             if let Some(window) = stall_drain.as_mut() {
-                let drained = window.observe(Instant::now(), rtp_totals(members).0);
+                let (pending, drops) = rtp_queue_state(members);
+                let drained = window.observe(Instant::now(), rtp_totals(members).0, pending, drops);
                 if let Some(drain) = drained {
                     telemetry.record_stall_drain(drain);
                     stall_drain = None;
@@ -2441,7 +2442,8 @@ fn send_packets(
     // A stall in the last 250 ms of the session never reaches its own deadline.
     // Report what the window saw rather than dropping the stall from the summary.
     if let Some(window) = stall_drain.take() {
-        telemetry.record_stall_drain(window.close(rtp_totals(members).0));
+        let (pending, drops) = rtp_queue_state(members);
+        telemetry.record_stall_drain(window.close(rtp_totals(members).0, pending, drops));
     }
     // Stop/reconfiguration shares one faded final packet and drains its render
     // deadline on every member before tearing down the common session.
@@ -2527,9 +2529,23 @@ fn send_packets(
         fields.insert("packets_per_member".into(), json!(packets));
         fields.insert("frames".into(), json!(schedule.frames));
         fields.insert("silence_packets".into(), json!(silence_packets));
-        fields.insert("max_send_lateness_us".into(), json!(schedule.max_lateness_us));
-        fields.insert("retransmits".into(), json!(members.iter().map(|m|m.media.metrics.retransmits_sent).sum::<u64>()));
-        fields.insert("ptp_packets_received".into(), json!(ptp.as_ref().map(|p|p.received.load(Ordering::Relaxed))));
+        fields.insert(
+            "max_send_lateness_us".into(),
+            json!(schedule.max_lateness_us),
+        );
+        fields.insert(
+            "retransmits".into(),
+            json!(
+                members
+                    .iter()
+                    .map(|m| m.media.metrics.retransmits_sent)
+                    .sum::<u64>()
+            ),
+        );
+        fields.insert(
+            "ptp_packets_received".into(),
+            json!(ptp.as_ref().map(|p| p.received.load(Ordering::Relaxed))),
+        );
         fields.insert("measured_latency_ms".into(), Json::Null);
         fields.insert("qualified".into(), json!(false));
     }
@@ -2656,42 +2672,18 @@ pub(crate) fn emit_session_summary(
     }
 }
 
-/// One warning in the existing shape. `reason` is `takeover` (the live loop
-/// reclaims on a fresh connection) or `limit` (the consecutive counter yields,
-/// non-retryable). The two must stay distinguishable in the payload.
-fn preemption_warning(
-    member: &Member,
-    reason: preemption::ReclaimReason,
-    consecutive: u32,
-) -> Json {
-    json!({
-        "event": "warning",
-        "host": member.peer.host.to_string(),
-        "channel": "control",
-        "code": "preempted",
-        "recovered": false,
-        "reason": reason.name(),
-        "consecutive": consecutive,
-        "message": match reason {
-            preemption::ReclaimReason::Takeover => "Another controller took over this receiver; AirFlash is reclaiming it",
-            preemption::ReclaimReason::Limit => "Another controller keeps taking over this receiver; AirFlash is yielding",
-        },
-    })
-}
+/// A confirmed takeover yields until the user explicitly starts playback again.
 fn preemption_fault(
     member: &Member,
     reason: preemption::ReclaimReason,
-    consecutive: u32,
+    _consecutive: u32,
 ) -> Fault {
     Fault::new(
         member.peer.host,
         "control",
         "preempted",
         false,
-        format!(
-            "Another controller keeps taking over this receiver ({consecutive} in a row within {} s); AirFlash yielded and will not reconnect automatically.",
-            preemption::TAKEOVER_WINDOW.as_secs()
-        ),
+        "Another controller took over this receiver; AirFlash stopped and will not reconnect automatically. Start playback again to claim it back.",
     )
     .with_reason(reason.name())
 }
@@ -2825,9 +2817,11 @@ fn preemption_probe(
             event["status_flags"] = json!(report.status_flags);
             // Telemetry only: bit 14 says the stereo partner is unreachable. It
             // has no session-ownership meaning and never changes the verdict.
-            event["stereo_partner_unreachable"] = json!(report
-                .status_flags
-                .is_some_and(|flags| flags & preemption::STEREO_PARTNER_UNREACHABLE != 0));
+            event["stereo_partner_unreachable"] = json!(
+                report
+                    .status_flags
+                    .is_some_and(|flags| flags & preemption::STEREO_PARTNER_UNREACHABLE != 0)
+            );
             event["message"] = json!(match (report.outcome, report.status_flags) {
                 // A group-wide failure is never reported as a dead device: the
                 // evidence belongs to our own side (Q42).
@@ -2872,6 +2866,7 @@ fn preemption_probe(
 /// (`local_network`) from "there was no default route to ask"
 /// (`local_network_unproven`), and `all_failed_for_ms` is how long the episode
 /// has run (it matters only for the time-boxed fallback).
+#[cfg(test)]
 fn preemption_local_network(
     receivers: usize,
     probes: &[preemption::ReceiverLiveness],
@@ -2943,7 +2938,9 @@ fn sample_capture(
 ) {
     let metrics = source.metrics();
     if let Some(previous) = baseline {
-        telemetry.input_drops += metrics.dropped_frames.saturating_sub(previous.dropped_frames);
+        telemetry.input_drops += metrics
+            .dropped_frames
+            .saturating_sub(previous.dropped_frames);
         telemetry.capture_glitches += metrics
             .discontinuities
             .saturating_sub(previous.discontinuities);
@@ -2986,17 +2983,26 @@ fn transport_metrics(
     let mut snapshot = telemetry.snapshot();
     if let Json::Object(ref mut fields) = snapshot {
         fields.insert("event".into(), json!("transport_metrics"));
-        fields.insert("session_uptime_ms".into(), json!(schedule.start.elapsed().as_millis()));
+        fields.insert(
+            "session_uptime_ms".into(),
+            json!(schedule.start.elapsed().as_millis()),
+        );
         fields.insert("sender_late_recoveries".into(), json!(schedule.recoveries));
         fields.insert("skipped_packets".into(), json!(schedule.skipped_packets));
-        fields.insert("max_send_lateness_us".into(), json!(schedule.max_lateness_us));
+        fields.insert(
+            "max_send_lateness_us".into(),
+            json!(schedule.max_lateness_us),
+        );
         fields.insert(
             "playout_ms".into(),
             json!((playout.as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0),
         );
         fields.insert("queue_depth".into(), json!(queue.map(|q| q.0)));
         fields.insert("queue_capacity".into(), json!(queue.map(|q| q.1)));
-        fields.insert("members".into(), json!(members.iter().map(|m| m.metrics(ptp)).collect::<Vec<_>>()));
+        fields.insert(
+            "members".into(),
+            json!(members.iter().map(|m| m.metrics(ptp)).collect::<Vec<_>>()),
+        );
     }
     snapshot
 }
@@ -3009,14 +3015,12 @@ fn round3(value: f64) -> f64 {
 /// so a process-wide cell keeps `set_lead` from having to thread another parameter
 /// through six call sites. Zero means "whatever the timeline needs".
 static LEAD_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-/// Absolute ceiling for an operator-requested lead. The effective ceiling is the
-/// receiver's declared buffer (`lead_ceiling`); this only bounds a request when the
-/// device never declared one.
+/// Absolute ceiling for an operator-requested extra lead. The lower session cap
+/// is a local policy derived from requested latency, not a measured device buffer.
 pub const MAX_LEAD_MS: i64 = 2000;
-/// The adaptive range WAC allows above the chosen latency is +100 ms. Staying inside
-/// the device's own buffer is what keeps a larger lead from simply overflowing.
+/// Local headroom above requested latency; receiver capacity is not measured here.
 pub const LEAD_HEADROOM_MS: i64 = 100;
-/// Extra lead a request may add, from what the receivers actually promised to buffer.
+/// Bound requested extra lead conservatively using the session's latency settings.
 fn lead_ceiling(members: &[Member]) -> i64 {
     lead_ceiling_from(members.iter().filter_map(|m| m.peer.profile.latency_ms))
 }
@@ -3027,7 +3031,10 @@ fn lead_ceiling_from(declared: impl Iterator<Item = u32>) -> i64 {
         .clamp(LEAD_HEADROOM_MS, MAX_LEAD_MS)
 }
 pub fn request_lead(ms: i64) {
-    LEAD_MS.store(ms.clamp(0, MAX_LEAD_MS), std::sync::atomic::Ordering::Release);
+    LEAD_MS.store(
+        ms.clamp(0, MAX_LEAD_MS),
+        std::sync::atomic::Ordering::Release,
+    );
 }
 pub fn requested_lead() -> i64 {
     LEAD_MS.load(std::sync::atomic::Ordering::Acquire)
@@ -3035,11 +3042,8 @@ pub fn requested_lead() -> i64 {
 pub fn reset_lead() {
     LEAD_MS.store(0, std::sync::atomic::Ordering::Release);
 }
-/// Time allowed for the receiver's Announce to arrive before SETUP. Three probes
-/// are sent 300 ms apart, so this only rides out one late reply.
-const BRMCA_NEGOTIATION_TIMEOUT: Duration = Duration::from_millis(1_200);
-/// A receiver that has accepted RTP this recently is still listening, even if the
-/// control channel is unhappy.
+/// Recent socket-write health. This does not prove receiver ownership and cannot
+/// override an explicit receiver-initiated TEARDOWN.
 const MEDIA_HEALTH_WINDOW: Duration = Duration::from_secs(2);
 /// How long a stale PTP offset keeps driving the timeline. The reference
 /// implementation freezes drift correction on PTP silence instead of ending the
@@ -3080,10 +3084,10 @@ mod tests {
         AIRPLAY2_BIT, Codec, CompatFingerprint, Formats, Profile, Timing, TimingPlan, Transport,
     };
     #[test]
-    fn lead_ceiling_follows_what_the_receiver_promised_to_buffer() {
-        // No declared buffer: only the absolute cap applies.
+    fn lead_ceiling_is_a_local_policy_based_on_requested_latency() {
+        // No requested latency: only the absolute cap applies.
         assert_eq!(lead_ceiling_from(std::iter::empty()), MAX_LEAD_MS);
-        // A solo HomePod buffer of 250 ms allows 250 + 100 ms of lead.
+        // A requested latency of 250 ms allows 250 + 100 ms of extra lead.
         assert_eq!(lead_ceiling_from([250].into_iter()), 350);
         // A stereo pair uses the largest member, not the smallest.
         assert_eq!(lead_ceiling_from([120, 300].into_iter()), 400);
@@ -3130,14 +3134,16 @@ mod tests {
             Codec::Auto,
         )
         .unwrap();
-        let line =
-            group_timing_diagnostic(&peers, &[homepod.clone(), appletv], plan).unwrap();
+        let line = group_timing_diagnostic(&peers, &[homepod.clone(), appletv], plan).unwrap();
         // The content that used to ride on the warning is still available, but
         // as a plain string written to the engine log. It explains the group
         // plan, never a downgrade.
         assert!(line.starts_with("group_timing_plan:"));
         assert!(line.contains("left") && line.contains("right"), "{line}");
-        assert!(line.contains("one PTP clock domain for the group"), "{line}");
+        assert!(
+            line.contains("one PTP clock domain for the group"),
+            "{line}"
+        );
         assert!(!line.contains("forced"), "{line}");
         // A group whose members agree on everything has no diagnostic at all.
         let homepod_plan = TimingPlan::select(
@@ -3309,9 +3315,7 @@ mod tests {
                     && request.first.starts_with("POST /feedback")
                 {
                     if connection
-                        .write(
-                            b"TEARDOWN rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 4242\r\n\r\n",
-                        )
+                        .write(b"TEARDOWN rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 4242\r\n\r\n")
                         .is_err()
                     {
                         break;
@@ -3358,14 +3362,15 @@ mod tests {
             next_event_rebuild: Instant::now(),
             preemption: preemption::Tracker::default(),
             preempted: false,
+            probe_task: None,
+            event_task: None,
         };
         (member, worker, methods)
     }
     #[test]
     fn a_preempted_member_closes_without_sending_a_teardown() {
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let (mut member, worker, methods) =
-            local_member_with(receiver.local_addr().unwrap(), None);
+        let (mut member, worker, methods) = local_member_with(receiver.local_addr().unwrap(), None);
         member.preempted = true;
         member.close();
         drop(member);
@@ -3378,18 +3383,88 @@ mod tests {
     #[test]
     fn a_normal_member_close_still_sends_teardown() {
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let (mut member, worker, methods) =
-            local_member_with(receiver.local_addr().unwrap(), None);
+        let (mut member, worker, methods) = local_member_with(receiver.local_addr().unwrap(), None);
         member.close();
         drop(member);
         worker.join().unwrap();
         assert_eq!(
-            methods.lock().unwrap().iter().filter(|m| *m == "TEARDOWN").count(),
+            methods
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| *m == "TEARDOWN")
+                .count(),
             1
         );
     }
     #[test]
-    fn an_unexpected_teardown_probes_the_receiver_and_reclaims() {
+    fn a_stalled_status_probe_keeps_sending_audio_and_is_cancelled_on_close() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let probe_port = listener.local_addr().unwrap().port();
+        let (ready, waiting) = std::sync::mpsc::channel();
+        let probe_server = thread::spawn(move || {
+            let (mut liveness, _) = listener.accept().unwrap();
+            liveness
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut bytes = [0; 1024];
+            assert_eq!(liveness.read(&mut bytes).unwrap(), 0);
+            let (mut status, _) = listener.accept().unwrap();
+            status
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            assert!(status.read(&mut bytes).unwrap() > 0);
+            ready.send(()).unwrap();
+            // Keep /info unanswered until Member::close cancels the probe.
+            assert_eq!(status.read(&mut bytes).unwrap(), 0);
+        });
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (mut member, worker, _) =
+            local_member_with_health(receiver.local_addr().unwrap(), None, Health::default());
+        member
+            .media
+            .connect_audio(receiver.local_addr().unwrap())
+            .unwrap();
+        member.peer.port = probe_port;
+        member
+            .health
+            .preemption_signal(preemption::Signal::ConnectionClose);
+        let cancel = Cancellation::default();
+        let started = Instant::now();
+        member.prepare_preemption(&cancel, started);
+        assert!(started.elapsed() < Duration::from_millis(250));
+        waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+        for index in 0..20 {
+            member.prepare_preemption(&cancel, Instant::now());
+            let now = Instant::now();
+            member
+                .media
+                .send(
+                    &[0; PCM_BYTES],
+                    index == 0,
+                    now,
+                    now + Duration::from_millis(200),
+                    &member.health,
+                )
+                .unwrap();
+        }
+        let mut packet = [0; 4096];
+        for _ in 0..20 {
+            assert!(receiver.recv(&mut packet).unwrap() > 0);
+        }
+        let stopped = Instant::now();
+        member.close();
+        assert!(stopped.elapsed() < Duration::from_secs(2));
+        drop(member);
+        worker.join().unwrap();
+        probe_server.join().unwrap();
+    }
+    #[test]
+    fn an_unexpected_teardown_with_a_free_receiver_is_a_transport_fault() {
         // The control symptom only triggers a probe. The fake receiver's fresh
         // `/info` connections say statusFlags=0, so the confirmed verdict is a
         // reclaim on a different connection rather than a fault. Q34 only
@@ -3407,12 +3482,10 @@ mod tests {
         let seen = emitted.clone();
         let mut counters = preemption::TakeoverCounters::default();
         let now = Instant::now() + Duration::from_secs(3);
-        let (poll, healthy) = member.poll_preemption(
-            &Cancellation::default(),
-            &mut counters,
-            now,
-            &|json| seen.lock().unwrap().push(json),
-        );
+        let (poll, healthy) =
+            member.poll_preemption(&Cancellation::default(), &mut counters, now, &|json| {
+                seen.lock().unwrap().push(json)
+            });
         assert!(!healthy, "the media health window has expired");
         assert!(
             matches!(poll, PreemptionPoll::Waiting),
@@ -3438,7 +3511,7 @@ mod tests {
         );
         assert!(matches!(
             poll,
-            PreemptionPoll::Reclaimed { consecutive: 1 }
+            PreemptionPoll::Yield(ref fault) if fault.code == "peer_closed"
         ));
         assert!(member.preempted);
         assert!(member.conn.lock().unwrap().is_poisoned());
@@ -3482,12 +3555,10 @@ mod tests {
             assert!(probe["policy"].is_string());
             assert!(probe["packets_prepared"].is_number());
             assert_eq!(probe["stereo_partner_unreachable"], false);
-            let warning = events
-                .iter()
-                .find(|event| event["code"] == "preempted")
-                .expect("the takeover must be reported");
-            assert_eq!(warning["reason"], "takeover");
-            assert_eq!(warning["consecutive"], 1);
+            assert!(
+                events.iter().all(|event| event["code"] != "preempted"),
+                "an idle receiver does not prove another controller took over"
+            );
         }
         drop(member);
         worker.join().unwrap();
@@ -3552,19 +3623,20 @@ mod tests {
         // The session was never displaced, so it still ends with a normal
         // TEARDOWN instead of being abandoned.
         assert_eq!(
-            methods.lock().unwrap().iter().filter(|m| *m == "TEARDOWN").count(),
+            methods
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| *m == "TEARDOWN")
+                .count(),
             1
         );
         probe_server.join().unwrap();
     }
     #[test]
-    fn healthy_rtp_beats_a_receiver_teardown_signal() {
-        // Q32: RTP health is stronger than any control-plane signal. The
-        // receiver's own TEARDOWN with our media still flowing does not make the
-        // active session bit somebody else's: it is our session, so fall
-        // through instead of reclaiming or queueing.
-        let (probe_addr, probe_server) =
-            status_probe_server(Some(preemption::RECEIVER_SESSION_ACTIVE));
+    fn udp_writes_do_not_override_a_confirmed_receiver_takeover() {
+        let active = preemption::RECEIVER_SESSION_ACTIVE;
+        let (probe_addr, probe_server) = status_probe_server_seq(vec![Some(active), Some(active)]);
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
         let (mut member, worker, methods) =
             local_member_with_health(receiver.local_addr().unwrap(), None, Health::default());
@@ -3572,44 +3644,36 @@ mod tests {
         member
             .health
             .preemption_signal(preemption::Signal::UnexpectedTeardown);
-        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = emitted.clone();
         let mut counters = preemption::TakeoverCounters::default();
-        let (poll, healthy) = member.poll_preemption(
+        let now = Instant::now();
+        let (first, healthy) =
+            member.poll_preemption(&Cancellation::default(), &mut counters, now, &|_| {});
+        assert!(
+            !healthy,
+            "UDP acceptance cannot contradict the explicit TEARDOWN"
+        );
+        assert!(matches!(first, PreemptionPoll::Waiting));
+        let (second, _) = member.poll_preemption(
             &Cancellation::default(),
             &mut counters,
-            Instant::now(),
-            &|json| seen.lock().unwrap().push(json),
+            now + preemption::CONFIRM_DELAY,
+            &|_| {},
         );
-        assert!(healthy);
         assert!(
-            matches!(poll, PreemptionPoll::None),
-            "our own active session must never reclaim or queue"
+            matches!(second, PreemptionPoll::Yield(ref fault) if fault.code == "preempted" && !fault.retryable)
         );
-        assert!(!member.preempted);
-        assert!(!member.conn.lock().unwrap().is_poisoned());
-        assert_eq!(
-            member.preemption.scheduled(),
-            None,
-            "OursActive does not schedule a probe"
-        );
-        {
-            let events = emitted.lock().unwrap();
-            let probe = events
-                .iter()
-                .find(|event| event["code"] == "preemption_probe")
-                .expect("the probe must be logged");
-            assert_eq!(probe["outcome"], "ours_active");
-            assert_eq!(probe["we_hold_session"], true);
-            assert_eq!(probe["status_flags"], preemption::RECEIVER_SESSION_ACTIVE);
-            assert!(events.iter().all(|event| event["code"] != "preempted"));
-        }
+        assert!(member.preemption.suspended());
+        assert!(member.preempted);
         drop(member);
         worker.join().unwrap();
-        // Not displaced: the session still ends with its normal TEARDOWN.
         assert_eq!(
-            methods.lock().unwrap().iter().filter(|m| *m == "TEARDOWN").count(),
-            1
+            methods
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| *m == "TEARDOWN")
+                .count(),
+            0
         );
         probe_server.join().unwrap();
     }
@@ -3633,12 +3697,10 @@ mod tests {
         let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = emitted.clone();
         let mut counters = preemption::TakeoverCounters::default();
-        let (first, healthy) = member.poll_preemption(
-            &Cancellation::default(),
-            &mut counters,
-            now,
-            &|json| seen.lock().unwrap().push(json),
-        );
+        let (first, healthy) =
+            member.poll_preemption(&Cancellation::default(), &mut counters, now, &|json| {
+                seen.lock().unwrap().push(json)
+            });
         assert!(!healthy, "the media health window has expired");
         assert!(
             matches!(first, PreemptionPoll::Waiting),
@@ -3653,14 +3715,9 @@ mod tests {
             &|json| seen.lock().unwrap().push(json),
         );
         assert!(
-            matches!(poll, PreemptionPoll::Waiting),
-            "another sender's session is a queue, never a reclaim"
+            matches!(poll, PreemptionPoll::Yield(ref fault) if fault.code == "preempted" && !fault.retryable)
         );
-        assert_eq!(
-            member.preemption.scheduled(),
-            Some(now + preemption::CONFIRM_DELAY + preemption::requeue_delay(0)),
-            "a confirmed busy verdict is queueing, and the queue backs off"
-        );
+        assert_eq!(member.preemption.scheduled(), None);
         {
             let events = emitted.lock().unwrap();
             let probe = events
@@ -3705,7 +3762,7 @@ mod tests {
         );
         assert!(matches!(
             poll,
-            PreemptionPoll::Reclaimed { consecutive: 1 }
+            PreemptionPoll::Yield(ref fault) if fault.code == "peer_closed"
         ));
         let events = emitted.lock().unwrap();
         let probe = events
@@ -3733,7 +3790,7 @@ mod tests {
         member.peer.port = probe_addr.port();
         member
             .health
-            .preemption_signal(preemption::Signal::UnexpectedTeardown);
+            .preemption_signal(preemption::Signal::ConnectionClose);
         let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = emitted.clone();
         let mut counters = preemption::TakeoverCounters::default();
@@ -3764,14 +3821,19 @@ mod tests {
         drop(member);
         worker.join().unwrap();
         assert_eq!(
-            methods.lock().unwrap().iter().filter(|m| *m == "TEARDOWN").count(),
+            methods
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| *m == "TEARDOWN")
+                .count(),
             1,
             "the session was never displaced and closes normally"
         );
         probe_server.join().unwrap();
     }
     #[test]
-    fn an_unreachable_control_port_reclaims_instead_of_a_generic_fault() {
+    fn an_unreachable_control_port_is_retryable_without_claiming_takeover() {
         // Bind and drop a listener to get a port with no receiver listening.
         // The TCP liveness probe proves the receiver cannot serve us, so the
         // verdict is gone: a reclaim, never busy and never a generic transport
@@ -3798,7 +3860,7 @@ mod tests {
             &|json| seen.lock().unwrap().push(json),
         );
         assert!(
-            matches!(poll, PreemptionPoll::Reclaimed { consecutive: 1 }),
+            matches!(poll, PreemptionPoll::Yield(ref fault) if fault.code == "peer_closed"),
             "a receiver that cannot serve us must take the reclaim path, never the generic fault path"
         );
         assert_eq!(
@@ -3874,7 +3936,7 @@ mod tests {
             &|json| seen.lock().unwrap().push(json),
             false,
         );
-        assert!(matches!(poll, PreemptionPoll::Reclaimed { consecutive: 1 }));
+        assert!(matches!(poll, PreemptionPoll::Yield(ref fault) if fault.code == "peer_closed"));
         assert_eq!(
             counters.consecutive(member.peer.host),
             0,
@@ -3912,7 +3974,7 @@ mod tests {
         worker.join().unwrap();
     }
     #[test]
-    fn an_escalating_unknown_liveness_reclaims_after_the_patience_limit() {
+    fn an_escalating_unknown_liveness_ends_the_old_transport_after_patience() {
         // Q42: `Unknown` is "temporarily unknown", not "mine forever". Media is
         // healthy — the UDP sends keep succeeding even when the device is
         // unreachable, which is exactly why MEDIA_HEALTH_WINDOW cannot decide
@@ -3937,8 +3999,13 @@ mod tests {
         };
         for step in 0..preemption::LIVENESS_PATIENCE - 1 {
             let at = now + Duration::from_secs(u64::from(step) * 3);
-            let (poll, _) =
-                member.apply_preemption(unknown_round(), &mut counters, at, &|json| seen.lock().unwrap().push(json), false);
+            let (poll, _) = member.apply_preemption(
+                unknown_round(),
+                &mut counters,
+                at,
+                &|json| seen.lock().unwrap().push(json),
+                false,
+            );
             assert!(
                 matches!(poll, PreemptionPoll::None),
                 "unknown is not a death yet"
@@ -3952,10 +4019,15 @@ mod tests {
             assert!(!member.preempted);
         }
         let at = now + Duration::from_secs(u64::from(preemption::LIVENESS_PATIENCE) * 3);
-        let (poll, _) =
-            member.apply_preemption(unknown_round(), &mut counters, at, &|json| seen.lock().unwrap().push(json), false);
+        let (poll, _) = member.apply_preemption(
+            unknown_round(),
+            &mut counters,
+            at,
+            &|json| seen.lock().unwrap().push(json),
+            false,
+        );
         assert!(
-            matches!(poll, PreemptionPoll::Reclaimed { consecutive: 1 }),
+            matches!(poll, PreemptionPoll::Yield(ref fault) if fault.code == "peer_closed"),
             "the fifth consecutive unknown escalates to a reclaim"
         );
         assert_eq!(
@@ -3965,7 +4037,9 @@ mod tests {
         );
         assert!(member.preempted);
         let events = emitted.lock().unwrap();
-        let last = events.iter().rfind(|event| event["code"] == "preemption_probe")
+        let last = events
+            .iter()
+            .rfind(|event| event["code"] == "preemption_probe")
             .expect("the escalated probe is logged");
         assert_eq!(last["tcp_liveness"], "unknown");
         assert_eq!(last["liveness_verdict"], "dead");
@@ -4031,10 +4105,7 @@ mod tests {
         assert_eq!(probe["local_network_suspected"], true);
         assert_eq!(probe["outcome"], "ours_active");
         assert!(
-            probe["message"]
-                .as_str()
-                .unwrap()
-                .contains("local network"),
+            probe["message"].as_str().unwrap().contains("local network"),
             "the line must say it is a local problem, got {}",
             probe["message"]
         );
@@ -4186,7 +4257,10 @@ mod tests {
             &discover,
             &unanswered,
         );
-        assert!(suppress, "inside the window the failure is still suppressed");
+        assert!(
+            suppress,
+            "inside the window the failure is still suppressed"
+        );
         let (suppress, warning) = episode.observe(
             &dead,
             2,
@@ -4216,138 +4290,9 @@ mod tests {
         // The per-device verdicts now stand, so the loop reclaims them.
         for probe in dead {
             let mut tracker = preemption::Tracker::default();
-            let note = tracker.observe_liveness(
-                preemption::LivenessSample::Probe(probe),
-                base,
-            );
+            let note = tracker.observe_liveness(preemption::LivenessSample::Probe(probe), base);
             assert_eq!(note.verdict, preemption::Verdict::Dead);
         }
-    }
-    #[test]
-    fn hitting_the_consecutive_limit_yields_with_reason_limit() {
-        // Two agreeing Free probes are needed: the first Free schedules the one
-        // confirmation probe and the second one carries the reclaim into the
-        // takeover counter, which is already at the limit here. The first two
-        // takeovers are seeded as reclaim → takeover cycles (each followed by a
-        // successful reclaim inside the window), which is exactly what the
-        // counter measures.
-        let (probe_addr, probe_server) = status_probe_server_seq(vec![Some(0), Some(0)]);
-        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let (mut member, worker, _methods) =
-            local_member_with_health(receiver.local_addr().unwrap(), None, Health::default());
-        member.peer.port = probe_addr.port();
-        let now = Instant::now() + Duration::from_secs(3);
-        let mut counters = preemption::TakeoverCounters::default();
-        counters.takeover(member.peer.host, now - Duration::from_secs(4));
-        counters.reclaimed(member.peer.host, now - Duration::from_secs(4));
-        counters.takeover(member.peer.host, now - Duration::from_secs(3));
-        counters.reclaimed(member.peer.host, now - Duration::from_secs(2));
-        member
-            .health
-            .preemption_signal(preemption::Signal::UnexpectedTeardown);
-        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = emitted.clone();
-        let (first, _) = member.poll_preemption(
-            &Cancellation::default(),
-            &mut counters,
-            now,
-            &|json| seen.lock().unwrap().push(json),
-        );
-        assert!(
-            matches!(first, PreemptionPoll::Waiting),
-            "the first Free still needs its confirmation"
-        );
-        let (poll, _) = member.poll_preemption(
-            &Cancellation::default(),
-            &mut counters,
-            now + preemption::CONFIRM_DELAY,
-            &|json| seen.lock().unwrap().push(json),
-        );
-        let fault = match poll {
-            PreemptionPoll::Yield(fault) => fault,
-            other => panic!("expected a yield, got {other:?}"),
-        };
-        assert_eq!(fault.code, "preempted");
-        assert_eq!(fault.reason.as_deref(), Some("limit"));
-        assert!(!fault.retryable);
-        assert!(fault.message.contains("yielded"));
-        assert_eq!(counters.consecutive(member.peer.host), 3);
-        // `yielding` is terminal: the tracker drops every queued probe and
-        // stays silent forever (Q34 §四).
-        assert!(member.preemption.suspended());
-        assert_eq!(member.preemption.scheduled(), None);
-        for elapsed in [1u64, 60, 3_600, 86_400] {
-            assert!(
-                !member
-                    .preemption
-                    .due(now + preemption::CONFIRM_DELAY + Duration::from_secs(elapsed)),
-                "a yielded tracker must not schedule a retry"
-            );
-        }
-        let events = emitted.lock().unwrap();
-        let warning = events
-            .iter()
-            .find(|event| event["code"] == "preempted")
-            .expect("the yield must be reported");
-        assert_eq!(warning["reason"], "limit");
-        assert_eq!(warning["consecutive"], 3);
-        drop(events);
-        drop(member);
-        worker.join().unwrap();
-        probe_server.join().unwrap();
-    }
-    #[test]
-    fn a_queueing_busy_receiver_never_reaches_the_yield() {
-        // Q34's headline correction: queueing behind a legitimately busy
-        // receiver is not a takeover. Even ten minutes of confirmed
-        // `BusyElsewhere` verdicts on an established session must not trigger
-        // `preempted(limit)`; the sender keeps polling with backoff.
-        let active = preemption::RECEIVER_SESSION_ACTIVE;
-        // Every verdict is confirmed, and every round makes one `/info` probe.
-        let (probe_addr, probe_server) =
-            status_probe_server_seq(vec![Some(active); 24]);
-        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let (mut member, worker, _methods) =
-            local_member_with_health(receiver.local_addr().unwrap(), None, Health::default());
-        member.peer.port = probe_addr.port();
-        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = emitted.clone();
-        let mut counters = preemption::TakeoverCounters::default();
-        let mut now = Instant::now() + Duration::from_secs(3);
-        member
-            .health
-            .preemption_signal(preemption::Signal::UnexpectedTeardown);
-        for round in 0..24 {
-            let (poll, _) = member.poll_preemption(
-                &Cancellation::default(),
-                &mut counters,
-                now,
-                &|json| seen.lock().unwrap().push(json),
-            );
-            assert!(
-                matches!(poll, PreemptionPoll::Waiting),
-                "round {round} must stay in the queue, not yield"
-            );
-            now += preemption::requeue_delay(round as u32) + preemption::CONFIRM_DELAY;
-            // Keep the media window expired for the whole run.
-            now += Duration::from_millis(1);
-        }
-        assert!(!member.preemption.suspended());
-        assert!(
-            !member.conn.lock().unwrap().is_poisoned(),
-            "the session was never reclaimed for being busy"
-        );
-        assert_eq!(counters.consecutive(member.peer.host), 0);
-        let events = emitted.lock().unwrap();
-        assert!(
-            events.iter().all(|event| event["code"] != "preempted"),
-            "queueing must never log a preempted warning"
-        );
-        assert!(events.iter().all(|event| event["code"] != "busy_exhausted"));
-        drop(events);
-        drop(member);
-        worker.join().unwrap();
-        probe_server.join().unwrap();
     }
     #[test]
     fn setup_rejections_are_terminal_while_running_feedback_rejections_degrade() {
@@ -4355,8 +4300,7 @@ mod tests {
         // this connection, so they stay terminal authentication failures. The
         // classifier is never run on the preemption path.
         for status in [401, 403, 454] {
-            let error =
-                anyhow::anyhow!("SETUP rtsp://127.0.0.1/test: RTSP/1.0 {status} Rejected");
+            let error = anyhow::anyhow!("SETUP rtsp://127.0.0.1/test: RTSP/1.0 {status} Rejected");
             let fault = Fault::from_setup_error("127.0.0.1", &error);
             assert_eq!(fault.channel, "setup");
             assert_eq!(fault.code, "authentication_failed");
@@ -4393,9 +4337,7 @@ mod tests {
             receiver.local_addr().unwrap(),
         )
         .unwrap();
-        media
-            .connect_audio(receiver.local_addr().unwrap())
-            .unwrap();
+        media.connect_audio(receiver.local_addr().unwrap()).unwrap();
         media.configure_latency(Duration::from_millis(200), false);
         let rate = 44_100u32;
         let start = Instant::now();
@@ -4617,9 +4559,62 @@ mod tests {
     }
 
     #[test]
+    fn a_buffered_link_expires_instead_of_shifting_an_unpublished_anchor() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let tcp = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            while socket.read(&mut bytes).unwrap_or(0) > 0 {}
+        });
+        let (mut member, _receiver, server) = local_member();
+        member.media.connect_buffered(address).unwrap();
+        let mut members = vec![member];
+        let options = summary_options("", "single", 0);
+        let gain = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0.0f32.to_bits()));
+        let events = std::sync::Mutex::new(Vec::new());
+        let outcome = send_packets(
+            &options,
+            &Cancellation::default(),
+            &gain,
+            crate::volume::Control::default(),
+            None,
+            &crate::standby::Control::default(),
+            &Clock::new(),
+            None,
+            &mut members,
+            None,
+            &mut preemption::TakeoverCounters::default(),
+            &[],
+            None,
+            &|event| {
+                if event["event"] == "streaming" {
+                    thread::sleep(Duration::from_millis(200));
+                }
+                events.lock().unwrap().push(event);
+            },
+        );
+        let error = outcome.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Fault>().unwrap().code,
+            "timeline_expired"
+        );
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| event["code"] != "timeline_reanchored")
+        );
+        drop(members);
+        server.join().unwrap();
+        tcp.join().unwrap();
+    }
+    #[test]
     fn a_normal_stop_emits_exactly_one_session_summary() {
         let options = summary_options("", "single", 40);
-        let (member, receiver, server) = local_member();
+        let (mut member, receiver, server) = local_member();
         member
             .media
             .connect_audio(receiver.local_addr().unwrap())
@@ -4682,7 +4677,7 @@ mod tests {
         let options = summary_options("", "single", 0);
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
         let health = Health::default();
-        let (member, server, methods) =
+        let (mut member, server, methods) =
             local_member_with_health(receiver.local_addr().unwrap(), None, health.clone());
         member
             .media
@@ -4830,7 +4825,7 @@ mod tests {
         // The standby pause ends the previous attempt; the resume builds a fresh
         // timeline and must report `silence_resume`, not a transport failure.
         let options = summary_options("", "single", 40);
-        let (member, receiver, server) = local_member();
+        let (mut member, receiver, server) = local_member();
         member
             .media
             .connect_audio(receiver.local_addr().unwrap())
@@ -4878,7 +4873,7 @@ mod tests {
         // and a reopened capture source gets its own bucket.
         assert_eq!(source_restart_reason(), TimelineResetReason::SourceRestart);
         let options = summary_options("", "single", 40);
-        let (member, receiver, server) = local_member();
+        let (mut member, receiver, server) = local_member();
         member
             .media
             .connect_audio(receiver.local_addr().unwrap())
@@ -4907,10 +4902,7 @@ mod tests {
         assert!(matches!(&outcome, Ok(StreamEnd::Finished)), "{outcome:?}");
         let summaries = summary_events(&events);
         assert_eq!(summaries.len(), 1);
-        assert_eq!(
-            summaries[0]["timeline_resets"]["source_restart"],
-            json!(1)
-        );
+        assert_eq!(summaries[0]["timeline_resets"]["source_restart"], json!(1));
         assert_eq!(
             summaries[0]["timeline_resets"]["start"],
             json!(0),
@@ -4962,7 +4954,8 @@ mod tests {
             0,
             Duration::from_secs(1),
         );
-        let root = std::env::temp_dir().join(format!("airflash-blocked-summary-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("airflash-blocked-summary-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         // A regular file where the logs directory should be makes create_dir_all
         // and the append fail deterministically.

@@ -172,8 +172,8 @@ pub fn matching(path: &str) -> Result<Vec<Application>> {
 ///
 /// The executable path is authoritative: a candidate with a different path is
 /// never attached. A pinned `(pid, started_at)` wins only while that exact
-/// process is still alive, but once it has exited all live roots of the same
-/// executable are candidates again (bounded by `cap`). A candidate that reuses
+/// process is still alive; after it exits only a unique live replacement may
+/// attach. An ambiguous set waits for explicit selection. A candidate that reuses
 /// the pinned PID with a different creation time is not mistaken for it.
 pub fn bind_plan(
     path: &str,
@@ -200,11 +200,19 @@ pub fn bind_plan(
             .cloned()
             .collect();
         rest.sort_by_key(|p| (p.started_at, p.process_id));
-        return rest.into_iter().take(cap).collect();
+        return if cap > 0 && rest.len() == 1 {
+            rest
+        } else {
+            Vec::new()
+        };
     }
     let mut instances: Vec<_> = candidates.into_iter().cloned().collect();
     instances.sort_by_key(|p| (p.started_at, p.process_id));
-    instances.into_iter().take(cap).collect()
+    if cap > 0 && instances.len() == 1 {
+        instances
+    } else {
+        Vec::new()
+    }
 }
 
 /// A stale identity may follow one replacement, but must never choose among
@@ -433,7 +441,7 @@ mod tests {
         assert_eq!(root(1, &items, &parents), 1);
     }
     #[test]
-    fn bind_plan_prefers_the_pinned_instance_and_captures_all_roots_otherwise() {
+    fn bind_plan_preserves_the_selection_and_refuses_ambiguous_replacements() {
         let path = "C:\\player.exe";
         let instances: Vec<_> = [(11, 10), (12, 20), (13, 30)]
             .into_iter()
@@ -452,10 +460,11 @@ mod tests {
         // No pin: every root of the executable, deterministically ordered.
         let all = bind_plan(path, &instances, None, 4);
         let pids: Vec<_> = all.iter().map(|p| p.process_id).collect();
-        assert_eq!(pids, [11, 12, 13]);
+        assert!(pids.is_empty());
+        assert_eq!(bind_plan(path, &instances[..1], None, 4)[0].process_id, 11);
         // Cap applies to the path-wide plan.
         let capped = bind_plan(path, &instances, None, 2);
-        assert_eq!(capped.len(), 2);
+        assert!(capped.is_empty());
     }
 
     #[test]
@@ -473,7 +482,7 @@ mod tests {
         // The pinned process exited; an unrelated PID 12 was reused later.
         let without_pin = bind_plan(path, &instances, Some((99, 5)), 4);
         let pids: Vec<_> = without_pin.iter().map(|p| p.process_id).collect();
-        assert_eq!(pids, [11, 12]);
+        assert!(pids.is_empty());
 
         instances.push(Application {
             path: path.into(),
@@ -484,7 +493,7 @@ mod tests {
         // Same PID, different creation time: not the process the request pinned.
         let reused = bind_plan(path, &instances, Some((99, 5)), 4);
         let pids: Vec<_> = reused.iter().map(|p| p.process_id).collect();
-        assert_eq!(pids, [11, 12]);
+        assert!(pids.is_empty());
 
         // Even unpinned, a different executable is never attached.
         let mut others = instances.clone();

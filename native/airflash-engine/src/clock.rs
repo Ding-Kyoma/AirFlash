@@ -149,7 +149,8 @@ pub fn parse_announce(packet: &[u8]) -> Option<BmcaDataset> {
     })
 }
 
-pub fn announce(clock: u64, seq: u16, ns: u64) -> Vec<u8> {    let mut p = header(11, 76, clock, seq, 0x0408, 0);
+pub fn announce(clock: u64, seq: u16, ns: u64) -> Vec<u8> {
+    let mut p = header(11, 76, clock, seq, 0x0408, 0);
     timestamp(&mut p[34..44], ns);
     // Local oscillator; priority is a preference, not a claim of GPS accuracy.
     p[47] = 96;
@@ -202,6 +203,8 @@ struct PeerState {
     /// delay from the estimate but is not required to establish one.
     offset: Option<f64>,
     offset_at: Option<Instant>,
+    /// Last mapping actually published by this association, with its sample age.
+    last_mapping: Option<(f64, Instant)>,
     /// Offset derived from complete Sync/Follow_Up pairs alone.
     sync_offset: Option<f64>,
     delay_age: Option<Instant>,
@@ -359,14 +362,25 @@ impl PeerState {
     /// rather than ending the session, so the timeline keeps using the final
     /// estimate until the caller's grace expires.
     fn frozen_offset(&self, now: Instant, grace: Duration) -> Option<f64> {
-        let at = self.offset_at?;
-        if now.duration_since(at) > grace {
+        let (offset, at) = self.last_mapping?;
+        if now.saturating_duration_since(at) > grace {
             return None;
         }
-        self.offset.or(self.sync_offset)
+        Some(offset)
     }
     fn stale_for(&self, now: Instant) -> Option<Duration> {
         self.last.map(|last| now.duration_since(last))
+    }
+    fn map_offset(&mut self, now: Instant, grace: Duration) -> Option<(f64, bool)> {
+        if self.ready(now) {
+            let offset = self.effective_offset(now)?;
+            self.last_mapping = Some((offset, self.last?));
+            Some((offset, false))
+        } else if !grace.is_zero() {
+            self.frozen_offset(now, grace).map(|offset| (offset, true))
+        } else {
+            None
+        }
     }
     /// Prefer a fresh delay measurement, then follow the ongoing Sync estimates
     /// when usable delay responses stop arriving.
@@ -681,8 +695,8 @@ fn followed_packet(s: &mut PeerState, data: &[u8], local_ns: u64, now: Instant, 
         // snapshot even though the role itself is not switched here.
         if let Some(dataset) = parse_announce(data) {
             s.bmca = Some(dataset);
-            s.better_master = dataset.compare(&BmcaDataset::local(own_id))
-                == std::cmp::Ordering::Less;
+            s.better_master =
+                dataset.compare(&BmcaDataset::local(own_id)) == std::cmp::Ordering::Less;
         }
     }
     if s.source_id != Some(source) || s.source_port != Some(source_port) {
@@ -946,7 +960,8 @@ impl PtpMaster {
             peer.packets = PacketSnapshot::default();
         }
     }
-    pub fn network_snapshot(&self) -> NetworkSnapshot {        self.network.lock().unwrap().clone()
+    pub fn network_snapshot(&self) -> NetworkSnapshot {
+        self.network.lock().unwrap().clone()
     }
     pub fn startup_timeout(&self, host: IpAddr) -> Duration {
         self.states
@@ -1014,24 +1029,15 @@ impl PtpMaster {
         local_ns: u64,
         grace: Duration,
     ) -> Result<(u64, u64, bool)> {
-        let states = self.states.lock().unwrap();
-        let s = states.get(&host).context("unknown timing peer")?;
+        let mut states = self.states.lock().unwrap();
+        let s = states.get_mut(&host).context("unknown timing peer")?;
         if !s.follow {
             return Ok((self.clock_id, local_ns, false));
         }
         let now = Instant::now();
-        let (offset, frozen) = if s.ready(now) {
-            (
-                s.effective_offset(now).context("missing clock offset")?,
-                false,
-            )
-        } else {
-            (
-                s.frozen_offset(now, grace)
-                    .context("receiver clock is not ready")?,
-                true,
-            )
-        };
+        let (offset, frozen) = s
+            .map_offset(now, grace)
+            .context("receiver clock is not ready")?;
         let mapped = local_ns as i128 + offset.round() as i128;
         Ok((
             s.clock_id.context("missing receiver clock identity")?,
@@ -1362,6 +1368,7 @@ mod tests {
         let peer = PeerState {
             offset: Some(1_500.0),
             offset_at: Some(now),
+            last_mapping: Some((1_500.0, now)),
             ..PeerState::default()
         };
         // Fresh: the normal path returns it and nothing is frozen.
@@ -1529,17 +1536,29 @@ mod tests {
         let base = BmcaDataset::local(7);
         // Lower priority1 wins, before anything else.
         assert_eq!(
-            BmcaDataset { priority1: 10, ..base }.compare(&base),
+            BmcaDataset {
+                priority1: 10,
+                ..base
+            }
+            .compare(&base),
             std::cmp::Ordering::Less
         );
         // Equal priority1: a better clock class wins.
         assert_eq!(
-            BmcaDataset { clock_class: 6, ..base }.compare(&base),
+            BmcaDataset {
+                clock_class: 6,
+                ..base
+            }
+            .compare(&base),
             std::cmp::Ordering::Less
         );
         // Class, accuracy, variance and priority2 all tie: identity decides.
         assert_eq!(
-            BmcaDataset { grandmaster: 1, ..base }.compare(&base),
+            BmcaDataset {
+                grandmaster: 1,
+                ..base
+            }
+            .compare(&base),
             std::cmp::Ordering::Less
         );
         // A dataset identical to ours is not "better", so no role flip.
@@ -1547,7 +1566,11 @@ mod tests {
         assert!(!(base.compare(&base) == std::cmp::Ordering::Less));
         // steps_removed only breaks ties on the same path.
         assert_eq!(
-            BmcaDataset { steps_removed: 3, ..base }.compare(&base),
+            BmcaDataset {
+                steps_removed: 3,
+                ..base
+            }
+            .compare(&base),
             std::cmp::Ordering::Greater
         );
     }
@@ -1556,10 +1579,17 @@ mod tests {
         let own = BmcaDataset::local(0xaaaa);
         // A HomePod advertising an Apple grandmaster (priority1 128) loses on the
         // first field, so it does not get to take the role.
-        let homepod = BmcaDataset { priority1: 128, clock_class: 6, ..own };
+        let homepod = BmcaDataset {
+            priority1: 128,
+            clock_class: 6,
+            ..own
+        };
         assert_eq!(homepod.compare(&own), std::cmp::Ordering::Greater);
         // A device with a better class and the same priority does.
-        let appliance = BmcaDataset { clock_class: 20, ..own };
+        let appliance = BmcaDataset {
+            clock_class: 20,
+            ..own
+        };
         assert_eq!(appliance.compare(&own), std::cmp::Ordering::Less);
     }
 
@@ -1618,7 +1648,8 @@ mod tests {
     #[test]
     fn wire_clock_and_lengths() {
         let id = 0x1234567812345678;
-        let (s, f) = sync_pair(id, 65535, 1234567890);        assert_eq!(&s[20..28], &id.to_be_bytes());
+        let (s, f) = sync_pair(id, 65535, 1234567890);
+        assert_eq!(&s[20..28], &id.to_be_bytes());
         assert_eq!(s.len(), 44);
         assert_eq!(f.len(), 96);
         assert_eq!(&f[34..44], &[0, 0, 0, 0, 0, 1, 13, 251, 56, 210]);
