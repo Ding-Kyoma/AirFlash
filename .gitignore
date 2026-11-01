@@ -58,3 +58,7 @@ AGENTS.md
 *.pfx
 *.key
 *.dmp
+
+# Local static-analysis report outputs; shared plans and answers stay tracked.
+/docs/improvement_plan/report/
+/docs/improvement_plan/REPORT-WinAirCast-vs-AirFlash.md
