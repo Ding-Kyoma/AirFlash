@@ -55,6 +55,63 @@ fn quiet_wav() -> std::path::PathBuf {
     wav.finalize().unwrap();
     path
 }
+
+#[test]
+fn forced_setup_warns_below_the_receiver_minimum_and_still_continues() {
+    for requested in [0, 120, 200, 2000] {
+        let mut receiver = mock_with_model(
+            "127.0.0.2",
+            false,
+            false,
+            Channel::Stereo,
+            0,
+            true,
+            Some("AppleTV6,2"),
+        );
+        receiver.peer.profile.timing = Timing::Ntp;
+        receiver.peer.profile.latency_ms = Some(requested);
+        let path = quiet_wav();
+        let mut options: ProbeOptions = serde_json::from_value(serde_json::json!({
+            "peers":[],"source":"wav","duration_ms":150,"gain":0.05,"latency_ms":requested,
+            "force_latency":true,"wav_path":path,"handshake_only":requested == 0
+        }))
+        .unwrap();
+        options.peers = vec![receiver.peer.clone()];
+        let eq = crate::equalizer::Control::new(options.equalizer, 44100).unwrap();
+        let events = Mutex::new(Vec::new());
+        let outcome = run_session(
+            options,
+            Cancellation::default(),
+            Arc::new(AtomicU32::new(0.05f32.to_bits())),
+            crate::volume::Control::default(),
+            eq,
+            |event| events.lock().unwrap().push(event),
+            (crate::clock::Clock::new(), None),
+        );
+        std::fs::remove_file(path).unwrap();
+        receiver.stop.store(true, Ordering::Relaxed);
+        receiver.worker.join().unwrap();
+        outcome.unwrap();
+        let events = events.lock().unwrap();
+        let negotiated = events
+            .iter()
+            .find(|event| event["event"] == "negotiated")
+            .unwrap();
+        assert_eq!(negotiated["requested_latency_ms"], requested);
+        assert_eq!(negotiated["effective_latency_ms"], f64::from(requested));
+        assert_eq!(negotiated["receiver_latency_min_ms"], 200.0);
+        assert_eq!(
+            events
+                .iter()
+                .any(|event| event["code"] == "forced_latency_below_minimum"),
+            requested < 200
+        );
+        if requested > 0 {
+            assert!(events.iter().any(|event| event["event"] == "streaming"));
+            assert!(!receiver.packets.lock().unwrap().is_empty());
+        }
+    }
+}
 fn mock(ip: &str, buffered: bool, alac: bool, channel: Channel, offset: i32, ap2: bool) -> Mock {
     mock_with_model(
         ip,
@@ -101,13 +158,7 @@ fn mock_with_cancel(
 }
 /// A receiver that is only probed with `/info`: the test expects the group to
 /// be refused before pairing or SETUP.
-fn mock_probe_only(
-    ip: &str,
-    alac: bool,
-    channel: Channel,
-    offset: i32,
-    ap2: bool,
-) -> Mock {
+fn mock_probe_only(ip: &str, alac: bool, channel: Channel, offset: i32, ap2: bool) -> Mock {
     mock_with_cancel_and_model(
         ip,
         false,
@@ -213,10 +264,7 @@ fn mock_with_cancel_and_model(
         if ap2 {
             // AirPlay 2 needs bit 40 *and* a modern firmware; the model decides
             // the solo timing answer and can be overridden per mock member.
-            info.insert(
-                "sourceVersion".into(),
-                plist::Value::String("366.0".into()),
-            );
+            info.insert("sourceVersion".into(), plist::Value::String("366.0".into()));
             if let Some(model) = model {
                 info.insert("model".into(), plist::Value::String(model.into()));
             }
@@ -742,7 +790,8 @@ fn a_mixed_homepod_and_apple_tv_group_runs_one_ptp_clock_domain() {
         0,
         true,
         Some("AppleTV6,2"),
-    );    left.peer.receiver_id = "homepod".into();
+    );
+    left.peer.receiver_id = "homepod".into();
     right.peer.receiver_id = "appletv".into();
     left.peer.profile.timing = Timing::Auto;
     right.peer.profile.timing = Timing::Auto;
@@ -905,7 +954,10 @@ fn a_mixed_group_is_refused_before_any_setup() {
     assert_eq!(fault.code, "mixed_timing_group");
     assert_eq!(fault.code, crate::profile::MixedTimingGroup::CODE);
     assert_eq!(fault.channel, "setup");
-    assert!(!fault.retryable, "a mixed group will not become legal on retry");
+    assert!(
+        !fault.retryable,
+        "a mixed group will not become legal on retry"
+    );
     assert!(
         fault.message.contains("Please connect them separately."),
         "{}",

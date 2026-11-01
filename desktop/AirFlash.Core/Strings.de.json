@@ -369,5 +369,17 @@
   "“{0}” claims AirPlay 2, but its firmware is older than 354.54.6, so it is treated as a classic device.": "„{0}“ gibt AirPlay 2 an, hat aber eine ältere Firmware als 354.54.6 und wird daher als klassisches Gerät behandelt.",
   "This stereo group is currently unusable.": "Diese Stereo-Gruppe kann derzeit nicht verwendet werden.",
   "Split into two independent receivers": "In zwei unabhängige Empfänger aufteilen",
-  "A member's AirPlay 2 capability is not known right now. The group can be saved, but the connection will be refused if the two members turn out to be incompatible.": "Die AirPlay-2-Fähigkeit eines Mitglieds ist derzeit unbekannt. Die Gruppe kann gespeichert werden; die Verbindung wird jedoch abgelehnt, wenn die beiden Mitglieder nicht kompatibel sind."
+  "A member's AirPlay 2 capability is not known right now. The group can be saved, but the connection will be refused if the two members turn out to be incompatible.": "Die AirPlay-2-Fähigkeit eines Mitglieds ist derzeit unbekannt. Die Gruppe kann gespeichert werden; die Verbindung wird jedoch abgelehnt, wenn die beiden Mitglieder nicht kompatibel sind.",
+  "Adaptive latency": "Adaptive Latenz",
+  "Force fixed latency": "Feste Latenz erzwingen",
+  "Keep recovery behavior": "Bisherige Wiederherstellung beibehalten",
+  "When forced, late audio may be dropped or the session reconnected; latency will not be increased automatically.": "Bei erzwungener Latenz kann verspätetes Audio verworfen oder die Verbindung neu aufgebaut werden; die Latenz wird nicht automatisch erhöht.",
+  "Adaptive mode ignores the forced setting. Existing fixed and custom modes keep their recovery behavior unless forced.": "Im adaptiven Modus ist die Erzwingung inaktiv. Ohne Erzwingung behalten feste und benutzerdefinierte Modi ihre bisherige Wiederherstellung bei.",
+  "Target values are not measured end-to-end audio latency.": "Zielwerte sind keine gemessene Ende-zu-Ende-Audiolatenz.",
+  "Forced latency requires every stereo member to use forced mode with the same target. Update the receiver settings.": "Alle Mitglieder der Stereogruppe müssen denselben erzwungenen Latenzwert verwenden. Passen Sie die Empfängereinstellungen an.",
+  "This audio engine does not support forced latency. Update the engine or turn off forced latency.": "Diese Audio-Engine unterstützt keine erzwungene Latenz. Aktualisieren Sie die Engine oder deaktivieren Sie die Erzwingung.",
+  "Fixed target · recovery enabled": "Festes Ziel · Wiederherstellung aktiviert",
+  "Requested {0} ms · engine plan {1} ms": "Angefordert: {0} ms · Engine: {1} ms",
+  "Receiver reports a minimum of {0} ms.": "Der Empfänger meldet einen Mindestwert von {0} ms.",
+  "Below the receiver's reported minimum: continuing at {0} ms. Playback may be rejected or silent.": "Unter dem gemeldeten Mindestwert: Wiedergabe wird mit {0} ms versucht. Sie kann abgelehnt werden oder stumm bleiben."
 }

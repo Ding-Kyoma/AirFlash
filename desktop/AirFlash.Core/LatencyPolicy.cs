@@ -16,6 +16,15 @@ namespace AirFlash.Core;
 public static class LatencyPolicy
 {
     public const string Mode = "adaptive";
+    private static IEnumerable<Receiver> Targets(Receiver receiver) => receiver.IsSoftwareGroup ? receiver.Peers : [receiver];
+    public static bool Forced(AppSettings settings, Receiver receiver) => Targets(receiver).Any(r => settings.ForcesLatency(r.Id));
+    public static string? ForceConflict(AppSettings settings, Receiver receiver)
+    {
+        if (!receiver.IsSoftwareGroup || !Forced(settings, receiver)) return null;
+        var members = receiver.Peers.ToArray();
+        return members.All(r => settings.ForcesLatency(r.Id)) && members.Select(r => settings.Latency(r.Id)).Distinct().Count() == 1
+            ? null : L.Get("Forced latency requires every stereo member to use forced mode with the same target. Update the receiver settings.");
+    }
     public sealed record Plan(int Initial, int Floor, int[] Ladder, string Reason)
     {
         public int Ceiling => Ladder[^1];

@@ -8,6 +8,90 @@ namespace AirFlash.Tests;
 public sealed class SessionTests
 {
     [Theory]
+    [InlineData("custom", true, true)]
+    [InlineData("custom", false, false)]
+    [InlineData("adaptive", true, false)]
+    public async Task ForcedLatencyIsAnOptionalStartParameterAndAdaptiveIgnoresIt(string mode, bool force, bool expected)
+    {
+        var process = new FakeConnection { SupportsForcedLatency = expected };
+        await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast);
+        var settings = Settings(); settings.LatencyMode = mode; settings.ForceLatency = force; settings.CustomBufferMs = 375;
+        await controller.StartAsync(Pod(), settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var start = Assert.Single(process.Commands, c => c.Command == "start").Parameters;
+        Assert.Equal(expected, start.TryGetProperty("force_latency", out _));
+        if (expected) { Assert.True(start.GetProperty("force_latency").GetBoolean()); Assert.Equal(375, start.Integer("latency_ms")); }
+    }
+    [Fact]
+    public async Task ForcedLatencyRefusesAnOldEngineWithoutStartingOrRetrying()
+    {
+        var process = new FakeConnection { SupportsForcedLatency = false };
+        var factory = new FakeFactory(process);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        var settings = Settings(); settings.ForceLatency = true; settings.ForceReconnect = true;
+        await controller.StartAsync(Pod(), settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Error);
+        Assert.Equal("forced_latency_unsupported", controller.Snapshot.Diagnostics?.LastFault?.Code);
+        Assert.DoesNotContain(process.Commands, c => c.Command == "start");
+        Assert.Equal(1, factory.OpenCount);
+    }
+    [Fact]
+    public async Task ForcedReconnectKeepsTheTargetAndTurningForceOffRebuildsTheSession()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection(); var third = new FakeConnection();
+        await using var controller = new SessionController(new FakeFactory(first, second, third), new FakeAudio(), timing: Fast);
+        var settings = Settings(); settings.LatencyMode = "custom"; settings.CustomBufferMs = 375; settings.ForceLatency = true;
+        await controller.StartAsync(Pod(), settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        first.EmitData(new { @event = "error", code = "timeline_expired", retryable = true, message = "late" });
+        await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var start = Assert.Single(second.Commands, c => c.Command == "start").Parameters;
+        Assert.Equal(375, start.Integer("latency_ms")); Assert.True(start.GetProperty("force_latency").GetBoolean());
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        settings.ForceLatency = false;
+        await controller.UpdateSettingsAsync(settings);
+        await third.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(Assert.Single(third.Commands, c => c.Command == "start").Parameters.TryGetProperty("force_latency", out _));
+    }
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ConflictingForcedGroupSettingsAreRejectedBeforeOpeningAnEngine(bool differentTarget)
+    {
+        var (receiver, settings) = SoftwareGroup();
+        settings.ForceLatency = true;
+        if (differentTarget) { settings.Options("a").LatencyMode = "custom"; settings.Options("a").CustomBufferMs = 400; }
+        else settings.Options("a").ForceLatency = false;
+        var factory = new FakeFactory();
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => controller.StartAsync(receiver, settings));
+        Assert.Equal(0, factory.OpenCount); Assert.Single(settings.SoftwareGroups);
+    }
+    [Fact]
+    public async Task ForcedGroupPreservesOffsetsAndAChangedMemberPolicyCannotKeepTheOldSession()
+    {
+        var (receiver, settings) = SoftwareGroup();
+        settings.LatencyMode = "custom"; settings.CustomBufferMs = 375; settings.ForceLatency = true;
+        var process = new FakeConnection(); var factory = new FakeFactory(process);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        await controller.StartAsync(receiver, settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var start = Assert.Single(process.Commands, c => c.Command == "start").Parameters;
+        Assert.True(start.GetProperty("force_latency").GetBoolean());
+        var peers = start.GetProperty("peers").EnumerateArray().ToArray();
+        Assert.All(peers, p => Assert.Equal(375, p.GetProperty("profile").Integer("latency_ms")));
+        Assert.Equal(-80, peers.Single(p => p.Text("receiver_id") == "a").GetProperty("profile").Integer("sync_offset_ms"));
+        Assert.Equal(25, peers.Single(p => p.Text("receiver_id") == "b").GetProperty("profile").Integer("sync_offset_ms"));
+        settings.Options("a").ForceLatency = false;
+        await controller.UpdateSettingsAsync(settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Error);
+        Assert.Equal("forced_latency_conflict", controller.Snapshot.Diagnostics?.LastFault?.Code);
+        Assert.False(controller.Snapshot.Diagnostics?.LastFault?.Retryable);
+        Assert.True(process.Disposed);
+        Assert.Equal(1, factory.OpenCount);
+        Assert.Single(settings.SoftwareGroups);
+    }
+    [Theory]
     [InlineData("realtime", true)]
     [InlineData("buffered", false)]
     public async Task AdaptiveLatencyUsesTheNegotiatedProfileAndResetsAfterStandby(string transport, bool shouldRaise)
@@ -174,7 +258,7 @@ public sealed class SessionTests
     }
 
     private static Receiver Pod(string id = "a") => new(id, id, "127.0.0.1");
-    private static AppSettings Settings() => new() { AutoConnectOnDiscover = false, ForceReconnect = false, MasterVolume = 10 };
+    private static AppSettings Settings() => new() { LatencyMode = "normal", AutoConnectOnDiscover = false, ForceReconnect = false, MasterVolume = 10 };
     private static readonly SessionTiming Fast = new(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1), TimeSpan.FromMilliseconds(10));
     private static EqualizerSettings Sound(double gain) { var eq = new EqualizerSettings { Enabled = true }; eq.SetBand(0, gain); return eq; }
     private static double EqGain(EngineCommand command) => command.Parameters.GetProperty("equalizer").GetProperty("band_gains_db")[0].GetDouble();
@@ -735,7 +819,8 @@ public sealed class SessionTests
         await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
         process.EmitData(new { @event = "standby", reason = "silence" });
         process.Emit("capture_metrics", metrics: new { last_audio_qpc_ns = 1, capture_to_send_p95_ms = (double?)null, underrun_packets = 2 });
-        await Until(() => controller.Snapshot.State == PlaybackState.Standby); Assert.Equal(1, factory.OpenCount); Assert.Null(controller.Snapshot.Metrics!.CaptureToSendP95);
+        await Until(() => controller.Snapshot.Metrics?.Underruns == 2);
+        Assert.Equal(PlaybackState.Standby, controller.Snapshot.State); Assert.Equal(1, factory.OpenCount); Assert.Null(controller.Snapshot.Metrics!.CaptureToSendP95);
     }
     [Fact]
     public async Task ApplicationCaptureNeverMutesEndpointAndLiveStandbyEditsDoNotRestart()
@@ -1139,6 +1224,7 @@ public sealed class SessionTests
         public string Session { get; private set; } = "";
         public bool Disposed { get; private set; }
         public bool RespondHello { get; init; } = true;
+        public bool SupportsForcedLatency { get; init; } = true;
         public object? ReceiverCapabilityResponse { get; init; }
         public TaskCompletionSource? GainEntered, GainGate;
         public async Task SendAsync(string session, string command, object? parameters, CancellationToken cancellation)
@@ -1158,7 +1244,7 @@ public sealed class SessionTests
                 case "set_gain": GainEntered?.TrySetResult(); if (GainGate is not null) await GainGate.Task.WaitAsync(cancellation); break;
             }
         }
-        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "application_capture" }.Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).ToArray() });
+        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "application_capture" }.Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).Concat(SupportsForcedLatency ? ["forced_latency"] : Array.Empty<string>()).ToArray() });
         public void EmitData(object payload, string? session = null)
         {
             var data = JsonSerializer.SerializeToNode(payload)!.AsObject(); data["version"] = 1; data["session_id"] = session ?? Session;

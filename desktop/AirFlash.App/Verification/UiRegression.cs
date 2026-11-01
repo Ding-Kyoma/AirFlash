@@ -11,6 +11,7 @@ internal static class UiRegression
 {
     public static async Task RunAsync(List<string> checks, string directory)
     {
+        await ForcedLatencyRegression.RunAsync(checks, directory);
         var store = new UiSmoke.MemoryStore(); var audio = new UiSmoke.MockAudio();
         var autostart = new UiSmoke.MockAutostart(); var discovery = new UiSmoke.MockDiscovery();
         var engine = new UiSmoke.MockFactory();

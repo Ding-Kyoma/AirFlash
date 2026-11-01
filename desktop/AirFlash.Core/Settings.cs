@@ -9,7 +9,7 @@ public sealed class ReceiverOptions : ObservableObject
     public void CopyFrom(ReceiverOptions source)
     {
         AutoConnect = source.AutoConnect; Hidden = source.Hidden; Volume = source.Volume;
-        LatencyMode = source.LatencyMode; CustomBufferMs = source.CustomBufferMs; StandbySeconds = source.StandbySeconds;
+        LatencyMode = source.LatencyMode; CustomBufferMs = source.CustomBufferMs; ForceLatency = source.ForceLatency; StandbySeconds = source.StandbySeconds;
         Codec = source.Codec; SampleRate = source.SampleRate; Transport = source.Transport; Timing = source.Timing;
     }
     private bool? _AutoConnect = null;
@@ -20,6 +20,8 @@ public sealed class ReceiverOptions : ObservableObject
     public int? Volume { get => _Volume; set => Set(ref _Volume, value); }
     private string? _LatencyMode = null;
     public string? LatencyMode { get => _LatencyMode; set => Set(ref _LatencyMode, value); }
+    private bool? _ForceLatency;
+    public bool? ForceLatency { get => _ForceLatency; set => Set(ref _ForceLatency, value); }
     private int? _CustomBufferMs = null;
     public int? CustomBufferMs { get => _CustomBufferMs; set => Set(ref _CustomBufferMs, value); }
     private double? _StandbySeconds = null;
@@ -92,8 +94,10 @@ public sealed class AppSettings : ObservableObject
     public string DiscoveryInterfaceId { get => _DiscoveryInterfaceId; set => Set(ref _DiscoveryInterfaceId, value ?? ""); }
     private EqualizerSettings _equalizer = new();
     public EqualizerSettings Equalizer { get => _equalizer; set => Set(ref _equalizer, value ?? new()); }
-    private string _LatencyMode = "normal";
+    private string _LatencyMode = LatencyPolicy.Mode;
     public string LatencyMode { get => _LatencyMode; set => Set(ref _LatencyMode, value); }
+    private bool _ForceLatency;
+    public bool ForceLatency { get => _ForceLatency; set => Set(ref _ForceLatency, value); }
     private int _CustomBufferMs = 1000;
     public int CustomBufferMs { get => _CustomBufferMs; set => Set(ref _CustomBufferMs, value); }
     private bool _StandbyEnabled = false;
@@ -131,12 +135,17 @@ public sealed class AppSettings : ObservableObject
     }
     /// <summary>Lead for a known receiver: adaptive mode derives it from the topology.</summary>
     public int Latency(Receiver receiver) => LatencyPolicy.Effective(this, receiver);
+    public bool ForcesLatency(string id)
+    {
+        var options = ReadOptions(id);
+        return (options.LatencyMode ?? LatencyMode) != LatencyPolicy.Mode && (options.ForceLatency ?? ForceLatency);
+    }
     public double Gain(string id) => Math.Clamp(MasterVolume, 0, 100) / 100d;
     public string? SampleRate(Receiver receiver) => receiver.IsSoftwareGroup ? SoftwareGroups.Single(g => g.Id == receiver.Id).SampleRate : ReadOptions(receiver.Id).SampleRate;
     public bool UsesDeviceLatency(Receiver receiver) => (receiver.IsSoftwareGroup ? receiver.Peers : [receiver]).Any(r =>
     {
         var options = ReadOptions(r.Id);
-        return options.LatencyMode is not null || LatencyMode == "custom" && options.CustomBufferMs is not null;
+        return options.LatencyMode is not null || options.ForceLatency is not null || LatencyMode == "custom" && options.CustomBufferMs is not null;
     });
     public string? EffectiveEndpoint => CaptureMode == "endpoint" ? CaptureEndpoint : null;
     public string? Validate()
@@ -186,7 +195,7 @@ public sealed class AppSettings : ObservableObject
         MaxReconnectAttempts = source.MaxReconnectAttempts; UiLanguage = source.UiLanguage; Theme = source.Theme;
         DiscoveryInterfaceId = source.DiscoveryInterfaceId;
         Equalizer.CopyFrom(source.Equalizer);
-        LatencyMode = source.LatencyMode; CustomBufferMs = source.CustomBufferMs;
+        LatencyMode = source.LatencyMode; CustomBufferMs = source.CustomBufferMs; ForceLatency = source.ForceLatency;
         StandbyEnabled = source.StandbyEnabled; StandbySilenceSeconds = source.StandbySilenceSeconds;
         CaptureMode = source.CaptureMode; CaptureEndpoint = source.CaptureEndpoint;
         CaptureApplicationPath = source.CaptureApplicationPath; CaptureApplicationInstance = source.CaptureApplicationInstance;

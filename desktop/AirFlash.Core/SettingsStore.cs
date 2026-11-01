@@ -47,6 +47,10 @@ public sealed class SettingsStore : ISettingsStore
                 var text = Decode(bytes);
                 var version = ReadVersion(text);
                 var json = JsonNode.Parse(text) as JsonObject ?? throw new JsonException(L.Get("Configuration must be a JSON object."));
+                // An existing file omitted this field under the release default.
+                // Only genuinely new/reset settings adopt the adaptive default.
+                if (!json.Any(pair => pair.Key.Equals("latency_mode", StringComparison.OrdinalIgnoreCase)))
+                    json["latency_mode"] = "normal";
                 if (version < AppSettings.CurrentSchemaVersion)
                 {
                     if (version < 2)

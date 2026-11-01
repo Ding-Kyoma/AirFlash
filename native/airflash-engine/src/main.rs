@@ -44,6 +44,7 @@ struct Running {
     gain: std::sync::Arc<std::sync::atomic::AtomicU32>,
     pending_pin: Option<std::sync::mpsc::Sender<zeroize::Zeroizing<String>>>,
     gain_limit: f64,
+    force_latency: bool,
     volume: airflash_engine::volume::Control,
     standby: airflash_engine::standby::Control,
     equalizer: Option<(airflash_engine::equalizer::Control, u32)>,
@@ -68,11 +69,39 @@ fn capabilities() -> Vec<&'static str> {
         "standby_release",
         "now_playing",
         "diagnostics",
+        "forced_latency",
     ];
     if airflash_engine::applications::supported() {
         values.push("application_capture");
     }
     values
+}
+
+fn lead_event(running: Option<&Running>, session: &str, params: &Value) -> Value {
+    let result = (|| -> anyhow::Result<i64> {
+        let running = running
+            .filter(|r| r.id == session && r.equalizer.is_some() && !r.cancel.is_cancelled())
+            .ok_or_else(|| anyhow::anyhow!("lead session is no longer active"))?;
+        anyhow::ensure!(
+            !running.force_latency,
+            "Runtime lead changes are disabled by forced latency"
+        );
+        let ms = params
+            .get("ms")
+            .or_else(|| params.get("lead_ms"))
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow::anyhow!("set_lead needs an integer ms"))?;
+        anyhow::ensure!(
+            (0..=airflash_engine::session::MAX_LEAD_MS).contains(&ms),
+            "lead must be 0..2000 ms"
+        );
+        airflash_engine::session::request_lead(ms);
+        Ok(ms)
+    })();
+    match result {
+        Ok(ms) => json!({"event":"lead_requested","ms":ms}),
+        Err(error) => json!({"event":"lead_error","message":error.to_string()}),
+    }
 }
 
 /// Monotonic sequence for metadata updates: the worker ignores stale ones.
@@ -300,6 +329,7 @@ fn main() {
                 let worker_standby = standby.clone();
                 let gain_limit = if request.command == "probe" { 0.1 } else { 1.0 };
                 let rate = options.sample_rate;
+                let force_latency = options.force_latency;
                 let equalizer =
                     airflash_engine::equalizer::Control::new(options.equalizer, rate).unwrap();
                 let worker_equalizer = equalizer.clone();
@@ -325,6 +355,7 @@ fn main() {
                     gain,
                     pending_pin: None,
                     gain_limit,
+                    force_latency,
                     volume,
                     standby,
                     equalizer: live_equalizer,
@@ -423,31 +454,11 @@ fn main() {
                 send(&request.id, &request.session_id, event);
             }
             "set_lead" => {
-                let result = (|| -> anyhow::Result<_> {
-                    anyhow::ensure!(
-                        running.as_ref().is_some_and(|r| r.id == request.session_id
-                            && r.equalizer.is_some()
-                            && !r.cancel.is_cancelled()),
-                        "lead session is no longer active"
-                    );
-                    let ms = request
-                        .params
-                        .get("ms")
-                        .or_else(|| request.params.get("lead_ms"))
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| anyhow::anyhow!("set_lead needs an integer ms"))?;
-                    anyhow::ensure!(
-                        (0..=airflash_engine::session::MAX_LEAD_MS).contains(&ms),
-                        "lead must be 0..2000 ms"
-                    );
-                    airflash_engine::session::request_lead(ms);
-                    Ok(ms)
-                })();
-                let event = match result {
-                    Ok(ms) => json!({"event":"lead_requested","ms":ms}),
-                    Err(error) => json!({"event":"lead_error","message":error.to_string()}),
-                };
-                send(&request.id, &request.session_id, event);
+                send(
+                    &request.id,
+                    &request.session_id,
+                    lead_event(running.as_ref(), &request.session_id, &request.params),
+                );
             }
             "pair_pin" => {
                 if let Some(r) = running.as_ref().filter(|r| r.id == request.session_id) {
@@ -559,6 +570,7 @@ fn main() {
                     gain: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
                     pending_pin: Some(tx),
                     gain_limit: 0.0,
+                    force_latency: false,
                     volume: airflash_engine::volume::Control::default(),
                     standby: airflash_engine::standby::Control::default(),
                     equalizer: None,
@@ -615,10 +627,37 @@ mod tests {
             gain: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             pending_pin: None,
             gain_limit: 1.0,
+            force_latency: false,
             volume: airflash_engine::volume::Control::default(),
             standby: airflash_engine::standby::Control::default(),
             equalizer: Some((Control::new(Settings::default(), rate).unwrap(), rate)),
         }
+    }
+
+    #[test]
+    fn forced_lead_commands_are_nonfatal_and_leave_the_current_lead_untouched() {
+        let mut running = stored_start(44100);
+        running.force_latency = true;
+        airflash_engine::session::request_lead(40);
+        for params in [
+            json!({"ms":10}),
+            json!({"ms":-1}),
+            json!({"ms":"bad"}),
+            Value::Null,
+        ] {
+            let reply = lead_event(Some(&running), "eq-session", &params);
+            assert_eq!(reply["event"], "lead_error");
+            assert!(reply.get("retryable").is_none());
+            assert_eq!(airflash_engine::session::requested_lead(), 40);
+            assert!(!running.cancel.is_cancelled());
+        }
+        running.force_latency = false;
+        assert_eq!(
+            lead_event(Some(&running), "eq-session", &json!({"ms":10}))["event"],
+            "lead_requested"
+        );
+        assert_eq!(airflash_engine::session::requested_lead(), 10);
+        airflash_engine::session::reset_lead();
     }
 
     fn reply(running: Option<&Running>, session: &str, params: Value) -> Value {

@@ -55,6 +55,32 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public string MuteLabel => Muted ? L.Get("Unmute") : L.Get("Mute");
     public string StatusTitle => _snapshot.State switch { PlaybackState.Connecting => L.Get("Connecting"), PlaybackState.Streaming => L.Get("Playing"), PlaybackState.Standby => L.Get("Standby"), PlaybackState.Pairing => L.Get("Pairing"), PlaybackState.Error => L.Get("Connection error"), PlaybackState.Preempted => L.Get("Taken over by another device"), _ => L.Get("Ready") };
     public string StatusDetail => _snapshot.Message.Length > 0 ? _snapshot.Message : _snapshot.IsActive ? L.Format("{0} · target {1} ms", _snapshot.Receiver?.Name, _snapshot.TargetLatency) : L.Get("Select a receiver to play system audio");
+    public string LatencyDetail
+    {
+        get
+        {
+            if (!_snapshot.IsActive || _snapshot.Receiver is not { } receiver) return "";
+            var targets = receiver.IsSoftwareGroup ? receiver.Peers : [receiver];
+            var policy = LatencyPolicy.Forced(_settings, receiver) ? L.Get("Force fixed latency")
+                : targets.All(r => (_settings.ReadOptions(r.Id).LatencyMode ?? _settings.LatencyMode) == LatencyPolicy.Mode)
+                    ? L.Get("Adaptive latency") : L.Get("Fixed target · recovery enabled");
+            var details = new List<string> { policy };
+            foreach (var item in _snapshot.Diagnostics?.Negotiated ?? [])
+            {
+                if (item.Number("effective_latency_ms") is not { } effective || item.Number("requested_latency_ms") is not { } requested) continue;
+                var text = L.Format("Requested {0} ms · engine plan {1} ms", requested.ToString("0.#"), effective.ToString("0.#"));
+                if (item.Number("receiver_latency_min_ms") is { } minimum)
+                {
+                    text += " · " + L.Format("Receiver reports a minimum of {0} ms.", minimum.ToString("0.#"));
+                    if (item.Boolean("force_latency") == true && requested < minimum)
+                        text += "\n" + L.Format("Below the receiver's reported minimum: continuing at {0} ms. Playback may be rejected or silent.", requested.ToString("0.#"));
+                }
+                if (receiver.IsGroup) text = (receiver.Peers.FirstOrDefault(p => p.Id == item.Text("receiver_id"))?.Name ?? receiver.Name) + ": " + text;
+                details.Add(text);
+            }
+            return string.Join("\n", details);
+        }
+    }
     public string MonitorLatency => _snapshot.Metrics?.CaptureToSendP95 is { } ms ? $"{ms:F1} ms" : "—";
     public string MonitorQueue => _snapshot.Metrics?.MaxQueueAge is { } ms ? $"{ms:F1} ms" : "—";
     public string MonitorUnderruns => _snapshot.Metrics?.Underruns?.ToString() ?? "—";
@@ -390,7 +416,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         var previous = _snapshot;
         _snapshot = snapshot;
         RefreshGlobalLatency();
-        Notify(nameof(Snapshot));
+        Notify(nameof(Snapshot)); Notify(nameof(LatencyDetail));
         if (title != StatusTitle) Notify(nameof(StatusTitle));
         if (detail != StatusDetail) Notify(nameof(StatusDetail));
         if (errors != ErrorDetails) Notify(nameof(ErrorDetails));

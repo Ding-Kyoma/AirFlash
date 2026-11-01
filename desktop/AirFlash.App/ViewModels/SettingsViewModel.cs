@@ -190,8 +190,12 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         RefreshGroupProfiles();
         AddGroupCommand.Refresh();
     }
+    public bool CanForceLatency => Draft.LatencyMode != LatencyPolicy.Mode;
     private void DraftChanged(object? sender, PropertyChangedEventArgs args)
     {
+        Notify(nameof(CanForceLatency));
+        if (sender is AppSettings && args.PropertyName == nameof(AppSettings.LatencyMode))
+            foreach (var row in Receivers) row.RefreshProfiles();
         if (sender is ReceiverOptions) { Equalizer.RefreshHeadroom(); RefreshGroupProfiles(); }
         if (_updating) return;
         if (args.PropertyName == nameof(AppSettings.CaptureMode))
@@ -337,6 +341,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
             {
                 row = new(receiver, options, current => PairRequested?.Invoke(current), () => RemoveManual(receiver.Id), () => CanEdit, () => App.EngineReady && !App.IsClosing, App);
                 row.GroupRate = () => Draft.SoftwareGroups.FirstOrDefault(g => g.LeftId == row.Receiver.Id || g.RightId == row.Receiver.Id)?.SampleRate;
+                row.GlobalLatencyMode = () => Draft.LatencyMode;
                 Receivers.Insert(index, row);
             }
             else
@@ -553,6 +558,8 @@ public sealed class ReceiverEditor : ObservableObject, IDisposable
     public ReceiverOptions Options { get; private set; }
     public ReceiverCapabilitySet Capabilities { get; private set; } = ReceiverCapabilitySet.Unknown;
     public Func<string?>? GroupRate { get; set; }
+    public Func<string>? GlobalLatencyMode { get; set; }
+    public bool CanForceLatency => (Options.LatencyMode ?? GlobalLatencyMode?.Invoke() ?? _app?.Settings.LatencyMode ?? LatencyPolicy.Mode) != LatencyPolicy.Mode;
     public bool CanSetSampleRate => GroupRate?.Invoke() is null;
     public string GroupRateHint => CanSetSampleRate ? "" : L.Get("The software stereo group controls this receiver's sample rate.");
     private string _capabilityError = "";
@@ -588,6 +595,7 @@ public sealed class ReceiverEditor : ObservableObject, IDisposable
     private static string Label(string value) => value switch { "auto" => L.Get("Automatic"), "pcm" => "PCM", "alac" => "ALAC", "realtime" => L.Get("Real-time UDP"), "buffered" => L.Get("Buffered TCP"), "ptp" => L.Get("Sender PTP clock"), "ntp" => "NTP", "follow" => L.Get("Follow receiver PTP clock"), "44100" => "44.1 kHz", "48000" => "48 kHz", _ => value };
     public void RefreshProfiles()
     {
+        Notify(nameof(CanForceLatency));
         Choice[] ChoicesFor(string field, IEnumerable<string> values)
         {
             var result = new List<Choice> { new("auto", AutoLabel(field)) };

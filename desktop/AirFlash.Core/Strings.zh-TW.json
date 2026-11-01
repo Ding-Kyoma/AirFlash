@@ -352,5 +352,17 @@
   "“{0}” claims AirPlay 2, but its firmware is older than 354.54.6, so it is treated as a classic device.": "「{0}」自稱支援 AirPlay 2，但韌體版本低於 354.54.6，已按經典裝置處理。",
   "This stereo group is currently unusable.": "該軟體立體聲組目前無法使用。",
   "Split into two independent receivers": "拆分為兩個獨立接收器",
-  "A member's AirPlay 2 capability is not known right now. The group can be saved, but the connection will be refused if the two members turn out to be incompatible.": "目前無法確認某個成員的 AirPlay 2 能力。仍可儲存該群組，但如果兩個成員不相容，連線會被拒絕。"
+  "A member's AirPlay 2 capability is not known right now. The group can be saved, but the connection will be refused if the two members turn out to be incompatible.": "目前無法確認某個成員的 AirPlay 2 能力。仍可儲存該群組，但如果兩個成員不相容，連線會被拒絕。",
+  "Adaptive latency": "自適應延遲",
+  "Force fixed latency": "強制固定延遲",
+  "Keep recovery behavior": "保留原恢復方式",
+  "When forced, late audio may be dropped or the session reconnected; latency will not be increased automatically.": "強制時可能捨棄遲到音訊或重新連線，但不會自動增加延遲。",
+  "Adaptive mode ignores the forced setting. Existing fixed and custom modes keep their recovery behavior unless forced.": "自適應模式下強制選項不生效。未開啟強制時，固定和自訂模式保留原有恢復方式。",
+  "Target values are not measured end-to-end audio latency.": "目標值並非實測的端到端音訊延遲。",
+  "Forced latency requires every stereo member to use forced mode with the same target. Update the receiver settings.": "組合內所有成員必須使用相同的強制延遲目標，請在接收器設定中統一配置。",
+  "This audio engine does not support forced latency. Update the engine or turn off forced latency.": "目前音訊引擎不支援強制固定延遲，請更新引擎或關閉強制選項。",
+  "Fixed target · recovery enabled": "固定目標 · 保留恢復方式",
+  "Requested {0} ms · engine plan {1} ms": "請求 {0} ms · 引擎採用 {1} ms",
+  "Receiver reports a minimum of {0} ms.": "裝置回報的最低值為 {0} ms。",
+  "Below the receiver's reported minimum: continuing at {0} ms. Playback may be rejected or silent.": "低於裝置回報的下限，仍按 {0} ms 嘗試，可能被裝置拒絕或沒有聲音。"
 }

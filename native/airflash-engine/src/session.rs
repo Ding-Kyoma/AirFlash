@@ -63,6 +63,8 @@ pub struct ProbeOptions {
     pub standby: crate::standby::Settings,
     pub duration_ms: u32,
     pub latency_ms: u32,
+    #[serde(default)]
+    pub force_latency: bool,
     pub gain: f32,
     #[serde(default)]
     pub equalizer: crate::equalizer::Settings,
@@ -91,7 +93,23 @@ fn default_timing() -> String {
     "ptp".into()
 }
 impl ProbeOptions {
+    fn validate_forced_latency(&self) -> Result<()> {
+        if self.force_latency {
+            let mut targets = self
+                .peers
+                .iter()
+                .map(|p| p.profile.latency_ms.unwrap_or(self.latency_ms));
+            if let Some(first) = targets.next() {
+                ensure!(
+                    targets.all(|value| value == first),
+                    "forced latency requires the same target on every group member"
+                );
+            }
+        }
+        Ok(())
+    }
     pub fn validate_start(&self) -> Result<()> {
+        self.validate_forced_latency()?;
         ensure!(
             matches!(self.source.as_str(), "loopback" | "application") && self.duration_ms == 0,
             "start requires unbounded live source"
@@ -134,6 +152,7 @@ impl ProbeOptions {
         bounded.validate()
     }
     pub fn validate(&self) -> Result<()> {
+        self.validate_forced_latency()?;
         self.equalizer.validate()?;
         ensure!(
             !self.standby.enabled
@@ -770,16 +789,26 @@ impl Member {
             .as_dictionary()
             .and_then(|d| d.get("latencyMin"))
             .and_then(Value::as_unsigned_integer);
-        let effective_latency = receiver_latency
+        let receiver_min = receiver_latency
             .filter(|v| *v > 0 && *v <= rate as u64 * 10)
             .map(|samples| Duration::from_nanos(samples * 1_000_000_000 / rate as u64));
+        let effective_latency =
+            selected_latency(requested_latency, receiver_min, options.force_latency);
         member.media.configure_latency(
-            effective_latency.unwrap_or(Duration::from_millis(u64::from(requested_latency))),
-            effective_latency.is_none(),
+            effective_latency,
+            receiver_min.is_none() || options.force_latency,
         );
         emit(
-            json!({"event":"negotiated","receiver_id":peer.receiver_id,"host":peer.host,"port":peer.port,"clock_role":member.compat.clock_role(),"data_port":data_port,"codec":member.compat.codec_name(),"transport":member.compat.transport(),"timing":member.compat.timing_name(),"channel":peer.profile.channel,"sync_offset_ms":peer.profile.sync_offset_ms,"qualification":"experimental","sample_rate":rate,"control_port":member.remote_control,"requested_latency_ms":options.latency_ms,"receiver_latency_min_samples":stream.as_dictionary().and_then(|d|d.get("latencyMin")).and_then(Value::as_unsigned_integer),"measured_latency_ms":null}),
+            json!({"event":"negotiated","receiver_id":peer.receiver_id,"host":peer.host,"port":peer.port,"clock_role":member.compat.clock_role(),"data_port":data_port,"codec":member.compat.codec_name(),"transport":member.compat.transport(),"timing":member.compat.timing_name(),"channel":peer.profile.channel,"sync_offset_ms":peer.profile.sync_offset_ms,"qualification":"experimental","sample_rate":rate,"control_port":member.remote_control,"requested_latency_ms":requested_latency,"effective_latency_ms":effective_latency.as_secs_f64()*1000.0,"force_latency":options.force_latency,"receiver_latency_min_ms":receiver_min.map(|v|v.as_secs_f64()*1000.0),"receiver_latency_min_samples":receiver_latency,"measured_latency_ms":null}),
         );
+        if options.force_latency && receiver_min.is_some_and(|min| effective_latency < min) {
+            emit(
+                json!({"event":"warning","channel":"latency","host":peer.host,
+                "code":"forced_latency_below_minimum","recovered":false,
+                "requested_latency_ms":requested_latency,"receiver_latency_min_ms":receiver_min.map(|v|v.as_secs_f64()*1000.0),
+                "message":"Forced target is below the receiver's reported minimum; continuing with the requested value. Playback may be rejected or silent."}),
+            );
+        }
         // A receiver that already ended the session during setup is a plain setup
         // failure, never preemption: there is no media or PTP history to pair the
         // request with yet.
@@ -1991,7 +2020,8 @@ fn send_packets(
     // an internal invariant, not a promise of sub-millisecond lead control
     // (Q44 §二).
     reset_lead();
-    let mutable_anchor = members.iter().all(|m| m.media.supports_timeline_shift());
+    let mutable_anchor =
+        !options.force_latency && members.iter().all(|m| m.media.supports_timeline_shift());
     let mut applied_lead_us = 0i64;
     let mut unsupported_lead = None;
     // RTP-side evidence for distinguishing a transport failure from a local
@@ -2127,7 +2157,7 @@ fn send_packets(
             if !mutable_anchor && requested != 0 && unsupported_lead != Some(requested) {
                 unsupported_lead = Some(requested);
                 emit(
-                    json!({"event":"lead_error","message":"Runtime lead changes require realtime UDP on every member"}),
+                    json!({"event":"lead_error","message":if options.force_latency { "Runtime lead changes are disabled by forced latency" } else { "Runtime lead changes require realtime UDP on every member" }}),
                 );
             }
             let wanted = if mutable_anchor {
@@ -2211,7 +2241,7 @@ fn send_packets(
                         if !mutable_anchor {
                             telemetry.expired += 1;
                             return Err(Fault::new("", "scheduler", "timeline_expired", true,
-                                "Buffered playback requires a fresh session anchor after a sender stall").into());
+                                if options.force_latency { "Forced latency requires a fresh session after a sender stall" } else { "Buffered playback requires a fresh session anchor after a sender stall" }).into());
                         }
                         // Over budget: move the whole timeline forward instead of
                         // tearing the session down. Sequence numbers and RTP
@@ -3020,6 +3050,14 @@ static LEAD_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new
 pub const MAX_LEAD_MS: i64 = 2000;
 /// Local headroom above requested latency; receiver capacity is not measured here.
 pub const LEAD_HEADROOM_MS: i64 = 100;
+fn selected_latency(requested_ms: u32, receiver_min: Option<Duration>, forced: bool) -> Duration {
+    let requested = Duration::from_millis(u64::from(requested_ms));
+    if forced {
+        requested
+    } else {
+        receiver_min.unwrap_or(requested)
+    }
+}
 /// Bound requested extra lead conservatively using the session's latency settings.
 fn lead_ceiling(members: &[Member]) -> i64 {
     lead_ceiling_from(members.iter().filter_map(|m| m.peer.profile.latency_ms))
@@ -3080,6 +3118,39 @@ mod simulation;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn forced_latency_keeps_the_requested_value_and_legacy_keeps_negotiation() {
+        for requested in [0, 120, 200, 500, 2000] {
+            for minimum in [
+                None,
+                Some(Duration::from_millis(50)),
+                Some(Duration::from_millis(200)),
+                Some(Duration::from_millis(500)),
+            ] {
+                assert_eq!(
+                    selected_latency(requested, minimum, true),
+                    Duration::from_millis(u64::from(requested))
+                );
+                assert_eq!(
+                    selected_latency(requested, minimum, false),
+                    minimum.unwrap_or(Duration::from_millis(u64::from(requested)))
+                );
+            }
+        }
+    }
+    #[test]
+    fn forced_group_targets_must_match_but_legacy_values_remain_valid() {
+        let mut options: ProbeOptions = serde_json::from_value(json!({
+            "peers":[{"host":"127.0.0.1","profile":{"latency_ms":120}},{"host":"127.0.0.2","profile":{"latency_ms":200}}],
+            "source":"loopback","duration_ms":0,"latency_ms":120,"gain":0.1
+        })).unwrap();
+        assert!(!options.force_latency);
+        assert!(options.validate_start().is_ok());
+        options.force_latency = true;
+        assert!(options.validate_start().is_err());
+        options.peers[1].profile.latency_ms = Some(120);
+        assert!(options.validate_start().is_ok());
+    }
     use crate::profile::{
         AIRPLAY2_BIT, Codec, CompatFingerprint, Formats, Profile, Timing, TimingPlan, Transport,
     };
@@ -4560,6 +4631,13 @@ mod tests {
 
     #[test]
     fn a_buffered_link_expires_instead_of_shifting_an_unpublished_anchor() {
+        buffered_expiry(false);
+    }
+    #[test]
+    fn forced_buffered_playback_also_rebuilds_instead_of_shifting_the_anchor() {
+        buffered_expiry(true);
+    }
+    fn buffered_expiry(forced: bool) {
         use std::io::Read;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -4571,7 +4649,8 @@ mod tests {
         let (mut member, _receiver, server) = local_member();
         member.media.connect_buffered(address).unwrap();
         let mut members = vec![member];
-        let options = summary_options("", "single", 0);
+        let mut options = summary_options("", "single", 0);
+        options.force_latency = forced;
         let gain = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0.0f32.to_bits()));
         let events = std::sync::Mutex::new(Vec::new());
         let outcome = send_packets(
@@ -4610,6 +4689,96 @@ mod tests {
         drop(members);
         server.join().unwrap();
         tcp.join().unwrap();
+    }
+    #[test]
+    fn forced_udp_expires_without_moving_the_timeline_after_a_large_stall() {
+        let (mut member, receiver, server) = local_member();
+        member
+            .media
+            .connect_audio(receiver.local_addr().unwrap())
+            .unwrap();
+        let mut members = vec![member];
+        let mut options = summary_options("", "single", 0);
+        options.force_latency = true;
+        let gain = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0.0f32.to_bits()));
+        let events = std::sync::Mutex::new(Vec::new());
+        let result = send_packets(
+            &options,
+            &Cancellation::default(),
+            &gain,
+            crate::volume::Control::default(),
+            None,
+            &crate::standby::Control::default(),
+            &Clock::new(),
+            None,
+            &mut members,
+            None,
+            &mut preemption::TakeoverCounters::default(),
+            &[],
+            None,
+            &|event| {
+                if event["event"] == "streaming" {
+                    thread::sleep(Duration::from_millis(200));
+                }
+                events.lock().unwrap().push(event);
+            },
+        );
+        assert_eq!(
+            result.unwrap_err().downcast_ref::<Fault>().unwrap().code,
+            "timeline_expired"
+        );
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|e| e["code"] != "timeline_reanchored" && e["event"] != "lead_changed")
+        );
+        let summary = events
+            .iter()
+            .find(|e| e["event"] == "transport_metrics")
+            .unwrap();
+        assert_eq!(summary["timeline_reanchored"], 0);
+        drop(members);
+        server.join().unwrap();
+    }
+    #[test]
+    fn a_zero_forced_target_expires_promptly_instead_of_spinning_or_adding_delay() {
+        let (mut member, receiver, server) = local_member();
+        member
+            .media
+            .connect_audio(receiver.local_addr().unwrap())
+            .unwrap();
+        member.media.configure_latency(Duration::ZERO, true);
+        let mut members = vec![member];
+        let mut options = summary_options("", "single", 0);
+        options.force_latency = true;
+        options.latency_ms = 0;
+        let gain = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0.0f32.to_bits()));
+        let began = Instant::now();
+        let result = send_packets(
+            &options,
+            &Cancellation::default(),
+            &gain,
+            crate::volume::Control::default(),
+            None,
+            &crate::standby::Control::default(),
+            &Clock::new(),
+            None,
+            &mut members,
+            None,
+            &mut preemption::TakeoverCounters::default(),
+            &[],
+            None,
+            &|_| {},
+        );
+        assert_eq!(
+            result.unwrap_err().downcast_ref::<Fault>().unwrap().code,
+            "timeline_expired"
+        );
+        assert!(began.elapsed() < Duration::from_secs(3));
+        assert_eq!(members[0].media.metrics.packets_sent, 0);
+        drop(members);
+        server.join().unwrap();
     }
     #[test]
     fn a_normal_stop_emits_exactly_one_session_summary() {
@@ -5137,6 +5306,7 @@ mod tests {
             standby: crate::standby::Settings::default(),
             duration_ms: 5001,
             latency_ms: 200,
+            force_latency: false,
             gain: 0.1,
             equalizer: crate::equalizer::Settings::default(),
             sample_rate: 44100,

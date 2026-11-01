@@ -95,6 +95,7 @@ public static class ReceiverCatalog
                 {
                     Hidden = options.Any(o => o.Hidden), AutoConnect = options.Any(o => o.AutoConnect == false) ? false : options.Select(o => o.AutoConnect).FirstOrDefault(v => v.HasValue),
                     Volume = options.Select(o => o.Volume).FirstOrDefault(v => v.HasValue), LatencyMode = options.Select(o => o.LatencyMode).FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)),
+                    ForceLatency = options.Select(o => o.ForceLatency).FirstOrDefault(v => v.HasValue),
                     CustomBufferMs = options.Select(o => o.CustomBufferMs).FirstOrDefault(v => v.HasValue), StandbySeconds = options.Select(o => o.StandbySeconds).FirstOrDefault(v => v.HasValue)
                     , Codec = options[0].Codec, SampleRate = options.Select(o => o.SampleRate).FirstOrDefault(v => v is not null), Transport = options[0].Transport, Timing = options[0].Timing
                 };

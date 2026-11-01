@@ -84,6 +84,33 @@ including either software stereo member, the control is disabled and points to
 **Settings > Receivers**. Stopping playback restores it; the global default remains
 editable in Settings.
 
+New installations and reset settings default to **Adaptive latency**. It selects
+an initial target from the negotiated codec and clock strategy, then increases
+headroom after sustained send lateness or repeated recovery. It does not
+automatically lower the target after a stable period; a new session resets it.
+Upgrades preserve existing latency modes, custom values, and recovery behavior.
+
+In **Settings > AirFlash streaming**, the 120/200/500 ms presets and 0–2000 ms
+custom target also offer an independent **Force fixed latency** switch. With it
+off, the existing recovery behavior remains. With it on, AirFlash does not
+automatically increase latency or move the playback timeline: short stalls may
+use brief silence and clear stale capture audio, while larger stalls reconnect
+at the same target within the configured retry limit. Adaptive mode ignores the
+switch while preserving its saved value and the custom target.
+
+Receiver settings can inherit the global policy, keep recovery, or force a fixed
+target. Forced software stereo requires every member to use the same forced
+target; conflicts are reported before playback without changing the group or its
+left/right synchronization offsets. Applying a target or policy change during
+playback rebuilds the session.
+
+A forced target below the receiver's reported minimum shows a warning and is
+still attempted; the receiver may reject playback or remain silent. The control
+panel distinguishes the requested target, engine plan, and receiver minimum.
+These scheduling values are not measured end-to-end audio latency. Without
+forcing, the existing negotiation of receiver latency remains in effect.
+Latency mode and UDP/TCP transport are independent settings.
+
 **Settings > General > Reset and restart** asks once before clearing all settings
 and receiver pairing. AirFlash stops playback and discovery, restores local mute,
 disables startup at login, deletes `config.json` and `native-credentials`, and restarts
