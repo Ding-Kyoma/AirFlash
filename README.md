@@ -86,7 +86,9 @@ editable in Settings.
 
 New installations and reset settings default to **Adaptive latency**. It selects
 an initial target from the negotiated codec and clock strategy, then increases
-headroom after sustained send lateness or repeated recovery. It does not
+headroom after sustained send lateness or repeated recovery. Both native and
+software stereo groups request a 50 ms starting target, with recovery steps of
+50/60/80/120/140/160/200 ms; receiver negotiation still applies. It does not
 automatically lower the target after a stable period; a new session resets it.
 Upgrades preserve existing latency modes, custom values, and recovery behavior.
 
@@ -110,6 +112,11 @@ panel distinguishes the requested target, engine plan, and receiver minimum.
 These scheduling values are not measured end-to-end audio latency. Without
 forcing, the existing negotiation of receiver latency remains in effect.
 Latency mode and UDP/TCP transport are independent settings.
+
+Stopping playback or cancelling a connection immediately shows **Disconnecting…**.
+The playback button becomes available again after the old session is cleaned up.
+AirFlash drains final engine output during shutdown and gives the engine a shared
+two-second stop budget before terminating an unresponsive engine process.
 
 **Settings > General > Reset and restart** asks once before clearing all settings
 and receiver pairing. AirFlash stops playback and discovery, restores local mute,

@@ -30,6 +30,8 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private readonly Action<DesktopSessionRecord> _sessionRecords = sessionRecords ?? DesktopSessionLog.Append;
     private CancellationTokenSource? _lifetime;
     private Task? _work;
+    private EngineShutdownException? _cleanupFailure;
+    public bool NeedsCleanup => _cleanupFailure is not null;
     private IEngineConnection? _connection;
     private string? _sessionId;
     private AppSettings _settings = new();
@@ -230,8 +232,13 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private static int InitialLatency(Receiver receiver, Receiver member, AppSettings settings, ReceiverProfile? negotiated)
     {
         var target = receiver.IsSoftwareGroup ? member : receiver;
-        if ((settings.ReadOptions(target.Id).LatencyMode ?? settings.LatencyMode) != LatencyPolicy.Mode || negotiated is null)
+        if ((settings.ReadOptions(target.Id).LatencyMode ?? settings.LatencyMode) != LatencyPolicy.Mode)
             return settings.Latency(target);
+        if (negotiated is null)
+        {
+            var options = ProfileOptions(receiver, member, settings);
+            return LatencyPolicy.For(receiver, options.Codec == "auto" ? null : options.Codec, options.Timing is not ("ntp")).Initial;
+        }
         return LatencyPolicy.For(receiver, negotiated.SelectedCodec, negotiated.SelectedTiming is "ptp" or "follow").Initial;
     }
     private static Dictionary<string, string?> ConnectionFields(Receiver receiver, AppSettings settings)
@@ -297,6 +304,11 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             }
             catch (PairCancelledException) { }
             catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+            catch (EngineShutdownException error)
+            {
+                if (RecordFailure(epoch, error) is { } notice) Publish(epoch, PlaybackState.Error, FailureMessage(receiver, notice));
+                throw;
+            }
             catch (Exception error) { if (RecordFailure(epoch, error) is { } notice) Publish(epoch, FailureState(notice), FailureMessage(receiver, notice)); }
             finally { await RestoreAudioAsync().ConfigureAwait(false); }
         }, CancellationToken.None);
@@ -311,7 +323,16 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     {
         lock (_sync) { ++_generation; _discoveredReceiver = null; _volumeEdit?.Cancel(); _volumeEdit?.Dispose(); _volumeEdit = null; _deviceVolume = new(); _memberVolumes.Clear(); _memberHosts.Clear(); }
         if (_lifetime is not null) await _lifetime.CancelAsync().ConfigureAwait(false);
-        if (_work is not null) await _work.ConfigureAwait(false);
+        if (_cleanupFailure is { } cleanup)
+        {
+            await cleanup.Connection.DisposeAsync().ConfigureAwait(false);
+            _cleanupFailure = null; _work = null;
+        }
+        if (_work is not null)
+        {
+            try { await _work.ConfigureAwait(false); }
+            catch (EngineShutdownException error) { _cleanupFailure = error; throw; }
+        }
         _lifetime?.Dispose(); _lifetime = null; _work = null;
         await RestoreAudioAsync().ConfigureAwait(false);
     }
@@ -817,6 +838,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                 }
             }
             catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { return; }
+            catch (EngineShutdownException) { throw; }
             catch (Exception error)
             {
                 await RestoreAudioAsync().ConfigureAwait(false);
@@ -894,6 +916,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         var notice = error switch
         {
             EngineFailure engineFailure => engineFailure.Notice,
+            EngineShutdownException shutdown => new EngineNotice("engine_cleanup_failed", "", "desktop", shutdown.Message, false),
             SocketException socket => new EngineNotice("network_error", "", "desktop", socket.Message, true),
             NetworkFailure network => new EngineNotice("network_error", "", "desktop", network.Message, true),
             _ => new EngineNotice("host_error", "", "desktop", error.Message)

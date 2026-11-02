@@ -8,6 +8,30 @@ namespace AirFlash.Tests;
 public sealed class SessionTests
 {
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AdaptiveStereoStartsBothMembersAtFiftyAndReconnectsAtTheSameInitialTarget(bool software)
+    {
+        var (group, settings) = SoftwareGroup();
+        if (!software) group = group with { Id = "stereo:pair", StereoId = "pair", IsSoftwareGroup = false };
+        settings.LatencyMode = "adaptive";
+        var first = new FakeConnection(); var second = new FakeConnection();
+        await using var controller = new SessionController(new FakeFactory(first, second), new FakeAudio(), timing: Fast);
+        await controller.StartAsync(group, settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        foreach (var process in new[] { first, second })
+        {
+            if (process == second)
+            {
+                first.EmitData(new { @event = "error", code = "timeline_expired", retryable = true });
+                await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            }
+            var start = Assert.Single(process.Commands, c => c.Command == "start").Parameters;
+            Assert.Equal(50, start.Integer("latency_ms"));
+            Assert.All(start.GetProperty("peers").EnumerateArray(), peer => Assert.Equal(50, peer.GetProperty("profile").Integer("latency_ms")));
+        }
+    }
+    [Theory]
     [InlineData("custom", true, true)]
     [InlineData("custom", false, false)]
     [InlineData("adaptive", true, false)]

@@ -364,5 +364,8 @@
   "Fixed target · recovery enabled": "固定目標 · 保留恢復方式",
   "Requested {0} ms · engine plan {1} ms": "請求 {0} ms · 引擎採用 {1} ms",
   "Receiver reports a minimum of {0} ms.": "裝置回報的最低值為 {0} ms。",
-  "Below the receiver's reported minimum: continuing at {0} ms. Playback may be rejected or silent.": "低於裝置回報的下限，仍按 {0} ms 嘗試，可能被裝置拒絕或沒有聲音。"
+  "Below the receiver's reported minimum: continuing at {0} ms. Playback may be rejected or silent.": "低於裝置回報的下限，仍按 {0} ms 嘗試，可能被裝置拒絕或沒有聲音。",
+  "Disconnecting…": "正在中斷連線…",
+  "Stopping playback and disconnecting…": "正在停止播放並中斷連線…",
+  "The audio engine could not stop. Try disconnecting again.": "音訊引擎未能停止，請再次嘗試中斷連線。"
 }

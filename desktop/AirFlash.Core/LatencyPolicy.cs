@@ -5,13 +5,10 @@ namespace AirFlash.Core;
 /// How much audio AirFlash holds at the receiver, and how far it may be tightened.
 /// </summary>
 /// <remarks>
-/// The lead is the one setting where a single number cannot serve every topology.
-/// A solo HomePod with ALAC over PTP tolerates about 50 ms; a stereo pair needs the
-/// two members' clocks to agree and starts at 120 ms. Rather than expose a slider
-/// and hope, the policy derives a starting lead from the negotiated stream and a
-/// ladder of candidates it may walk up (trouble) or down (a long clean window).
-/// The floor is the value that was validated for that topology: going below it
-/// trades an audible glitch for a few milliseconds nobody can measure.
+/// Adaptive solo ALAC/PTP and stereo playback request a 50 ms starting lead.
+/// These are scheduling targets, not measured acoustic latency or guaranteed
+/// device minima. The desktop walks the ladder upward after repeated trouble;
+/// a fresh session resets the target. Stable playback does not trigger downshifts.
 /// </remarks>
 public static class LatencyPolicy
 {
@@ -32,8 +29,8 @@ public static class LatencyPolicy
     public static Plan For(Receiver receiver, string? codec = null, bool ptp = true, int? customMs = null)
     {
         ArgumentNullException.ThrowIfNull(receiver);
-        if (receiver.IsSoftwareGroup) return new(120, 120, [120, 140, 160, 200], "software stereo");
-        if (receiver.IsGroup) return new(120, 120, [120, 140, 160, 200], "homepod stereo");
+        if (receiver.IsSoftwareGroup) return new(50, 50, [50, 60, 80, 120, 140, 160, 200], "software stereo");
+        if (receiver.IsGroup) return new(50, 50, [50, 60, 80, 120, 140, 160, 200], "homepod stereo");
         var alac = codec is not ("pcm");
         if (customMs is { } custom)
         {

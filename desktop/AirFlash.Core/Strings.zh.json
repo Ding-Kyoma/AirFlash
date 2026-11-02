@@ -381,5 +381,8 @@
   "Fixed target · recovery enabled": "固定目标 · 保留恢复方式",
   "Requested {0} ms · engine plan {1} ms": "请求 {0} ms · 引擎采用 {1} ms",
   "Receiver reports a minimum of {0} ms.": "设备报告的最低值为 {0} ms。",
-  "Below the receiver's reported minimum: continuing at {0} ms. Playback may be rejected or silent.": "低于设备报告的下限，仍按 {0} ms 尝试，可能被设备拒绝或没有声音。"
+  "Below the receiver's reported minimum: continuing at {0} ms. Playback may be rejected or silent.": "低于设备报告的下限，仍按 {0} ms 尝试，可能被设备拒绝或没有声音。",
+  "Disconnecting…": "正在断开…",
+  "Stopping playback and disconnecting…": "正在停止播放并断开连接…",
+  "The audio engine could not stop. Try disconnecting again.": "音频引擎未能停止，请再次尝试断开连接。"
 }

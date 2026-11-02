@@ -29,14 +29,16 @@ public sealed class LatencyPolicyTests
     }
 
     [Fact]
-    public void Groups_never_go_below_the_pair_floor()
+    public void Both_group_types_start_at_fifty_and_keep_the_upper_recovery_steps()
     {
-        foreach (var receiver in new[] { Pair() })
+        foreach (var receiver in new[] { Pair(), Pair() with { Id = "software:pair", IsSoftwareGroup = true } })
         {
             var plan = LatencyPolicy.For(receiver);
-            Assert.Equal(120, plan.Initial);
-            Assert.Equal(120, plan.Floor);
-            Assert.Equal(120, LatencyPolicy.Next(120, plan, false));
+            Assert.Equal(50, plan.Initial);
+            Assert.Equal(50, plan.Floor);
+            Assert.Equal(new[] { 50, 60, 80, 120, 140, 160, 200 }, plan.Ladder);
+            Assert.Equal(50, LatencyPolicy.Next(50, plan, false));
+            Assert.Equal(60, LatencyPolicy.Next(50, plan, true));
             Assert.Equal(140, LatencyPolicy.Next(120, plan, true));
         }
     }
@@ -77,7 +79,7 @@ public sealed class LatencyPolicyTests
         Assert.Equal(50, settings.Latency(Solo()));
         settings.Options("z-airplay").Codec = "pcm";
         Assert.Equal(60, settings.Latency(Solo()));
-        Assert.Equal(120, settings.Latency(Pair()));
+        Assert.Equal(50, settings.Latency(Pair()));
         // Other modes keep their historical values.
         settings.LatencyMode = "normal";
         Assert.Equal(200, settings.Latency(Solo()));

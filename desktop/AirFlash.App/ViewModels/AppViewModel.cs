@@ -49,12 +49,15 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public IReadOnlyList<Receiver> AllReceivers => _known.Values.Concat(SoftwareStereo.Resolve(_known.Values, _settings)).OrderBy(r => r.Name, StringComparer.CurrentCultureIgnoreCase).ToArray();
     public AppSettings Settings => _settings;
     public SessionSnapshot Snapshot => _snapshot;
+    private Task? _stopTask;
+    private long _playIntent;
+    public bool IsStopping { get; private set; }
     public string Notice { get => _notice; private set { Set(ref _notice, value); Notify(nameof(ErrorDetails)); } }
     public int MasterVolume { get => _settings.MasterVolume; set { if (_closing || _resetting) return; value = Math.Clamp(value, 0, 100); if (value == _settings.MasterVolume) return; _settings.MasterVolume = value; VolumeChanged(); Notify(); } }
     public bool Muted => Session.Muted;
     public string MuteLabel => Muted ? L.Get("Unmute") : L.Get("Mute");
-    public string StatusTitle => _snapshot.State switch { PlaybackState.Connecting => L.Get("Connecting"), PlaybackState.Streaming => L.Get("Playing"), PlaybackState.Standby => L.Get("Standby"), PlaybackState.Pairing => L.Get("Pairing"), PlaybackState.Error => L.Get("Connection error"), PlaybackState.Preempted => L.Get("Taken over by another device"), _ => L.Get("Ready") };
-    public string StatusDetail => _snapshot.Message.Length > 0 ? _snapshot.Message : _snapshot.IsActive ? L.Format("{0} · target {1} ms", _snapshot.Receiver?.Name, _snapshot.TargetLatency) : L.Get("Select a receiver to play system audio");
+    public string StatusTitle => IsStopping ? L.Get("Disconnecting…") : Session.NeedsCleanup ? L.Get("Connection error") : _snapshot.State switch { PlaybackState.Connecting => L.Get("Connecting"), PlaybackState.Streaming => L.Get("Playing"), PlaybackState.Standby => L.Get("Standby"), PlaybackState.Pairing => L.Get("Pairing"), PlaybackState.Error => L.Get("Connection error"), PlaybackState.Preempted => L.Get("Taken over by another device"), _ => L.Get("Ready") };
+    public string StatusDetail => IsStopping ? L.Get("Stopping playback and disconnecting…") : Session.NeedsCleanup ? L.Get("The audio engine could not stop. Try disconnecting again.") : _snapshot.Message.Length > 0 ? _snapshot.Message : _snapshot.IsActive ? L.Format("{0} · target {1} ms", _snapshot.Receiver?.Name, _snapshot.TargetLatency) : L.Get("Select a receiver to play system audio");
     public string LatencyDetail
     {
         get
@@ -114,7 +117,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public string ErrorDetails => _snapshot.State is PlaybackState.Error or PlaybackState.Preempted ? _snapshot.Message : Notice;
     /// <summary>The receiver now belongs to another controller. Reconnecting is a
     /// deliberate user action, never the automatic transport retry.</summary>
-    public bool CanReconnect => !_closing && _snapshot.State == PlaybackState.Preempted && _snapshot.Receiver is not null;
+    public bool CanReconnect => !_closing && !IsStopping && !Session.NeedsCleanup && _snapshot.State == PlaybackState.Preempted && _snapshot.Receiver is not null;
     public string EngineVersion { get; set; } = L.Get("Unknown");
     public bool EngineReady => _engine is null || _engine.State == EngineAvailability.Ready;
     public bool EngineFailed => _engine?.State == EngineAvailability.Failed;
@@ -122,8 +125,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         ? L.Format("The audio engine could not start: {0}", _engine!.Error)
         : L.Get("Initializing audio engine…");
     public AsyncCommand RetryEngineCommand { get; }
-    public bool CanEditGlobalLatency => !_closing && !_resetting && !(_snapshot.State is PlaybackState.Connecting or PlaybackState.Streaming or PlaybackState.Standby && _snapshot.Receiver is { } receiver && _settings.UsesDeviceLatency(receiver));
-    public string GlobalLatencyHint => CanEditGlobalLatency ? "" : L.Get("This device uses its receiver latency mode. Adjust it in Settings → Receivers.");
+    public bool CanEditGlobalLatency => !_closing && !_resetting && !IsStopping && !(_snapshot.State is PlaybackState.Connecting or PlaybackState.Streaming or PlaybackState.Standby && _snapshot.Receiver is { } receiver && _settings.UsesDeviceLatency(receiver));
+    public string GlobalLatencyHint => IsStopping ? L.Get("Disconnecting…") : CanEditGlobalLatency ? "" : L.Get("This device uses its receiver latency mode. Adjust it in Settings → Receivers.");
     public ObservableCollection<StreamChoice> LatencyChoices { get; } = [];
     public string LatencyMode { get => _settings.LatencyMode; set { if (!CanEditGlobalLatency || value == _settings.LatencyMode || value is null) return; _settings.LatencyMode = value; VolumeChanged(); Notify(); RefreshGlobalLatency(); } }
     private void RefreshGlobalLatency() { Notify(nameof(CanEditGlobalLatency)); Notify(nameof(GlobalLatencyHint)); }
@@ -188,7 +191,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             _discoverySearchTimer!.Stop(); _searchSettled = true; Notify(nameof(DiscoveryEmptyTitle));
         }, dispatcher);
         _discoverySearchTimer.Stop();
-        StopCommand = new(() => StopAsync(), ShowError, () => _snapshot.IsActive);
+        StopCommand = new(() => StopAsync(), ShowError, () => !IsStopping && (_snapshot.IsActive || Session.NeedsCleanup));
         ReconnectCommand = new(() => _snapshot.Receiver is { } receiver ? ToggleAsync(receiver) : Task.CompletedTask, ShowError, () => CanReconnect);
         MuteCommand = new(async () => { await Session.SetMutedAsync(!Session.Muted); Notify(nameof(Muted)); Notify(nameof(MuteLabel)); }, ShowError);
         MergeManualReceivers();
@@ -264,13 +267,14 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private async Task OnEndpointsChangedAsync()
     {
         if (_closing || _resetting) return;
+        var intent = _playIntent;
         await _settingsGate.WaitAsync();
         try
         {
             if (_closing || _resetting) return;
             var next = await _audio.GetDefaultEndpointIdAsync();
             if (_closing || _resetting) return;
-            if (_settings.CaptureMode == "loopback" && next != _defaultEndpoint && _snapshot.IsActive && _snapshot.State != PlaybackState.Pairing && _snapshot.Receiver is { } receiver) await Session.StartAsync(receiver, _settings.Clone());
+            if (!IsStopping && intent == _playIntent && _settings.CaptureMode == "loopback" && next != _defaultEndpoint && _snapshot.IsActive && _snapshot.State != PlaybackState.Pairing && _snapshot.Receiver is { } receiver) await Session.StartAsync(receiver, _settings.Clone());
             _defaultEndpoint = next;
             if (!_snapshot.IsActive) await _audio.RestoreAsync();
         }
@@ -409,7 +413,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         }
         Notify(nameof(AllReceivers));
     }
-    private void SessionChanged(SessionSnapshot snapshot) => _dispatcher.BeginInvoke(() =>
+    private void SessionChanged(SessionSnapshot snapshot) => _dispatcher.BeginInvoke(() => ApplySessionSnapshot(snapshot));
+    private void ApplySessionSnapshot(SessionSnapshot snapshot)
     {
         if (_closing || !ReferenceEquals(snapshot, Session.Snapshot)) return;
         var title = StatusTitle; var detail = StatusDetail; var errors = ErrorDetails;
@@ -430,7 +435,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         }
         foreach (var row in Receivers) row.Refresh();
         if (_monitorVisible) RefreshMonitor();
-    });
+    }
     public void SetMonitorVisible(bool visible)
     {
         _monitorVisible = visible;
@@ -461,29 +466,57 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     }
     public async Task ToggleAsync(Receiver receiver)
     {
-        if (_closing) return;
+        if (_closing || IsStopping) return;
         if (_snapshot.IsActive && _snapshot.Receiver?.Id == receiver.Id) { await StopAsync(); return; }
-        if (_closing || _resetting || !EngineReady) return;
+        if (_closing || _resetting || !EngineReady || Session.NeedsCleanup) return;
         var group = AllReceivers.FirstOrDefault(r => r.IsGroup && !r.IsSoftwareGroup && r.Members.Any(m => m.Address == receiver.Address));
         if (group is not null) receiver = group;
+        var intent = ++_playIntent;
         await FlushVolumeAsync();
         await _settingsGate.WaitAsync();
         try
         {
-            if (_closing || _resetting || !EngineReady) return;
+            if (_closing || _resetting || IsStopping || intent != _playIntent || !EngineReady || Session.NeedsCleanup) return;
+            if (_settings.CaptureMode == "loopback") _defaultEndpoint = await _audio.GetDefaultEndpointIdAsync();
+            if (_closing || _resetting || IsStopping || intent != _playIntent) return;
             _autoSuppressed = false; Notice = "";
             _autoAttempted.Add(receiver.Id);
             await Session.StartAsync(receiver, _settings.Clone());
+            if (intent != _playIntent) return;
             _settings.LastReceiverId = receiver.Id;
             VolumeChanged();
         }
         finally { _settingsGate.Release(); }
         await FlushVolumeAsync();
     }
-    public async Task StopAsync(bool userInitiated = true)
+    public Task StopAsync(bool userInitiated = true)
     {
         if (userInitiated) _autoSuppressed = true;
-        await Session.StopAsync();
+        if (_stopTask is not null) return _stopTask;
+        ++_playIntent;
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _stopTask = completion.Task;
+        IsStopping = true; RefreshStopUi();
+        _ = StopCoreAsync(completion);
+        return completion.Task;
+    }
+    private async Task StopCoreAsync(TaskCompletionSource completion)
+    {
+        Exception? failure = null;
+        try { await Session.StopAsync(); }
+        catch (Exception error) { failure = error; }
+        finally
+        {
+            ApplySessionSnapshot(Session.Snapshot);
+            IsStopping = false; _stopTask = null; RefreshStopUi();
+        }
+        if (failure is null) completion.TrySetResult(); else completion.TrySetException(failure);
+    }
+    private void RefreshStopUi()
+    {
+        Notify(nameof(IsStopping)); Notify(nameof(StatusTitle)); Notify(nameof(StatusDetail)); Notify(nameof(CanReconnect));
+        RefreshGlobalLatency(); StopCommand.Refresh(); ReconnectCommand.Refresh();
+        foreach (var row in Receivers) row.Refresh();
     }
     private void ScheduleAutoConnect() { _autoTimer.Stop(); if (!_closing && !_resetting) _autoTimer.Start(); }
     private async Task SaveSettingsAsync(AppSettings settings, bool? identityBackup = null)
@@ -496,7 +529,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     }
     internal async Task TryAutoConnectAsync()
     {
-        if (_closing || _resetting || !EngineReady || _autoSuppressed || Session.Snapshot.IsActive) return;
+        if (_closing || _resetting || IsStopping || Session.NeedsCleanup || !EngineReady || _autoSuppressed || Session.Snapshot.IsActive) return;
         var eligible = AllReceivers.Where(r => r.Online && r.Complete && !_settings.ReadOptions(r.Id).Hidden && (_settings.ReadOptions(r.Id).AutoConnect ?? _settings.AutoConnectOnDiscover));
         var receiver = eligible.OrderByDescending(r => r.Id == _settings.LastReceiverId).FirstOrDefault();
         if (receiver is not null && !_autoAttempted.Contains(receiver.Id)) await ToggleAsync(receiver);
@@ -718,9 +751,12 @@ public sealed class ReceiverViewModel : ObservableObject
     public bool Muted => DeviceVolume.Display == 0;
     public string MuteLabel => Muted ? L.Get("Unmute") : L.Get("Mute");
     public bool Active => _app.Snapshot.IsActive && _app.Snapshot.Receiver?.Id == Receiver.Id;
-    public bool CanPlay => Active || _app.EngineReady && Receiver.Online && Receiver.Complete;
-    public string PlayHint => Active ? L.Get("Stop playback / disconnect") : L.Get("Play on this device");
-    public string StateText => (Active ? _app.StatusTitle : !Receiver.Online ? L.Get("Offline") : !Receiver.Complete ? L.Get("Waiting for the other member") : L.Get("Disconnected")) + (Receiver.IsGroup ? $" · {Receiver.Members.Length}/2" : "");
+    public bool IsStopping => _app.IsStopping && _app.Snapshot.Receiver?.Id == Receiver.Id;
+    public bool NeedsDisconnect => Active || _app.Session.NeedsCleanup && _app.Snapshot.Receiver?.Id == Receiver.Id;
+    public System.Windows.Input.ICommand PlaybackCommand => NeedsDisconnect ? _app.StopCommand : ToggleCommand;
+    public bool CanPlay => !_app.IsStopping && !_app.Session.NeedsCleanup && (Active || _app.EngineReady && Receiver.Online && Receiver.Complete);
+    public string PlayHint => IsStopping ? L.Get("Disconnecting…") : NeedsDisconnect ? L.Get("Stop playback / disconnect") : L.Get("Play on this device");
+    public string StateText => (NeedsDisconnect ? _app.StatusTitle : !Receiver.Online ? L.Get("Offline") : !Receiver.Complete ? L.Get("Waiting for the other member") : L.Get("Disconnected")) + (Receiver.IsGroup ? $" · {Receiver.Members.Length}/2" : "");
     public AsyncCommand ToggleCommand { get; }
     public AsyncCommand MuteCommand { get; }
     public void Refresh()
@@ -729,7 +765,7 @@ public sealed class ReceiverViewModel : ObservableObject
         foreach (var row in MemberVolumes.Where(r => members.All(m => m.Id != r.Receiver.Id)).ToArray()) MemberVolumes.Remove(row);
         foreach (var member in members)
         { var row = MemberVolumes.FirstOrDefault(r => r.Receiver.Id == member.Id); if (row is null) MemberVolumes.Add(row = new(_app, member)); else row.Receiver = member; row.Refresh(); }
-        var values = new Dictionary<string, object?> { [nameof(HasSingleVolume)] = HasSingleVolume, [nameof(Name)] = Name, [nameof(Detail)] = Detail, [nameof(Volume)] = Volume, [nameof(VolumeText)] = VolumeText, [nameof(VolumeStatus)] = VolumeStatus, [nameof(CanSetVolume)] = CanSetVolume, [nameof(CanMute)] = CanMute, [nameof(Muted)] = Muted, [nameof(MuteLabel)] = MuteLabel, [nameof(Active)] = Active, [nameof(CanPlay)] = CanPlay, [nameof(PlayHint)] = PlayHint, [nameof(StateText)] = StateText };
+        var values = new Dictionary<string, object?> { [nameof(IsStopping)] = IsStopping, [nameof(NeedsDisconnect)] = NeedsDisconnect, [nameof(PlaybackCommand)] = PlaybackCommand, [nameof(HasSingleVolume)] = HasSingleVolume, [nameof(Name)] = Name, [nameof(Detail)] = Detail, [nameof(Volume)] = Volume, [nameof(VolumeText)] = VolumeText, [nameof(VolumeStatus)] = VolumeStatus, [nameof(CanSetVolume)] = CanSetVolume, [nameof(CanMute)] = CanMute, [nameof(Muted)] = Muted, [nameof(MuteLabel)] = MuteLabel, [nameof(Active)] = Active, [nameof(CanPlay)] = CanPlay, [nameof(PlayHint)] = PlayHint, [nameof(StateText)] = StateText };
         foreach (var (name, value) in values)
             if (!_display.TryGetValue(name, out var old) || !Equals(old, value))
             {
