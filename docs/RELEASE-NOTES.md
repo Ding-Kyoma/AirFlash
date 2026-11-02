@@ -1,4 +1,4 @@
-# AirFlash 0.6.0
+# AirFlash 0.6.1
 
 Changes since AirFlash 0.5.4.
 
@@ -26,4 +26,4 @@ Latency targets describe sender scheduling, not measured end-to-end acoustic lat
 
 These changes have automated and localhost simulation coverage. No real HomePod playback test was performed for this release.
 
-Download **AirFlash-0.6.0.msi** or portable **AirFlash.exe**; verify with **SHA256SUMS.txt**. Binaries are unsigned.
+Download **AirFlash-0.6.1.msi** or portable **AirFlash.exe**; verify with **SHA256SUMS.txt**. Binaries are unsigned.
