@@ -1,19 +1,29 @@
-# AirFlash 0.5.4
+# AirFlash 0.6.0
 
-Changes since AirFlash 0.5.0.
+Changes since AirFlash 0.5.4.
 
 ## Features
 
-- Show the configured custom latency in the control panel and open receiver settings from the latency display.
-- Include per-receiver clock phases, packet counts, rejected-packet reasons, socket errors, and the audio engine path in PTP startup failure diagnostics.
+- Add an optional **Force fixed latency** policy for global and per-receiver settings. Software stereo groups require the same forced target on every member.
+- Distinguish the requested latency target, the engine's scheduling plan, and the receiver's reported minimum in the control panel.
+- Send available Windows Now Playing information to receivers and forward supported receiver playback commands to Windows media controls.
+- Add JSON diagnostic export with network identifiers and file paths redacted, alongside more detailed session, timing, and recovery metrics.
 
 ## Bug Fixes
 
-- Start PTP timing after session peer setup and retry lost clock subscriptions within the startup window.
-- Answer peer-delay requests while following a receiver's clock.
-- Match out-of-order Sync and Follow_Up messages without overwriting pending pairs or refreshing expired timing samples.
-- Account for bounded advertised exchange intervals when waiting for clock readiness and detecting lost timing exchanges.
+- Keep Stop and Cancel responsive when engine commands are blocked, and limit cleanup time for an unresponsive engine process.
+- Recover from missing latency-change acknowledgements even when a system timer wakes before the confirmation deadline.
+- Yield when another controller takes over a receiver. When session ownership cannot be confirmed, restore local audio, pause automatic recovery, and offer manual reconnect.
+- Check that receivers are available before automatic reconnection, and replenish retry budgets only after sustained, verified receiver health.
+- Correct PTP clock-offset calculation and reject stale or reordered timing samples.
+- Recover failed event channels without restarting audio, and rebind failed audio capture where possible. Reconnect when buffered playback can no longer use its existing timeline.
+- Preserve existing stereo groups during settings migration and report known timing incompatibilities before playback.
+- Keep application capture bound to the selected process instance and avoid selecting an unrelated instance when a restarted application is ambiguous.
+- Default new and reset settings to **Normal · 200 ms**. Migrate the retired adaptive latency setting to Normal while preserving other fixed modes and custom targets.
+- Show localized Home app speaker-access guidance for pairing failures with `TLV error [2]`.
 
-These PTP changes have automated and localhost simulation coverage. Confirmation on affected HomePod setups is still needed; network or firewall restrictions can still prevent timing traffic.
+Latency targets describe sender scheduling, not measured end-to-end acoustic latency. A forced target below the receiver's reported minimum may cause playback to fail or remain silent.
 
-Download **AirFlash-0.5.4.msi** or portable **AirFlash.exe**; verify with **SHA256SUMS.txt**. Binaries are unsigned.
+These changes have automated and localhost simulation coverage. No real HomePod playback test was performed for this release.
+
+Download **AirFlash-0.6.0.msi** or portable **AirFlash.exe**; verify with **SHA256SUMS.txt**. Binaries are unsigned.
