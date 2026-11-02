@@ -110,7 +110,32 @@ public sealed class GateFailureTests
         var notice = Notice("authentication_failed", channel: "authentication", message: "synthetic verify rejected");
         Assert.Equal(GateFailureKind.PasswordOrPairing, GateFailure.Classify(receiver, notice));
         Assert.Equal(L.Get("This device requires a password or pairing that AirFlash could not complete. Pair it again in Receivers."), GateFailure.Message(receiver, notice));
+        Assert.Null(GateFailure.ActionHint(notice));
     }
+
+    [Theory]
+    [InlineData("pairing rejected (TLV error [2])")]
+    [InlineData("PAIRING REJECTED (TLV ERROR [2])")]
+    [InlineData("pair setup failed: pairing rejected (TLV error [2]): Caused by: rejected by accessory")]
+    public void OnlyTheExactTlvTwoAuthenticationFailureAddsHomeAccessGuidance(string message)
+    {
+        var receiver = Physical(Bit40, "366.0");
+        var notice = Notice("authentication_failed", channel: "authentication", message: message);
+        Assert.Equal(GateFailureKind.PasswordOrPairing, GateFailure.Classify(receiver, notice));
+        Assert.Equal(L.Get("This device requires a password or pairing that AirFlash could not complete. Pair it again in Receivers."), GateFailure.Message(receiver, notice));
+        Assert.Equal(L.Get("In the Home app, set speaker access to “Everyone,” then try again."), GateFailure.ActionHint(notice));
+    }
+
+    [Theory]
+    [InlineData("authentication_failed", "pairing rejected (TLV error [3])")]
+    [InlineData("authentication_failed", "pairing rejected (TLV error [20])")]
+    [InlineData("authentication_failed", "pairing authentication failed")]
+    [InlineData("authentication_failed", "TLV error [2]")]
+    [InlineData("authentication_failed", "MFi authentication failed")]
+    [InlineData("protocol_error", "pairing rejected (TLV error [2])")]
+    [InlineData("session_rejected", "pairing rejected (TLV error [2])")]
+    public void OtherAuthenticationEvidenceDoesNotAddHomeAccessGuidance(string code, string message)
+        => Assert.Null(GateFailure.ActionHint(Notice(code, message: message)));
 
     [Fact]
     public void SessionRejectionIsOnlyAPairingGateWithTxtPasswordEvidence()

@@ -179,6 +179,58 @@ public sealed class IpcFailureTests
         Assert.True(connection.Disposed);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TlvTwoAuthenticationFailurePublishesAnImmediateHomeAccessHint(bool pairing)
+    {
+        var connection = new Connection(); var next = new Connection(); var factory = new Factory(connection, next);
+        await using var controller = new SessionController(factory, new Audio(false), timing: Timing);
+        var fault = Signal(); controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Error) fault.TrySetResult(); };
+        if (pairing) await controller.PairAsync(Receiver(), Settings(), (_, _) => throw new InvalidOperationException("No PIN requested"));
+        else await controller.StartAsync(Receiver(), Settings());
+        await connection.Starting.Task.WaitAsync(Limit);
+        const string detail = "pairing rejected (TLV error [2]): Caused by: rejected by accessory";
+        connection.Current("error", new { code = "authentication_failed", channel = "authentication", host = "192.0.2.10", retryable = false, message = detail });
+        await fault.Task.WaitAsync(Limit);
+
+        Assert.Equal(L.Get("This device requires a password or pairing that AirFlash could not complete. Pair it again in Receivers."), controller.Snapshot.Message);
+        Assert.Equal(L.Get("In the Home app, set speaker access to “Everyone,” then try again."), controller.Snapshot.ActionHint);
+        Assert.Contains(detail, controller.Snapshot.Diagnostics?.LastFault?.Detail);
+        Assert.Equal(detail, controller.Snapshot.Diagnostics?.LastFault?.Message);
+
+        await controller.StopAsync();
+        Assert.Equal(PlaybackState.Idle, controller.Snapshot.State);
+        Assert.Equal("", controller.Snapshot.ActionHint);
+        Assert.Contains(detail, controller.Snapshot.Diagnostics?.LastFault?.Detail);
+
+        var nextFault = Signal(); controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Error) nextFault.TrySetResult(); };
+        await controller.StartAsync(Receiver(), Settings());
+        await next.Starting.Task.WaitAsync(Limit);
+        Assert.Equal(PlaybackState.Connecting, controller.Snapshot.State);
+        Assert.Equal("", controller.Snapshot.ActionHint);
+        next.Current("streaming");
+        next.Current("error", new { code = "authentication_failed", channel = "authentication", retryable = false, message = "pairing rejected (TLV error [3])" });
+        await nextFault.Task.WaitAsync(Limit);
+        Assert.Equal(PlaybackState.Error, controller.Snapshot.State);
+        Assert.Equal("", controller.Snapshot.ActionHint);
+    }
+
+    [Fact]
+    public async Task TlvThreeAuthenticationFailureDoesNotPublishTheHomeAccessHint()
+    {
+        var connection = new Connection(); var factory = new Factory(connection);
+        await using var controller = new SessionController(factory, new Audio(false), timing: Timing);
+        var fault = Signal(); controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Error) fault.TrySetResult(); };
+        await controller.StartAsync(Receiver(), Settings());
+        await connection.Starting.Task.WaitAsync(Limit);
+        connection.Current("error", new { code = "authentication_failed", channel = "authentication", host = "192.0.2.10", retryable = false, message = "pairing rejected (TLV error [3])" });
+        await fault.Task.WaitAsync(Limit);
+
+        Assert.Equal("", controller.Snapshot.ActionHint);
+        Assert.Contains("TLV error [3]", controller.Snapshot.Diagnostics?.LastFault?.Detail);
+    }
+
     [Fact]
     public async Task SocketFailureBeforeAConnectionExistsPublishesTheNetworkGateMessage()
     {
@@ -222,10 +274,11 @@ public sealed class IpcFailureTests
         Assert.True(connection.Disposed);
     }
 
-    private sealed class Factory(Connection connection) : IEngineFactory
+    private sealed class Factory(params Connection[] connections) : IEngineFactory
     {
+        private readonly ConcurrentQueue<Connection> _connections = new(connections);
         public int OpenCount;
-        public IEngineConnection Open() { if (Interlocked.Increment(ref OpenCount) != 1) throw new IOException("unexpected retry"); return connection; }
+        public IEngineConnection Open() { Interlocked.Increment(ref OpenCount); return _connections.TryDequeue(out var connection) ? connection : throw new IOException("unexpected retry"); }
     }
     private sealed class Connection : IEngineConnection
     {

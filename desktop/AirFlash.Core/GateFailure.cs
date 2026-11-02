@@ -32,6 +32,7 @@ public enum GateFailureKind
 /// </summary>
 public static class GateFailure
 {
+    private const string HomeAccessTlvError = "pairing rejected (TLV error [2])";
     private static readonly HashSet<string> NetworkCodes = new(StringComparer.OrdinalIgnoreCase)
     {
         "network_error", "socket_error", "connection_reset", "connection_refused",
@@ -81,6 +82,19 @@ public static class GateFailure
             _ => null
         };
     }
+
+    /// <summary>
+    /// Narrow, display-only guidance for the receiver's Home access-control
+    /// rejection. Outer anyhow context is preserved in the engine fault, so match
+    /// the exact TLV marker inside the message rather than requiring the whole
+    /// detail to equal it.
+    /// </summary>
+    public static string? ActionHint(EngineNotice? notice)
+        => notice is not null
+            && notice.Code.Equals("authentication_failed", StringComparison.OrdinalIgnoreCase)
+            && notice.Message.Contains(HomeAccessTlvError, StringComparison.OrdinalIgnoreCase)
+                ? L.Get("In the Home app, set speaker access to “Everyone,” then try again.")
+                : null;
 
     /// <summary>
     /// WAC's group rule for the classic-only explanation: any member with positive

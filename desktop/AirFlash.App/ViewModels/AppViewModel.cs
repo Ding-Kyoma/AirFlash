@@ -120,7 +120,10 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             return summary;
         }
     }
-    public string ErrorDetails => _snapshot.State is PlaybackState.Error or PlaybackState.Preempted ? _snapshot.Message : Notice;
+    public string ActionHint => _snapshot.State == PlaybackState.Error ? _snapshot.ActionHint : "";
+    public string ErrorDetails => _snapshot.State is PlaybackState.Error or PlaybackState.Preempted
+        ? _snapshot.Diagnostics?.LastFault?.Detail is { Length: > 0 } detail ? detail : _snapshot.Message
+        : Notice;
     /// <summary>The receiver now belongs to another controller. Reconnecting is a
     /// deliberate user action, never the automatic transport retry.</summary>
     public bool CanReconnect => !_closing && !IsStopping && !Session.NeedsCleanup && _snapshot.State == PlaybackState.Preempted && _snapshot.Receiver is not null;
@@ -423,7 +426,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private void ApplySessionSnapshot(SessionSnapshot snapshot)
     {
         if (_closing || !ReferenceEquals(snapshot, Session.Snapshot)) return;
-        var title = StatusTitle; var detail = StatusDetail; var errors = ErrorDetails;
+        var title = StatusTitle; var detail = StatusDetail; var errors = ErrorDetails; var hint = ActionHint;
         var previous = _snapshot;
         _snapshot = snapshot;
         RefreshGlobalLatency();
@@ -431,6 +434,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         if (title != StatusTitle) Notify(nameof(StatusTitle));
         if (detail != StatusDetail) Notify(nameof(StatusDetail));
         if (errors != ErrorDetails) Notify(nameof(ErrorDetails));
+        if (hint != ActionHint) Notify(nameof(ActionHint));
         if (previous.State != snapshot.State || previous.Receiver?.Id != snapshot.Receiver?.Id)
         {
             RefreshReceivers();
@@ -695,7 +699,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         }
         ResetCompleted?.Invoke();
     }
-    public string Diagnostics() => $"AirFlash {AppPaths.DisplayVersion} / WPF\n" + L.Format("Engine: {0}\nStatus: {1}\n{2}\nLocal p95: {3}\nQueue age: {4}\nUnderruns: {5}; drops: {6}\nEnd-to-end latency: not measured", EngineVersion, StatusTitle, StatusDetail, MonitorLatency, MonitorQueue, MonitorUnderruns, MonitorDrops) + "\n" + System.Text.Json.JsonSerializer.Serialize(_snapshot.Diagnostics, AppSettings.JsonOptions);
+    public string Diagnostics() => $"AirFlash {AppPaths.DisplayVersion} / WPF\n" + L.Format("Engine: {0}\nStatus: {1}\n{2}\nLocal p95: {3}\nQueue age: {4}\nUnderruns: {5}; drops: {6}\nEnd-to-end latency: not measured", EngineVersion, StatusTitle, StatusDetail, MonitorLatency, MonitorQueue, MonitorUnderruns, MonitorDrops) + (ActionHint.Length > 0 ? "\n" + ActionHint : "") + "\n" + System.Text.Json.JsonSerializer.Serialize(_snapshot.Diagnostics, AppSettings.JsonOptions);
     /// <summary>Write the current engine's redacted diagnostic bundle into the log folder.</summary>
     public async Task<string> ExportDiagnosticsAsync()
     {

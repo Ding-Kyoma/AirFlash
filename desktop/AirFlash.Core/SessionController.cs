@@ -12,6 +12,7 @@ public sealed record SessionSnapshot(PlaybackState State, Receiver? Receiver = n
     internal long Generation { get; init; }
     public LatencyRuntime? Latency { get; init; }
     public int? PendingLatency { get; init; }
+    public string ActionHint { get; init; } = "";
 }
 public sealed record SessionTiming(TimeSpan Connect, TimeSpan Read, TimeSpan Pin, TimeSpan Retry)
 {
@@ -310,10 +311,10 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
             catch (EngineShutdownException error)
             {
-                if (RecordFailure(epoch, error) is { } notice) Publish(epoch, PlaybackState.Error, FailureMessage(receiver, notice));
+                if (RecordFailure(epoch, error) is { } notice) Publish(epoch, PlaybackState.Error, FailureMessage(receiver, notice), failure: notice);
                 throw;
             }
-            catch (Exception error) { if (RecordFailure(epoch, error) is { } notice) Publish(epoch, FailureState(notice), FailureMessage(receiver, notice)); }
+            catch (Exception error) { if (RecordFailure(epoch, error) is { } notice) Publish(epoch, FailureState(notice), FailureMessage(receiver, notice), failure: notice); }
             finally { await RestoreAudioAsync().ConfigureAwait(false); }
         }, CancellationToken.None);
     }
@@ -862,7 +863,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                     if (!_adaptive.ConsumeRebuild(_settings.MaxReconnectAttempts))
                     {
                         var exhausted = new EngineFailure(new("adaptive_recovery_exhausted", "", "scheduler", L.Get("Adaptive recovery could not stabilize playback. Reconnect to try again."), false));
-                        if (RecordFailure(epoch, exhausted) is { } failure) Publish(epoch, PlaybackState.Error, failure.Detail);
+                        if (RecordFailure(epoch, exhausted) is { } failure) Publish(epoch, PlaybackState.Error, failure.Detail, failure: failure);
                         return;
                     }
                     log?.Invoke($"Adaptive latency rebuilding: target_ms={rebuild.Target}; reason={rebuild.Message}; rebuild={_adaptive.Rebuilds}/{_settings.MaxReconnectAttempts}");
@@ -870,7 +871,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                 if (startedAt != 0 && Stopwatch.GetElapsedTime(startedAt) >= TimeSpan.FromSeconds(10)) attempts = 0;
                 ++attempts;
                 if (RecordFailure(epoch, error) is not { } notice) return;
-                Publish(epoch, FailureState(notice), FailureMessage(receiver, notice));
+                Publish(epoch, FailureState(notice), FailureMessage(receiver, notice), failure: notice);
                 // A preempted receiver belongs to another controller now; retrying
                 // would fight it. The user gets an explicit reconnect action instead.
                 if (notice.Code == "preempted" || !(_settings.ForceReconnect || receiver.IsSoftwareGroup || notice.Code is "timeline_expired" or "clock_lost" or "adaptive_rebuild") || attempts > _settings.MaxReconnectAttempts || notice.Retryable == false || notice.Retryable is null && IsAuthenticationFailure(error.Message)) return;
@@ -1018,13 +1019,18 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     {
         try { await audio.RestoreAsync().ConfigureAwait(false); } catch (Exception error) { log?.Invoke(L.Format("Failed to restore local mute state: {0}", error.Message)); }
     }
-    private void Publish(long epoch, PlaybackState state, string message = "", StreamMetrics? metrics = null)
+    private void Publish(long epoch, PlaybackState state, string message = "", StreamMetrics? metrics = null, EngineNotice? failure = null)
     {
         SessionSnapshot snapshot;
         lock (_sync)
         {
             if (epoch != _generation) return;
-            snapshot = new(state, _receiver, message, metrics ?? _snapshot.Metrics, _receiver is null ? 0 : _adaptive.Current > 0 ? _adaptive.Current : _settings.Latency(_receiver), _diagnostics, _receiver is null ? 0 : _snapshot.StreamRate, _deviceVolume, new Dictionary<string, DeviceVolumeState>(_memberVolumes)) { Generation = epoch, Latency = _adaptive.Runtime, PendingLatency = _adaptive.Pending?.Action.Target };
+            // LastFault survives stops and reconnects for diagnostics. Only the
+            // current failure (or a refresh of that same error) owns its hint.
+            var hint = state != PlaybackState.Error ? "" : failure is not null
+                ? GateFailure.ActionHint(failure) ?? ""
+                : _snapshot.Generation == epoch && _snapshot.State == state && _snapshot.Message == message ? _snapshot.ActionHint : "";
+            snapshot = new(state, _receiver, message, metrics ?? _snapshot.Metrics, _receiver is null ? 0 : _adaptive.Current > 0 ? _adaptive.Current : _settings.Latency(_receiver), _diagnostics, _receiver is null ? 0 : _snapshot.StreamRate, _deviceVolume, new Dictionary<string, DeviceVolumeState>(_memberVolumes)) { Generation = epoch, Latency = _adaptive.Runtime, PendingLatency = _adaptive.Pending?.Action.Target, ActionHint = hint };
             _snapshot = snapshot;
         }
         Changed?.Invoke(snapshot);

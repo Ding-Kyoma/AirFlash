@@ -65,6 +65,8 @@ playback and acoustic synchronization have not been qualified by this implementa
 2. Start AirFlash and wait for the receiver list to populate.
 3. Select the complete `HomePod stereo · 2/2` entry and press play.
 4. Complete PIN pairing in **Settings > Receivers** if the receiver requests it.
+   If pairing fails with `pairing rejected (TLV error [2])`, open the Home app,
+   set speaker access to **Everyone**, and try again.
 5. Choose the capture endpoint and latency profile in Settings when the defaults
    are not suitable.
 

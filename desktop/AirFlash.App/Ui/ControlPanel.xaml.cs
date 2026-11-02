@@ -3,6 +3,8 @@ using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Automation.Peers;
+using System.Windows.Data;
 using System.Windows.Media;
 using System.Windows.Input;
 using System.Windows.Threading;
@@ -73,6 +75,16 @@ public partial class ControlPanel : Window
     private void OnDeactivated(object sender, EventArgs args)
     {
         Dispatcher.BeginInvoke(() => { if (!IsActive && !MenuOpen) { _lastDismissed = DateTime.UtcNow; Hide(); } }, DispatcherPriority.Background);
+    }
+    private void OnActionHintUpdated(object sender, DataTransferEventArgs args)
+    {
+        if (!AutomationPeer.ListenerExists(AutomationEvents.LiveRegionChanged)) return;
+        Dispatcher.BeginInvoke(() =>
+        {
+            if (PairingActionHint.IsVisible && PairingActionHint.Text.Length > 0)
+                (UIElementAutomationPeer.FromElement(PairingActionHint) ?? UIElementAutomationPeer.CreatePeerForElement(PairingActionHint))?
+                    .RaiseAutomationEvent(AutomationEvents.LiveRegionChanged);
+        }, DispatcherPriority.Loaded);
     }
     private void OnKeyDown(object sender, KeyEventArgs args) { if (args.Key == Key.Escape) { Hide(); args.Handled = true; } }
     private void OnClosing(object? sender, CancelEventArgs args) { if (!_allowClose) { args.Cancel = true; Hide(); } }

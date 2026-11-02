@@ -14,3 +14,23 @@ The fixture visits all eight pages in light and dark themes, requesting window s
 For a bounded manual pointer check, add `--ui-scroll-hold` to a focused command. After the automated checks, the same isolated Settings window remains open on Equalizer for 60 seconds. Check wheel scrolling over bands, drag the page scrollbar to both ends, and visit other pages. The fixture checks settings and playback again after the hold, then closes its own window.
 
 These checks use the installed WPF runtime and do not access real accessories. Routed events and rendered layouts do not replace physical checks with different monitors, display scaling or touchpads.
+
+## Pairing error guidance
+
+The control panel adds Home app speaker-access guidance only for `authentication_failed`
+whose message contains `pairing rejected (TLV error [2])`. Other authentication errors
+retain their existing messages. The hint is shown beneath the current error, clears
+on stop or reconnect, and appears in the copied summary. Raw fault details, monitor
+history and the JSON diagnostic export are retained separately.
+
+Run the isolated fixture for each supported UI language (`en-US`, `zh-CN`, `zh-TW`,
+`de-DE`):
+
+```powershell
+.\AirFlash.exe --ui-smoke --ui-pairing-hint-smoke --ui-language de-DE --output artifacts/pairing-hint-de/report.json
+```
+
+The fixture checks both playback and explicit pairing failures, raw error details,
+clearing on stop and reconnect, the copied summary, JSON export, and the settings
+monitor. It renders the wrapped hint in light and dark themes at 100% and 200%.
+These images do not replace physical display-scaling or screen-reader testing.

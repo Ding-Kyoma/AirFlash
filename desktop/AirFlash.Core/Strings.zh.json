@@ -387,5 +387,6 @@
   "Below the receiver's reported minimum: continuing at {0} ms. Playback may be rejected or silent.": "低于设备报告的下限，仍按 {0} ms 尝试，可能被设备拒绝或没有声音。",
   "Disconnecting…": "正在断开…",
   "Stopping playback and disconnecting…": "正在停止播放并断开连接…",
-  "The audio engine could not stop. Try disconnecting again.": "音频引擎未能停止，请再次尝试断开连接。"
+  "The audio engine could not stop. Try disconnecting again.": "音频引擎未能停止，请再次尝试断开连接。",
+  "In the Home app, set speaker access to “Everyone,” then try again.": "请在家庭App中，将扬声器访问权限设置为所有人，然后重试。"
 }
