@@ -709,18 +709,22 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         cancellation.ThrowIfCancellationRequested();
                         await CheckAdaptiveAsync(connection, session, epoch, cancellation).ConfigureAwait(false);
                         var wait = startedAt == 0 ? deadline - DateTime.UtcNow : _timing.Read;
-                        // Timer due-times are whole milliseconds. Round up so a
-                        // timer cannot fire just before the monotonic deadline and
-                        // turn a missing lead acknowledgement into a generic fault.
+                        // System timers can wake before the monotonic deadline.
+                        // Recheck a lead deadline after waking instead of turning
+                        // a missing acknowledgement into a generic read fault.
+                        var waitingForLead = false;
                         if (_adaptive.ConfirmationRemaining is { } remaining && remaining < wait)
-                            wait = TimeSpan.FromMilliseconds(Math.Ceiling(remaining.TotalMilliseconds));
+                        {
+                            waitingForLead = true;
+                            wait = TimeSpan.FromMilliseconds(Math.Max(1, Math.Ceiling(remaining.TotalMilliseconds)));
+                        }
                         if (wait <= TimeSpan.Zero) throw new TimeoutException(L.Get("Timed out connecting to the audio device."));
                         JsonElement item;
                         try { item = await ReadEventAsync(connection, session, wait, cancellation).ConfigureAwait(false); }
-                        catch (TimeoutException) when (_adaptive.ConfirmationRemaining <= TimeSpan.Zero)
+                        catch (TimeoutException) when (waitingForLead)
                         {
                             await CheckAdaptiveAsync(connection, session, epoch, cancellation).ConfigureAwait(false);
-                            throw;
+                            continue;
                         }
                         var kind = item.Text("event");
                         if (kind == "error") throw new EngineFailure(EngineNotice.Parse(item));

@@ -291,21 +291,43 @@ public sealed class SessionTests
         Assert.Equal(2, factory.OpenCount);
         Assert.DoesNotContain(first.Commands, c => c.Command == "set_lead");
     }
-    [Fact]
-    public async Task AdaptiveConfirmationDeadlineRebuildsWhenEngineStopsReporting()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AdaptiveConfirmationDeadlineRebuildsWhenEngineStopsReporting(bool wakeEarly)
     {
         var first = new FakeConnection(); var second = new FakeConnection();
-        await using var controller = new SessionController(new FakeFactory(first, second), new FakeAudio(),
-            timing: Fast with { Read = TimeSpan.FromSeconds(10) });
+        var events = new ConcurrentQueue<string>();
+        var clock = new ManualDeadlineClock();
+        await using var controller = new SessionController(new FakeFactory(first, second), new FakeAudio(), log: events.Enqueue,
+            timing: Fast with { Read = TimeSpan.FromSeconds(10) }, clock: clock);
         var settings = Settings(); settings.LatencyMode = "adaptive";
         await controller.StartAsync(Pod(), settings);
         await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
         first.EmitData(new { @event = "negotiated", receiver_id = "a", codec = "alac", transport = "realtime", timing = "ptp" });
         for (var i = 0; i < 3; i++) first.EmitData(new { @event = "warning", code = "timeline_reanchored", recovered = true });
         await Until(() => controller.Snapshot.PendingLatency == 60);
+        // Wait until the event reader has armed its timer, rather than racing
+        // the separate timeout used while sending the lead command.
+        await first.LeadReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        if (wakeEarly)
+        {
+            var reads = Volatile.Read(ref first.ReadCount);
+            clock.WakeAfter(TimeSpan.FromMilliseconds(4975));
+            await Until(() => Volatile.Read(ref first.ReadCount) > reads || controller.Snapshot.State == PlaybackState.Error);
+            Assert.Equal(PlaybackState.Streaming, controller.Snapshot.State);
+            Assert.Equal(60, controller.Snapshot.PendingLatency);
+            Assert.False(second.Started.Task.IsCompleted);
+        }
         // No metrics, errors or acknowledgements: the reader's own deadline must
-        // still enter adaptive recovery rather than leaving playback in Error.
-        await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(8));
+        // still enter adaptive recovery. Advance virtual time instead of waiting
+        // five real seconds and depending on the machine's timer resolution.
+        clock.WakeAfter(TimeSpan.FromMilliseconds(wakeEarly ? 25 : 5000));
+        try { await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(2)); }
+        catch (TimeoutException)
+        {
+            throw new Xunit.Sdk.XunitException($"State: {controller.Snapshot.State}; fault: {controller.Snapshot.Diagnostics?.LastFault}\n{string.Join('\n', events)}");
+        }
         await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
         Assert.Equal(60, controller.Snapshot.TargetLatency);
         Assert.Equal("adaptive_rebuild", controller.Snapshot.Diagnostics?.LastFault?.Code);
@@ -1386,6 +1408,52 @@ public sealed class SessionTests
         Assert.Equal("127.0.0.1", process.Commands.Single(c => c.Command == "set_device_volume").Parameters.Text("host"));
         await controller.StopAsync(); await edit;
     }
+    // A manually awakened one-shot timer lets the test control both monotonic
+    // time and an early wake-up without sleeping or scheduling real timers.
+    private sealed class ManualDeadlineClock : TimeProvider
+    {
+        private readonly object _gate = new();
+        private readonly List<ManualTimer> _timers = [];
+        private long _ticks;
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+        public override long GetTimestamp() => Interlocked.Read(ref _ticks);
+        public override DateTimeOffset GetUtcNow() => DateTimeOffset.UnixEpoch + TimeSpan.FromTicks(GetTimestamp());
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            lock (_gate)
+            {
+                var timer = new ManualTimer(this, callback, state);
+                _timers.Add(timer); timer.Change(dueTime, period); return timer;
+            }
+        }
+        public void WakeAfter(TimeSpan elapsed)
+        {
+            ManualTimer timer;
+            lock (_gate)
+            {
+                Interlocked.Add(ref _ticks, elapsed.Ticks);
+                timer = Assert.Single(_timers, t => t.Armed);
+                timer.Armed = false;
+            }
+            timer.Fire();
+        }
+        private sealed class ManualTimer(ManualDeadlineClock owner, TimerCallback callback, object? state) : ITimer
+        {
+            public bool Armed;
+            public bool Change(TimeSpan dueTime, TimeSpan period)
+            {
+                Assert.Equal(Timeout.InfiniteTimeSpan, period);
+                lock (owner._gate)
+                {
+                    if (!owner._timers.Contains(this)) return false;
+                    Armed = dueTime != Timeout.InfiniteTimeSpan; return true;
+                }
+            }
+            public void Fire() => callback(state);
+            public void Dispose() { lock (owner._gate) { Armed = false; owner._timers.Remove(this); } }
+            public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
+        }
+    }
     private sealed class FakeFactory(params FakeConnection[] processes) : IEngineFactory
     {
         private readonly ConcurrentQueue<FakeConnection> _processes = new(processes);
@@ -1398,6 +1466,8 @@ public sealed class SessionTests
         private readonly Channel<JsonElement> _events = Channel.CreateUnbounded<JsonElement>();
         public ConcurrentQueue<EngineCommand> Commands { get; } = new();
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource LeadReadStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int ReadCount;
         public TaskCompletionSource PairSent { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource StopSent { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Disposing { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1454,7 +1524,12 @@ public sealed class SessionTests
                     lead_ceiling_ms = 100, live_lead_supported = true }, session);
             else _events.Writer.TryWrite(JsonSerializer.SerializeToElement(new { version = 1, session_id = session ?? Session, @event = kind, message, metrics }));
         }
-        public async ValueTask<JsonElement?> ReadAsync(CancellationToken cancellation) { try { return await _events.Reader.ReadAsync(cancellation); } catch (ChannelClosedException) { return null; } }
+        public async ValueTask<JsonElement?> ReadAsync(CancellationToken cancellation)
+        {
+            Interlocked.Increment(ref ReadCount);
+            if (Commands.Any(c => c.Command == "set_lead")) LeadReadStarted.TrySetResult();
+            try { return await _events.Reader.ReadAsync(cancellation); } catch (ChannelClosedException) { return null; }
+        }
         public async ValueTask DisposeAsync() { Disposing.TrySetResult(); if (BlockDispose is not null) await BlockDispose.Task; Disposed = true; _events.Writer.TryComplete(); DisposedSignal.TrySetResult(); }
     }
     private sealed class FakeAudio : IAudioService
