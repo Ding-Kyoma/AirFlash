@@ -48,9 +48,10 @@ public sealed class SettingsStore : ISettingsStore
                 var version = ReadVersion(text);
                 var json = JsonNode.Parse(text) as JsonObject ?? throw new JsonException(L.Get("Configuration must be a JSON object."));
                 // An existing file omitted this field under the release default.
-                // Only genuinely new/reset settings adopt the adaptive default.
+                // Only genuinely new/reset settings adopt the normal default.
                 if (!json.Any(pair => pair.Key.Equals("latency_mode", StringComparison.OrdinalIgnoreCase)))
                     json["latency_mode"] = "normal";
+                NormalizeLatencyModes(json);
                 if (version < AppSettings.CurrentSchemaVersion)
                 {
                     if (version < 2)
@@ -170,12 +171,28 @@ public sealed class SettingsStore : ISettingsStore
     {
         if (json["custom_buffer_ms"] is JsonValue value && value.TryGetValue<int>(out var ms)) json["custom_buffer_ms"] = Math.Clamp(ms, 0, 2000);
     }
+    private static void NormalizeLatencyModes(JsonObject json)
+    {
+        static void Normalize(JsonObject owner)
+        {
+            var key = owner.Select(pair => pair.Key).FirstOrDefault(k => k.Equals("latency_mode", StringComparison.OrdinalIgnoreCase));
+            if (key is not null && owner[key] is JsonValue value && value.TryGetValue<string>(out var mode)
+                && mode.Equals(LatencyPolicy.Mode, StringComparison.OrdinalIgnoreCase))
+                owner[key] = "normal";
+        }
+        Normalize(json);
+        if (json["receivers"] is JsonObject receivers)
+            foreach (var receiver in receivers.Select(pair => pair.Value).OfType<JsonObject>()) Normalize(receiver);
+    }
     public void Save(AppSettings settings) { lock (_gate) SaveLocked(settings); }
     private void SaveLocked(AppSettings settings)
     {
         if (_unsupportedSchema) throw new NotSupportedException(L.Get("This configuration is from a newer version. Update the app first."));
         if (settings.SchemaVersion > AppSettings.CurrentSchemaVersion) throw new NotSupportedException(L.Get("This configuration is from a newer version. Update the app first."));
         var saved = settings.Clone();
+        saved.LatencyMode = saved.LatencyMode.Equals(LatencyPolicy.Mode, StringComparison.OrdinalIgnoreCase) ? "normal" : saved.LatencyMode;
+        foreach (var options in saved.Receivers.Values)
+            if (options.LatencyMode?.Equals(LatencyPolicy.Mode, StringComparison.OrdinalIgnoreCase) == true) options.LatencyMode = "normal";
         // While the one-time Q45 split is pending, keep the file one version
         // back: a crash before the catalog pass must not let the migration be
         // skipped. Once it is discharged this save writes the current version.

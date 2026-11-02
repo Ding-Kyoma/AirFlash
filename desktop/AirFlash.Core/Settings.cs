@@ -94,7 +94,7 @@ public sealed class AppSettings : ObservableObject
     public string DiscoveryInterfaceId { get => _DiscoveryInterfaceId; set => Set(ref _DiscoveryInterfaceId, value ?? ""); }
     private EqualizerSettings _equalizer = new();
     public EqualizerSettings Equalizer { get => _equalizer; set => Set(ref _equalizer, value ?? new()); }
-    private string _LatencyMode = LatencyPolicy.Mode;
+    private string _LatencyMode = "normal";
     public string LatencyMode { get => _LatencyMode; set => Set(ref _LatencyMode, value); }
     private bool _ForceLatency;
     public bool ForceLatency { get => _ForceLatency; set => Set(ref _ForceLatency, value); }

@@ -68,16 +68,12 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             if (!_snapshot.IsActive || _snapshot.Receiver is not { } receiver) return "";
             var targets = receiver.IsSoftwareGroup ? receiver.Peers : [receiver];
             var policy = LatencyPolicy.Forced(_settings, receiver) ? L.Get("Force fixed latency")
-                : targets.All(r => (_settings.ReadOptions(r.Id).LatencyMode ?? _settings.LatencyMode) == LatencyPolicy.Mode)
-                    ? L.Get("Adaptive latency") : L.Get("Fixed target · recovery enabled");
+                : L.Get("Fixed target · recovery enabled");
             var details = new List<string> { policy };
             foreach (var item in _snapshot.Diagnostics?.Negotiated ?? [])
             {
                 if (item.Number("effective_latency_ms") is not { } effective || item.Number("requested_latency_ms") is not { } requested) continue;
-                var text = _snapshot.Latency is { } runtime
-                    ? L.Format("Startup request {0} ms · negotiated baseline {1} ms · adaptive extra {2} ms · current plan {3} ms",
-                        requested.ToString("0.#"), runtime.BaselineMs.ToString("0.#"), runtime.ExtraMs.ToString("0.#"), runtime.EffectiveMs.ToString("0.#"))
-                    : L.Format("Requested {0} ms · engine plan {1} ms", requested.ToString("0.#"), effective.ToString("0.#"));
+                var text = L.Format("Requested {0} ms · engine plan {1} ms", requested.ToString("0.#"), effective.ToString("0.#"));
                 if (item.Number("receiver_latency_min_ms") is { } minimum)
                 {
                     text += " · " + L.Format("Receiver reports a minimum of {0} ms.", minimum.ToString("0.#"));

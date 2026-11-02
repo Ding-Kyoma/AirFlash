@@ -51,7 +51,6 @@
         <Border Style="{StaticResource Card}">
           <StackPanel>
             <TextBlock Text="{loc:Text 'Latency mode'}" Style="{StaticResource SectionTitle}"/>
-            <RadioButton Content="{loc:Text 'Adaptive latency'}" GroupName="LatencyMode" IsChecked="{Binding Draft.LatencyMode, Converter={StaticResource Equal}, ConverterParameter=adaptive}"/>
             <RadioButton Content="{loc:Text 'Real-time · target 120 ms'}" GroupName="LatencyMode" IsChecked="{Binding Draft.LatencyMode, Converter={StaticResource Equal}, ConverterParameter=realtime}"/>
             <RadioButton Content="{loc:Text 'Normal · target 200 ms'}" GroupName="LatencyMode" IsChecked="{Binding Draft.LatencyMode, Converter={StaticResource Equal}, ConverterParameter=normal}"/>
             <RadioButton Content="{loc:Text 'Buffered · target 500 ms'}" GroupName="LatencyMode" IsChecked="{Binding Draft.LatencyMode, Converter={StaticResource Equal}, ConverterParameter=buffered}"/>
@@ -62,7 +61,6 @@
             </StackPanel>
             <CheckBox Content="{loc:Text 'Force fixed latency'}" IsChecked="{Binding Draft.ForceLatency}" IsEnabled="{Binding CanForceLatency}" AutomationProperties.Name="{loc:Text 'Force fixed latency'}"/>
             <TextBlock Text="{loc:Text 'When forced, late audio may be dropped or the session reconnected; latency will not be increased automatically.'}" Style="{StaticResource Hint}" TextWrapping="Wrap" Margin="26,4,0,6"/>
-            <TextBlock Text="{loc:Text 'Adaptive mode ignores the forced setting. Existing fixed and custom modes keep their recovery behavior unless forced.'}" Style="{StaticResource Hint}" TextWrapping="Wrap"/>
             <TextBlock Text="{loc:Text 'Target values are not measured end-to-end audio latency.'}" Style="{StaticResource Hint}" TextWrapping="Wrap" Margin="0,6,0,0"/>
           </StackPanel>
         </Border>
@@ -253,7 +251,6 @@
                       <ComboBox ItemsSource="{x:Static vm:Choices.ReceiverLatencies}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.LatencyMode, Mode=TwoWay}" Margin="0,4,0,12"/>
                       <TextBlock Text="{loc:Text 'Force fixed latency'}" Style="{StaticResource Hint}"/>
                       <ComboBox ItemsSource="{x:Static vm:Choices.ForcedLatencies}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Options.ForceLatency, Mode=TwoWay}" IsEnabled="{Binding CanForceLatency}" Margin="0,4,0,8" AutomationProperties.Name="{loc:Text 'Force fixed latency'}"/>
-                      <TextBlock Text="{loc:Text 'Adaptive mode ignores the forced setting. Existing fixed and custom modes keep their recovery behavior unless forced.'}" Style="{StaticResource Hint}" TextWrapping="Wrap" Margin="0,0,0,12"/>
                       <StackPanel IsEnabled="{Binding Options.LatencyMode, Converter={StaticResource Equal}, ConverterParameter=custom}">
                         <TextBlock Text="{loc:Text 'Custom latency / ms (blank uses global)'}" Style="{StaticResource Hint}"/>
                         <TextBox Text="{Binding Options.CustomBufferMs, UpdateSourceTrigger=PropertyChanged, ValidatesOnExceptions=True, NotifyOnValidationError=True}" Margin="0,4,0,12"/>

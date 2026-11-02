@@ -14,7 +14,7 @@ internal static class UiRegression
         await PairingHintRegression.RunAsync(checks, directory);
         await StopRegression.RunAsync(checks, directory);
         await ForcedLatencyRegression.RunAsync(checks, directory);
-        await AdaptiveLatencyRegression.RunAsync(checks, directory);
+        await LatencyEntryRegression.RunAsync(checks);
         var store = new UiSmoke.MemoryStore(); var audio = new UiSmoke.MockAudio();
         var autostart = new UiSmoke.MockAutostart(); var discovery = new UiSmoke.MockDiscovery();
         var engine = new UiSmoke.MockFactory();

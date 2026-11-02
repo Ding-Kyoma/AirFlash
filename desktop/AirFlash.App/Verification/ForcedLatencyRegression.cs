@@ -38,8 +38,10 @@ internal static class ForcedLatencyRegression
         {
             var vm = window.ViewModel;
             var force = Descendants(window).OfType<CheckBox>().Single(c => System.Windows.Automation.AutomationProperties.GetName(c) == L.Get("Force fixed latency"));
-            Check(vm.Draft.LatencyMode == "adaptive" && force.IsChecked == false && !force.IsEnabled,
-                "fresh settings select adaptive and disable inactive forced latency", checks);
+            Check(vm.Draft.LatencyMode == "normal" && force.IsChecked == false && force.IsEnabled,
+                "fresh settings select normal with the forced latency switch available", checks);
+            Check(Choices.ReceiverLatencies.All(c => c.Value is not "adaptive"),
+                "receiver latency choices omit the retired adaptive mode", checks);
             vm.Draft.LatencyMode = "custom"; await Pump();
             Check(force.IsEnabled, "custom mode enables the independent force switch", checks);
             var input = Descendants(window).OfType<TextBox>().Single(t => System.Windows.Automation.AutomationProperties.GetName(t) == L.Get("Custom latency"));
@@ -51,9 +53,9 @@ internal static class ForcedLatencyRegression
             row.Options.ForceLatency = false; await Pump();
             Check(!vm.Draft.ForcesLatency(receiver.Id), "receiver override can retain recovery under a forced global target", checks);
             row.Options.ForceLatency = null;
-            vm.Draft.LatencyMode = "adaptive"; await Pump();
-            Check(!force.IsEnabled && force.IsChecked == true && !row.CanForceLatency && !vm.Draft.ForcesLatency(receiver.Id),
-                "adaptive ignores force without erasing the saved fixed choice", checks);
+            vm.Draft.LatencyMode = "normal"; await Pump();
+            Check(force.IsEnabled && row.CanForceLatency && vm.Draft.ForcesLatency(receiver.Id),
+                "normal mode remains forceable after switching from custom", checks);
             vm.Draft.LatencyMode = "custom"; await Pump();
             Check(row.CanForceLatency && vm.Draft.CustomBufferMs == 750, "returning to custom restores the fixed target and switch", checks);
             Check(await vm.ApplyAsync(), "forced latency settings can be applied", checks);

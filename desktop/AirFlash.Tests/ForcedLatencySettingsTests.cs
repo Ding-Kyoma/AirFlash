@@ -5,16 +5,16 @@ namespace AirFlash.Tests;
 public sealed class ForcedLatencySettingsTests
 {
     [Fact]
-    public async Task FreshAndResetSettingsUseAdaptiveWithoutForcing()
+    public async Task FreshAndResetSettingsUseNormalWithoutForcing()
     {
         using var fixture = new Fixture();
         var store = new SettingsStore(fixture.Path);
-        Assert.Equal("adaptive", store.Load().LatencyMode);
+        Assert.Equal("normal", store.Load().LatencyMode);
         var settings = new AppSettings { LatencyMode = "custom", CustomBufferMs = 650, ForceLatency = true };
         store.Save(settings);
         await store.ResetAsync();
         var reset = store.Load();
-        Assert.Equal("adaptive", reset.LatencyMode);
+        Assert.Equal("normal", reset.LatencyMode);
         Assert.False(reset.ForceLatency);
     }
 
@@ -22,7 +22,9 @@ public sealed class ForcedLatencySettingsTests
     [InlineData("{\"schema_version\":4}", "normal")]
     [InlineData("{\"schema_version\":5,\"LATENCY_MODE\":\"custom\",\"custom_buffer_ms\":650}", "custom")]
     [InlineData("{\"schema_version\":4,\"latency_mode\":\"buffered\"}", "buffered")]
-    [InlineData("{\"schema_version\":5,\"latency_mode\":\"adaptive\"}", "adaptive")]
+    [InlineData("{\"schema_version\":5,\"latency_mode\":\"adaptive\"}", "normal")]
+    [InlineData("{\"schema_version\":5,\"LATENCY_MODE\":\"ADAPTIVE\"}", "normal")]
+    [InlineData("{\"schema_version\":5,\"latency_mode\":\"custom\",\"custom_buffer_ms\":650,\"receivers\":{\"a\":{\"latency_mode\":\"adaptive\"},\"b\":{\"latency_mode\":\"buffered\"}}}", "custom")]
     public void ExistingFilesKeepTheReleaseModeAndRecoveryAcrossRepeatedSaves(string json, string expected)
     {
         using var fixture = new Fixture();
@@ -34,8 +36,27 @@ public sealed class ForcedLatencySettingsTests
             Assert.Equal(expected, settings.LatencyMode);
             Assert.False(settings.ForceLatency);
             if (expected == "custom") Assert.Equal(650, settings.CustomBufferMs);
+            if (json.Contains("\"receivers\""))
+            {
+                Assert.Equal("normal", settings.ReadOptions("a").LatencyMode);
+                Assert.Equal("buffered", settings.ReadOptions("b").LatencyMode);
+            }
             store.Save(settings);
         }
+    }
+
+    [Fact]
+    public void SavingAProgrammaticAdaptiveValueNormalizesIt()
+    {
+        using var fixture = new Fixture();
+        var settings = new AppSettings();
+        settings.LatencyMode = "adaptive";
+        settings.Options("a").LatencyMode = "adaptive";
+        var store = new SettingsStore(fixture.Path);
+        store.Save(settings);
+        var loaded = store.Load();
+        Assert.Equal("normal", loaded.LatencyMode);
+        Assert.Equal("normal", loaded.ReadOptions("a").LatencyMode);
     }
 
     [Fact]
@@ -59,8 +80,8 @@ public sealed class ForcedLatencySettingsTests
             Assert.True(copy.ForcesLatency("b"));
             Assert.Equal(675, copy.CustomBufferMs);
         }
-        copy.LatencyMode = "adaptive";
-        Assert.False(copy.ForcesLatency("b"));
+        copy.LatencyMode = "normal";
+        Assert.True(copy.ForcesLatency("b"));
         Assert.True(copy.ForceLatency);
         copy.LatencyMode = "custom";
         Assert.True(copy.ForcesLatency("b"));
