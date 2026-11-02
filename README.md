@@ -84,29 +84,17 @@ including either software stereo member, the control is disabled and points to
 **Settings > Receivers**. Stopping playback restores it; the global default remains
 editable in Settings.
 
-New installations and reset settings default to **Adaptive latency**. It selects
-an initial target from the negotiated codec and clock strategy, then increases
-receiver buffering after sustained send lateness, repeated recovery, or active-audio
-underruns, without delaying the sender's cadence. Changes must be confirmed by the
-engine; the panel separates startup requests, negotiated baseline, adaptive extra,
-and the current plan. After each change it observes ten seconds of fresh health
-data before raising again. Unconfirmed changes time out after five seconds and
-rebuild at the requested target; continued trouble at the ladder ceiling also
-rebuilds within the configured retry budget. Sixty seconds of healthy evidence
-resets that budget. It does not automatically lower the target after a stable
-period. Recovery rebuilds retain the requested target; a new playback run or
-standby resume selects the initial target again.
-Both native and software stereo groups request a 50 ms starting target, with
-recovery steps of 50/60/80/120/140/160/200 ms; receiver minima still apply.
-Upgrades preserve existing latency modes, custom values, and recovery behavior.
+New installations and reset settings default to **Normal · 200 ms**. The
+selectable modes are Real-time, Normal, Buffered, and Custom. Existing settings
+that used the retired adaptive mode load as Normal; other fixed modes and custom
+values are preserved.
 
 In **Settings > AirFlash streaming**, the 120/200/500 ms presets and 0–2000 ms
 custom target also offer an independent **Force fixed latency** switch. With it
 off, the existing recovery behavior remains. With it on, AirFlash does not
 automatically increase latency or move the playback timeline: short stalls may
 use brief silence and clear stale capture audio, while larger stalls reconnect
-at the same target within the configured retry limit. Adaptive mode ignores the
-switch while preserving its saved value and the custom target.
+at the same target within the configured retry limit.
 
 Receiver settings can inherit the global policy, keep recovery, or force a fixed
 target. Forced software stereo requires every member to use the same forced

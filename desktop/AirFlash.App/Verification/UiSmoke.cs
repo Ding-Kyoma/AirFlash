@@ -127,6 +127,7 @@ internal static class UiSmoke
             Check(panel.IsVisible, "dropdown does not dismiss panel", checks); mode.IsDropDownOpen = false; await Pump();
             var customLatency = ((IEnumerable<StreamChoice>)mode.ItemsSource).Single(c => Equals(c.Value, "custom"));
             Check(customLatency.Label == L.Format("Custom · {0} ms", app.Settings.CustomBufferMs), "global latency menu shows the configured custom delay", checks);
+            Check(((IEnumerable<StreamChoice>)mode.ItemsSource).All(c => !Equals(c.Value, "adaptive")), "global latency menu omits the retired adaptive mode", checks);
             CheckPanelIcons(panel, app, checks);
             Render(panel, Path.Combine(directory, "panel-icons-idle.png"), 1);
             var settingsButton = Descendants(panel).OfType<Button>().Single(b => System.Windows.Automation.AutomationProperties.GetName(b) == L.Get("Settings"));

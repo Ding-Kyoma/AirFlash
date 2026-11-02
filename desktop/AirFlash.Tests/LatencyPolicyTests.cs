@@ -99,12 +99,11 @@ public sealed class LatencyPolicyTests
     }
 
     [Fact]
-    public void Adaptive_is_a_valid_mode_and_survives_save_load()
+    public void Adaptive_is_retained_internally_but_not_used_as_the_default()
     {
         var settings = new AppSettings { LatencyMode = LatencyPolicy.Mode };
+        Assert.Contains(LatencyPolicy.Mode, AppSettings.Modes);
         Assert.Null(settings.Validate());
-        var json = System.Text.Json.JsonSerializer.Serialize(settings, AppSettings.JsonOptions);
-        var saved = System.Text.Json.JsonSerializer.Deserialize<AppSettings>(json, AppSettings.JsonOptions)!;
-        Assert.Equal(LatencyPolicy.Mode, saved.LatencyMode);
+        Assert.Equal("normal", new AppSettings().LatencyMode);
     }
 }
