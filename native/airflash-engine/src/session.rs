@@ -4693,12 +4693,9 @@ mod tests {
     }
     #[test]
     fn an_unreachable_control_port_requires_manual_reconnect_without_claiming_takeover() {
-        // Bind and drop a listener to get a port with no receiver listening.
-        // The TCP liveness probe proves the receiver cannot serve us, so the
-        // verdict is gone: a reclaim, never busy and never a generic transport
-        // fault. Which raw state it is depends on the local stack (a returned
-        // RST is `refused`, a dropped SYN is `dead`); both are the same action
-        // and both are Q42's "not serving us".
+        // A closed port can return an RST (`refused`) or time out (`dead`).
+        // Both outcomes must pause automatic recovery without claiming a
+        // takeover, while diagnostics describe the actual raw probe state.
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let dead = probe.local_addr().unwrap();
         drop(probe);
@@ -4735,12 +4732,16 @@ mod tests {
         assert_eq!(probe["outcome"], "gone");
         assert_eq!(probe["tcp_reachable"], false);
         assert_eq!(probe["liveness_verdict"], "dead");
-        assert!(
-            matches!(probe["tcp_liveness"].as_str(), Some("dead" | "refused")),
-            "the raw probe state is logged, got {}",
-            probe["tcp_liveness"]
-        );
-        assert!(probe["message"].as_str().unwrap().contains("not reachable"));
+        let message = probe["message"].as_str().unwrap();
+        assert!(message.contains("ownership is unconfirmed"), "{message}");
+        match probe["tcp_liveness"].as_str() {
+            Some("refused") => {
+                assert!(message.contains("refused"), "{message}");
+                assert!(message.contains("alive"), "{message}");
+            }
+            Some("dead") => assert!(message.contains("not reachable"), "{message}"),
+            state => panic!("the raw probe state must be refused or dead, got {state:?}"),
+        }
         assert!(
             events.iter().all(|event| event["code"] != "preempted"),
             "an unreachable device is not reported as another controller's takeover"
