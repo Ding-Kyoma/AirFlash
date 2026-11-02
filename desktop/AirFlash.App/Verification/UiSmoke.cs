@@ -557,6 +557,7 @@ internal static class UiSmoke
     internal sealed class MockFactory : IEngineFactory
     {
         public int StopDelayMs;
+        public TaskCompletionSource? StopEntered, StopGate;
         public bool FailOpen;
         public bool AutoReady = true;
         public bool SupportsAdaptiveLead;
@@ -624,6 +625,6 @@ internal static class UiSmoke
         {
             try { return await _events.Reader.ReadAsync(cancellation); } catch (ChannelClosedException) { return null; }
         }
-        public async ValueTask DisposeAsync() { await Task.Delay(factory.StopDelayMs); if (_metrics is not null) { await _metrics.CancelAsync(); _metrics.Dispose(); } _events.Writer.TryComplete(); Interlocked.Increment(ref factory.DisposedCount); }
+        public async ValueTask DisposeAsync() { factory.StopEntered?.TrySetResult(); if (factory.StopGate is { } gate) await gate.Task; await Task.Delay(factory.StopDelayMs); if (_metrics is not null) { await _metrics.CancelAsync(); _metrics.Dispose(); } _events.Writer.TryComplete(); Interlocked.Increment(ref factory.DisposedCount); }
     }
 }

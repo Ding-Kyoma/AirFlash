@@ -109,7 +109,7 @@
                       <TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Name}"/>
                       <TextBlock Text="{Binding StateText}" Style="{StaticResource Hint}" Margin="0,3,0,0"/>
                     </StackPanel>
-                    <Button Grid.Column="2" Command="{Binding ToggleCommand}" ToolTip="{Binding PlayHint}" AutomationProperties.Name="{Binding PlayHint}" Style="{StaticResource IconButton}" Foreground="{DynamicResource AccentBrush}">
+                    <Button Grid.Column="2" Command="{Binding PlaybackCommand}" ToolTip="{Binding PlayHint}" AutomationProperties.Name="{Binding PlayHint}" Style="{StaticResource IconButton}" Foreground="{DynamicResource AccentBrush}">
                       <Viewbox Width="16" Height="16" Stretch="Uniform">
                         <Grid Width="24" Height="24">
                           <Path x:Name="PlaybackIcon" Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType={x:Type Button}}}">
@@ -117,8 +117,30 @@
                               <Style TargetType="Path">
                                 <Setter Property="Data" Value="{StaticResource PlayIconGeometry}"/>
                                 <Style.Triggers>
-                                  <DataTrigger Binding="{Binding Active}" Value="True">
+                                  <DataTrigger Binding="{Binding NeedsDisconnect}" Value="True">
                                     <Setter Property="Data" Value="{StaticResource StopIconGeometry}"/>
+                                  </DataTrigger>
+                                  <DataTrigger Binding="{Binding IsStopping}" Value="True">
+                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                  </DataTrigger>
+                                </Style.Triggers>
+                              </Style>
+                            </Path.Style>
+                          </Path>
+                          <Path x:Name="DisconnectSpinner" Data="M 12,3 A 9,9 0 1 1 3,12" Stroke="{DynamicResource AccentBrush}" StrokeThickness="2.5" StrokeStartLineCap="Round" StrokeEndLineCap="Round" RenderTransformOrigin="0.5,0.5" AutomationProperties.Name="{loc:Text 'Disconnecting…'}">
+                            <Path.RenderTransform><RotateTransform/></Path.RenderTransform>
+                            <Path.Style>
+                              <Style TargetType="Path">
+                                <Setter Property="Visibility" Value="Collapsed"/>
+                                <Style.Triggers>
+                                  <DataTrigger Binding="{Binding IsStopping}" Value="True">
+                                    <Setter Property="Visibility" Value="Visible"/>
+                                    <DataTrigger.EnterActions>
+                                      <BeginStoryboard Name="DisconnectAnimation">
+                                        <Storyboard><DoubleAnimation Storyboard.TargetProperty="(UIElement.RenderTransform).(RotateTransform.Angle)" From="0" To="360" Duration="0:0:1" RepeatBehavior="Forever"/></Storyboard>
+                                      </BeginStoryboard>
+                                    </DataTrigger.EnterActions>
+                                    <DataTrigger.ExitActions><StopStoryboard BeginStoryboardName="DisconnectAnimation"/></DataTrigger.ExitActions>
                                   </DataTrigger>
                                 </Style.Triggers>
                               </Style>

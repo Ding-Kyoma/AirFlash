@@ -16,17 +16,23 @@ internal static class AdaptiveLatencyRegression
     }
     public static async Task RunAsync(List<string> checks, string directory)
     {
-        var engine = new MockFactory { SupportsAdaptiveLead = true };
+        var engine = new MockFactory { SupportsAdaptiveLead = true, AutoReady = false };
         var left = new Receiver("adaptive-left", "Left", "127.0.0.1");
         var right = new Receiver("adaptive-right", "Right", "127.0.0.2");
         var receiver = new Receiver("stereo:adaptive", "Adaptive stereo", left.Address) { Members = [left, right] };
         await using var app = new AppViewModel(new MemoryStore(), new MockDiscovery { Items = [receiver] }, new MockAutostart(), new MockAudio(), engine, Application.Current.Dispatcher);
         app.Start(); await app.Startup;
         await app.Session.StartAsync(receiver, app.Settings);
-        await Until(() => app.Snapshot.State == PlaybackState.Streaming);
+        await Until(() => engine.EmitEvent is not null);
+        // Simulate the reported 120 ms negotiated baseline independently of the
+        // policy's current starting request, so the historical 120 -> 140 case
+        // remains covered when the starting ladder changes.
         foreach (var member in receiver.Peers)
             engine.EmitEvent!(new { @event = "negotiated", receiver_id = member.Id, host = member.Address,
                 codec = "alac", transport = "realtime", timing = "ptp", requested_latency_ms = 120, effective_latency_ms = 120 });
+        engine.EmitEvent!(new { @event = "streaming", session_epoch = 1, lead_sequence = 0,
+            baseline_ms = 120, lead_extra_ms = 0, effective_latency_ms = 120, lead_ceiling_ms = 100, live_lead_supported = true });
+        await Until(() => app.Snapshot.State == PlaybackState.Streaming);
         for (var i = 0; i < 3; i++) engine.EmitEvent!(new { @event = "warning", code = "sender_late_recovered", recovered = true });
         await Until(() => app.Snapshot.PendingLatency == 140);
         if (app.Snapshot.TargetLatency != 120 || !app.StatusDetail.Contains(L.Format("Adjusting to {0} ms…", 140)))

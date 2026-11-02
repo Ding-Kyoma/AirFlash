@@ -384,5 +384,8 @@
   "Fixed target · recovery enabled": "Festes Ziel · Wiederherstellung aktiviert",
   "Requested {0} ms · engine plan {1} ms": "Angefordert: {0} ms · Engine: {1} ms",
   "Receiver reports a minimum of {0} ms.": "Der Empfänger meldet einen Mindestwert von {0} ms.",
-  "Below the receiver's reported minimum: continuing at {0} ms. Playback may be rejected or silent.": "Unter dem gemeldeten Mindestwert: Wiedergabe wird mit {0} ms versucht. Sie kann abgelehnt werden oder stumm bleiben."
+  "Below the receiver's reported minimum: continuing at {0} ms. Playback may be rejected or silent.": "Unter dem gemeldeten Mindestwert: Wiedergabe wird mit {0} ms versucht. Sie kann abgelehnt werden oder stumm bleiben.",
+  "Disconnecting…": "Verbindung wird getrennt…",
+  "Stopping playback and disconnecting…": "Wiedergabe wird gestoppt und die Verbindung getrennt…",
+  "The audio engine could not stop. Try disconnecting again.": "Die Audio-Engine konnte nicht beendet werden. Versuchen Sie erneut, die Verbindung zu trennen."
 }

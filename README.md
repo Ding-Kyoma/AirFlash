@@ -96,6 +96,8 @@ rebuilds within the configured retry budget. Sixty seconds of healthy evidence
 resets that budget. It does not automatically lower the target after a stable
 period. Recovery rebuilds retain the requested target; a new playback run or
 standby resume selects the initial target again.
+Both native and software stereo groups request a 50 ms starting target, with
+recovery steps of 50/60/80/120/140/160/200 ms; receiver minima still apply.
 Upgrades preserve existing latency modes, custom values, and recovery behavior.
 
 In **Settings > AirFlash streaming**, the 120/200/500 ms presets and 0–2000 ms
@@ -118,6 +120,11 @@ panel distinguishes the requested target, engine plan, and receiver minimum.
 These scheduling values are not measured end-to-end audio latency. Without
 forcing, the existing negotiation of receiver latency remains in effect.
 Latency mode and UDP/TCP transport are independent settings.
+
+Stopping playback or cancelling a connection immediately shows **Disconnecting…**.
+The playback button becomes available again after the old session is cleaned up.
+AirFlash drains final engine output during shutdown and gives the engine a shared
+two-second stop budget before terminating an unresponsive engine process.
 
 **Settings > General > Reset and restart** asks once before clearing all settings
 and receiver pairing. AirFlash stops playback and discovery, restores local mute,
