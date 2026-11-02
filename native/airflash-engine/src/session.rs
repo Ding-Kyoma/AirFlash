@@ -48,6 +48,8 @@ fn default_sample_rate() -> u32 {
 pub struct ProbeOptions {
     pub peers: Vec<Peer>,
     #[serde(default)]
+    pub intent: StartIntent,
+    #[serde(default)]
     pub wav_path: PathBuf,
     #[serde(default = "default_source")]
     pub source: String,
@@ -89,6 +91,13 @@ pub struct ProbeOptions {
     /// fills this in after deserializing, and standalone callers leave it empty.
     #[serde(skip)]
     pub report_session_id: String,
+}
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StartIntent {
+    #[default]
+    Manual,
+    Automatic,
 }
 fn default_source() -> String {
     "wav".into()
@@ -388,6 +397,9 @@ struct Member {
     preemption: preemption::Tracker,
     /// The receiver took this session over. Never send a TEARDOWN back to it.
     preempted: bool,
+    /// Loss of the established feedback/clock association is not proof of takeover.
+    ownership_uncertain: bool,
+    ownership_check_started: Option<Instant>,
     probe_task: Option<ProbeTask>,
     event_task: Option<EventTask>,
 }
@@ -669,6 +681,8 @@ impl Member {
             next_event_rebuild: Instant::now(),
             preemption: preemption::Tracker::default(),
             preempted: false,
+            ownership_uncertain: false,
+            ownership_check_started: None,
             probe_task: None,
             event_task: None,
         };
@@ -915,6 +929,20 @@ impl Member {
         }
         let signals = self.health.take_preemption_signals();
         for signal in &signals {
+            if signal.ends_session()
+                || matches!(
+                    signal,
+                    preemption::Signal::FeedbackLost | preemption::Signal::ClockLost
+                )
+            {
+                self.ownership_check_started.get_or_insert(now);
+            }
+            if matches!(
+                signal,
+                preemption::Signal::FeedbackLost | preemption::Signal::ClockLost
+            ) {
+                self.ownership_uncertain = true;
+            }
             self.preemption.observe(*signal, now);
         }
         if !self.preemption.due(now) {
@@ -922,9 +950,10 @@ impl Member {
         }
         // A successful UDP send is local socket acceptance, not receiver playback.
         // In particular it cannot contradict a receiver-initiated TEARDOWN.
-        let media_healthy =
-            self.media.media_healthy(now, MEDIA_HEALTH_WINDOW) && !self.preemption.session_ended();
-        let we_hold_session = !self.preemption.session_ended();
+        let media_healthy = self.media.media_healthy(now, MEDIA_HEALTH_WINDOW)
+            && !self.preemption.session_ended()
+            && !self.ownership_uncertain;
+        let we_hold_session = !self.preemption.session_ended() && !self.ownership_uncertain;
         let host = self.peer.host;
         let port = self.peer.port;
         let stop = Cancellation::default();
@@ -1003,6 +1032,17 @@ impl Member {
         local_suspected: bool,
     ) -> (PreemptionPoll, bool) {
         let media_healthy = round.media_healthy;
+        if self
+            .ownership_check_started
+            .is_some_and(|at| now.saturating_duration_since(at) >= Duration::from_secs(15))
+        {
+            self.preempted = true;
+            self.preemption.suspend();
+            return (
+                PreemptionPoll::Yield(ownership_unconfirmed(self.peer.host)),
+                media_healthy,
+            );
+        }
         let Some(probe) = round.probe else {
             // Evidence only: no probe was due this round.
             if let Some(probed) = round.evidence {
@@ -1015,7 +1055,16 @@ impl Member {
                     false,
                 ));
             }
-            return (PreemptionPoll::None, media_healthy);
+            let investigating = (self.ownership_uncertain || self.preemption.session_ended())
+                && (self.probe_task.is_some() || self.preemption.scheduled().is_some());
+            return (
+                if investigating {
+                    PreemptionPoll::Waiting
+                } else {
+                    PreemptionPoll::None
+                },
+                media_healthy,
+            );
         };
         let sample = if local_suspected {
             preemption::LivenessSample::LocalSuspect
@@ -1057,6 +1106,12 @@ impl Member {
         }
         if let Some((first, second)) = note.disagreement {
             emit(preemption_probe_disagreement(self, first, second));
+            self.preempted = true;
+            self.preemption.suspend();
+            return (
+                PreemptionPoll::Yield(ownership_unconfirmed(self.peer.host)),
+                media_healthy,
+            );
         }
         match note.action {
             preemption::ProbeAction::Confirm => (PreemptionPoll::Waiting, media_healthy),
@@ -1068,11 +1123,17 @@ impl Member {
                 }
                 self.preemption.suspend();
                 (
-                    PreemptionPoll::Yield(preemption_fault(
-                        self,
-                        preemption::ReclaimReason::Takeover,
-                        1,
-                    )),
+                    PreemptionPoll::Yield(
+                        if self.preemption.session_ended()
+                            && result
+                                .as_ref()
+                                .is_ok_and(|r| r.outcome == preemption::ProbeOutcome::BusyElsewhere)
+                        {
+                            preemption_fault(self, preemption::ReclaimReason::Takeover, 1)
+                        } else {
+                            ownership_unconfirmed(self.peer.host)
+                        },
+                    ),
                     media_healthy,
                 )
             }
@@ -1088,15 +1149,25 @@ impl Member {
                     connection.poison();
                 }
                 self.preemption.suspend();
-                // A free or unreachable receiver is not evidence of another sender.
+                // Only confirmed Free permits a new association. A timeout, an
+                // unreachable peer or missing flags cannot authorize a takeover.
                 (
-                    PreemptionPoll::Yield(Fault::new(
-                        self.peer.host,
-                        "feedback",
-                        "peer_closed",
-                        true,
-                        "Receiver ended the current session; reconnect explicitly or use the configured transport retry",
-                    )),
+                    PreemptionPoll::Yield(
+                        if result
+                            .as_ref()
+                            .is_ok_and(|r| r.outcome == preemption::ProbeOutcome::Free)
+                        {
+                            Fault::new(
+                                self.peer.host,
+                                "feedback",
+                                "peer_closed",
+                                true,
+                                "Receiver ended the current session; reconnect explicitly or use the configured transport retry",
+                            )
+                        } else {
+                            ownership_unconfirmed(self.peer.host)
+                        },
+                    ),
                     media_healthy,
                 )
             }
@@ -1162,7 +1233,7 @@ impl Member {
                 .into_iter()
                 .find(|snapshot| snapshot.host == self.peer.host)
         });
-        json!({"id":if self.peer.receiver_id.is_empty() {self.peer.host.to_string()} else {self.peer.receiver_id.clone()}, "host":self.peer.host, "ip":self.peer.host, "active":!self.closed, "codec":self.compat.codec_name(),"transport":self.compat.transport(),"timing":self.compat.timing_name(),"clock_role":self.compat.clock_role(),"channel":self.peer.profile.channel,"sync_offset_ms":self.peer.profile.sync_offset_ms,"qualification":"experimental","media":self.media.metrics(), "health":self.health.snapshot(), "ptp_offset_ns":clock.as_ref().and_then(|s| s.offset_ns), "ptp_offset_count":clock.as_ref().map(|s| s.exchanges), "ptp_ready":clock.as_ref().is_some_and(|s| s.ready), "ptp_phase":clock.as_ref().map(|s| s.phase)})
+        json!({"id":if self.peer.receiver_id.is_empty() {self.peer.host.to_string()} else {self.peer.receiver_id.clone()}, "host":self.peer.host, "ip":self.peer.host, "active":!self.closed, "codec":self.compat.codec_name(),"transport":self.compat.transport(),"timing":self.compat.timing_name(),"clock_role":self.compat.clock_role(),"channel":self.peer.profile.channel,"sync_offset_ms":self.peer.profile.sync_offset_ms,"qualification":"experimental","media":self.media.metrics(), "health":self.health.snapshot(), "ptp_offset_ns":clock.as_ref().and_then(|s| s.offset_ns), "ptp_offset_count":clock.as_ref().map(|s| s.exchanges), "ptp_required":self.compat.uses_ptp(), "ptp_ready":clock.as_ref().is_some_and(|s| s.ready), "ptp_phase":clock.as_ref().map(|s| s.phase)})
     }
     fn close(&mut self) {
         if self.closed {
@@ -1174,7 +1245,7 @@ impl Member {
         self.feedback.take();
         // A receiver that took the session over must not receive a TEARDOWN from
         // the session it just displaced; the takeover already ended it.
-        if self.session_started && !self.preempted {
+        if self.session_started && !self.preempted && !self.health.ownership_uncertain() {
             let _ = self.conn.lock().unwrap().finish_session(&self.uri);
         }
         self.events.take();
@@ -1578,6 +1649,7 @@ fn run_live(
                 };
                 if current != reason {
                     emit(json!({"event":"standby","reason":current}));
+                    options.intent = StartIntent::Automatic;
                     reason = current;
                 }
                 if Instant::now() >= next_metrics {
@@ -1640,9 +1712,13 @@ fn run_live(
                 // The next attempt is a reconnect after the receiver was taken
                 // over: the engine-side timeline restarts with the new session.
                 reset_before = Some(TimelineResetReason::SessionRestart);
+                options.intent = StartIntent::Automatic;
                 continue;
             }
         };
+        // Every subsequent attempt is automatic, including a capture-source
+        // restart and waking after we released the receiver for silence.
+        options.intent = StartIntent::Automatic;
         match ended {
             StreamEnd::Finished => break,
             StreamEnd::SourceEnded => {
@@ -1677,6 +1753,76 @@ fn reset_adaptive_target(options: &mut ProbeOptions) {
             peer.profile.latency_ms = Some(initial);
         }
     }
+}
+
+fn ownership_unconfirmed(host: impl ToString) -> Fault {
+    Fault::new(
+        host,
+        "preemption",
+        "ownership_unconfirmed",
+        false,
+        "Receiver session ownership could not be confirmed; automatic recovery paused until manual reconnect",
+    )
+}
+
+/// Read-only preflight shared by transport retries and native standby resumes.
+/// No authentication, SETUP or RECORD may precede both complete free rounds.
+fn require_free_receivers(
+    peers: &[Peer],
+    cancel: &Cancellation,
+    emit: &impl Fn(Json),
+) -> Result<()> {
+    for round in 0..2 {
+        cancel.check()?;
+        let reports = thread::scope(|scope| {
+            let jobs: Vec<_> = peers
+                .iter()
+                .map(|peer| {
+                    scope.spawn(move || {
+                        preemption::probe_report(
+                            SocketAddr::new(peer.host, peer.port),
+                            cancel,
+                            preemption::PROBE_TIMEOUT,
+                            false,
+                        )
+                    })
+                })
+                .collect();
+            jobs.into_iter()
+                .map(|job| {
+                    job.join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("ownership probe panicked")))
+                })
+                .collect::<Vec<_>>()
+        });
+        cancel.check()?;
+        let mut blocked = None;
+        for (peer, report) in peers.iter().zip(reports) {
+            let free = report
+                .as_ref()
+                .is_ok_and(|r| r.outcome == preemption::ProbeOutcome::Free);
+            emit(
+                json!({"event":"warning","channel":"preemption","code":"automatic_start_probe",
+                "host":peer.host,"round":round + 1,"status_flags":report.as_ref().ok().and_then(|r| r.status_flags),
+                "automatic_recovery_allowed":free && round == 1,"recovered":free,
+                "message":match &report { Ok(r) => format!("Automatic start ownership check: {}", r.outcome.name()), Err(e) => format!("Automatic start ownership check failed: {e:#}") }}),
+            );
+            if !free {
+                blocked.get_or_insert(peer.host);
+            }
+        }
+        if let Some(host) = blocked {
+            return Err(ownership_unconfirmed(host).into());
+        }
+        if round == 0 {
+            let until = Instant::now() + preemption::CONFIRM_DELAY;
+            while Instant::now() < until {
+                cancel.check()?;
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1728,6 +1874,9 @@ fn run_stream(
     // decision needs every fingerprint, and no receiver may be configured before
     // that one decision exists.
     let mut probes = Vec::new();
+    if options.intent == StartIntent::Automatic {
+        require_free_receivers(&options.peers, cancel, emit)?;
+    }
     for peer in &options.peers {
         cancel.check()?;
         probes.push(probe_member(peer, cancel, &emit)?);
@@ -2084,6 +2233,7 @@ fn send_packets(
     ));
     let mut pcm = vec![0; PCM_BYTES];
     let started_ns = crate::wasapi::qpc_ns();
+    let mut pending_clock_fault: Option<String> = None;
     // Q46's all-failed rule state. The gateway address is discovered once per
     // all-failed episode (not per round: a routing-table lookup every 3 s of an
     // outage would buy nothing) while its reachability is probed again on every
@@ -2130,7 +2280,23 @@ fn send_packets(
                 let waiting = match preemption {
                     PreemptionPoll::None => false,
                     PreemptionPoll::Waiting => true,
-                    PreemptionPoll::Yield(fault) => return Err(fault.into()),
+                    PreemptionPoll::Yield(mut fault) => {
+                        if fault.code == "peer_closed"
+                            && let Some(host) = &pending_clock_fault
+                        {
+                            fault = Fault::new(
+                                host,
+                                "clock",
+                                "clock_lost",
+                                true,
+                                "PTP exchanges stopped; receiver confirmed free",
+                            );
+                        }
+                        emit(
+                            json!({"event":"warning","channel":"preemption","code":"recovery_decision","host":fault.host,"recovered":false,"fault_code":fault.code,"automatic_recovery_allowed":fault.retryable,"message":fault.message}),
+                        );
+                        return Err(fault.into());
+                    }
                 };
                 member.health.check()?;
                 // While another sender owns the receiver, a dead control channel
@@ -2171,16 +2337,25 @@ fn send_packets(
                         .filter(|m| m.compat.uses_ptp())
                         .map(|m| m.peer.host)
                         .collect();
-                    emit(clock_status(timer, &hosts, "lost"));
-                    return Err(Fault::new(
-                        host.to_string(),
-                        "clock",
-                        "clock_lost",
-                        true,
-                        "PTP exchanges stopped",
-                    )
-                    .into());
+                    if pending_clock_fault.is_none() {
+                        emit(clock_status(timer, &hosts, "lost"));
+                        emit(
+                            json!({"event":"warning","channel":"clock","code":"recovery_original_fault","host":host,"fault_code":"clock_lost","recovered":false,"message":"PTP exchanges stopped; verifying receiver ownership before recovery"}),
+                        );
+                        pending_clock_fault = Some(host.to_string());
+                        for member in members.iter() {
+                            member
+                                .health
+                                .preemption_signal(preemption::Signal::ClockLost);
+                        }
+                    }
                 }
+            }
+            if pending_clock_fault.is_some() {
+                // Timing is unusable. Stop producing media while the bounded
+                // background probes settle; cancellation remains responsive.
+                thread::sleep(Duration::from_millis(2));
+                continue;
             }
             for member in members.iter_mut() {
                 member
@@ -2494,6 +2669,18 @@ fn send_packets(
         }
         Ok(StreamEnd::Finished)
     })();
+    // A single uncertain member makes group-wide cleanup unsafe. Never send an
+    // old association's TEARDOWN to the other half of a taken-over stereo pair.
+    if members.iter().any(|m| {
+        m.preempted
+            || m.ownership_uncertain
+            || m.preemption.session_ended()
+            || m.health.ownership_uncertain()
+    }) {
+        for member in members.iter_mut() {
+            member.preempted = true;
+        }
+    }
     // A stall in the last 250 ms of the session never reaches its own deadline.
     // Report what the window saw rather than dropping the stall from the summary.
     if let Some(window) = stall_drain.take() {
@@ -2887,12 +3074,11 @@ fn preemption_probe(
                 (preemption::ProbeOutcome::Gone, _)
                     if probed == preemption::ReceiverLiveness::Refused =>
                 {
-                    "Receiver refused the control connection (the host is alive, it is just not serving AirPlay); reclaiming"
+                    "Receiver refused the control connection (the host is alive, it is just not serving AirPlay); ownership is unconfirmed"
                         .to_string()
                 }
                 (preemption::ProbeOutcome::Gone, _) => {
-                    "Receiver control port is not reachable; the device is gone, reclaiming"
-                        .to_string()
+                    "Receiver control port is not reachable; ownership is unconfirmed".to_string()
                 }
                 (_, Some(flags)) => {
                     format!("Receiver /info statusFlags=0x{flags:016x} ({flags})")
@@ -2901,13 +3087,14 @@ fn preemption_probe(
                     "Receiver /info has no usable statusFlags; keeping our session (conservative)"
                         .to_string()
                 }
-                (_, None) => "Receiver /info has no usable statusFlags; reclaiming".to_string(),
+                (_, None) =>
+                    "Receiver /info has no usable statusFlags; ownership is unconfirmed".to_string(),
             });
         }
         Err(error) => {
             event["outcome"] = json!("error");
             event["message"] = json!(format!(
-                "Receiver status probe failed ({error:#}); reclaiming anyway"
+                "Receiver status probe failed ({error:#}); ownership is unconfirmed"
             ));
         }
     }
@@ -3671,6 +3858,18 @@ mod tests {
         JoinHandle<()>,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
+        local_member_with_feedback_drop(receiver_addr, teardown, health, false)
+    }
+    fn local_member_with_feedback_drop(
+        receiver_addr: SocketAddr,
+        teardown: Option<std::sync::Arc<std::sync::Mutex<Option<UdpSocket>>>>,
+        health: Health,
+        drop_feedback: bool,
+    ) -> (
+        Member,
+        JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let conn =
@@ -3692,6 +3891,9 @@ mod tests {
                         .unwrap_or("")
                         .to_owned(),
                 );
+                if drop_feedback && request.first.starts_with("POST /feedback") {
+                    break;
+                }
                 let body = if request.first.starts_with("GET /info") {
                     let value = dictionary(vec![("initialVolume", Value::Real(-15.0))]);
                     let mut bytes = Vec::new();
@@ -3764,10 +3966,251 @@ mod tests {
             next_event_rebuild: Instant::now(),
             preemption: preemption::Tracker::default(),
             preempted: false,
+            ownership_uncertain: false,
+            ownership_check_started: None,
             probe_task: None,
             event_task: None,
         };
         (member, worker, methods)
+    }
+    #[test]
+    fn feedback_eof_without_teardown_stops_the_whole_group_without_reclaiming() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mut left, left_worker, left_methods) = local_member_with_feedback_drop(
+            receiver.local_addr().unwrap(),
+            None,
+            Health::default(),
+            true,
+        );
+        let (mut right, right_worker, right_methods) =
+            local_member_with(receiver.local_addr().unwrap(), None);
+        let (probe_addr, probe_worker) = status_probe_server_seq(vec![
+            Some(preemption::RECEIVER_SESSION_ACTIVE),
+            Some(preemption::RECEIVER_SESSION_ACTIVE),
+        ]);
+        left.peer.port = probe_addr.port();
+        left.media
+            .connect_audio(receiver.local_addr().unwrap())
+            .unwrap();
+        right
+            .media
+            .connect_audio(receiver.local_addr().unwrap())
+            .unwrap();
+        left.start_feedback(Instant::now()).unwrap();
+        let mut members = vec![left, right];
+        let events = std::sync::Mutex::new(Vec::new());
+        let result = send_packets(
+            &summary_options("", "native_stereo", 4500),
+            &Cancellation::default(),
+            &std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0.0f32.to_bits())),
+            crate::volume::Control::default(),
+            None,
+            &crate::standby::Control::default(),
+            &Clock::new(),
+            None,
+            &mut members,
+            None,
+            &mut preemption::TakeoverCounters::default(),
+            &vec![0; FRAMES * 2],
+            None,
+            &|event| events.lock().unwrap().push(event),
+        );
+        let fault = result.unwrap_err().downcast::<Fault>().unwrap();
+        assert_eq!(fault.code, "ownership_unconfirmed");
+        assert!(!fault.retryable);
+        assert!(members.iter().all(|m| m.media.metrics.packets_sent > 0));
+        assert!(members.iter().all(|m| m.preempted));
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e["code"] == "feedback_lost")
+        );
+        drop(members);
+        left_worker.join().unwrap();
+        right_worker.join().unwrap();
+        probe_worker.join().unwrap();
+        for methods in [left_methods, right_methods] {
+            assert!(
+                !methods
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|m| matches!(m.as_str(), "TEARDOWN" | "SETUP" | "RECORD"))
+            );
+        }
+    }
+    #[test]
+    fn clock_loss_alone_is_unknown_when_the_active_session_cannot_be_identified() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mut member, worker, methods) = local_member_with(receiver.local_addr().unwrap(), None);
+        let (addr, probe_worker) =
+            status_probe_server_seq(vec![Some(preemption::RECEIVER_SESSION_ACTIVE); 2]);
+        member.peer.port = addr.port();
+        member
+            .health
+            .preemption_signal(preemption::Signal::ClockLost);
+        let now = Instant::now();
+        let mut takeovers = preemption::TakeoverCounters::default();
+        assert!(matches!(
+            member
+                .poll_preemption(&Cancellation::default(), &mut takeovers, now, &|_| {})
+                .0,
+            PreemptionPoll::Waiting
+        ));
+        assert!(
+            matches!(member.poll_preemption(&Cancellation::default(), &mut takeovers, now + preemption::CONFIRM_DELAY, &|_| {}).0,
+            PreemptionPoll::Yield(ref f) if f.code == "ownership_unconfirmed" && !f.retryable)
+        );
+        drop(member);
+        worker.join().unwrap();
+        probe_worker.join().unwrap();
+        assert!(!methods.lock().unwrap().iter().any(|m| m == "TEARDOWN"));
+    }
+    #[test]
+    fn clock_failure_is_adjudicated_before_cleanup_and_keeps_the_original_fault() {
+        let (mut member, receiver, server) = local_member();
+        member.compat = crate::profile::CompatProfile::derive(
+            &dictionary(vec![]),
+            &crate::profile::Profile {
+                timing: crate::profile::Timing::Ptp,
+                ..Default::default()
+            },
+            &[],
+            44100,
+            true,
+        )
+        .unwrap();
+        member
+            .media
+            .connect_audio(receiver.local_addr().unwrap())
+            .unwrap();
+        let (addr, probe_server) =
+            status_probe_server_seq(vec![Some(preemption::RECEIVER_SESSION_ACTIVE); 2]);
+        member.peer.port = addr.port();
+        let clock = Clock::new();
+        let timer = PtpMaster::from_sockets(
+            vec![],
+            vec![],
+            clock.clone(),
+            UdpSocket::bind("127.0.0.1:0").unwrap(),
+            UdpSocket::bind("127.0.0.1:0").unwrap(),
+        )
+        .unwrap();
+        let mut members = vec![member];
+        let events = std::sync::Mutex::new(Vec::new());
+        let result = send_packets(
+            &summary_options("", "single", 4000),
+            &Cancellation::default(),
+            &std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0.0f32.to_bits())),
+            crate::volume::Control::default(),
+            None,
+            &crate::standby::Control::default(),
+            &clock,
+            None,
+            &mut members,
+            Some(&timer),
+            &mut preemption::TakeoverCounters::default(),
+            &vec![0; FRAMES * 2],
+            None,
+            &|e| events.lock().unwrap().push(e),
+        );
+        assert_eq!(
+            result.unwrap_err().downcast::<Fault>().unwrap().code,
+            "ownership_unconfirmed"
+        );
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e["code"] == "recovery_original_fault" && e["fault_code"] == "clock_lost")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e["code"] == "recovery_decision"
+                    && e["automatic_recovery_allowed"] == false)
+        );
+        drop(events);
+        drop(members);
+        server.join().unwrap();
+        probe_server.join().unwrap();
+    }
+    #[test]
+    fn ownership_probe_timeout_and_deadline_never_authorize_recovery() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mut member, server, _) = local_member_with(receiver.local_addr().unwrap(), None);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        member.peer.port = listener.local_addr().unwrap().port();
+        let probe_server = thread::spawn(move || {
+            let (liveness, _) = listener.accept().unwrap();
+            drop(liveness);
+            let (socket, _) = listener.accept().unwrap();
+            let mut conn = Connection::from_stream(socket, Cancellation::default()).unwrap();
+            assert!(conn.read().unwrap().first.starts_with("GET /info"));
+            assert!(conn.read().is_err()); // requester closes after its bounded timeout
+        });
+        member
+            .health
+            .preemption_signal(preemption::Signal::FeedbackLost);
+        let now = Instant::now();
+        let mut takeovers = preemption::TakeoverCounters::default();
+        assert!(
+            matches!(member.poll_preemption(&Cancellation::default(), &mut takeovers, now, &|_| {}).0,
+            PreemptionPoll::Yield(ref f) if f.code == "ownership_unconfirmed" && !f.retryable)
+        );
+        drop(member);
+        server.join().unwrap();
+        probe_server.join().unwrap();
+
+        let (mut member, _, server) = local_member();
+        member.ownership_check_started = Some(now);
+        let round = PreemptionRound {
+            media_healthy: true,
+            signals: vec![],
+            evidence: None,
+            probe: None,
+        };
+        assert!(
+            matches!(member.apply_preemption(round, &mut takeovers, now + Duration::from_secs(15), &|_| {}, false).0,
+            PreemptionPoll::Yield(ref f) if f.code == "ownership_unconfirmed" && !f.retryable)
+        );
+        drop(member);
+        server.join().unwrap();
+    }
+    #[test]
+    fn automatic_start_requires_two_free_rounds_for_every_receiver() {
+        for blocked in [None, Some(0), Some(preemption::RECEIVER_SESSION_ACTIVE)] {
+            let (left_addr, left_server) = status_probe_server_seq(vec![Some(0), Some(0)]);
+            let right_responses = if blocked == Some(0) {
+                vec![Some(0), Some(0)]
+            } else {
+                vec![Some(0), blocked]
+            };
+            let (right_addr, right_server) = status_probe_server_seq(right_responses);
+            let peers: Vec<Peer> = [left_addr, right_addr]
+                .into_iter()
+                .map(|addr| Peer {
+                    receiver_id: String::new(),
+                    host: addr.ip(),
+                    port: addr.port(),
+                    codecs: vec![],
+                    profile: Default::default(),
+                })
+                .collect();
+            let result = require_free_receivers(&peers, &Cancellation::default(), &|_| {});
+            if blocked == Some(0) {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(
+                    result.unwrap_err().downcast::<Fault>().unwrap().code,
+                    "ownership_unconfirmed"
+                );
+            }
+            left_server.join().unwrap();
+            right_server.join().unwrap();
+        }
     }
     #[test]
     fn a_preempted_member_closes_without_sending_a_teardown() {
@@ -3781,6 +4224,20 @@ mod tests {
             !methods.lock().unwrap().iter().any(|m| m == "TEARDOWN"),
             "the receiver that took the session over must not get a TEARDOWN back"
         );
+    }
+    #[test]
+    fn stopping_before_ownership_signals_are_polled_skips_stale_teardown() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mut member, worker, methods) = local_member_with(receiver.local_addr().unwrap(), None);
+        member
+            .health
+            .preemption_signal(preemption::Signal::FeedbackLost);
+        member.health.take_preemption_signals();
+        assert!(member.health.ownership_uncertain());
+        member.close();
+        drop(member);
+        worker.join().unwrap();
+        assert!(!methods.lock().unwrap().iter().any(|m| m == "TEARDOWN"));
     }
     #[test]
     fn a_normal_member_close_still_sends_teardown() {
@@ -4142,7 +4599,7 @@ mod tests {
         probe_server.join().unwrap();
     }
     #[test]
-    fn a_status_flags_field_that_is_missing_is_unknown_and_still_reclaims() {
+    fn missing_status_flags_require_manual_reconnect() {
         let (probe_addr, probe_server) = status_probe_server(None);
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
         let (mut member, worker, _methods) =
@@ -4164,7 +4621,7 @@ mod tests {
         );
         assert!(matches!(
             poll,
-            PreemptionPoll::Yield(ref fault) if fault.code == "peer_closed"
+            PreemptionPoll::Yield(ref fault) if fault.code == "ownership_unconfirmed" && !fault.retryable
         ));
         let events = emitted.lock().unwrap();
         let probe = events
@@ -4235,7 +4692,7 @@ mod tests {
         probe_server.join().unwrap();
     }
     #[test]
-    fn an_unreachable_control_port_is_retryable_without_claiming_takeover() {
+    fn an_unreachable_control_port_requires_manual_reconnect_without_claiming_takeover() {
         // Bind and drop a listener to get a port with no receiver listening.
         // The TCP liveness probe proves the receiver cannot serve us, so the
         // verdict is gone: a reclaim, never busy and never a generic transport
@@ -4262,8 +4719,8 @@ mod tests {
             &|json| seen.lock().unwrap().push(json),
         );
         assert!(
-            matches!(poll, PreemptionPoll::Yield(ref fault) if fault.code == "peer_closed"),
-            "a receiver that cannot serve us must take the reclaim path, never the generic fault path"
+            matches!(poll, PreemptionPoll::Yield(ref fault) if fault.code == "ownership_unconfirmed" && !fault.retryable),
+            "an unreachable receiver must not authorize automatic recovery"
         );
         assert_eq!(
             counters.consecutive(member.peer.host),
@@ -4338,7 +4795,9 @@ mod tests {
             &|json| seen.lock().unwrap().push(json),
             false,
         );
-        assert!(matches!(poll, PreemptionPoll::Yield(ref fault) if fault.code == "peer_closed"));
+        assert!(
+            matches!(poll, PreemptionPoll::Yield(ref fault) if fault.code == "ownership_unconfirmed" && !fault.retryable)
+        );
         assert_eq!(
             counters.consecutive(member.peer.host),
             0,
@@ -4376,7 +4835,7 @@ mod tests {
         worker.join().unwrap();
     }
     #[test]
-    fn an_escalating_unknown_liveness_ends_the_old_transport_after_patience() {
+    fn an_escalating_unknown_liveness_pauses_automatic_recovery_after_patience() {
         // Q42: `Unknown` is "temporarily unknown", not "mine forever". Media is
         // healthy — the UDP sends keep succeeding even when the device is
         // unreachable, which is exactly why MEDIA_HEALTH_WINDOW cannot decide
@@ -4429,7 +4888,7 @@ mod tests {
             false,
         );
         assert!(
-            matches!(poll, PreemptionPoll::Yield(ref fault) if fault.code == "peer_closed"),
+            matches!(poll, PreemptionPoll::Yield(ref fault) if fault.code == "ownership_unconfirmed" && !fault.retryable),
             "the fifth consecutive unknown escalates to a reclaim"
         );
         assert_eq!(
@@ -5620,7 +6079,25 @@ mod tests {
     }
     #[test]
     fn unsafe_probe_rejected() {
+        let mut parameters =
+            json!({"peers":[{"host":"127.0.0.1"}],"duration_ms":0,"latency_ms":120,"gain":0.1});
+        assert_eq!(
+            serde_json::from_value::<ProbeOptions>(parameters.clone())
+                .unwrap()
+                .intent,
+            StartIntent::Manual
+        );
+        parameters["intent"] = json!("automatic");
+        assert_eq!(
+            serde_json::from_value::<ProbeOptions>(parameters.clone())
+                .unwrap()
+                .intent,
+            StartIntent::Automatic
+        );
+        parameters["intent"] = json!("unknown");
+        assert!(serde_json::from_value::<ProbeOptions>(parameters).is_err());
         let mut o = ProbeOptions {
+            intent: StartIntent::Manual,
             peers: vec![Peer {
                 receiver_id: String::new(),
                 host: "127.0.0.1".parse().unwrap(),

@@ -67,6 +67,7 @@ fn capabilities() -> Vec<&'static str> {
         "member_volume",
         "receiver_password",
         "standby_release",
+        "receiver_ownership_guard",
         "now_playing",
         "diagnostics",
         "forced_latency",

@@ -122,7 +122,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         : Notice;
     /// <summary>The receiver now belongs to another controller. Reconnecting is a
     /// deliberate user action, never the automatic transport retry.</summary>
-    public bool CanReconnect => !_closing && !IsStopping && !Session.NeedsCleanup && _snapshot.State == PlaybackState.Preempted && _snapshot.Receiver is not null;
+    public bool CanReconnect => !_closing && !IsStopping && !Session.NeedsCleanup && Session.RequiresManualReconnect && _snapshot.Receiver is not null;
     public string EngineVersion { get; set; } = L.Get("Unknown");
     public bool EngineReady => _engine is null || _engine.State == EngineAvailability.Ready;
     public bool EngineFailed => _engine?.State == EngineAvailability.Failed;
@@ -425,6 +425,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         var title = StatusTitle; var detail = StatusDetail; var errors = ErrorDetails; var hint = ActionHint;
         var previous = _snapshot;
         _snapshot = snapshot;
+        if (Session.RequiresManualReconnect) _autoSuppressed = true;
         RefreshGlobalLatency();
         Notify(nameof(Snapshot)); Notify(nameof(LatencyDetail));
         if (title != StatusTitle) Notify(nameof(StatusTitle));
@@ -470,7 +471,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             if (row is null) MonitorMembers.Add(new(member)); else row.Update(member);
         }
     }
-    public async Task ToggleAsync(Receiver receiver)
+    public Task ToggleAsync(Receiver receiver) => ToggleAsync(receiver, SessionStartIntent.Manual);
+    private async Task ToggleAsync(Receiver receiver, SessionStartIntent startIntent)
     {
         if (_closing || IsStopping) return;
         if (_snapshot.IsActive && _snapshot.Receiver?.Id == receiver.Id) { await StopAsync(); return; }
@@ -485,9 +487,10 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             if (_closing || _resetting || IsStopping || intent != _playIntent || !EngineReady || Session.NeedsCleanup) return;
             if (_settings.CaptureMode == "loopback") _defaultEndpoint = await _audio.GetDefaultEndpointIdAsync();
             if (_closing || _resetting || IsStopping || intent != _playIntent) return;
-            _autoSuppressed = false; Notice = "";
+            if (startIntent == SessionStartIntent.Manual) _autoSuppressed = false;
+            Notice = "";
             _autoAttempted.Add(receiver.Id);
-            await Session.StartAsync(receiver, _settings.Clone());
+            await Session.StartAsync(receiver, _settings.Clone(), startIntent);
             if (intent != _playIntent) return;
             _settings.LastReceiverId = receiver.Id;
             VolumeChanged();
@@ -535,10 +538,10 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     }
     internal async Task TryAutoConnectAsync()
     {
-        if (_closing || _resetting || IsStopping || Session.NeedsCleanup || !EngineReady || _autoSuppressed || Session.Snapshot.IsActive) return;
+        if (_closing || _resetting || IsStopping || Session.NeedsCleanup || Session.RequiresManualReconnect || !EngineReady || _autoSuppressed || Session.Snapshot.IsActive) return;
         var eligible = AllReceivers.Where(r => r.Online && r.Complete && !_settings.ReadOptions(r.Id).Hidden && (_settings.ReadOptions(r.Id).AutoConnect ?? _settings.AutoConnectOnDiscover));
         var receiver = eligible.OrderByDescending(r => r.Id == _settings.LastReceiverId).FirstOrDefault();
-        if (receiver is not null && !_autoAttempted.Contains(receiver.Id)) await ToggleAsync(receiver);
+        if (receiver is not null && !_autoAttempted.Contains(receiver.Id)) await ToggleAsync(receiver, SessionStartIntent.Automatic);
     }
     public DeviceVolumeState ReceiverVolume(string id) => _snapshot.State is PlaybackState.Streaming or PlaybackState.Standby
         ? _snapshot.Receiver?.IsSoftwareGroup == true ? _snapshot.MemberVolumes?.GetValueOrDefault(id) ?? new() : _snapshot.Receiver?.Id == id ? _snapshot.DeviceVolume ?? new() : new() : new();

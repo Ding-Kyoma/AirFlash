@@ -187,6 +187,8 @@ struct HealthState {
     /// Control-plane symptoms of a takeover. They are evidence only: the
     /// session thread probes the receiver's live `statusFlags` before deciding.
     preemption_signals: Vec<Signal>,
+    /// Retained after draining signals so cancellation cannot lose cleanup safety.
+    ownership_uncertain: bool,
 }
 #[derive(Clone, Default)]
 pub struct Health(Arc<Mutex<HealthState>>);
@@ -262,10 +264,16 @@ impl Health {
     /// the session thread drains them and probes the receiver's live status.
     pub fn preemption_signal(&self, signal: Signal) {
         let mut state = self.0.lock().unwrap();
+        if signal.ends_session() || matches!(signal, Signal::FeedbackLost | Signal::ClockLost) {
+            state.ownership_uncertain = true;
+        }
         if state.preemption_signals.len() == 8 {
             state.preemption_signals.remove(0);
         }
         state.preemption_signals.push(signal);
+    }
+    pub fn ownership_uncertain(&self) -> bool {
+        self.0.lock().unwrap().ownership_uncertain
     }
     /// Take the symptoms collected since the previous poll.
     pub fn take_preemption_signals(&self) -> Vec<Signal> {
@@ -434,12 +442,16 @@ impl FeedbackWorker {
                         } else {
                             // Feedback is a health probe, not the audio path: keep
                             // sending and let `check_control` decide when to give up.
+                            health.preemption_signal(Signal::FeedbackLost);
                             health.0.lock().unwrap().metrics.feedback_failures += 1;
                             health.notice(
                                 &fault.host,
                                 "feedback",
                                 "feedback_lost",
-                                "Receiver feedback stopped; audio continues",
+                                &format!(
+                                    "Receiver feedback stopped ({}): {}",
+                                    fault.code, fault.message
+                                ),
                                 false,
                             );
                             health.degrade(fault);

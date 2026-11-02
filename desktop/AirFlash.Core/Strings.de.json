@@ -386,5 +386,6 @@
   "Disconnecting…": "Verbindung wird getrennt…",
   "Stopping playback and disconnecting…": "Wiedergabe wird gestoppt und die Verbindung getrennt…",
   "The audio engine could not stop. Try disconnecting again.": "Die Audio-Engine konnte nicht beendet werden. Versuchen Sie erneut, die Verbindung zu trennen.",
-  "In the Home app, set speaker access to “Everyone,” then try again.": "Legen Sie in der Home-App den Lautsprecherzugriff auf „Alle“ fest, und versuchen Sie es dann erneut."
+  "In the Home app, set speaker access to “Everyone,” then try again.": "Legen Sie in der Home-App den Lautsprecherzugriff auf „Alle“ fest, und versuchen Sie es dann erneut.",
+  "Receiver session ownership could not be confirmed. Automatic recovery is paused. Reconnect manually to continue.": "Die Sitzung des Empfängers konnte nicht bestätigt werden. Die automatische Wiederherstellung ist pausiert. Verbinden Sie sich manuell erneut, um fortzufahren."
 }

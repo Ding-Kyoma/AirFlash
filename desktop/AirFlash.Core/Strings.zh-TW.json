@@ -369,5 +369,6 @@
   "Disconnecting…": "正在中斷連線…",
   "Stopping playback and disconnecting…": "正在停止播放並中斷連線…",
   "The audio engine could not stop. Try disconnecting again.": "音訊引擎未能停止，請再次嘗試中斷連線。",
-  "In the Home app, set speaker access to “Everyone,” then try again.": "請在「家庭」App 中，將揚聲器存取權限設為「所有人」，然後再試一次。"
+  "In the Home app, set speaker access to “Everyone,” then try again.": "請在「家庭」App 中，將揚聲器存取權限設為「所有人」，然後再試一次。",
+  "Receiver session ownership could not be confirmed. Automatic recovery is paused. Reconnect manually to continue.": "無法確認接收器目前的連線，已暫停自動恢復。請手動重新連線以繼續播放。"
 }

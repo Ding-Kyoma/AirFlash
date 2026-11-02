@@ -6,14 +6,18 @@ public sealed record MemberTransportMetrics(string Host, long? PacketsSent, long
     long? RetransmitQueueDrops, long? RetransmitSendErrors, double? FeedbackRttMs, long? FeedbackFailures,
     bool? FeedbackDelayed, long? EventMessages, double? ReceiverLatencyMs, bool? ReceiverLatencyEstimated)
 {
+    public long? FeedbackSuccesses { get; init; }
+    public bool? PtpReady { get; init; }
+    public bool? PtpRequired { get; init; }
     public static MemberTransportMetrics Parse(JsonElement member)
     {
         var media = member.TryGetProperty("media", out var m) && m.ValueKind == JsonValueKind.Object ? m : JsonSerializer.SerializeToElement(new { });
         var health = member.TryGetProperty("health", out var h) && h.ValueKind == JsonValueKind.Object ? h : JsonSerializer.SerializeToElement(new { });
-        return new(member.Text("host", "—"), media.Integer("packets_sent"), media.Integer("media_send_errors"), media.Integer("sync_send_errors"),
+        return new MemberTransportMetrics(member.Text("host", "—"), media.Integer("packets_sent"), media.Integer("media_send_errors"), media.Integer("sync_send_errors"),
             media.Integer("retransmit_requests"), media.Integer("retransmits_sent"), media.Integer("retransmit_missing"), media.Integer("retransmit_expired"),
             media.Integer("retransmit_queue_drops"), media.Integer("retransmit_send_errors"), health.Number("feedback_rtt_ms"), health.Integer("feedback_failures"),
-            health.Boolean("feedback_delayed"), health.Integer("event_messages"), media.Number("receiver_latency_ms"), media.Boolean("receiver_latency_estimated"));
+            health.Boolean("feedback_delayed"), health.Integer("event_messages"), media.Number("receiver_latency_ms"), media.Boolean("receiver_latency_estimated"))
+            { FeedbackSuccesses = health.Integer("feedback_successes"), PtpReady = member.Boolean("ptp_ready"), PtpRequired = member.Boolean("ptp_required") };
     }
 }
 public sealed record TransportMetrics(double? SessionUptimeMs, long? SenderLateRecoveries, long? SkippedPackets, double? MaxSendLatenessUs, IReadOnlyList<MemberTransportMetrics> Members, double? LatenessP50Ms = null, double? LatenessP99Ms = null, double? IntervalLatenessP99Ms = null,

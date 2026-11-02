@@ -251,6 +251,10 @@ pub enum Signal {
     UnexpectedTeardown,
     /// The receiver asked for the control connection to be closed.
     ConnectionClose,
+    /// The established feedback connection stopped answering. Ownership is unknown.
+    FeedbackLost,
+    /// PTP stopped beyond its grace period; verify ownership before rebuilding.
+    ClockLost,
 }
 
 impl Signal {
@@ -258,6 +262,8 @@ impl Signal {
         match self {
             Self::UnexpectedTeardown => "unexpected_teardown",
             Self::ConnectionClose => "connection_close",
+            Self::FeedbackLost => "feedback_lost",
+            Self::ClockLost => "clock_lost",
         }
     }
 

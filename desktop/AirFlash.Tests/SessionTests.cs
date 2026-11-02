@@ -798,6 +798,68 @@ public sealed class SessionTests
         var settings = Settings(); settings.ForceReconnect = true; settings.MaxReconnectAttempts = 1;
         await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming); first.Emit("error", message: "network lost");
         await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(2)); Assert.True(first.Disposed); Assert.NotEqual(first.Session, second.Session);
+        Assert.Equal("manual", first.Commands.Single(c => c.Command == "start").Parameters.Text("intent"));
+        Assert.Equal("automatic", second.Commands.Single(c => c.Command == "start").Parameters.Text("intent"));
+    }
+    [Theory]
+    [InlineData("preempted")]
+    [InlineData("ownership_unconfirmed")]
+    public async Task OwnershipFaultRestoresSoundAndRequiresExplicitManualReconnect(string code)
+    {
+        var first = new FakeConnection(); var second = new FakeConnection();
+        var factory = new FakeFactory(first, second); var audio = new FakeAudio();
+        await using var controller = new SessionController(factory, audio, timing: Fast);
+        var settings = Settings(); settings.ForceReconnect = true;
+        await controller.StartAsync(Pod(), settings, SessionStartIntent.Automatic);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.Equal("automatic", first.Commands.Single(c => c.Command == "start").Parameters.Text("intent"));
+        Assert.True(audio.Muted);
+        first.EmitData(new { @event = "error", code, channel = "preemption", retryable = false, message = "ownership test" });
+        await Until(() => first.Disposed && controller.RequiresManualReconnect);
+        Assert.False(audio.Muted);
+        Assert.Equal(code == "preempted" ? PlaybackState.Preempted : PlaybackState.Error, controller.Snapshot.State);
+        await controller.StartAsync(Pod(), settings, SessionStartIntent.Automatic);
+        settings.CustomBufferMs = 777; await controller.UpdateSettingsAsync(settings);
+        await controller.RefreshReceiverAsync(Pod() with { Address = "127.0.0.2" }, controller.Snapshot, new Dictionary<string, string>());
+        Assert.Equal(1, factory.OpenCount); Assert.True(controller.RequiresManualReconnect);
+        await controller.StopAsync();
+        await controller.StartAsync(Pod(), settings, SessionStartIntent.Automatic);
+        Assert.Equal(1, factory.OpenCount);
+        await controller.StartAsync(Pod(), settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.False(controller.RequiresManualReconnect); Assert.Equal(2, factory.OpenCount);
+        Assert.Equal("manual", second.Commands.Single(c => c.Command == "start").Parameters.Text("intent"));
+    }
+    [Fact]
+    public async Task ClockFaultLoopDoesNotReplenishRetriesFromStreamingUptime()
+    {
+        var processes = new[] { new FakeConnection(), new FakeConnection(), new FakeConnection() };
+        var factory = new FakeFactory(processes); var clock = new AdaptiveLatencyTests.ManualClock();
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast, clock: clock);
+        var settings = Settings(); settings.MaxReconnectAttempts = 2;
+        await controller.StartAsync(Pod(), settings);
+        for (var i = 0; i < 3; i++)
+        {
+            var process = processes[i];
+            await Until(() => process.Started.Task.IsCompleted && controller.Snapshot.State == PlaybackState.Streaming);
+            clock.Advance(20);
+            process.EmitData(new { @event = "error", code = "clock_lost", retryable = true, message = "PTP stopped" });
+            await process.DisposedSignal.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        }
+        await Until(() => controller.Snapshot.State == PlaybackState.Error);
+        Assert.Equal(3, factory.OpenCount); Assert.Equal(2, controller.Snapshot.Diagnostics!.ReconnectCount);
+    }
+    [Fact]
+    public async Task AnEngineWithoutOwnershipProtectionCannotStartOrRetry()
+    {
+        var process = new FakeConnection { SupportsOwnershipGuard = false }; var factory = new FakeFactory(process);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        var settings = Settings(); settings.ForceReconnect = true;
+        await controller.StartAsync(Pod(), settings);
+        await Until(() => process.Disposed && controller.Snapshot.State == PlaybackState.Error);
+        Assert.DoesNotContain(process.Commands, c => c.Command == "start");
+        Assert.Equal(1, factory.OpenCount);
+        Assert.Equal("ownership_guard_required", controller.Snapshot.Diagnostics?.LastFault?.Code);
     }
     [Fact]
     public async Task DesktopSessionRecordJoinsTheEngineRowAndCarriesTheWholeFaultStory()
@@ -1347,6 +1409,7 @@ public sealed class SessionTests
         public bool RespondHello { get; init; } = true;
         public bool SupportsForcedLatency { get; init; } = true;
         public bool SupportsAdaptiveLead { get; init; } = true;
+        public bool SupportsOwnershipGuard { get; init; } = true;
         private int _latencyBase;
         private long _streamEpoch = 1;
         public object? ReceiverCapabilityResponse { get; init; }
@@ -1368,7 +1431,7 @@ public sealed class SessionTests
                 case "set_gain": GainEntered?.TrySetResult(); if (GainGate is not null) await GainGate.Task.WaitAsync(cancellation); break;
             }
         }
-        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "application_capture" }.Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).Concat(SupportsForcedLatency ? ["forced_latency"] : Array.Empty<string>()).Concat(SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).ToArray() });
+        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture" }.Where(c => SupportsOwnershipGuard || c != "receiver_ownership_guard").Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).Concat(SupportsForcedLatency ? ["forced_latency"] : Array.Empty<string>()).Concat(SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).ToArray() });
         public void ConfirmLead(int extra)
         {
             var command = Commands.Last(c => c.Command == "set_lead");
