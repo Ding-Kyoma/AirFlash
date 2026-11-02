@@ -54,7 +54,10 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public bool Muted => Session.Muted;
     public string MuteLabel => Muted ? L.Get("Unmute") : L.Get("Mute");
     public string StatusTitle => _snapshot.State switch { PlaybackState.Connecting => L.Get("Connecting"), PlaybackState.Streaming => L.Get("Playing"), PlaybackState.Standby => L.Get("Standby"), PlaybackState.Pairing => L.Get("Pairing"), PlaybackState.Error => L.Get("Connection error"), PlaybackState.Preempted => L.Get("Taken over by another device"), _ => L.Get("Ready") };
-    public string StatusDetail => _snapshot.Message.Length > 0 ? _snapshot.Message : _snapshot.IsActive ? L.Format("{0} · target {1} ms", _snapshot.Receiver?.Name, _snapshot.TargetLatency) : L.Get("Select a receiver to play system audio");
+    public string StatusDetail => _snapshot.Message.Length > 0 ? _snapshot.Message : _snapshot.IsActive
+        ? L.Format("{0} · target {1} ms", _snapshot.Receiver?.Name, _snapshot.TargetLatency)
+            + (_snapshot.PendingLatency is { } target ? " · " + L.Format("Adjusting to {0} ms…", target) : "")
+        : L.Get("Select a receiver to play system audio");
     public string LatencyDetail
     {
         get
@@ -68,7 +71,10 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             foreach (var item in _snapshot.Diagnostics?.Negotiated ?? [])
             {
                 if (item.Number("effective_latency_ms") is not { } effective || item.Number("requested_latency_ms") is not { } requested) continue;
-                var text = L.Format("Requested {0} ms · engine plan {1} ms", requested.ToString("0.#"), effective.ToString("0.#"));
+                var text = _snapshot.Latency is { } runtime
+                    ? L.Format("Startup request {0} ms · negotiated baseline {1} ms · adaptive extra {2} ms · current plan {3} ms",
+                        requested.ToString("0.#"), runtime.BaselineMs.ToString("0.#"), runtime.ExtraMs.ToString("0.#"), runtime.EffectiveMs.ToString("0.#"))
+                    : L.Format("Requested {0} ms · engine plan {1} ms", requested.ToString("0.#"), effective.ToString("0.#"));
                 if (item.Number("receiver_latency_min_ms") is { } minimum)
                 {
                     text += " · " + L.Format("Receiver reports a minimum of {0} ms.", minimum.ToString("0.#"));

@@ -113,7 +113,7 @@ public sealed class SessionTests
         if (shouldRaise)
         {
             Assert.Equal(20, Assert.Single(process.Commands, c => c.Command == "set_lead").Parameters.Integer("ms"));
-            process.EmitData(new { @event = "lead_changed", applied_ms = 20 });
+            process.ConfirmLead(20);
             await Until(() => controller.Snapshot.TargetLatency == 80);
         }
         else Assert.DoesNotContain(process.Commands, c => c.Command == "set_lead");
@@ -145,7 +145,7 @@ public sealed class SessionTests
             await Until(() => process.Commands.Any(c => c.Command == "set_lead"));
             Assert.Equal(10, process.Commands.Single(c => c.Command == "set_lead").Parameters.Integer("ms"));
             Assert.Equal(50, controller.Snapshot.TargetLatency);
-            process.EmitData(new { @event = "lead_changed", applied_ms = 10 });
+            process.ConfirmLead(10);
             await Until(() => controller.Snapshot.TargetLatency == 60);
             for (var i = 0; i < 20; i++)
                 process.EmitData(new { @event = "warning", code = "timeline_reanchored", recovered = true });
@@ -163,8 +163,11 @@ public sealed class SessionTests
         var settings = Settings(); settings.LatencyMode = "adaptive";
         await controller.StartAsync(Pod(), settings);
         await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
-        first.EmitData(new { @event = "lead_changed", applied_ms = 50 });
-        await Until(() => controller.Snapshot.TargetLatency == 100);
+        first.EmitData(new { @event = "negotiated", receiver_id = "a", codec = "alac", transport = "realtime", timing = "ptp" });
+        for (var i = 0; i < 3; i++) first.EmitData(new { @event = "warning", code = "timeline_reanchored", recovered = true });
+        await Until(() => first.Commands.Any(c => c.Command == "set_lead"));
+        first.ConfirmLead(10);
+        await Until(() => controller.Snapshot.TargetLatency == 60);
         await controller.StopAsync();
         await controller.StartAsync(Pod(), settings);
         await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
@@ -188,6 +191,72 @@ public sealed class SessionTests
         Assert.Equal(1, factory.OpenCount);
         Assert.Equal(7, controller.Snapshot.Metrics!.Underruns);
         Assert.Equal(PlaybackState.Streaming, controller.Snapshot.State);
+    }
+    [Fact]
+    public async Task AdaptiveConfirmationTimeoutRebuildsAtTheRequestedTargetWithoutSavingSettings()
+    {
+        var clock = new AdaptiveLatencyTests.ManualClock();
+        var first = new FakeConnection(); var second = new FakeConnection();
+        await using var controller = new SessionController(new FakeFactory(first, second), new FakeAudio(),
+            timing: Fast with { Read = TimeSpan.FromSeconds(10) }, clock: clock);
+        var settings = Settings(); settings.LatencyMode = "adaptive";
+        await controller.StartAsync(Pod(), settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        first.EmitData(new { @event = "negotiated", receiver_id = "a", codec = "alac", transport = "realtime", timing = "ptp" });
+        for (var i = 0; i < 3; i++) first.EmitData(new { @event = "warning", code = "timeline_reanchored", recovered = true });
+        await Until(() => first.Commands.Any(c => c.Command == "set_lead"));
+        Assert.Equal(50, controller.Snapshot.TargetLatency); Assert.Equal(60, controller.Snapshot.PendingLatency);
+        clock.Advance(5.01);
+        first.EmitData(new { @event = "capture_metrics", metrics = new { underrun_packets = 0 } });
+        await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var start = second.Commands.Single(c => c.Command == "start").Parameters;
+        Assert.Equal(60, start.Integer("latency_ms"));
+        Assert.Equal(60, start.GetProperty("peers")[0].GetProperty("profile").Integer("latency_ms"));
+        Assert.Equal(50, start.Integer("adaptive_initial_latency_ms"));
+        Assert.Equal(60, controller.Snapshot.TargetLatency); Assert.Null(controller.Snapshot.PendingLatency);
+        Assert.Equal("adaptive", settings.LatencyMode); Assert.Equal(50, settings.Latency(Pod()));
+    }
+    [Fact]
+    public async Task AdaptiveRebuildBudgetStopsEvenWhenEachAttemptWasStreaming()
+    {
+        var first = new FakeConnection { SupportsAdaptiveLead = false };
+        var second = new FakeConnection { SupportsAdaptiveLead = false };
+        var factory = new FakeFactory(first, second);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast with { Read = TimeSpan.FromSeconds(10) });
+        var settings = Settings(); settings.LatencyMode = "adaptive"; settings.MaxReconnectAttempts = 1;
+        await controller.StartAsync(Pod(), settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        foreach (var process in new[] { first, second })
+        {
+            await process.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+            process.EmitData(new { @event = "negotiated", receiver_id = "a", codec = "alac", transport = "realtime", timing = "ptp" });
+            for (var i = 0; i < 3; i++) process.EmitData(new { @event = "warning", code = "timeline_reanchored", recovered = true });
+        }
+        await Until(() => controller.Snapshot.State == PlaybackState.Error);
+        Assert.Equal("adaptive_recovery_exhausted", controller.Snapshot.Diagnostics?.LastFault?.Code);
+        Assert.Equal(2, factory.OpenCount);
+        Assert.DoesNotContain(first.Commands, c => c.Command == "set_lead");
+    }
+    [Fact]
+    public async Task AdaptiveConfirmationDeadlineRebuildsWhenEngineStopsReporting()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection();
+        await using var controller = new SessionController(new FakeFactory(first, second), new FakeAudio(),
+            timing: Fast with { Read = TimeSpan.FromSeconds(10) });
+        var settings = Settings(); settings.LatencyMode = "adaptive";
+        await controller.StartAsync(Pod(), settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        first.EmitData(new { @event = "negotiated", receiver_id = "a", codec = "alac", transport = "realtime", timing = "ptp" });
+        for (var i = 0; i < 3; i++) first.EmitData(new { @event = "warning", code = "timeline_reanchored", recovered = true });
+        await Until(() => controller.Snapshot.PendingLatency == 60);
+        // No metrics, errors or acknowledgements: the reader's own deadline must
+        // still enter adaptive recovery rather than leaving playback in Error.
+        await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(8));
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.Equal(60, controller.Snapshot.TargetLatency);
+        Assert.Equal("adaptive_rebuild", controller.Snapshot.Diagnostics?.LastFault?.Code);
     }
     [Fact]
     public async Task DiagnosticsWithoutPlaybackDoNotSpawnAnEmptyEngine()
@@ -1225,6 +1294,9 @@ public sealed class SessionTests
         public bool Disposed { get; private set; }
         public bool RespondHello { get; init; } = true;
         public bool SupportsForcedLatency { get; init; } = true;
+        public bool SupportsAdaptiveLead { get; init; } = true;
+        private int _latencyBase;
+        private long _streamEpoch = 1;
         public object? ReceiverCapabilityResponse { get; init; }
         public TaskCompletionSource? GainEntered, GainGate;
         public async Task SendAsync(string session, string command, object? parameters, CancellationToken cancellation)
@@ -1237,20 +1309,36 @@ public sealed class SessionTests
             {
                 case "hello": Session = session; if (RespondHello) EmitHello(); break;
                 case "get_receiver_capabilities": EmitData(ReceiverCapabilityResponse!); break;
-                case "start": Session = session; Started.TrySetResult(); if (autoReady) Emit("streaming"); break;
+                case "start": Session = session; _latencyBase = (int)outgoing.Parameters.Integer("latency_ms")!; Started.TrySetResult(); if (autoReady) Emit("streaming"); break;
                 case "pair": Session = session; PairSent.TrySetResult(); Emit("pin_required"); break;
                 case "pair_pin": Emit("paired"); break;
                 case "stop": StopSent.TrySetResult(); _events.Writer.TryComplete(); break;
                 case "set_gain": GainEntered?.TrySetResult(); if (GainGate is not null) await GainGate.Task.WaitAsync(cancellation); break;
             }
         }
-        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "application_capture" }.Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).Concat(SupportsForcedLatency ? ["forced_latency"] : Array.Empty<string>()).ToArray() });
+        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "application_capture" }.Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).Concat(SupportsForcedLatency ? ["forced_latency"] : Array.Empty<string>()).Concat(SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).ToArray() });
+        public void ConfirmLead(int extra)
+        {
+            var command = Commands.Last(c => c.Command == "set_lead");
+            EmitData(new { @event = "lead_changed", applied_ms = extra, lead_extra_ms = extra,
+                lead_sequence = command.Parameters.Integer("sequence"), session_epoch = _streamEpoch,
+                baseline_ms = _latencyBase, effective_latency_ms = _latencyBase + extra,
+                lead_ceiling_ms = 100, live_lead_supported = SupportsAdaptiveLead });
+        }
         public void EmitData(object payload, string? session = null)
         {
             var data = JsonSerializer.SerializeToNode(payload)!.AsObject(); data["version"] = 1; data["session_id"] = session ?? Session;
             _events.Writer.TryWrite(JsonSerializer.SerializeToElement(data));
         }
-        public void Emit(string kind, string? session = null, string? message = null, object? metrics = null) => _events.Writer.TryWrite(JsonSerializer.SerializeToElement(new { version = 1, session_id = session ?? Session, @event = kind, message, metrics }));
+        public void Emit(string kind, string? session = null, string? message = null, object? metrics = null)
+        {
+            if (kind == "resuming") ++_streamEpoch;
+            if (kind == "streaming" && SupportsAdaptiveLead)
+                EmitData(new { @event = kind, session_epoch = _streamEpoch, lead_sequence = 0,
+                    baseline_ms = _latencyBase, lead_extra_ms = 0, effective_latency_ms = _latencyBase,
+                    lead_ceiling_ms = 100, live_lead_supported = true }, session);
+            else _events.Writer.TryWrite(JsonSerializer.SerializeToElement(new { version = 1, session_id = session ?? Session, @event = kind, message, metrics }));
+        }
         public async ValueTask<JsonElement?> ReadAsync(CancellationToken cancellation) { try { return await _events.Reader.ReadAsync(cancellation); } catch (ChannelClosedException) { return null; } }
         public async ValueTask DisposeAsync() { Disposing.TrySetResult(); if (BlockDispose is not null) await BlockDispose.Task; Disposed = true; _events.Writer.TryComplete(); DisposedSignal.TrySetResult(); }
     }

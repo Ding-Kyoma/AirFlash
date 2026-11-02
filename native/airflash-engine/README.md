@@ -1,6 +1,17 @@
 # Native AirPlay engine
 
 Windows-only Rust sidecar; JSONL v1 on stdin/stdout. Diagnostics must not contain keys or PINs.
+`hello.capabilities` includes `adaptive_lead_v2`. Adaptive live starts accept
+`adaptive_latency: true` and `adaptive_initial_latency_ms` (0–2000); recovery
+rebuilds honor the raised request above a receiver minimum, while standby resets
+to the initial target. Fixed/forced starts retain their negotiation policies.
+`set_lead` accepts extra `ms`, a positive `sequence`, and the current
+`session_epoch`. `lead_requested` only accepts the command; `lead_changed` and
+`transport_metrics` confirm `lead_sequence`, `baseline_ms`, `lead_extra_ms`,
+`effective_latency_ms`, `lead_ceiling_ms`, and `live_lead_supported` for that epoch.
+No-ops and clamps report the actual result. Extra lead is bounded to 100 ms and a
+2000 ms total, and changes the playback mapping and packet expiry without shifting
+sender pacing. `playout_ms` additionally includes group alignment offsets.
 Desktop/validation commands use `start` (live WASAPI); finite tests use `probe` (<=5000ms, gain<=0.1,
 440Hz WAV peak<=0.05). EOF cancels all owned work. `stop` and gain changes apply only to the
 matching session. `pair` emits `pin_required`; `pair_pin` completes pairing, validates the

@@ -65,6 +65,10 @@ pub struct ProbeOptions {
     pub latency_ms: u32,
     #[serde(default)]
     pub force_latency: bool,
+    #[serde(default)]
+    pub adaptive_latency: bool,
+    #[serde(default)]
+    pub adaptive_initial_latency_ms: Option<u32>,
     pub gain: f32,
     #[serde(default)]
     pub equalizer: crate::equalizer::Settings,
@@ -94,6 +98,14 @@ fn default_timing() -> String {
 }
 impl ProbeOptions {
     fn validate_forced_latency(&self) -> Result<()> {
+        ensure!(
+            self.adaptive_initial_latency_ms.is_none_or(|ms| ms <= 2000),
+            "adaptive initial latency must be 0..2000 ms"
+        );
+        ensure!(
+            !self.adaptive_latency || !self.force_latency,
+            "adaptive and forced latency are mutually exclusive"
+        );
         if self.force_latency {
             let mut targets = self
                 .peers
@@ -794,6 +806,13 @@ impl Member {
             .map(|samples| Duration::from_nanos(samples * 1_000_000_000 / rate as u64));
         let effective_latency =
             selected_latency(requested_latency, receiver_min, options.force_latency);
+        // A recovery rebuild must actually retain its raised target even when
+        // the receiver reports a lower minimum. Fixed modes keep negotiation.
+        let effective_latency = if options.adaptive_latency {
+            effective_latency.max(Duration::from_millis(u64::from(requested_latency)))
+        } else {
+            effective_latency
+        };
         member.media.configure_latency(
             effective_latency,
             receiver_min.is_none() || options.force_latency,
@@ -1455,7 +1474,7 @@ fn source_restart_reason() -> TimelineResetReason {
 }
 
 fn run_live(
-    options: ProbeOptions,
+    mut options: ProbeOptions,
     cancel: Cancellation,
     gain: std::sync::Arc<std::sync::atomic::AtomicU32>,
     volume: crate::volume::Control,
@@ -1627,6 +1646,7 @@ fn run_live(
         match ended {
             StreamEnd::Finished => break,
             StreamEnd::SourceEnded => {
+                reset_adaptive_target(&mut options);
                 source = None;
                 paused = None;
                 // A new capture source starts a new playback timeline, but the
@@ -1634,6 +1654,7 @@ fn run_live(
                 reset_before = Some(source_restart_reason());
             }
             StreamEnd::Silence(at) => {
+                reset_adaptive_target(&mut options);
                 paused = Some(at);
                 emit(json!({"event":"standby","reason":"silence"}));
                 // Standby released the receiver, so resuming rebuilds the whole
@@ -1645,6 +1666,17 @@ fn run_live(
     }
     emit(json!({"event":"stopped","cancelled":cancel.is_cancelled()}));
     Ok(())
+}
+
+fn reset_adaptive_target(options: &mut ProbeOptions) {
+    if options.adaptive_latency
+        && let Some(initial) = options.adaptive_initial_latency_ms
+    {
+        options.latency_ms = initial;
+        for peer in &mut options.peers {
+            peer.profile.latency_ms = Some(initial);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1941,7 +1973,8 @@ fn send_packets(
     let rate = options.sample_rate;
     let start = Instant::now();
     let base_ns = clock.now_ns();
-    let common_latency = members.iter().map(|m| m.media.latency()).max().unwrap()
+    let negotiated_baseline = members.iter().map(|m| m.media.latency()).max().unwrap();
+    let common_latency = negotiated_baseline
         + Duration::from_millis(
             members
                 .iter()
@@ -2019,11 +2052,15 @@ fn send_packets(
     // the microsecond reset comparison below) does not lose a remainder. This is
     // an internal invariant, not a promise of sub-millisecond lead control
     // (Q44 §二).
-    reset_lead();
+    begin_lead(telemetry.session_epoch);
     let mutable_anchor =
         !options.force_latency && members.iter().all(|m| m.media.supports_timeline_shift());
-    let mut applied_lead_us = 0i64;
-    let mut unsupported_lead = None;
+    let mut lead = LiveLead {
+        ceiling_ms: lead_ceiling(common_latency),
+        supported: mutable_anchor,
+        ..LiveLead::default()
+    };
+    let mut lead_revision = 0;
     // RTP-side evidence for distinguishing a transport failure from a local
     // sender stall when a successful re-anchor absorbs a missed deadline (Q43,
     // Q44). The pre-stall window is compared against the sender's own steady
@@ -2038,9 +2075,13 @@ fn send_packets(
     let mut next_sync = start;
     let mut silence_packets = 0u64;
     let mut recovery_left = 0u64;
-    emit(
+    emit(with_lead(
         json!({"event":"streaming","members":members.len(),"clock_id":clock_id,"first_send_unix_ns":clock.now_ns(),"first_send_qpc_ns":crate::wasapi::qpc_ns(),"requested_latency_ms":options.latency_ms,"sample_rate":rate,"measured_latency_ms":null,"qualified":false}),
-    );
+        &lead,
+        &schedule,
+        negotiated_baseline,
+        telemetry.session_epoch,
+    ));
     let mut pcm = vec![0; PCM_BYTES];
     let started_ns = crate::wasapi::qpc_ns();
     // Q46's all-failed rule state. The gateway address is discovered once per
@@ -2152,36 +2193,19 @@ fn send_packets(
             // `base_ns + anchor_shift + frames`, so a lead change moves the sync
             // anchor without rewriting the session's origin (a rewritten origin is
             // exactly what makes the receiver jump a segment).
-            let ceiling = lead_ceiling(members);
-            let requested = requested_lead();
-            if !mutable_anchor && requested != 0 && unsupported_lead != Some(requested) {
-                unsupported_lead = Some(requested);
-                emit(
-                    json!({"event":"lead_error","message":if options.force_latency { "Runtime lead changes are disabled by forced latency" } else { "Runtime lead changes require realtime UDP on every member" }}),
-                );
-            }
-            let wanted = if mutable_anchor {
-                requested.min(ceiling)
-            } else {
-                0
-            };
-            let wanted_us = wanted * 1_000;
-            if wanted_us != applied_lead_us {
-                let applied_us = schedule.add_shift_us(wanted_us - applied_lead_us);
-                if applied_us != 0 {
-                    applied_lead_us += applied_us;
-                    telemetry.lead_extra_ms = applied_lead_us as f64 / 1_000.0;
-                    // The timeline anchor moved because *we* asked for a different
-                    // playout lead, not because delivery failed. Every shift moves
-                    // the lead counters, but only a shift at least as long as the
-                    // splice ramp (5 ms) is a timeline reset: smaller adjustments
-                    // are inaudible and would make `latency_change` equal
-                    // `lead_shift_count` (Q44 §二).
-                    telemetry.record_lead_shift(applied_us);
-                    emit(
-                        json!({"event":"lead_changed","channel":"scheduler","host":null,"requested_ms":wanted,"applied_ms":applied_lead_us / 1_000,"shift_us":applied_us,"ceiling_ms":ceiling,"shift_ms":round3(schedule.shift.as_secs_f64() * 1000.0)}),
-                    );
-                }
+            let requested = lead_request();
+            if requested.revision != lead_revision
+                && requested.session_epoch == telemetry.session_epoch
+            {
+                lead_revision = requested.revision;
+                emit(lead.apply(
+                    requested,
+                    &mut schedule,
+                    &mut telemetry,
+                    negotiated_baseline,
+                    members,
+                ));
+                next_sync = Instant::now();
             }
             let deadline = schedule.deadline();
             let now = Instant::now();
@@ -2213,7 +2237,11 @@ fn send_packets(
                 let earliest = members
                     .iter()
                     .map(|m| {
-                        offset_deadline(deadline, common_latency, m.peer.profile.sync_offset_ms)
+                        offset_deadline(
+                            schedule.playout_deadline(),
+                            common_latency,
+                            m.peer.profile.sync_offset_ms,
+                        )
                     })
                     .collect::<Result<Vec<_>>>()?
                     .into_iter()
@@ -2322,11 +2350,7 @@ fn send_packets(
             // unwind of an already-counted re-anchor, not a new timeline reset:
             // counting it would turn one stall into a stream of `latency_change`
             // events that nobody caused.
-            schedule.relax_to(
-                now,
-                late,
-                Duration::from_micros(applied_lead_us.max(0) as u64),
-            );
+            schedule.relax(now, late);
             if now >= next_sync {
                 for m in members.iter_mut() {
                     let local = offset_time(
@@ -2411,6 +2435,7 @@ fn send_packets(
                     common_latency,
                     live.map(crate::live::Loopback::depth),
                     ptp,
+                    &lead,
                 );
                 crate::telemetry::publish_diagnostics(snapshot.clone());
                 telemetry.lateness_interval = crate::telemetry::Histogram::default();
@@ -2438,7 +2463,7 @@ fn send_packets(
                     packets == 0,
                     Instant::now(),
                     offset_deadline(
-                        schedule.deadline(),
+                        schedule.playout_deadline(),
                         common_latency - member.media.latency(),
                         member.peer.profile.sync_offset_ms,
                     )?,
@@ -2484,7 +2509,7 @@ fn send_packets(
     let drained = if outcome.is_ok() {
         (|| -> Result<()> {
             if let Some(source) = &live {
-                let render = offset_deadline(schedule.deadline(), common_latency, 0)?;
+                let render = offset_deadline(schedule.playout_deadline(), common_latency, 0)?;
                 let (fade, _) = source.silence_packet(0.0)?;
                 let mut sent = true;
                 for member in members.iter_mut() {
@@ -2495,7 +2520,7 @@ fn send_packets(
                             false,
                             Instant::now(),
                             offset_deadline(
-                                schedule.deadline(),
+                                schedule.playout_deadline(),
                                 common_latency - member.media.latency(),
                                 member.peer.profile.sync_offset_ms,
                             )?,
@@ -2550,6 +2575,7 @@ fn send_packets(
         common_latency,
         live.map(crate::live::Loopback::depth),
         ptp,
+        &lead,
     );
     crate::telemetry::publish_diagnostics(snapshot.clone());
     emit(snapshot);
@@ -2587,7 +2613,7 @@ fn send_packets(
         options,
         members,
         &telemetry,
-        applied_lead_us / 1_000,
+        schedule.playout_lead.as_millis() as i64,
         start.elapsed(),
     );
     let path = (!options.report_session_id.is_empty()).then(crate::telemetry::summary_path);
@@ -3009,6 +3035,7 @@ fn transport_metrics(
     playout: Duration,
     queue: Option<(usize, usize)>,
     ptp: Option<&PtpMaster>,
+    lead: &LiveLead,
 ) -> Json {
     let mut snapshot = telemetry.snapshot();
     if let Json::Object(ref mut fields) = snapshot {
@@ -3025,7 +3052,9 @@ fn transport_metrics(
         );
         fields.insert(
             "playout_ms".into(),
-            json!((playout.as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0),
+            json!(round3(
+                (playout + schedule.playout_lead).as_secs_f64() * 1000.0
+            )),
         );
         fields.insert("queue_depth".into(), json!(queue.map(|q| q.0)));
         fields.insert("queue_capacity".into(), json!(queue.map(|q| q.1)));
@@ -3034,7 +3063,75 @@ fn transport_metrics(
             json!(members.iter().map(|m| m.metrics(ptp)).collect::<Vec<_>>()),
         );
     }
-    snapshot
+    let baseline = members
+        .iter()
+        .map(|m| m.media.latency())
+        .max()
+        .unwrap_or(playout);
+    with_lead(snapshot, lead, schedule, baseline, telemetry.session_epoch)
+}
+#[derive(Default)]
+struct LiveLead {
+    sequence: u64,
+    requested_ms: i64,
+    ceiling_ms: i64,
+    supported: bool,
+}
+impl LiveLead {
+    fn apply(
+        &mut self,
+        request: LeadRequest,
+        schedule: &mut MediaSchedule,
+        telemetry: &mut crate::telemetry::SessionTelemetry,
+        baseline: Duration,
+        members: &mut [Member],
+    ) -> Json {
+        if !self.supported {
+            return json!({"event":"lead_error","sequence":request.sequence,"session_epoch":telemetry.session_epoch,"message":"Runtime lead changes require unforced realtime UDP on every member"});
+        }
+        let wanted_us = request.ms.min(self.ceiling_ms) * 1_000;
+        let applied_us =
+            schedule.add_shift_us(wanted_us - schedule.playout_lead.as_micros() as i64);
+        self.sequence = request.sequence;
+        self.requested_ms = request.ms;
+        telemetry.lead_extra_ms = schedule.playout_lead.as_secs_f64() * 1000.0;
+        if applied_us != 0 {
+            telemetry.record_lead_shift(applied_us);
+            for member in members {
+                member
+                    .media
+                    .packetizer
+                    .shift_playout(applied_us, schedule.playout_lead);
+            }
+        }
+        // No-ops and clamps must acknowledge the real result, too.
+        with_lead(
+            json!({"event":"lead_changed","channel":"scheduler","host":null,"sequence":request.sequence,"requested_ms":request.ms,"applied_ms":schedule.playout_lead.as_millis(),"shift_us":applied_us,"ceiling_ms":self.ceiling_ms,"shift_ms":round3(schedule.shift.as_secs_f64() * 1000.0)}),
+            self,
+            schedule,
+            baseline,
+            telemetry.session_epoch,
+        )
+    }
+}
+fn with_lead(
+    mut event: Json,
+    lead: &LiveLead,
+    schedule: &MediaSchedule,
+    baseline: Duration,
+    epoch: u64,
+) -> Json {
+    event["session_epoch"] = json!(epoch);
+    event["lead_sequence"] = json!(lead.sequence);
+    event["lead_requested_ms"] = json!(lead.requested_ms);
+    event["baseline_ms"] = json!(round3(baseline.as_secs_f64() * 1000.0));
+    event["lead_extra_ms"] = json!(round3(schedule.playout_lead.as_secs_f64() * 1000.0));
+    event["effective_latency_ms"] = json!(round3(
+        (baseline + schedule.playout_lead).as_secs_f64() * 1000.0
+    ));
+    event["lead_ceiling_ms"] = json!(lead.ceiling_ms);
+    event["live_lead_supported"] = json!(lead.supported);
+    event
 }
 fn round3(value: f64) -> f64 {
     (value * 1000.0).round() / 1000.0
@@ -3044,7 +3141,19 @@ fn round3(value: f64) -> f64 {
 /// The engine runs one session at a time (the IPC front end serialises `start`),
 /// so a process-wide cell keeps `set_lead` from having to thread another parameter
 /// through six call sites. Zero means "whatever the timeline needs".
-static LEAD_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+#[derive(Clone, Copy, Default)]
+struct LeadRequest {
+    ms: i64,
+    sequence: u64,
+    session_epoch: u64,
+    revision: u64,
+}
+static LEAD_REQUEST: std::sync::Mutex<LeadRequest> = std::sync::Mutex::new(LeadRequest {
+    ms: 0,
+    sequence: 0,
+    session_epoch: 0,
+    revision: 0,
+});
 /// Absolute ceiling for an operator-requested extra lead. The lower session cap
 /// is a local policy derived from requested latency, not a measured device buffer.
 pub const MAX_LEAD_MS: i64 = 2000;
@@ -3059,26 +3168,48 @@ fn selected_latency(requested_ms: u32, receiver_min: Option<Duration>, forced: b
     }
 }
 /// Bound requested extra lead conservatively using the session's latency settings.
-fn lead_ceiling(members: &[Member]) -> i64 {
-    lead_ceiling_from(members.iter().filter_map(|m| m.peer.profile.latency_ms))
-}
-fn lead_ceiling_from(declared: impl Iterator<Item = u32>) -> i64 {
-    declared
-        .max()
-        .map_or(MAX_LEAD_MS, |ms| i64::from(ms) + LEAD_HEADROOM_MS)
-        .clamp(LEAD_HEADROOM_MS, MAX_LEAD_MS)
+fn lead_ceiling(baseline: Duration) -> i64 {
+    (MAX_LEAD_MS - baseline.as_millis().min(i64::MAX as u128) as i64).clamp(0, LEAD_HEADROOM_MS)
 }
 pub fn request_lead(ms: i64) {
-    LEAD_MS.store(
-        ms.clamp(0, MAX_LEAD_MS),
-        std::sync::atomic::Ordering::Release,
+    let mut request = LEAD_REQUEST.lock().unwrap();
+    request.ms = ms.clamp(0, MAX_LEAD_MS);
+    request.sequence += 1;
+    request.revision += 1;
+}
+pub fn request_lead_for(ms: i64, sequence: u64, epoch: u64) -> Result<()> {
+    let mut request = LEAD_REQUEST.lock().unwrap();
+    ensure!(
+        epoch > 0 && request.session_epoch == epoch,
+        "lead stream epoch is no longer active"
     );
+    ensure!(
+        sequence > 0 && sequence >= request.sequence,
+        "stale lead sequence"
+    );
+    ensure!(
+        sequence != request.sequence || ms == request.ms,
+        "lead sequence already used"
+    );
+    request.ms = ms.clamp(0, MAX_LEAD_MS);
+    request.sequence = sequence;
+    request.revision += 1;
+    Ok(())
+}
+fn lead_request() -> LeadRequest {
+    *LEAD_REQUEST.lock().unwrap()
 }
 pub fn requested_lead() -> i64 {
-    LEAD_MS.load(std::sync::atomic::Ordering::Acquire)
+    lead_request().ms
 }
 pub fn reset_lead() {
-    LEAD_MS.store(0, std::sync::atomic::Ordering::Release);
+    *LEAD_REQUEST.lock().unwrap() = LeadRequest::default();
+}
+fn begin_lead(epoch: u64) {
+    *LEAD_REQUEST.lock().unwrap() = LeadRequest {
+        session_epoch: epoch,
+        ..LeadRequest::default()
+    };
 }
 /// Recent socket-write health. This does not prove receiver ownership and cannot
 /// override an explicit receiver-initiated TEARDOWN.
@@ -3155,19 +3286,219 @@ mod tests {
         AIRPLAY2_BIT, Codec, CompatFingerprint, Formats, Profile, Timing, TimingPlan, Transport,
     };
     #[test]
-    fn lead_ceiling_is_a_local_policy_based_on_requested_latency() {
-        // No requested latency: only the absolute cap applies.
-        assert_eq!(lead_ceiling_from(std::iter::empty()), MAX_LEAD_MS);
-        // A requested latency of 250 ms allows 250 + 100 ms of extra lead.
-        assert_eq!(lead_ceiling_from([250].into_iter()), 350);
-        // A stereo pair uses the largest member, not the smallest.
-        assert_eq!(lead_ceiling_from([120, 300].into_iter()), 400);
-        // Tiny values still leave the +100 ms headroom available.
-        assert_eq!(lead_ceiling_from([10].into_iter()), 110);
-        // And nothing exceeds the absolute cap.
-        assert_eq!(lead_ceiling_from([5000].into_iter()), MAX_LEAD_MS);
-        // A request above the ceiling is clamped before it reaches the scheduler.
-        assert_eq!(5000.min(lead_ceiling_from([250].into_iter())), 350);
+    fn lead_ceiling_bounds_extra_and_total_latency_separately() {
+        for baseline in [0, 50, 120, 250, 300] {
+            assert_eq!(lead_ceiling(Duration::from_millis(baseline)), 100);
+        }
+        assert_eq!(lead_ceiling(Duration::from_millis(1950)), 50);
+        assert_eq!(lead_ceiling(Duration::from_millis(2000)), 0);
+        assert_eq!(lead_ceiling(Duration::from_millis(5000)), 0);
+    }
+    #[test]
+    fn lead_acknowledges_no_ops_clamps_and_rejections_with_actual_runtime() {
+        let mut schedule = MediaSchedule::new(Instant::now(), 44_100);
+        let mut telemetry = crate::telemetry::SessionTelemetry::new();
+        let mut lead = LiveLead {
+            supported: true,
+            ceiling_ms: 100,
+            ..LiveLead::default()
+        };
+        let baseline = Duration::from_millis(120);
+        for (sequence, requested, applied) in [(1, 0, 0), (2, 20, 20), (3, 20, 20), (4, 500, 100)] {
+            let reply = lead.apply(
+                LeadRequest {
+                    ms: requested,
+                    sequence,
+                    ..LeadRequest::default()
+                },
+                &mut schedule,
+                &mut telemetry,
+                baseline,
+                &mut [],
+            );
+            assert_eq!(reply["event"], "lead_changed");
+            assert_eq!(reply["sequence"], sequence);
+            assert_eq!(reply["session_epoch"], telemetry.session_epoch);
+            assert_eq!(reply["requested_ms"], requested);
+            assert_eq!(reply["applied_ms"], applied);
+            assert_eq!(reply["effective_latency_ms"], 120.0 + applied as f64);
+            let periodic = with_lead(
+                json!({}),
+                &lead,
+                &schedule,
+                baseline,
+                telemetry.session_epoch,
+            );
+            assert_eq!(periodic["lead_sequence"], reply["sequence"]);
+            assert_eq!(
+                periodic["effective_latency_ms"],
+                reply["effective_latency_ms"]
+            );
+        }
+        assert_eq!(
+            telemetry.lead_shift_count, 2,
+            "no-op acknowledgements are not timeline changes"
+        );
+        lead.supported = false;
+        let rejected = lead.apply(
+            LeadRequest {
+                sequence: 5,
+                ..LeadRequest::default()
+            },
+            &mut schedule,
+            &mut telemetry,
+            baseline,
+            &mut [],
+        );
+        assert_eq!(rejected["event"], "lead_error");
+        assert_eq!(rejected["sequence"], 5);
+        assert_eq!(lead.sequence, 4);
+        assert_eq!(schedule.playout_lead, Duration::from_millis(100));
+    }
+    #[test]
+    fn adaptive_udp_packets_and_sync_keep_sample_identity_and_gain_real_headroom() {
+        for rate in [44_100, 48_000] {
+            for ptp in [false, true] {
+                for offset in [0, -80, 25] {
+                    let audio_rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+                    let control_rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+                    for socket in [&audio_rx, &control_rx] {
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                    }
+                    let mut media = MediaTransport::new(
+                        Packetizer::with_rate([7; 32], 100, 0, 1, rate),
+                        UdpSocket::bind("127.0.0.1:0").unwrap(),
+                        UdpSocket::bind("127.0.0.1:0").unwrap(),
+                        control_rx.local_addr().unwrap(),
+                    )
+                    .unwrap();
+                    media.connect_audio(audio_rx.local_addr().unwrap()).unwrap();
+                    media.configure_latency(Duration::from_millis(120), true);
+                    let start = Instant::now();
+                    let base_ns = 1_000_000_000u64;
+                    let mut schedule = MediaSchedule::new(start, rate);
+                    let common = Duration::from_millis(120 + (-offset).max(0) as u64);
+                    let mut buf = [0; 4096];
+                    for (index, target) in [120, 140, 160, 200].into_iter().enumerate() {
+                        schedule.add_shift_us(
+                            (target - 120) * 1_000 - schedule.playout_lead.as_micros() as i64,
+                        );
+                        let expected_send = start
+                            + Duration::from_nanos(
+                                index as u64 * FRAMES as u64 * 1_000_000_000 / rate as u64,
+                            );
+                        assert_eq!(schedule.deadline(), expected_send);
+                        let media_time = offset_deadline(
+                            schedule.playout_deadline(),
+                            common - media.latency(),
+                            offset,
+                        )
+                        .unwrap();
+                        let margin = media_time + media.latency() - schedule.deadline();
+                        assert_eq!(
+                            margin,
+                            common
+                                + schedule.playout_lead
+                                + Duration::from_millis(offset.max(0) as u64)
+                                - Duration::from_millis((-offset).max(0) as u64)
+                        );
+                        let network = offset_time(
+                            base_ns
+                                + schedule.anchor_shift_ns()
+                                + schedule.frames * 1_000_000_000 / rate as u64,
+                            common,
+                            media.latency(),
+                            offset,
+                        )
+                        .unwrap();
+                        media.sync(network, ptp.then_some(7), rate * 120 / 1000, index == 0);
+                        let length = control_rx.recv(&mut buf).unwrap();
+                        assert_eq!(
+                            u32::from_be_bytes(buf[4..8].try_into().unwrap()),
+                            index as u32 * FRAMES as u32
+                        );
+                        if ptp {
+                            assert_eq!(length, 28);
+                            assert_eq!(
+                                u64::from_be_bytes(buf[8..16].try_into().unwrap())
+                                    - base_ns
+                                    - schedule.frames * 1_000_000_000 / rate as u64,
+                                (margin - media.latency()).as_nanos() as u64
+                            );
+                        } else {
+                            assert_eq!(length, 20);
+                            assert_eq!(&buf[8..16], &rtp::ntp(network));
+                        }
+                        media
+                            .send(
+                                &vec![0; PCM_BYTES],
+                                index == 0,
+                                expected_send,
+                                media_time,
+                                &Health::default(),
+                            )
+                            .unwrap();
+                        audio_rx.recv(&mut buf).unwrap();
+                        assert_eq!(
+                            u16::from_be_bytes(buf[2..4].try_into().unwrap()),
+                            100 + index as u16
+                        );
+                        assert_eq!(
+                            u32::from_be_bytes(buf[4..8].try_into().unwrap()),
+                            index as u32 * FRAMES as u32
+                        );
+                        schedule.sent();
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn adaptive_standby_restores_initial_target_without_changing_fixed_modes() {
+        let mut options = summary_options("", "native_stereo", 0);
+        options.latency_ms = 200;
+        options.peers[0].profile.latency_ms = Some(200);
+        options.adaptive_initial_latency_ms = Some(120);
+        reset_adaptive_target(&mut options);
+        assert_eq!(options.latency_ms, 200);
+        options.adaptive_latency = true;
+        reset_adaptive_target(&mut options);
+        assert_eq!(options.latency_ms, 120);
+        assert_eq!(options.peers[0].profile.latency_ms, Some(120));
+    }
+    #[test]
+    fn alignment_guard_is_not_mistaken_for_an_adaptive_ladder_step() {
+        let (mut member, _receiver, server) = local_member();
+        member
+            .media
+            .configure_latency(Duration::from_millis(120), true);
+        member.peer.profile.sync_offset_ms = -80;
+        let mut schedule = MediaSchedule::new(Instant::now(), 44_100);
+        schedule.add_shift(20);
+        let telemetry = crate::telemetry::SessionTelemetry::new();
+        let lead = LiveLead {
+            sequence: 1,
+            requested_ms: 20,
+            ceiling_ms: 100,
+            supported: true,
+        };
+        let members = vec![member];
+        let snapshot = transport_metrics(
+            &members,
+            &schedule,
+            &telemetry,
+            Duration::from_millis(200),
+            None,
+            None,
+            &lead,
+        );
+        assert_eq!(snapshot["baseline_ms"], 120.0);
+        assert_eq!(snapshot["effective_latency_ms"], 140.0);
+        assert_eq!(snapshot["playout_ms"], 220.0);
+        drop(members);
+        server.join().unwrap();
     }
     #[test]
     fn group_timing_diagnostic_is_log_only_and_names_every_member() {
@@ -5307,6 +5638,8 @@ mod tests {
             duration_ms: 5001,
             latency_ms: 200,
             force_latency: false,
+            adaptive_latency: false,
+            adaptive_initial_latency_ms: None,
             gain: 0.1,
             equalizer: crate::equalizer::Settings::default(),
             sample_rate: 44100,

@@ -923,6 +923,9 @@ pub struct MediaSchedule {
     /// Extra playout lead accumulated by re-anchoring. The sync anchor must be
     /// shifted by the same amount, so `seq → rtptime → networkTime` stays linear.
     pub shift: Duration,
+    /// Receiver buffering requested by the adaptive controller. Unlike recovery
+    /// shift, this never delays capture consumption or the send cadence.
+    pub playout_lead: Duration,
     /// Re-anchors are bounded so a permanently stalled sender still expires.
     pub reanchored: u64,
     pub reanchor_shift_us: i64,
@@ -948,6 +951,7 @@ impl MediaSchedule {
             skipped_packets: 0,
             max_lateness_us: 0,
             shift: Duration::ZERO,
+            playout_lead: Duration::ZERO,
             reanchored: 0,
             reanchor_shift_us: 0,
             reanchors: VecDeque::new(),
@@ -966,7 +970,12 @@ impl MediaSchedule {
     /// The sync anchor moves with the timeline: callers add this to the session's
     /// base network time before publishing `networkTime`.
     pub fn anchor_shift_ns(&self) -> u64 {
-        self.shift.as_nanos() as u64
+        (self.shift + self.playout_lead).as_nanos() as u64
+    }
+    /// The media clock and retransmit expiry use this deadline; pacing uses
+    /// `deadline()` instead. Moving both would leave receiver headroom unchanged.
+    pub fn playout_deadline(&self) -> Instant {
+        self.deadline() + self.playout_lead
     }
     pub fn recover(&mut self, now: Instant, live: bool) -> Result<u64> {
         let late = now.saturating_duration_since(self.deadline());
@@ -1085,29 +1094,24 @@ impl MediaSchedule {
         self.add_shift_us(delta_ms.saturating_mul(1_000)) / 1_000
     }
 
-    /// Apply a lead change in microseconds. Positive values delay playout, which
-    /// is what the receiver sees; the sync anchor moves with the deadline so the
-    /// timeline stays consistent. Returns the signed change actually applied, in
-    /// microseconds, clamped to the same ceiling as a re-anchor.
+    /// Apply a receiver lead change without moving the sender's deadline.
+    /// Returns the signed change actually applied, in microseconds.
     ///
     /// Microseconds are an internal invariant, not a product capability: the IPC
     /// request is whole milliseconds. The session counts every applied shift, and
     /// only a shift at least as long as the 5 ms splice ramp is a
     /// `latency_change` reset (Q44 §二).
     pub fn add_shift_us(&mut self, delta_us: i64) -> i64 {
-        let before = self.shift;
+        let before = self.playout_lead;
         let target = if delta_us >= 0 {
-            self.shift
+            self.playout_lead
                 .saturating_add(Duration::from_micros(delta_us as u64))
         } else {
-            self.shift
+            self.playout_lead
                 .saturating_sub(Duration::from_micros(delta_us.unsigned_abs()))
         }
         .min(MAX_SHIFT);
-        self.shift = target;
-        // A deliberate lead change resets the settle timer so the new value is not
-        // immediately relaxed back.
-        self.next_relax = None;
+        self.playout_lead = target;
         if target >= before {
             (target - before).as_micros() as i64
         } else {
@@ -1413,17 +1417,52 @@ mod schedule_tests {
         let mut s = MediaSchedule::new(start, 44_100);
         let deadline = s.deadline();
         assert_eq!(s.add_shift(40), 40);
-        assert_eq!(s.deadline(), deadline + Duration::from_millis(40));
+        assert_eq!(s.deadline(), deadline);
+        assert_eq!(s.playout_deadline(), deadline + Duration::from_millis(40));
         assert_eq!(s.anchor_shift_ns(), 40_000_000);
         // Negative deltas come back off the same ledger.
         assert_eq!(s.add_shift(-15), -15);
-        assert_eq!(s.shift, Duration::from_millis(25));
+        assert_eq!(s.playout_lead, Duration::from_millis(25));
         // Never below zero.
         assert_eq!(s.add_shift(-1000), -25);
-        assert_eq!(s.shift, Duration::ZERO);
+        assert_eq!(s.playout_lead, Duration::ZERO);
         // And never above the re-anchor ceiling.
         assert_eq!(s.add_shift(10_000), MAX_SHIFT.as_millis() as i64);
-        assert_eq!(s.shift, MAX_SHIFT);
+        assert_eq!(s.playout_lead, MAX_SHIFT);
+    }
+    #[test]
+    fn adaptive_headroom_does_not_move_pacing_and_survives_recovery_relaxation() {
+        for rate in [44_100, 48_000] {
+            let start = Instant::now();
+            let mut schedule = MediaSchedule::new(start, rate);
+            let baseline = Duration::from_millis(120);
+            for target in [140, 160, 200] {
+                let before = schedule.deadline();
+                let delta = (target - 120) * 1_000 - schedule.playout_lead.as_micros() as i64;
+                assert_eq!(schedule.add_shift_us(delta), delta);
+                assert_eq!(schedule.deadline(), before, "capture must keep its cadence");
+                assert_eq!(
+                    schedule.playout_deadline() + baseline - before,
+                    Duration::from_millis(target as u64)
+                );
+                schedule.sent();
+            }
+            let frames = schedule.frames;
+            schedule
+                .reanchor(schedule.deadline() + Duration::from_millis(300))
+                .unwrap();
+            assert!(schedule.shift > Duration::ZERO);
+            for second in 1..70 {
+                schedule.relax(start + Duration::from_secs(second), Duration::ZERO);
+            }
+            assert_eq!(schedule.shift, Duration::ZERO);
+            assert_eq!(schedule.playout_lead, Duration::from_millis(80));
+            assert_eq!(schedule.anchor_shift_ns(), 80_000_000);
+            assert_eq!(
+                schedule.frames, frames,
+                "neither operation skips RTP samples"
+            );
+        }
     }
     #[test]
     fn reanchor_does_not_count_a_no_op() {

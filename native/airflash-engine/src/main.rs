@@ -70,6 +70,7 @@ fn capabilities() -> Vec<&'static str> {
         "now_playing",
         "diagnostics",
         "forced_latency",
+        "adaptive_lead_v2",
     ];
     if airflash_engine::applications::supported() {
         values.push("application_capture");
@@ -95,12 +96,27 @@ fn lead_event(running: Option<&Running>, session: &str, params: &Value) -> Value
             (0..=airflash_engine::session::MAX_LEAD_MS).contains(&ms),
             "lead must be 0..2000 ms"
         );
-        airflash_engine::session::request_lead(ms);
+        if let Some(sequence) = params.get("sequence") {
+            let sequence = sequence
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("lead sequence must be positive"))?;
+            let epoch = params
+                .get("session_epoch")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow::anyhow!("lead session_epoch is required"))?;
+            airflash_engine::session::request_lead_for(ms, sequence, epoch)?;
+        } else {
+            airflash_engine::session::request_lead(ms);
+        }
         Ok(ms)
     })();
     match result {
-        Ok(ms) => json!({"event":"lead_requested","ms":ms}),
-        Err(error) => json!({"event":"lead_error","message":error.to_string()}),
+        Ok(ms) => {
+            json!({"event":"lead_requested","ms":ms,"sequence":params.get("sequence"),"session_epoch":params.get("session_epoch")})
+        }
+        Err(error) => {
+            json!({"event":"lead_error","message":error.to_string(),"sequence":params.get("sequence"),"session_epoch":params.get("session_epoch")})
+        }
     }
 }
 

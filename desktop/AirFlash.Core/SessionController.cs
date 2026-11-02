@@ -10,12 +10,14 @@ public sealed record SessionSnapshot(PlaybackState State, Receiver? Receiver = n
 {
     public bool IsActive => State is PlaybackState.Connecting or PlaybackState.Streaming or PlaybackState.Standby or PlaybackState.Pairing;
     internal long Generation { get; init; }
+    public LatencyRuntime? Latency { get; init; }
+    public int? PendingLatency { get; init; }
 }
 public sealed record SessionTiming(TimeSpan Connect, TimeSpan Read, TimeSpan Pin, TimeSpan Retry)
 {
     public static SessionTiming Default { get; } = new(TimeSpan.FromSeconds(40), TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(120), TimeSpan.FromSeconds(1));
 }
-public sealed class SessionController(IEngineFactory factory, IAudioService audio, Action<string>? log = null, SessionTiming? timing = null, Action<DesktopSessionRecord>? sessionRecords = null) : IAsyncDisposable
+public sealed class SessionController(IEngineFactory factory, IAudioService audio, Action<string>? log = null, SessionTiming? timing = null, Action<DesktopSessionRecord>? sessionRecords = null, TimeProvider? clock = null) : IAsyncDisposable
 {
     private readonly SemaphoreSlim _serial = new(1, 1);
     private readonly SemaphoreSlim _audioWriter = new(1, 1);
@@ -25,6 +27,8 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private NowPlaying? _nowPlaying;
     private readonly object _sync = new();
     private readonly SessionTiming _timing = timing ?? SessionTiming.Default;
+    private readonly TimeProvider _clock = clock ?? TimeProvider.System;
+    private readonly AdaptiveLatency _adaptive = new(clock ?? TimeProvider.System);
     // Q40: the companion record for the engine's session-summary.csv. Tests pass a
     // collector; production appends beside the engine file.
     private readonly Action<DesktopSessionRecord> _sessionRecords = sessionRecords ?? DesktopSessionLog.Append;
@@ -219,13 +223,13 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     public event Action<SessionSnapshot>? Changed;
     public bool Muted => _muted;
     private static ReceiverOptions ProfileOptions(Receiver receiver, Receiver member, AppSettings settings) => settings.ReadOptions(receiver.IsGroup && !receiver.IsSoftwareGroup ? receiver.Id : member.Id);
-    private static object PeerProfile(Receiver receiver, Receiver member, AppSettings settings, ReceiverProfile? negotiated = null)
+    private static object PeerProfile(Receiver receiver, Receiver member, AppSettings settings, ReceiverProfile? negotiated = null, int? adaptiveTarget = null)
     {
         var options = ProfileOptions(receiver, member, settings);
         return new { codec = options.Codec, transport = options.Transport, timing = options.Timing == "follow" ? "ptp" : options.Timing,
             follow_receiver_clock = options.Timing == "follow" || options.Timing == "auto" && member.FollowReceiverClock, features = member.Features,
             channel = receiver.IsSoftwareGroup ? member.Channel : "stereo", sync_offset_ms = receiver.IsSoftwareGroup ? member.SyncOffsetMs : 0,
-            latency_ms = InitialLatency(receiver, member, settings, negotiated) };
+            latency_ms = adaptiveTarget ?? InitialLatency(receiver, member, settings, negotiated) };
     }
     private static int InitialLatency(Receiver receiver, Receiver member, AppSettings settings, ReceiverProfile? negotiated)
     {
@@ -284,7 +288,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         await StopLockedAsync().ConfigureAwait(false);
         _settings = settings.Clone(); _receiver = receiver;
         var epoch = ++_generation;
-        lock (_sync) { _diagnostics = new(); _warnings.Clear(); _snapshot = new(PlaybackState.Idle); _lastDiagnostic = null; }
+        lock (_sync) { _diagnostics = new(); _warnings.Clear(); _snapshot = new(PlaybackState.Idle); _lastDiagnostic = null; _adaptive.Reset(); }
         _lifetime = new();
         var cancellation = _lifetime.Token;
         Publish(epoch, requestPin is null ? PlaybackState.Connecting : PlaybackState.Pairing);
@@ -526,57 +530,40 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             _diagnosticWriter.Release();
         }
     }
-    private int _adaptiveLead = -1;
     private int _adaptiveBase;
-    private int? _pendingAdaptiveLead;
-    private long _lastLeadChange;
-    private long _recoveries;
-    private long _recoveryWindow;
-    private readonly LatenessWatch _lateness = new();
-    /// <summary>
-    /// Walk the latency ladder one step up when the engine keeps having to recover
-    /// the timeline, or when it is chronically late without ever recovering. Three
-    /// recoveries inside a minute is a pattern, not a hiccup; one step per minute
-    /// keeps the adjustment inaudible.
-    /// </summary>
-    private async Task AdaptLeadAsync(IEngineConnection connection, string session, long epoch, JsonElement item)
+    private int _adaptiveInitial;
+    private bool _confirmedLeadSupported;
+    private async Task CheckAdaptiveAsync(IEngineConnection connection, string session, long epoch, CancellationToken cancellation)
     {
-        if (AdaptivePlan() is null) return;
-        if (item.Text("code") is not ("timeline_reanchored" or "sender_late_recovered")) return;
-        var now = Stopwatch.GetTimestamp();
-        if (_recoveryWindow == 0 || Stopwatch.GetElapsedTime(_recoveryWindow, now) > TimeSpan.FromSeconds(60)) { _recoveryWindow = now; _recoveries = 0; }
-        if (++_recoveries < 3) return;
-        _recoveryWindow = now; _recoveries = 0;
-        await RaiseLeadAsync(connection, session, epoch, "repeated recoveries").ConfigureAwait(false);
-    }
-    /// <summary>Chronic lateness: the p99 of send lateness stays high without ever
-    /// reaching the re-anchor budget, so the recovery counter never fires.</summary>
-    private async Task AdaptLeadToLatenessAsync(IEngineConnection connection, string session, long epoch, TransportMetrics metrics)
-    {
-        if (AdaptivePlan() is null) return;
-        if (!_lateness.Observe(metrics.IntervalLatenessP99Ms)) return;
-        await RaiseLeadAsync(connection, session, epoch, "sustained p99 lateness").ConfigureAwait(false);
-    }
-    private async Task RaiseLeadAsync(IEngineConnection connection, string session, long epoch, string reason)
-    {
-        int current, next, extra;
+        AdaptiveAction? action;
         lock (_sync)
         {
-            if (epoch != _generation || !ReferenceEquals(_connection, connection) || AdaptivePlan() is not { } plan || _pendingAdaptiveLead is not null) return;
-            if (_lastLeadChange != 0 && Stopwatch.GetElapsedTime(_lastLeadChange) < TimeSpan.FromSeconds(60)) return;
-            current = _adaptiveLead < 0 ? _adaptiveBase : _adaptiveLead;
-            next = LatencyPolicy.Next(current, plan, true);
-            if (next <= current) return;
-            extra = Math.Max(0, next - _adaptiveBase);
-            _pendingAdaptiveLead = next;
+            if (epoch != _generation || !ReferenceEquals(_connection, connection) || AdaptivePlan() is not { } plan) return;
+            action = _adaptive.Evaluate(plan, _confirmedLeadSupported);
         }
-        log?.Invoke(L.Format("Adaptive latency: raised the lead to {0} ms after {1}", next, reason));
-        try { await connection.SendAsync(session, "set_lead", new { ms = extra }, CancellationToken.None).ConfigureAwait(false); }
-        catch (Exception error) when (error is IOException or ObjectDisposedException or InvalidOperationException)
+        if (action is null) return;
+        if (action.Rebuild) throw new AdaptiveRebuild(action.Target, action.Reason);
+        log?.Invoke($"Adaptive latency requested: session={session}; stream_epoch={action.SessionEpoch}; sequence={action.Sequence}; target_ms={action.Target}; extra_ms={action.ExtraMs}; reason={action.Reason}");
+        PublishCurrent(epoch);
+        using var timeout = new CancellationTokenSource(AdaptiveLatency.ConfirmationTimeout, _clock);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellation, timeout.Token);
+        try { await connection.SendAsync(session, "set_lead", new { ms = action.ExtraMs, sequence = action.Sequence, session_epoch = action.SessionEpoch }, linked.Token).ConfigureAwait(false); }
+        catch (Exception error) when (error is IOException or ObjectDisposedException or InvalidOperationException || error is OperationCanceledException && !cancellation.IsCancellationRequested)
         {
-            lock (_sync) { if (epoch == _generation) _pendingAdaptiveLead = null; }
-            log?.Invoke(L.Format("Adaptive latency change failed: {0}", error.Message));
+            lock (_sync)
+            {
+                _adaptive.Reject(action.Sequence, action.SessionEpoch, error.Message);
+                if (AdaptivePlan() is { } plan) _adaptive.Evaluate(plan, _confirmedLeadSupported);
+            }
+            throw new AdaptiveRebuild(action.Target, "lead command failed: " + error.Message);
         }
+    }
+    private void AcceptLatency(JsonElement item)
+    {
+        if (LatencyRuntime.Parse(item) is not { } runtime) return;
+        bool confirmed;
+        lock (_sync) confirmed = _adaptive.Accept(runtime);
+        if (confirmed) log?.Invoke($"Adaptive latency applied: stream_epoch={runtime.SessionEpoch}; sequence={runtime.Sequence}; baseline_ms={runtime.BaselineMs}; extra_ms={runtime.ExtraMs}; effective_ms={runtime.EffectiveMs}; ceiling_ms={runtime.CeilingMs}; observation_seconds=10");
     }
     private LatencyPolicy.Plan? AdaptivePlan()
     {
@@ -590,15 +577,8 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             return LatencyPolicy.For(receiver, negotiated[0].Text("codec"), negotiated[0].Text("timing") == "ptp");
         }
     }
-    private void ResetAdaptive(bool resetBase = true)
-    {
-        lock (_sync)
-        {
-            _adaptiveLead = -1; _pendingAdaptiveLead = null; _lastLeadChange = 0;
-            if (resetBase) _adaptiveBase = _receiver is null ? 0 : _settings.Latency(_receiver);
-            _recoveries = 0; _recoveryWindow = 0; _lateness.Reset();
-        }
-    }
+    private static bool UsesAdaptive(AppSettings settings, Receiver receiver) => !LatencyPolicy.Forced(settings, receiver)
+        && (receiver.IsSoftwareGroup ? receiver.Peers : [receiver]).All(r => (settings.ReadOptions(r.Id).LatencyMode ?? settings.LatencyMode) == LatencyPolicy.Mode);
     private async Task RunStreamAsync(Receiver receiver, long epoch, CancellationToken cancellation)
     {
         var attempts = 0;
@@ -635,7 +615,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                 await using var connection = factory.Open();
                 var session = Guid.NewGuid().ToString("N");
                 SetConnection(connection, session);
-                ResetAdaptive();
+                lock (_sync) _adaptive.BeginAttempt(_settings.Latency(receiver));
                 try
                 {
                     lock (_sync) { if (epoch == _generation) { _diagnostics = _diagnostics with { Transport = null, Warnings = [], Negotiated = [], ClockStatus = null }; _warnings.Clear(); _deviceVolume = new(); _memberVolumes.Clear(); _memberHosts.Clear(); foreach (var pair in hosts) _memberHosts[pair.Key] = pair.Value; _volumeEdit?.Cancel(); _snapshot = _snapshot with { Metrics = null }; } }
@@ -643,6 +623,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                     var deadline = DateTime.UtcNow + _timing.Connect;
                     await connection.SendAsync(session, "hello", null, cancellation).ConfigureAwait(false);
                     var hello = await ReadEventAsync(connection, session, _timing.Connect, cancellation).ConfigureAwait(false);
+                    _confirmedLeadSupported = EngineHandshake.HasCapability(hello, "adaptive_lead_v2");
                     EngineHandshake.RequireStreamingCapabilities(hello);
                     EngineHandshake.RequireCapabilities(hello, "standby_release");
                     if (forceLatency && !EngineHandshake.HasCapability(hello, "forced_latency"))
@@ -654,16 +635,24 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                     if (capabilities.Members.Count > 0 && selected.Count == 0) throw new InvalidOperationException(L.Get("The receiver does not support this stream profile. Choose Automatic or a supported option in Receivers."));
                     var sampleRate = selected.FirstOrDefault()?.Profile.SampleRate ?? (int.TryParse(settings.SampleRate(receiver), out var explicitRate) ? explicitRate : 44100);
                     peers.Clear();
+                    _adaptiveInitial = receiver.Peers.Max(member => InitialLatency(receiver, member, settings, selected.FirstOrDefault(s => s.ReceiverId == member.Id)?.Profile));
+                    var adaptiveMode = UsesAdaptive(settings, receiver);
+                    _adaptiveBase = adaptiveMode ? Math.Max(_adaptiveInitial, _adaptive.RecoveryTarget ?? 0) : _adaptiveInitial;
+                    lock (_sync) _adaptive.BeginAttempt(_adaptiveBase);
                     foreach (var member in receiver.Peers.OrderByDescending(p => p.IsLeader))
                         peers.Add(new { receiver_id = member.Id, host = hosts[member.Id], port = member.Port,
                             codecs = member.Codecs.Select(x => (int)x).ToArray(),
-                            profile = PeerProfile(receiver, member, settings, selected.FirstOrDefault(s => s.ReceiverId == member.Id)?.Profile) });
-                    _adaptiveBase = receiver.Peers.Max(member => InitialLatency(receiver, member, settings, selected.FirstOrDefault(s => s.ReceiverId == member.Id)?.Profile));
+                            profile = PeerProfile(receiver, member, settings, selected.FirstOrDefault(s => s.ReceiverId == member.Id)?.Profile, adaptiveMode ? _adaptiveBase : null) });
                     await _equalizerWriter.WaitAsync(cancellation).ConfigureAwait(false);
                     try
                     {
                         var startParameters = JsonSerializer.SerializeToNode(new { peers, group_mode = receiver.IsSoftwareGroup ? "software_stereo" : receiver.IsGroup ? "native_stereo" : "single", group_id = receiver.IsGroup && !receiver.IsSoftwareGroup ? receiver.StereoId : null, source = settings.CaptureMode == "application" ? "application" : "loopback", capture_application_path = settings.CaptureMode == "application" ? settings.CaptureApplicationPath : null, capture_process_id = settings.CaptureMode == "application" ? settings.CaptureApplicationInstance?.ProcessId : null, capture_process_started_at = settings.CaptureMode == "application" ? settings.CaptureApplicationInstance?.StartedAt : null, standby = StandbyParameters(settings, receiver.Id), duration_ms = 0, latency_ms = _adaptiveBase, gain = Gain(receiver), timing = "ptp", capture_endpoint = settings.EffectiveEndpoint, sample_rate = sampleRate, equalizer = EffectiveEqualizer().WireParameters() })!.AsObject();
                         if (forceLatency) startParameters["force_latency"] = true;
+                        if (adaptiveMode && _confirmedLeadSupported)
+                        {
+                            startParameters["adaptive_latency"] = true;
+                            startParameters["adaptive_initial_latency_ms"] = _adaptiveInitial;
+                        }
                         await connection.SendAsync(session, "start", startParameters, cancellation).ConfigureAwait(false);
                         lock (_sync) { if (epoch == _generation) _snapshot = _snapshot with { StreamRate = sampleRate }; }
                         lock (_sync) { if (epoch == _generation && ReferenceEquals(_connection, connection)) _equalizerReady = true; }
@@ -674,9 +663,21 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                     while (true)
                     {
                         cancellation.ThrowIfCancellationRequested();
+                        await CheckAdaptiveAsync(connection, session, epoch, cancellation).ConfigureAwait(false);
                         var wait = startedAt == 0 ? deadline - DateTime.UtcNow : _timing.Read;
+                        // Timer due-times are whole milliseconds. Round up so a
+                        // timer cannot fire just before the monotonic deadline and
+                        // turn a missing lead acknowledgement into a generic fault.
+                        if (_adaptive.ConfirmationRemaining is { } remaining && remaining < wait)
+                            wait = TimeSpan.FromMilliseconds(Math.Ceiling(remaining.TotalMilliseconds));
                         if (wait <= TimeSpan.Zero) throw new TimeoutException(L.Get("Timed out connecting to the audio device."));
-                        var item = await ReadEventAsync(connection, session, wait, cancellation).ConfigureAwait(false);
+                        JsonElement item;
+                        try { item = await ReadEventAsync(connection, session, wait, cancellation).ConfigureAwait(false); }
+                        catch (TimeoutException) when (_adaptive.ConfirmationRemaining <= TimeSpan.Zero)
+                        {
+                            await CheckAdaptiveAsync(connection, session, epoch, cancellation).ConfigureAwait(false);
+                            throw;
+                        }
                         var kind = item.Text("event");
                         if (kind == "error") throw new EngineFailure(EngineNotice.Parse(item));
                         if (kind == "stopped") throw new IOException(L.Get("The audio session ended unexpectedly."));
@@ -696,19 +697,16 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                             // the stream; this line records the codec, transport, timing and
                             // clock role needed to diagnose a silent session.
                             log?.Invoke($"Receiver negotiated: {item.Text("receiver_id", item.Text("host"))}; host {item.Text("host")}; codec {item.Text("codec")}; transport {item.Text("transport")}; timing {item.Text("timing")}; clock_role {item.Text("clock_role")}; {item.Integer("sample_rate")} Hz");
+                            if (item.Number("effective_latency_ms") is { } baseline) lock (_sync) _adaptive.Negotiated(baseline);
                         }
                         if (kind is "lead_changed" or "lead_error")
                         {
                             lock (_sync)
                             {
                                 if (epoch != _generation) continue;
-                                if (kind == "lead_changed" && item.Integer("applied_ms") is { } extra)
-                                {
-                                    _adaptiveLead = _adaptiveBase + (int)Math.Clamp(extra, 0, 2000);
-                                    _lastLeadChange = Stopwatch.GetTimestamp();
-                                }
-                                _pendingAdaptiveLead = null;
+                                if (kind == "lead_error") _adaptive.Reject(item.Integer("sequence"), item.Integer("session_epoch"), item.Text("message"));
                             }
+                            if (kind == "lead_changed") AcceptLatency(item);
                             PublishCurrent(epoch);
                         }
                         if (kind is "clock_status" or "scheduler_status")
@@ -722,6 +720,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         }
                         if (kind == "streaming")
                         {
+                            AcceptLatency(item);
                             startedAt = Stopwatch.GetTimestamp();
                             lock (_sync) { if (epoch != _generation) continue; _transportStreaming = true; }
                             await ApplyLocalMuteAsync().ConfigureAwait(false);
@@ -731,6 +730,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         }
                         else if (kind == "standby")
                         {
+                            lock (_sync) _adaptive.Suspend();
                             startedAt = Stopwatch.GetTimestamp();
                             await RestoreAudioAsync().ConfigureAwait(false);
                             var message = item.Text("reason") switch
@@ -743,7 +743,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         }
                         else if (kind == "resuming")
                         {
-                            ResetAdaptive(resetBase: false);
+                            lock (_sync) _adaptive.Resume(_adaptiveInitial);
                             startedAt = 0; deadline = DateTime.UtcNow + _timing.Connect;
                             Publish(epoch, PlaybackState.Connecting, L.Get("Audio detected; reconnecting…"));
                         }
@@ -784,7 +784,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                                 _diagnostics = _diagnostics with { Warnings = _warnings.Values.ToArray() };
                             }
                             log?.Invoke($"Engine warning: {item}");
-                            _ = AdaptLeadAsync(connection, session, epoch, item);
+                            if (AdaptivePlan() is not null) lock (_sync) _adaptive.Recovery(item.Text("code"));
                             var current = Snapshot;
                             var takeover = notice.Code == "preempted" && notice.Reason == "takeover";
                             Publish(epoch, current.State, takeover ? L.Get("Another device took over this AirPlay session. AirFlash reclaimed it.") : current.Message);
@@ -792,8 +792,14 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         else if (kind == "transport_metrics" && startedAt != 0)
                         {
                             var metrics = TransportMetrics.Parse(item);
+                            AcceptLatency(item);
                             lock (_sync) { if (epoch != _generation) continue; _diagnostics = _diagnostics with { Transport = metrics }; }
-                            _ = AdaptLeadToLatenessAsync(connection, session, epoch, metrics);
+                            if (AdaptivePlan() is not null)
+                            {
+                                bool fresh; lock (_sync) fresh = _adaptive.Observe(metrics);
+                                if (fresh && metrics.SessionUptimeMs is { } uptime && (int)(uptime / 1000) % 10 == 0)
+                                    log?.Invoke($"Adaptive latency health: stream_epoch={metrics.SessionEpoch}; effective_ms={_adaptive.Current}; p99_ms={metrics.IntervalLatenessP99Ms}; active_underruns={metrics.UnderrunsActive}; idle_underruns={metrics.UnderrunsIdle}; rebuilds={_adaptive.Rebuilds}");
+                            }
                             var current = Snapshot; Publish(epoch, current.State, current.Message);
                         }
                         else if (kind == "capture_metrics" && item.TryGetProperty("metrics", out var metrics))
@@ -802,6 +808,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                             var current = Snapshot;
                             Publish(epoch, current.State, current.Message, metrics: parsed);
                         }
+                        await CheckAdaptiveAsync(connection, session, epoch, cancellation).ConfigureAwait(false);
                     }
                 }
                 finally
@@ -821,13 +828,23 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             {
                 await RestoreAudioAsync().ConfigureAwait(false);
                 if (cancellation.IsCancellationRequested) return;
+                if (error is AdaptiveRebuild rebuild)
+                {
+                    if (!_adaptive.ConsumeRebuild(_settings.MaxReconnectAttempts))
+                    {
+                        var exhausted = new EngineFailure(new("adaptive_recovery_exhausted", "", "scheduler", L.Get("Adaptive recovery could not stabilize playback. Reconnect to try again."), false));
+                        if (RecordFailure(epoch, exhausted) is { } failure) Publish(epoch, PlaybackState.Error, failure.Detail);
+                        return;
+                    }
+                    log?.Invoke($"Adaptive latency rebuilding: target_ms={rebuild.Target}; reason={rebuild.Message}; rebuild={_adaptive.Rebuilds}/{_settings.MaxReconnectAttempts}");
+                }
                 if (startedAt != 0 && Stopwatch.GetElapsedTime(startedAt) >= TimeSpan.FromSeconds(10)) attempts = 0;
                 ++attempts;
                 if (RecordFailure(epoch, error) is not { } notice) return;
                 Publish(epoch, FailureState(notice), FailureMessage(receiver, notice));
                 // A preempted receiver belongs to another controller now; retrying
                 // would fight it. The user gets an explicit reconnect action instead.
-                if (notice.Code == "preempted" || !(_settings.ForceReconnect || receiver.IsSoftwareGroup || notice.Code is "timeline_expired" or "clock_lost") || attempts > _settings.MaxReconnectAttempts || notice.Retryable == false || notice.Retryable is null && IsAuthenticationFailure(error.Message)) return;
+                if (notice.Code == "preempted" || !(_settings.ForceReconnect || receiver.IsSoftwareGroup || notice.Code is "timeline_expired" or "clock_lost" or "adaptive_rebuild") || attempts > _settings.MaxReconnectAttempts || notice.Retryable == false || notice.Retryable is null && IsAuthenticationFailure(error.Message)) return;
                 // This is the one reconnect notion the desktop already has; the
                 // companion record only reports it, it does not add a second one.
                 ++reconnects;
@@ -894,6 +911,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         var notice = error switch
         {
             EngineFailure engineFailure => engineFailure.Notice,
+            AdaptiveRebuild adaptive => new EngineNotice("adaptive_rebuild", "", "scheduler", adaptive.Message, true),
             SocketException socket => new EngineNotice("network_error", "", "desktop", socket.Message, true),
             NetworkFailure network => new EngineNotice("network_error", "", "desktop", network.Message, true),
             _ => new EngineNotice("host_error", "", "desktop", error.Message)
@@ -909,6 +927,10 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         return notice;
     }
     private sealed class PairCancelledException : OperationCanceledException;
+    private sealed class AdaptiveRebuild(int target, string reason) : IOException(reason)
+    {
+        public int Target { get; } = target;
+    }
     private sealed class NetworkFailure : IOException
     {
         public NetworkFailure(string message) : base(message) { }
@@ -922,10 +944,10 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         try { await connection.SendAsync(session, "stop", null, timeout.Token).ConfigureAwait(false); }
         catch (Exception error) when (error is IOException or OperationCanceledException or ObjectDisposedException or InvalidOperationException) { }
     }
-    private static async Task<JsonElement> ReadEventAsync(IEngineConnection connection, string session, TimeSpan wait, CancellationToken cancellation)
+    private async Task<JsonElement> ReadEventAsync(IEngineConnection connection, string session, TimeSpan wait, CancellationToken cancellation)
     {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-        timeout.CancelAfter(wait);
+        using var deadline = new CancellationTokenSource(wait, _clock);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation, deadline.Token);
         try
         {
             while (true)
@@ -972,7 +994,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         lock (_sync)
         {
             if (epoch != _generation) return;
-            snapshot = new(state, _receiver, message, metrics ?? _snapshot.Metrics, _receiver is null ? 0 : _adaptiveLead >= 0 ? _adaptiveLead : _adaptiveBase > 0 ? _adaptiveBase : _settings.Latency(_receiver), _diagnostics, _receiver is null ? 0 : _snapshot.StreamRate, _deviceVolume, new Dictionary<string, DeviceVolumeState>(_memberVolumes)) { Generation = epoch };
+            snapshot = new(state, _receiver, message, metrics ?? _snapshot.Metrics, _receiver is null ? 0 : _adaptive.Current > 0 ? _adaptive.Current : _settings.Latency(_receiver), _diagnostics, _receiver is null ? 0 : _snapshot.StreamRate, _deviceVolume, new Dictionary<string, DeviceVolumeState>(_memberVolumes)) { Generation = epoch, Latency = _adaptive.Runtime, PendingLatency = _adaptive.Pending?.Action.Target };
             _snapshot = snapshot;
         }
         Changed?.Invoke(snapshot);

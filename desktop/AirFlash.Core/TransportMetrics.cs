@@ -16,7 +16,8 @@ public sealed record MemberTransportMetrics(string Host, long? PacketsSent, long
             health.Boolean("feedback_delayed"), health.Integer("event_messages"), media.Number("receiver_latency_ms"), media.Boolean("receiver_latency_estimated"));
     }
 }
-public sealed record TransportMetrics(double? SessionUptimeMs, long? SenderLateRecoveries, long? SkippedPackets, double? MaxSendLatenessUs, IReadOnlyList<MemberTransportMetrics> Members, double? LatenessP50Ms = null, double? LatenessP99Ms = null, double? IntervalLatenessP99Ms = null)
+public sealed record TransportMetrics(double? SessionUptimeMs, long? SenderLateRecoveries, long? SkippedPackets, double? MaxSendLatenessUs, IReadOnlyList<MemberTransportMetrics> Members, double? LatenessP50Ms = null, double? LatenessP99Ms = null, double? IntervalLatenessP99Ms = null,
+    long? SessionEpoch = null, long? UnderrunsActive = null, long? UnderrunsIdle = null, LatencyRuntime? Latency = null)
 {
     public static TransportMetrics Parse(JsonElement item)
     {
@@ -25,7 +26,8 @@ public sealed record TransportMetrics(double? SessionUptimeMs, long? SenderLateR
             item.TryGetProperty("members", out var members) && members.ValueKind == JsonValueKind.Array ? members.EnumerateArray().Select(MemberTransportMetrics.Parse).ToArray() : [],
             lateness.ValueKind == JsonValueKind.Object ? lateness.Number("p50_ms") : null,
             lateness.ValueKind == JsonValueKind.Object ? lateness.Number("p99_ms") : null,
-            item.TryGetProperty("lateness_interval", out var interval) && interval.ValueKind == JsonValueKind.Object ? interval.Number("p99_ms") : null);
+            item.TryGetProperty("lateness_interval", out var interval) && interval.ValueKind == JsonValueKind.Object ? interval.Number("p99_ms") : null,
+            item.Integer("session_epoch"), item.Integer("underruns_active"), item.Integer("underruns_idle"), LatencyRuntime.Parse(item));
     }
 }
 public sealed record EngineNotice(string Code, string Host, string Channel, string Message, bool? Retryable = null, string? Reason = null)

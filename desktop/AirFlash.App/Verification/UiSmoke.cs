@@ -559,6 +559,7 @@ internal static class UiSmoke
         public int StopDelayMs;
         public bool FailOpen;
         public bool AutoReady = true;
+        public bool SupportsAdaptiveLead;
         public Action<object>? EmitEvent;
         public ConcurrentQueue<JsonElement> Commands { get; } = new();
         public int CreatedCount, DisposedCount;
@@ -578,7 +579,7 @@ internal static class UiSmoke
         public Task SendAsync(string session, string command, object? parameters, CancellationToken cancellation)
         {
             factory.Commands.Enqueue(JsonSerializer.SerializeToElement(new { command, @params = parameters }));
-            if (command == "hello") Emit(session, new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "application_capture", "forced_latency" } });
+            if (command == "hello") Emit(session, new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "application_capture", "forced_latency" }.Concat(factory.SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).ToArray() });
             if (command == "start")
             {
                 _host = JsonSerializer.SerializeToElement(parameters).GetProperty("peers")[0].Text("host");
@@ -586,7 +587,12 @@ internal static class UiSmoke
                 foreach (var peer in data.GetProperty("peers").EnumerateArray())
                     Emit(session, new { @event = "negotiated", receiver_id = peer.Text("receiver_id"), host = peer.Text("host"), port = peer.Integer("port"), codec = "alac", transport = "realtime", timing = "ptp", clock_role = peer.GetProperty("profile").Boolean("follow_receiver_clock") == true ? "follow" : "sender", sample_rate = data.Integer("sample_rate") });
                 factory.EmitEvent = payload => Emit(session, payload);
-                if (factory.AutoReady) Emit(session, new { @event = "streaming" });
+                if (factory.AutoReady)
+                {
+                    if (factory.SupportsAdaptiveLead) Emit(session, new { @event = "streaming", session_epoch = 1, lead_sequence = 0,
+                        baseline_ms = data.Integer("latency_ms"), lead_extra_ms = 0, effective_latency_ms = data.Integer("latency_ms"), lead_ceiling_ms = 100, live_lead_supported = true });
+                    else Emit(session, new { @event = "streaming" });
+                }
                 var hosts = data.Text("group_mode") == "software_stereo" ? data.GetProperty("peers").EnumerateArray().Select(p => p.Text("host")).ToArray() : [_host];
                 foreach (var host in hosts)
                 {

@@ -75,6 +75,20 @@ impl Packetizer {
         self.latency = latency;
         self.retention = Duration::from_secs(1).max(latency + Duration::from_millis(250));
     }
+    /// Already sent packets follow the same retimed playback anchor as new ones.
+    /// Their encrypted bytes and RTP identity remain unchanged.
+    pub fn shift_playout(&mut self, delta_us: i64, extra: Duration) {
+        let delta = Duration::from_micros(delta_us.unsigned_abs());
+        for packet in &mut self.history {
+            packet.deadline = if delta_us >= 0 {
+                packet.deadline + delta
+            } else {
+                packet.deadline.checked_sub(delta).unwrap_or(packet.sent_at)
+            };
+        }
+        self.retention =
+            Duration::from_secs(1).max(self.latency + extra + Duration::from_millis(250));
+    }
     /// Deliberately lost media slots advance RTP, but never reuse an encryption nonce.
     pub fn skip_packets(&mut self, count: u64) {
         self.seq = self.seq.wrapping_add(count as u16);
@@ -235,6 +249,36 @@ mod tests {
         assert_eq!(p.len(), 28);
         assert_eq!(&p[4..8], &20000u32.to_be_bytes());
         assert_eq!(&p[20..], &456u64.to_be_bytes());
+    }
+    #[test]
+    fn retiming_extends_cached_packet_expiry_without_reencrypting() {
+        let mut sender = Packetizer::new([7; 32], 100, 200, 1);
+        sender.configure_latency(Duration::from_millis(120));
+        let start = Instant::now();
+        let bytes = sender
+            .packet_at(
+                &vec![0; PCM_BYTES],
+                true,
+                start,
+                start + Duration::from_millis(120),
+            )
+            .unwrap();
+        let later = start + Duration::from_millis(130);
+        assert!(matches!(
+            sender.retransmit_packet(100, later),
+            Retransmit::Expired
+        ));
+        sender.shift_playout(20_000, Duration::from_millis(20));
+        let Retransmit::Packet(reply) = sender.retransmit_packet(100, later) else {
+            panic!("raised headroom must extend the old packet too")
+        };
+        assert_eq!(&reply[4..], &bytes);
+        assert_eq!(sender.seq, 101);
+        assert_eq!(sender.timestamp, 200 + FRAMES as u32);
+        assert!(matches!(
+            sender.retransmit_packet(100, start + Duration::from_millis(140)),
+            Retransmit::Expired
+        ));
     }
 }
 

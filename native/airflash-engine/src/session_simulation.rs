@@ -112,6 +112,49 @@ fn forced_setup_warns_below_the_receiver_minimum_and_still_continues() {
         }
     }
 }
+#[test]
+fn adaptive_rebuild_honors_raised_target_above_receiver_minimum() {
+    let mut receiver = mock_with_model(
+        "127.0.0.2",
+        false,
+        false,
+        Channel::Stereo,
+        0,
+        true,
+        Some("AppleTV6,2"),
+    );
+    receiver.peer.profile.timing = Timing::Ntp;
+    receiver.peer.profile.latency_ms = Some(300);
+    let path = quiet_wav();
+    let mut options: ProbeOptions = serde_json::from_value(serde_json::json!({
+        "peers":[],"source":"wav","duration_ms":100,"gain":0.05,"latency_ms":300,
+        "adaptive_latency":true,"adaptive_initial_latency_ms":200,"wav_path":path
+    }))
+    .unwrap();
+    options.peers = vec![receiver.peer.clone()];
+    let events = Mutex::new(Vec::new());
+    let outcome = run_session(
+        options,
+        Cancellation::default(),
+        Arc::new(AtomicU32::new(0.05f32.to_bits())),
+        crate::volume::Control::default(),
+        crate::equalizer::Control::new(crate::equalizer::Settings::default(), 44100).unwrap(),
+        |event| events.lock().unwrap().push(event),
+        (crate::clock::Clock::new(), None),
+    );
+    std::fs::remove_file(path).unwrap();
+    receiver.stop.store(true, Ordering::Relaxed);
+    receiver.worker.join().unwrap();
+    outcome.unwrap();
+    let events = events.lock().unwrap();
+    let negotiated = events
+        .iter()
+        .find(|event| event["event"] == "negotiated")
+        .unwrap();
+    assert_eq!(negotiated["requested_latency_ms"], 300);
+    assert_eq!(negotiated["receiver_latency_min_ms"], 200.0);
+    assert_eq!(negotiated["effective_latency_ms"], 300.0);
+}
 fn mock(ip: &str, buffered: bool, alac: bool, channel: Channel, offset: i32, ap2: bool) -> Mock {
     mock_with_model(
         ip,

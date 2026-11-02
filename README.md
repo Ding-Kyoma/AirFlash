@@ -86,8 +86,16 @@ editable in Settings.
 
 New installations and reset settings default to **Adaptive latency**. It selects
 an initial target from the negotiated codec and clock strategy, then increases
-headroom after sustained send lateness or repeated recovery. It does not
-automatically lower the target after a stable period; a new session resets it.
+receiver buffering after sustained send lateness, repeated recovery, or active-audio
+underruns, without delaying the sender's cadence. Changes must be confirmed by the
+engine; the panel separates startup requests, negotiated baseline, adaptive extra,
+and the current plan. After each change it observes ten seconds of fresh health
+data before raising again. Unconfirmed changes time out after five seconds and
+rebuild at the requested target; continued trouble at the ladder ceiling also
+rebuilds within the configured retry budget. Sixty seconds of healthy evidence
+resets that budget. It does not automatically lower the target after a stable
+period. Recovery rebuilds retain the requested target; a new playback run or
+standby resume selects the initial target again.
 Upgrades preserve existing latency modes, custom values, and recovery behavior.
 
 In **Settings > AirFlash streaming**, the 120/200/500 ms presets and 0–2000 ms
