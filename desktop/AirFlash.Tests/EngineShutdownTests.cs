@@ -74,7 +74,7 @@ public sealed class EngineShutdownTests
         var pending = connection.SendAsync("shutdown", "set_now_playing", new { text = new string('x', 131072) }, CancellationToken.None);
         await connection.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(4));
         var failure = await Record.ExceptionAsync(() => pending);
-        Assert.True(failure is OperationCanceledException or IOException or ObjectDisposedException, failure?.ToString());
+        Assert.True(failure is IOException or ObjectDisposedException, failure?.ToString());
         Assert.Single(log, line => line.Contains("deadline exceeded"));
     }
     [Fact]

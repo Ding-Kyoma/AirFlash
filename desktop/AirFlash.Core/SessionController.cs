@@ -315,6 +315,13 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     }
     public async Task StopAsync()
     {
+        // A live command may hold _serial while waiting for the engine pipe.
+        // Cancel the worker first so its disposal can interrupt that write.
+        CancellationTokenSource? lifetime;
+        lock (_sync) lifetime = _lifetime;
+        if (lifetime is not null)
+            try { await lifetime.CancelAsync().ConfigureAwait(false); }
+            catch (ObjectDisposedException) { }
         await _serial.WaitAsync().ConfigureAwait(false);
         try { log?.Invoke("Session stop reason=user_stop"); await StopLockedAsync().ConfigureAwait(false); _receiver = null; Publish(_generation, PlaybackState.Idle); }
         finally { _serial.Release(); }

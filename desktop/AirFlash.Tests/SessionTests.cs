@@ -7,6 +7,34 @@ namespace AirFlash.Tests;
 
 public sealed class SessionTests
 {
+    [Fact]
+    public async Task StopCancelsTheSessionBeforeWaitingForABlockedLiveCommand()
+    {
+        var process = new FakeConnection(); var factory = new FakeFactory(process);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        process.BeforeSend = async (command, cancellation) =>
+        {
+            if (command.Command != "set_gain") return;
+            entered.TrySetResult();
+            await Task.WhenAny(process.DisposedSignal.Task, release.Task).WaitAsync(cancellation);
+            throw new ObjectDisposedException("engine");
+        };
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        try
+        {
+            await controller.StartAsync(Pod(), Settings());
+            await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+            var mute = controller.SetMutedAsync(true);
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            await controller.StopAsync().WaitAsync(TimeSpan.FromSeconds(3));
+            await mute.WaitAsync(TimeSpan.FromSeconds(3));
+            Assert.Equal(PlaybackState.Idle, controller.Snapshot.State);
+            Assert.True(process.Disposed);
+            Assert.Equal(1, factory.OpenCount);
+        }
+        finally { release.TrySetResult(); }
+    }
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

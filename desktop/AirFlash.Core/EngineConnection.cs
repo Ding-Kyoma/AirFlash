@@ -76,9 +76,14 @@ public sealed class ProcessEngineConnection : IEngineConnection
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellation, _ioStop.Token);
         if (command == "stop") linked.CancelAfter(ShutdownRemaining());
         var request = JsonSerializer.Serialize(new { version = 1, id = Guid.NewGuid().ToString("N"), session_id = session, command, @params = parameters ?? new { } });
-        await _writer.WaitAsync(linked.Token).ConfigureAwait(false);
-        try { await _process.StandardInput.WriteLineAsync(request.AsMemory(), linked.Token).ConfigureAwait(false); await _process.StandardInput.FlushAsync(linked.Token).ConfigureAwait(false); }
-        finally { _writer.Release(); }
+        try
+        {
+            await _writer.WaitAsync(linked.Token).ConfigureAwait(false);
+            try { await _process.StandardInput.WriteLineAsync(request.AsMemory(), linked.Token).ConfigureAwait(false); await _process.StandardInput.FlushAsync(linked.Token).ConfigureAwait(false); }
+            finally { _writer.Release(); }
+        }
+        catch (OperationCanceledException error) when (_ioStop.IsCancellationRequested && !cancellation.IsCancellationRequested)
+        { throw new ObjectDisposedException(nameof(ProcessEngineConnection), error.Message); }
     }
     public async ValueTask<JsonElement?> ReadAsync(CancellationToken cancellation)
     {
