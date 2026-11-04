@@ -13,10 +13,29 @@
         <!-- Scope the Fluent thumb border override to volume sliders. -->
         <SolidColorBrush x:Key="ControlElevationBorderBrush" Color="{Binding BorderBrush.Color, RelativeSource={RelativeSource AncestorType={x:Type Slider}}}"/>
       </Style.Resources>
+      <Style.Triggers>
+        <!-- Fluent's 104 DIP minimum overflows compact rows with long translations. -->
+        <Trigger Property="Orientation" Value="Horizontal">
+          <Setter Property="MinWidth" Value="60"/>
+        </Trigger>
+      </Style.Triggers>
+    </Style>
+    <Style x:Key="VolumeMuteButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+      <Setter Property="MinWidth" Value="64"/>
+      <Setter Property="Padding" Value="8,4"/>
+      <Setter Property="Margin" Value="10,0,0,0"/>
+      <Setter Property="FontSize" Value="11"/>
+      <Setter Property="ContentTemplate">
+        <Setter.Value>
+          <DataTemplate>
+            <TextBlock Text="{Binding}" MaxWidth="90" TextWrapping="Wrap" TextAlignment="Center"/>
+          </DataTemplate>
+        </Setter.Value>
+      </Setter>
     </Style>
   </Window.Resources>
   <Border BorderBrush="{DynamicResource LineBrush}" BorderThickness="1" Padding="16" Background="{DynamicResource CanvasBrush}">
-    <Grid>
+    <Grid Grid.IsSharedSizeScope="True">
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
@@ -150,16 +169,20 @@
                       </Viewbox>
                     </Button>
                     <Grid Grid.Row="1" Grid.ColumnSpan="3" Margin="0,9,0,0" Visibility="{Binding HasSingleVolume, Converter={StaticResource BoolVisibility}}">
+                      <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                      </Grid.RowDefinitions>
                       <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="108"/>
+                        <ColumnDefinition Width="Auto" SharedSizeGroup="VolumeLabel"/>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="40"/>
-                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto" SharedSizeGroup="VolumeMute"/>
                       </Grid.ColumnDefinitions>
-                      <TextBlock Text="{Binding VolumeStatus}" Style="{StaticResource Hint}" VerticalAlignment="Center" TextWrapping="Wrap" Margin="0,0,8,0"/>
-                      <Slider IsEnabled="{Binding CanSetVolume}" Style="{StaticResource VolumeSlider}" Grid.Column="1" Minimum="0" Maximum="100" TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding Volume, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Center" AutomationProperties.Name="{loc:Text 'Device volume'}" PreviewMouseLeftButtonDown="OnSliderPreviewMouseLeftButtonDown"/>
+                      <Slider Grid.Column="1" IsEnabled="{Binding CanSetVolume}" Style="{StaticResource VolumeSlider}" Minimum="0" Maximum="100" TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding Volume, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Center" AutomationProperties.Name="{loc:Text 'Device volume'}" PreviewMouseLeftButtonDown="OnSliderPreviewMouseLeftButtonDown"/>
                       <TextBlock Grid.Column="2" Text="{Binding VolumeText}" HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="{DynamicResource MutedBrush}"/>
-                      <Button Grid.Column="3" Content="{Binding MuteLabel}" Command="{Binding MuteCommand}" AutomationProperties.Name="{Binding MuteLabel}" Width="64" Padding="8,4" Margin="10,0,0,0" FontSize="11"/>
+                      <Button Grid.Column="3" Style="{StaticResource VolumeMuteButton}" Content="{Binding MuteLabel}" Command="{Binding MuteCommand}" AutomationProperties.Name="{Binding MuteLabel}"/>
+                      <TextBlock Grid.Row="1" Grid.ColumnSpan="4" Text="{Binding VolumeStatus}" Style="{StaticResource Hint}" TextWrapping="Wrap" Margin="0,4,0,0" Visibility="{Binding VolumeStatus, Converter={StaticResource NonEmpty}}"/>
                     </Grid>
                     <ItemsControl Grid.Row="2" Grid.ColumnSpan="3" ItemsSource="{Binding MemberVolumes}" Margin="0,8,0,0">
                       <ItemsControl.ItemTemplate>
@@ -203,15 +226,15 @@
         <Border Padding="12" Margin="0,0,0,10" CornerRadius="10" Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource LineBrush}" BorderThickness="1" Visibility="{Binding Settings.ShowMasterControl, Converter={StaticResource BoolVisibility}}">
           <Grid>
             <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="108"/>
-            <ColumnDefinition Width="*"/>
-            <ColumnDefinition Width="40"/>
-            <ColumnDefinition Width="Auto"/>
-          </Grid.ColumnDefinitions>
-          <TextBlock Text="{loc:Text 'Master volume'}" VerticalAlignment="Center" Margin="0,0,14,0" FontWeight="SemiBold"/>
+              <ColumnDefinition Width="Auto" SharedSizeGroup="VolumeLabel"/>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="40"/>
+              <ColumnDefinition Width="Auto" SharedSizeGroup="VolumeMute"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Text="{loc:Text 'Master volume'}" VerticalAlignment="Center" Margin="0,0,8,0" FontWeight="SemiBold"/>
             <Slider Style="{StaticResource VolumeSlider}" Grid.Column="1" Minimum="0" Maximum="100" TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding MasterVolume, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Center" AutomationProperties.Name="{loc:Text 'Master volume'}" PreviewMouseLeftButtonDown="OnSliderPreviewMouseLeftButtonDown"/>
             <TextBlock Grid.Column="2" Text="{Binding MasterVolume, StringFormat={}{0}%}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
-            <Button Grid.Column="3" Content="{Binding MuteLabel}" Command="{Binding MuteCommand}" AutomationProperties.Name="{Binding MuteLabel}" Width="64" Padding="8,4" Margin="10,0,0,0" FontSize="11"/>
+            <Button Grid.Column="3" Style="{StaticResource VolumeMuteButton}" Content="{Binding MuteLabel}" Command="{Binding MuteCommand}" AutomationProperties.Name="{Binding MuteLabel}"/>
           </Grid>
         </Border>
       </StackPanel>

@@ -1,5 +1,10 @@
 using System.Windows;
+using System.Windows.Automation;
+using System.Windows.Automation.Peers;
+using System.Windows.Automation.Provider;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Media;
 using System.Windows.Threading;
 using AirFlash.App.Services;
 using AirFlash.App.Ui;
@@ -478,7 +483,8 @@ internal static class UiRegression
                     return origin.X >= 0 && origin.X + element.ActualWidth <= panel.ActualWidth + 1;
                 }) && controls.OfType<Slider>().All(slider => slider.ActualWidth >= 60),
                     $"{label}: volume sliders, buttons and latency selector fit the compact panel", checks);
-                foreach (var scale in new[] { 1d, 1.25d })
+                await CheckCompactVolumeLayoutAsync(panel, app, engine, receiver, label, checks, directory);
+                foreach (var scale in new[] { 1d, 1.25d, 1.5d, 2d })
                     UiSmoke.Render(panel, Path.Combine(directory, $"compact-panel-{label}-{scale * 100}.png"), scale);
                 var playingHeight = panel.ActualHeight;
                 await app.Session.StopAsync();
@@ -489,6 +495,120 @@ internal static class UiRegression
                 UiSmoke.Render(panel, Path.Combine(directory, $"compact-panel-{label}-stopped.png"), 1);
             }
             finally { panel.ShutdownPanel(); }
+        }
+    }
+    private static async Task CheckCompactVolumeLayoutAsync(ControlPanel panel, AppViewModel app,
+        UiSmoke.MockFactory engine, Receiver receiver, string label, List<string> checks, string directory)
+    {
+        var sliders = UiSmoke.Descendants(panel).OfType<Slider>().Where(slider => slider.IsVisible).ToArray();
+        var master = sliders.Single(slider => AutomationProperties.GetName(slider) == L.Get("Master volume"));
+        var device = sliders.Single(slider => AutomationProperties.GetName(slider) == L.Get("Device volume"));
+        var masterRow = (Grid)master.Parent;
+        var title = masterRow.Children.OfType<TextBlock>().Single(text => Grid.GetColumn(text) == 0);
+        var gap = master.TranslatePoint(new(), masterRow).X - title.TranslatePoint(new(title.ActualWidth, 0), masterRow).X;
+        Check(Math.Abs(gap - 8) <= 1,
+            $"{label}: master volume uses only an 8 DIP gap after its localized label", checks);
+
+        var deviceRow = (Grid)device.Parent;
+        var status = deviceRow.Children.OfType<TextBlock>().Single(text => Grid.GetRow(text) == 1);
+        var row = (ReceiverViewModel)device.DataContext;
+        var deviceWidth = device.ActualWidth;
+        var rowHeight = deviceRow.ActualHeight;
+        CheckStatus(false, "confirmed");
+        checks.Add($"{label}: volume layout measured at {VisualTreeHelper.GetDpi(panel).PixelsPerDip * 100:0}% physical display scaling");
+
+        device.SetCurrentValue(Slider.ValueProperty, 50d);
+        await Until(() => row.VolumeStatus == L.Get("Synchronizing…")); await Pump();
+        CheckStatus(true, "pending");
+        UiSmoke.Render(panel, Path.Combine(directory, $"compact-volume-{label}-pending-125.png"), 1.25);
+        await Until(() => row.Volume == 50 && row.VolumeStatus.Length == 0); await Pump();
+        CheckStatus(false, "confirmed after edit");
+        foreach (var state in new[] { "unconfirmed", "unsynced", "confirmed" })
+        {
+            engine.EmitEvent!(new { @event = "device_volume", host = receiver.Address, volume = 50,
+                sequence = app.ReceiverVolume(receiver.Id).Sequence, status = state, available = true });
+            await Until(() => app.ReceiverVolume(receiver.Id).Status == state); await Pump();
+            CheckStatus(state != "confirmed", state);
+        }
+
+        foreach (var slider in new[] { master, device })
+        {
+            slider.SetCurrentValue(Slider.ValueProperty, 50d);
+            if (slider == device) await Until(() => row.Volume == 50 && row.VolumeStatus.Length == 0);
+            await Pump();
+            var track = (Track)slider.Template.FindName("PART_Track", slider);
+            var travel = track.ActualWidth - track.Thumb.ActualWidth;
+            foreach (var value in new[] { 0, 50, 100 })
+            {
+                var position = track.Thumb.ActualWidth / 2 + travel * value / 100;
+                var point = track.TranslatePoint(new(position, track.ActualHeight / 2), slider);
+                Check(slider.InputHitTest(point) is DependencyObject hit && (hit == slider || slider.IsAncestorOf(hit))
+                    && VolumeSliderMath.ValueFromPosition(position, track.ActualWidth, track.Thumb.ActualWidth, 0, 100) == value,
+                    $"{label}: {AutomationProperties.GetName(slider)} track is clickable at {value}%", checks);
+            }
+            foreach (var value in new[] { 100, 0, 50 })
+            {
+                var delta = (value - slider.Value) / 100 * (track.ActualWidth - track.Thumb.ActualWidth);
+                track.Thumb.RaiseEvent(new DragDeltaEventArgs(delta, 0) { RoutedEvent = Thumb.DragDeltaEvent });
+                await Until(() => slider == master ? app.MasterVolume == value : row.Volume == value && row.VolumeStatus.Length == 0);
+                await Pump();
+                var grid = (Grid)slider.Parent;
+                var percent = grid.Children.OfType<TextBlock>().Single(text => Grid.GetRow(text) == 0 && Grid.GetColumn(text) == 2);
+                var button = grid.Children.OfType<Button>().Single();
+                Check(slider.Value == value && percent.Text == $"{value}%"
+                    && slider.TranslatePoint(new(slider.ActualWidth, 0), grid).X <= percent.TranslatePoint(new(), grid).X + 1
+                    && percent.TranslatePoint(new(percent.ActualWidth, 0), grid).X <= button.TranslatePoint(new(), grid).X,
+                    $"{label}: dragging {AutomationProperties.GetName(slider)} to {value}% preserves binding and non-overlapping readout", checks);
+                CheckMuteButton(slider, button);
+            }
+        }
+
+        var deviceMute = deviceRow.Children.OfType<Button>().Single();
+        await InvokeAsync(deviceMute); await Until(() => row.Muted && row.VolumeStatus.Length == 0);
+        await Pump(); CheckMuteButton(device, deviceMute);
+        UiSmoke.Render(panel, Path.Combine(directory, $"compact-volume-{label}-muted-125.png"), 1.25);
+        await InvokeAsync(deviceMute); await Until(() => row.Volume == 50 && row.VolumeStatus.Length == 0);
+        Check(!row.Muted, $"{label}: device mute button restores the volume after layout changes", checks);
+        var masterMute = masterRow.Children.OfType<Button>().Single();
+        await InvokeAsync(masterMute); await Until(() => app.Muted);
+        await Pump(); CheckMuteButton(master, masterMute);
+        UiSmoke.Render(panel, Path.Combine(directory, $"compact-volume-{label}-master-muted-125.png"), 1.25);
+        await InvokeAsync(masterMute); await Until(() => !app.Muted);
+        Check(app.MasterVolume == 50, $"{label}: master mute button preserves the volume after layout changes", checks);
+        master.SetCurrentValue(Slider.ValueProperty, 100d); await Pump();
+
+        static async Task InvokeAsync(Button button)
+        {
+            await Until(() => button.IsEnabled);
+            ((IInvokeProvider)new ButtonAutomationPeer(button).GetPattern(PatternInterface.Invoke)!).Invoke();
+        }
+
+        void CheckMuteButton(Slider slider, Button button)
+        {
+            CheckAlignedSliders();
+            var text = UiSmoke.Descendants(button).OfType<TextBlock>().Single();
+            var bounds = text.TransformToAncestor(button).TransformBounds(new Rect(text.RenderSize));
+            Check(slider.ActualWidth >= 60 && bounds.Left >= 0 && bounds.Right <= button.ActualWidth + 1
+                && bounds.Top >= 0 && bounds.Bottom <= button.ActualHeight + 1
+                && text.ActualWidth + 1 >= text.DesiredSize.Width && text.ActualHeight + 1 >= text.DesiredSize.Height,
+                $"{label}: {AutomationProperties.GetName(slider)} '{button.Content}' fits while retaining a usable slider", checks);
+        }
+
+        void CheckStatus(bool visible, string state)
+        {
+            CheckAlignedSliders();
+            Check(Math.Abs(device.ActualWidth - deviceWidth) <= 1
+                && (visible ? status.IsVisible && status.TranslatePoint(new(), deviceRow).Y >= device.ActualHeight
+                    : status.Visibility == Visibility.Collapsed && Math.Abs(deviceRow.ActualHeight - rowHeight) <= 1),
+                $"{label}: {state} volume status sits below a stable-width slider and leaves no empty row", checks);
+        }
+
+        void CheckAlignedSliders()
+        {
+            var masterStart = master.TranslatePoint(new(), panel).X;
+            var deviceStart = device.TranslatePoint(new(), panel).X;
+            Check(Math.Abs(masterStart - deviceStart) <= 1 && Math.Abs(master.ActualWidth - device.ActualWidth) <= 1,
+                $"{label}: device and master volume tracks share the same start and width", checks);
         }
     }
     private static async Task Pump() { await Application.Current.Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle); await Task.Delay(20); }
