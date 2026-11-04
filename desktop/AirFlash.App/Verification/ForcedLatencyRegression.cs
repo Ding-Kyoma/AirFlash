@@ -82,11 +82,11 @@ internal static class ForcedLatencyRegression
         engine.EmitEvent!(new { @event = "capture_metrics", metrics = new { underrun_packets = 0 } });
         await Until(() => app.LatencyDetail.Contains(L.Format("Receiver reports a minimum of {0} ms.", 1000)));
         Check(app.Snapshot.State == PlaybackState.Streaming
-            && app.LatencyDetail.Contains(L.Get("Force fixed latency"))
+            && app.Settings.ForceLatency
             && app.LatencyDetail.Contains(L.Format("Below the receiver's reported minimum: continuing at {0} ms. Playback may be rejected or silent.", 750)),
             "receiver minimum warning stays visible without blocking playback", checks);
         var panel = new ControlPanel(app); panel.Show(); await Pump();
         try { Render(panel, Path.Combine(directory, "forced-latency-warning.png"), 1); }
-        finally { panel.Close(); }
+        finally { panel.ShutdownPanel(); }
     }
 }

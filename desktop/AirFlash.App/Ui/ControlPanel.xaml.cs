@@ -14,6 +14,7 @@ namespace AirFlash.App.Ui;
 
 public partial class ControlPanel : Window
 {
+    public const double CompactWidth = 400;
     private readonly AppViewModel _viewModel;
     private bool _allowClose;
     private bool _placing;
@@ -27,19 +28,10 @@ public partial class ControlPanel : Window
     public ControlPanel(AppViewModel viewModel)
     {
         InitializeComponent(); _viewModel = viewModel; DataContext = viewModel; WindowThemeService.Track(this); AppIconService.Track(this);
-        viewModel.SettingsChanged += UpdateLayoutSettings;
         viewModel.Receivers.CollectionChanged += OnReceiversChanged;
         IsVisibleChanged += (_, _) => viewModel.SetPanelVisible(IsVisible);
         SizeChanged += (_, _) => { if (!_placing) RequestPlacement(); };
         DpiChanged += (_, _) => RequestPlacement();
-        UpdateLayoutSettings();
-    }
-    private void UpdateLayoutSettings()
-    {
-        var width = _viewModel.Settings.ShowWiderVolume ? 520 : 440;
-        if (Width == width) return;
-        Width = width;
-        RequestPlacement();
     }
     public void ToggleFromTray()
     {
@@ -48,6 +40,7 @@ public partial class ControlPanel : Window
     }
     public void ShowPanel()
     {
+        Width = CompactWidth;
         Show(); RequestPlacement(); Activate();
     }
     public void RequestPlacement()
@@ -64,11 +57,14 @@ public partial class ControlPanel : Window
             UiPerformance.Count("panel.place");
             var area = Tray?.WorkArea() ?? NativeWindowPlacement.CursorWorkArea();
             var maxDip = area.Rect.Height * .7 / area.Scale;
-            var constraintsChanged = MaxHeight != maxDip;
+            var constraintsChanged = MaxHeight != maxDip || Width != CompactWidth;
+            Width = CompactWidth;
             DeviceScroll.MaxHeight = Math.Max(80, maxDip - 280);
             MaxHeight = maxDip;
             if (constraintsChanged || ActualHeight <= 0) UpdateLayout();
-            NativeWindowPlacement.Place(this, area, Width, ActualHeight);
+            // Native placement converts this DIP width to monitor pixels once.
+            // Never reuse a width fed back by a native resize or a DPI transition.
+            NativeWindowPlacement.Place(this, area, CompactWidth, ActualHeight);
         }
         finally { _placing = false; }
     }
@@ -119,7 +115,6 @@ public partial class ControlPanel : Window
         => RequestPlacement();
     public void ShutdownPanel()
     {
-        _viewModel.SettingsChanged -= UpdateLayoutSettings;
         _viewModel.Receivers.CollectionChanged -= OnReceiversChanged;
         _placement?.Abort();
         _allowClose = true; Close();

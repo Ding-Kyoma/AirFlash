@@ -15,6 +15,7 @@ internal static class UiRegression
         await StopRegression.RunAsync(checks, directory);
         await ForcedLatencyRegression.RunAsync(checks, directory);
         await LatencyEntryRegression.RunAsync(checks);
+        await RunCompactPanelRegressionAsync(checks, directory);
         var store = new UiSmoke.MemoryStore(); var audio = new UiSmoke.MockAudio();
         var autostart = new UiSmoke.MockAutostart(); var discovery = new UiSmoke.MockDiscovery();
         var engine = new UiSmoke.MockFactory();
@@ -429,6 +430,66 @@ internal static class UiRegression
         await using var hiddenApp = new AppViewModel(hiddenStore, hiddenDiscovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), new UiSmoke.MockFactory(), Application.Current.Dispatcher);
         hiddenApp.Start(); await hiddenApp.Startup; await Pump();
         Check(hiddenDiscovery.Starts == 0, "hidden per-device automatic connection does not request startup discovery", checks);
+    }
+    private static async Task RunCompactPanelRegressionAsync(List<string> checks, string directory)
+    {
+        var left = new Receiver("compact-left", "家庭影院", "127.0.0.1");
+        var right = new Receiver("compact-right", "家庭影院 (2)", "127.0.0.2");
+        var stereo = new Receiver("stereo:compact", left.Name, left.Address) { Members = [left, right] };
+        foreach (var receiver in new[] { left, stereo })
+        {
+            var label = receiver.IsGroup ? "stereo" : "single";
+            var store = new UiSmoke.MemoryStore(); var saved = store.Load();
+            saved.LatencyMode = "realtime"; store.Save(saved);
+            var engine = new UiSmoke.MockFactory();
+            await using var app = new AppViewModel(store, new UiSmoke.MockDiscovery { Items = [receiver] },
+                new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+            app.SetPanelVisible(true); app.Start(); await app.Startup; await Pump();
+            var panel = new ControlPanel(app);
+            try
+            {
+                await app.Session.StartAsync(receiver, app.Settings);
+                await Until(() => app.Snapshot.State == PlaybackState.Streaming);
+                foreach (var member in receiver.Peers)
+                    engine.EmitEvent!(new { @event = "negotiated", receiver_id = member.Id, host = member.Address,
+                        codec = "alac", transport = "realtime", timing = "ptp", requested_latency_ms = 120, effective_latency_ms = 120 });
+                engine.EmitEvent!(new { @event = "capture_metrics", metrics = new { underrun_packets = 0 } });
+                var count = receiver.Peers.Count();
+                await Until(() => app.LatencyDetail.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length == count);
+                panel.ShowPanel(); await Pump();
+                var status = (TextBlock)panel.FindName("StatusDetailText");
+                var latency = (TextBlock)panel.FindName("LatencyDetailText");
+                Check(status.Visibility == Visibility.Collapsed && latency.IsVisible
+                    && latency.ActualHeight <= count * latency.LineHeight + 1,
+                    $"{label}: normal playback shows one latency line per HomePod without duplicate summary or policy rows", checks);
+                Check(app.StatusDetail.Length > 0 && app.Diagnostics().Contains(app.StatusDetail, StringComparison.Ordinal),
+                    $"{label}: the full status summary remains available to monitoring and diagnostics", checks);
+                for (var i = 0; i < 4; i++)
+                {
+                    panel.Hide(); panel.ShowPanel(); panel.Place(); await Pump();
+                    Check(Math.Abs(panel.ActualWidth - 400) <= 1,
+                        $"{label}: opening {i + 1} keeps the panel at 400 DIP", checks);
+                }
+                var controls = UiSmoke.Descendants(panel).OfType<FrameworkElement>()
+                    .Where(element => element.IsVisible && element is Button or ComboBox or Slider).ToArray();
+                Check(controls.All(element =>
+                {
+                    var origin = element.TranslatePoint(new(0, 0), panel);
+                    return origin.X >= 0 && origin.X + element.ActualWidth <= panel.ActualWidth + 1;
+                }) && controls.OfType<Slider>().All(slider => slider.ActualWidth >= 60),
+                    $"{label}: volume sliders, buttons and latency selector fit the compact panel", checks);
+                foreach (var scale in new[] { 1d, 1.25d })
+                    UiSmoke.Render(panel, Path.Combine(directory, $"compact-panel-{label}-{scale * 100}.png"), scale);
+                var playingHeight = panel.ActualHeight;
+                await app.Session.StopAsync();
+                await Until(() => app.Snapshot.State == PlaybackState.Idle); await Pump();
+                Check(status.IsVisible && latency.Visibility == Visibility.Collapsed && app.LatencyDetail.Length == 0
+                    && (count == 1 || panel.ActualHeight < playingHeight),
+                    $"{label}: stopping clears latency rows and their spacing, and restores the ready prompt", checks);
+                UiSmoke.Render(panel, Path.Combine(directory, $"compact-panel-{label}-stopped.png"), 1);
+            }
+            finally { panel.ShutdownPanel(); }
+        }
     }
     private static async Task Pump() { await Application.Current.Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle); await Task.Delay(20); }
     private static async Task Until(Func<bool> condition)

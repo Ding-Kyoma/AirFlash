@@ -61,15 +61,14 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         ? L.Format("{0} · target {1} ms", _snapshot.Receiver?.Name, _snapshot.TargetLatency)
             + (_snapshot.PendingLatency is { } target ? " · " + L.Format("Adjusting to {0} ms…", target) : "")
         : L.Get("Select a receiver to play system audio");
+    public string PanelStatusDetail => !IsStopping && !Session.NeedsCleanup && _snapshot.State == PlaybackState.Streaming
+        && _snapshot.Message.Length == 0 && _snapshot.PendingLatency is null ? "" : StatusDetail;
     public string LatencyDetail
     {
         get
         {
             if (!_snapshot.IsActive || _snapshot.Receiver is not { } receiver) return "";
-            var targets = receiver.IsSoftwareGroup ? receiver.Peers : [receiver];
-            var policy = LatencyPolicy.Forced(_settings, receiver) ? L.Get("Force fixed latency")
-                : L.Get("Fixed target · recovery enabled");
-            var details = new List<string> { policy };
+            var details = new List<string>();
             foreach (var item in _snapshot.Diagnostics?.Negotiated ?? [])
             {
                 if (item.Number("effective_latency_ms") is not { } effective || item.Number("requested_latency_ms") is not { } requested) continue;
@@ -427,7 +426,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         _snapshot = snapshot;
         if (Session.RequiresManualReconnect) _autoSuppressed = true;
         RefreshGlobalLatency();
-        Notify(nameof(Snapshot)); Notify(nameof(LatencyDetail));
+        Notify(nameof(Snapshot)); Notify(nameof(LatencyDetail)); Notify(nameof(PanelStatusDetail));
         if (title != StatusTitle) Notify(nameof(StatusTitle));
         if (detail != StatusDetail) Notify(nameof(StatusDetail));
         if (errors != ErrorDetails) Notify(nameof(ErrorDetails));
@@ -523,7 +522,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     }
     private void RefreshStopUi()
     {
-        Notify(nameof(IsStopping)); Notify(nameof(StatusTitle)); Notify(nameof(StatusDetail)); Notify(nameof(CanReconnect));
+        Notify(nameof(IsStopping)); Notify(nameof(StatusTitle)); Notify(nameof(StatusDetail)); Notify(nameof(PanelStatusDetail)); Notify(nameof(CanReconnect));
         RefreshGlobalLatency(); StopCommand.Refresh(); ReconnectCommand.Refresh();
         foreach (var row in Receivers) row.Refresh();
     }
