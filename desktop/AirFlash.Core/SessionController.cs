@@ -625,6 +625,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         // count and the compact sequence) instead of only the latest reason.
         var reconnects = 0;
         var transportFaults = new List<string>();
+        var recovering = false;
         while (!cancellation.IsCancellationRequested)
         {
             var attemptIntent = intent;
@@ -768,6 +769,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         }
                         if (kind == "streaming")
                         {
+                            recovering = false;
                             AcceptLatency(item);
                             startedAt = Stopwatch.GetTimestamp();
                             lock (_sync) { if (epoch != _generation) continue; _transportStreaming = true; }
@@ -778,6 +780,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         }
                         else if (kind == "standby")
                         {
+                            recovering = false;
                             recoveryHealth.ResetStability();
                             lock (_sync) _adaptive.Suspend();
                             startedAt = Stopwatch.GetTimestamp();
@@ -906,7 +909,9 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                     log?.Invoke($"Session automatic recovery blocked; code={notice.Code}; manual_reconnect_required=true");
                     return;
                 }
-                if (!(_settings.ForceReconnect || receiver.IsSoftwareGroup || notice.Code is "timeline_expired" or "clock_lost" or "adaptive_rebuild") || attempts > _settings.MaxReconnectAttempts || notice.Retryable == false || notice.Retryable is null && IsAuthenticationFailure(error.Message)) return;
+                var recoveryAllowed = _settings.ForceReconnect || receiver.IsSoftwareGroup || notice.Code is "timeline_expired" or "clock_lost" or "adaptive_rebuild" || (recovering && (notice.Code is "host_error" or "network_error" || notice.Retryable == true));
+                if (!recoveryAllowed || attempts > _settings.MaxReconnectAttempts || notice.Retryable == false || notice.Retryable is null && IsAuthenticationFailure(error.Message)) return;
+                recovering = true;
                 // This is the one reconnect notion the desktop already has; the
                 // companion record only reports it, it does not add a second one.
                 ++reconnects;
