@@ -84,6 +84,14 @@ public sealed class SettingsTests
         Assert.Null(settings.Validate());
         Assert.Equal("de", settings.Clone().UiLanguage);
     }
+
+    [Fact]
+    public void SpanishLanguageIsAcceptedAndPersists()
+    {
+        var settings = new AppSettings { UiLanguage = "es" };
+        Assert.Null(settings.Validate());
+        Assert.Equal("es", settings.Clone().UiLanguage);
+    }
     [Fact]
     public void FirstRunDefaultsMatchStartupPage()
     {
