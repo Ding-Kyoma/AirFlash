@@ -1,13 +1,14 @@
-# AirFlash 0.6.2
+# AirFlash 0.6.3
 
-Changes since AirFlash 0.6.1.
+Changes since AirFlash 0.6.2.
 
 ## Bug Fixes
 
-- Keep the control panel at a compact 400-DIP width when reopened, repositioned, or moved between displays with different scaling.
-- Simplify normal playback details to one latency line per receiver, hiding duplicate status and policy summaries while keeping warnings and recovery prompts visible. Full status details remain available in monitoring and diagnostics.
-- Clear latency rows and their spacing after playback stops, and restore the ready prompt.
+- Align device and master volume sliders in the compact control panel across supported interface languages.
+- Show volume synchronization messages below the device slider without changing its width, and remove the extra row when synchronization completes.
+- Keep translated mute and unmute labels within their buttons while preserving usable slider space.
+- Restore rounded corners on the tray control panel.
 
-Automated UI regression coverage includes single receivers and stereo groups, repeated panel opening, control layout, and stopping playback. No real HomePod playback test was performed for this release.
+Automated UI regression coverage includes single receivers and stereo groups, localized volume layouts, slider dragging, mute and unmute actions, synchronization messages, and stopping playback. No real HomePod playback test was performed for this release.
 
-Download **AirFlash-0.6.2.msi** or portable **AirFlash.exe**; verify with **SHA256SUMS.txt**. Binaries are unsigned.
+Download **AirFlash-0.6.3.msi** or portable **AirFlash.exe**; verify with **SHA256SUMS.txt**. Binaries are unsigned.
