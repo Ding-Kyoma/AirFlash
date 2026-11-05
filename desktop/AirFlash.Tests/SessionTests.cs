@@ -59,6 +59,31 @@ public sealed class SessionTests
             Assert.All(start.GetProperty("peers").EnumerateArray(), peer => Assert.Equal(50, peer.GetProperty("profile").Integer("latency_ms")));
         }
     }
+    [Fact]
+    public async Task TimelineExpiredRecoverySurvivesTransientConnectFailureAndReconnects()
+    {
+        var first = new FakeConnection();
+        var second = new FakeConnection();
+        second.BeforeSend = (cmd, ct) =>
+        {
+            if (cmd.CommandName == "start") throw new IOException("connect 192.168.0.x:7000");
+            return Task.CompletedTask;
+        };
+        var third = new FakeConnection();
+        var factory = new FakeFactory(first, second, third);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        var settings = Settings();
+        settings.ForceReconnect = false;
+        await controller.StartAsync(Pod(), settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+
+        first.EmitData(new { @event = "error", code = "timeline_expired", retryable = true });
+
+        await third.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.Equal(PlaybackState.Streaming, controller.Snapshot.State);
+        Assert.Equal(3, factory.OpenCount);
+    }
     [Theory]
     [InlineData("custom", true, true)]
     [InlineData("custom", false, false)]
