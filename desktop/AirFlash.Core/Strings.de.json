@@ -387,5 +387,19 @@
   "Stopping playback and disconnecting…": "Wiedergabe wird gestoppt und die Verbindung getrennt…",
   "The audio engine could not stop. Try disconnecting again.": "Die Audio-Engine konnte nicht beendet werden. Versuchen Sie erneut, die Verbindung zu trennen.",
   "In the Home app, set speaker access to “Everyone,” then try again.": "Legen Sie in der Home-App den Lautsprecherzugriff auf „Alle“ fest, und versuchen Sie es dann erneut.",
-  "Receiver session ownership could not be confirmed. Automatic recovery is paused. Reconnect manually to continue.": "Die Sitzung des Empfängers konnte nicht bestätigt werden. Die automatische Wiederherstellung ist pausiert. Verbinden Sie sich manuell erneut, um fortzufahren."
+  "Receiver session ownership could not be confirmed. Automatic recovery is paused. Reconnect manually to continue.": "Die Sitzung des Empfängers konnte nicht bestätigt werden. Die automatische Wiederherstellung ist pausiert. Verbinden Sie sich manuell erneut, um fortzufahren.",
+  "Software groups": "Software-Gruppen",
+  "Multi-room": "Multiroom",
+  "Multi-room · {0} speakers": "Multiroom · {0} Lautsprecher",
+  "Create multi-room group": "Multiroom-Gruppe erstellen",
+  "Two independent receivers for stereo, or multiple receivers for synchronized multi-room playback. Positive offset delays that member.": "Zwei unabhängige Empfänger für Stereo oder mehrere Empfänger für synchrone Multiroom-Wiedergabe. Ein positiver Offset verzögert dieses Mitglied.",
+  "Speakers": "Lautsprecher",
+  "＋ Add speaker": "＋ Lautsprecher hinzufügen",
+  "Remove speaker": "Lautsprecher entfernen",
+  "Offset / ms (−500 to +500)": "Offset / ms (−500 bis +500)",
+  "Waiting for other members": "Warten auf andere Mitglieder",
+  "Multi-room groups require distinct independent receivers.": "Multiroom-Gruppen erfordern voneinander verschiedene unabhängige Empfänger.",
+  "Multi-room groups require at least two distinct independent receivers.": "Multiroom-Gruppen erfordern mindestens zwei voneinander verschiedene unabhängige Empfänger.",
+  "All multi-room members must be online.": "Alle Multiroom-Mitglieder müssen online sein.",
+  "Wait until all multi-room members are online before pairing.": "Warten Sie vor dem Koppeln, bis alle Multiroom-Mitglieder online sind."
 }

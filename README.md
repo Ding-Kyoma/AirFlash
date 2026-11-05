@@ -40,7 +40,8 @@ or a similar tool, and route the audio you want to stream to that endpoint.
 
 - Streams Windows system audio to HomePod over AirPlay 2.
 - Supports synchronized playback on existing two-device HomePod stereo pairs.
-- Adds experimental two-receiver software stereo groups, independent hardware volume,
+- Adds software groups: two-receiver stereo pairs and multi-room groups (3+ receivers) with
+  synchronized playback, per-receiver synchronization offsets, independent hardware volume,
   per-receiver PCM/ALAC and UDP/TCP profiles, and 5 ms continuity transitions.
 - Offers automatic device discovery, PIN pairing, and manual device setup.
 - Lets you filter device discovery by selecting a network adapter in Settings.
@@ -77,8 +78,9 @@ prefers a supported 44.1 kHz profile, then 48 kHz. Its label shows the expected
 selection before playback and the negotiated selection while playing; unapplied
 edits continue to show predictions. Offline or undetected receivers offer Automatic
 and retain existing explicit settings as pending verification. Native stereo pairs
-use their members' common capabilities. Software stereo groups control both members'
-common sample rate and default to 44.1 kHz.
+use their members' common capabilities. Software stereo and multi-room groups control all members'
+common sample rate and default to 44.1 kHz. In **Settings > Receivers**, you can group
+speakers into Stereo (L/R) pairs or Multi-Room groups with custom per-speaker offsets (±500 ms).
 
 The control panel's **Global latency mode** changes the shared default. While the
 current connecting, playing, or standby receiver uses an independent latency mode,
