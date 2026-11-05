@@ -2,7 +2,8 @@
 
 <p align="center">
   <a href="../README.md">English</a> ·
-  <a href="README.zh-CN.md">简体中文</a>
+  <a href="README.zh-CN.md">简体中文</a> ·
+  <a href="README.es.md">Español</a>
 </p>
 
 <p align="center">
@@ -43,7 +44,7 @@ AirFlash 提供 Windows x64 可执行文件和可独立运行的 MSI 安装包�
 - 在设置中提供 10 段均衡器，支持音效预设和即时试听。
 - 支持采集指定应用及其子进程，或播放与录音端点，包括虚拟音频设备。
 - 支持静音超时后释放 AirPlay 会话，并在检测到声音后自动恢复。
-- 提供便携式 Windows x64 程序，支持英文、简体中文、繁体中文和德文界面。
+- 提供便携式 Windows x64 程序，支持英文、简体中文、繁体中文、德文和西班牙文界面。
 
 ## 功能计划
 

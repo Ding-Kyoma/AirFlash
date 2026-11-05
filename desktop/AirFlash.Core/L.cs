@@ -10,6 +10,7 @@ public static class L
     private static readonly Dictionary<string, string> ChineseSimplified = LoadStrings("AirFlash.Core.Strings.zh.json");
     private static readonly Dictionary<string, string> ChineseTraditional = LoadStrings("AirFlash.Core.Strings.zh-TW.json");
     private static readonly Dictionary<string, string> German = LoadStrings("AirFlash.Core.Strings.de.json");
+    private static readonly Dictionary<string, string> Spanish = LoadStrings("AirFlash.Core.Strings.es.json");
     private static Dictionary<string, string> _strings = [];
     public static bool IsChinese { get; private set; }
 
@@ -24,6 +25,7 @@ public static class L
             var language = preference.Split('-')[0];
             if (language.Equals("zh", StringComparison.OrdinalIgnoreCase)) return "zh";
             if (language.Equals("de", StringComparison.OrdinalIgnoreCase)) return "de";
+            if (language.Equals("es", StringComparison.OrdinalIgnoreCase)) return "es";
             if (language.Equals("en", StringComparison.OrdinalIgnoreCase)) return "en";
         }
         return "en";
@@ -38,6 +40,7 @@ public static class L
             "zh-TW" => ChineseTraditional,
             "zh"    => ChineseSimplified,
             "de"    => German,
+            "es"    => Spanish,
             _       => []
         };
         var culture = CultureInfo.GetCultureInfo(lang switch
@@ -45,6 +48,7 @@ public static class L
             "zh-TW" => "zh-TW",
             "zh"    => "zh-CN",
             "de"    => "de-DE",
+            "es"    => "es-ES",
             _       => "en-US"
         });
         CultureInfo.CurrentUICulture = culture;
