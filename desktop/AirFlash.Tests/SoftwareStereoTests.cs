@@ -97,4 +97,95 @@ public sealed class SoftwareStereoTests
         Assert.Throws<IOException>(() => EngineHandshake.RequireStreamingCapabilities(System.Text.Json.JsonSerializer.SerializeToElement(new { version = 1, @event = "hello", capabilities = new[] { "continuity" } })));
         Assert.Equal((1ul << 41) | 1, ReceiverAggregator.ParseFeatures("0x1,0x200"));
     }
+    [Fact]
+    public void MultiRoomGroupResolvesAllMembersWithStereoChannelsAndCorrectDetail()
+    {
+        var settings = new AppSettings();
+        var group = new SoftwareStereoGroup
+        {
+            Id = "software:multi",
+            Name = "Whole Flat",
+            GroupMode = "multi_room",
+            Members = [
+                new() { ReceiverId = "a", OffsetMs = 0 },
+                new() { ReceiverId = "b", OffsetMs = -25 },
+                new() { ReceiverId = "c", OffsetMs = 50 },
+                new() { ReceiverId = "d", OffsetMs = 10 }
+            ],
+            SampleRate = "48000"
+        };
+        settings.SoftwareGroups.Add(group);
+        var catalog = new[]
+        {
+            Pod("a", "192.168.1.10"),
+            Pod("b", "192.168.1.11"),
+            Pod("c", "192.168.1.12"),
+            Pod("d", "192.168.1.13")
+        };
+        var resolved = SoftwareStereo.Resolve(catalog, settings).Single();
+        Assert.True(resolved.Complete);
+        Assert.True(resolved.Online);
+        Assert.Equal("multi_room", resolved.GroupMode);
+        Assert.Equal(4, resolved.Members.Length);
+        Assert.Equal("Multi-room · 4 speakers", resolved.Detail);
+        Assert.All(resolved.Members, m => Assert.Equal("stereo", m.Channel));
+        Assert.Equal(-25, resolved.Members[1].SyncOffsetMs);
+        Assert.Equal(50, resolved.Members[2].SyncOffsetMs);
+
+        var withOffline = SoftwareStereo.Resolve([catalog[0], catalog[1], catalog[2]], settings).Single();
+        Assert.False(withOffline.Complete);
+    }
+    [Fact]
+    public void MultiRoomValidationEnforcesMinimumMembersDistinctReceiversAndOffsets()
+    {
+        var settings = new AppSettings();
+        var group = new SoftwareStereoGroup
+        {
+            Id = "software:multi",
+            Name = "Living + Kitchen",
+            GroupMode = "multi_room",
+            Members = [
+                new() { ReceiverId = "a", OffsetMs = 0 },
+                new() { ReceiverId = "b", OffsetMs = 0 }
+            ]
+        };
+        settings.SoftwareGroups.Add(group);
+        Assert.Null(settings.Validate());
+
+        group.Members.RemoveAt(1);
+        Assert.NotNull(settings.Validate());
+
+        group.Members.Add(new() { ReceiverId = "a", OffsetMs = 0 });
+        Assert.NotNull(settings.Validate());
+
+        group.Members[1] = new() { ReceiverId = "b", OffsetMs = 501 };
+        Assert.NotNull(settings.Validate());
+    }
+    [Fact]
+    public void MultiRoomGroupMembershipRefusesAirPlay1And2Mix()
+    {
+        var settings = new AppSettings();
+        var group = new SoftwareStereoGroup
+        {
+            Id = "software:multi",
+            Name = "Mixed Group",
+            GroupMode = "multi_room",
+            Members = [
+                new() { ReceiverId = "ap2_1", OffsetMs = 0 },
+                new() { ReceiverId = "ap2_2", OffsetMs = 0 },
+                new() { ReceiverId = "classic", OffsetMs = 0 }
+            ]
+        };
+        settings.SoftwareGroups.Add(group);
+        var catalog = new[]
+        {
+            Pod("ap2_1", "192.168.1.10", AirPlayRouting.AirPlay2Feature, "366.0"),
+            Pod("ap2_2", "192.168.1.11", AirPlayRouting.AirPlay2Feature, "366.0"),
+            Pod("classic", "192.168.1.12", 0UL, "220.68")
+        };
+        var resolved = SoftwareStereo.Resolve(catalog, settings).Single();
+        Assert.False(resolved.Online);
+        Assert.False(resolved.Complete);
+        Assert.Empty(resolved.Members);
+    }
 }

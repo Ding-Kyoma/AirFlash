@@ -267,7 +267,7 @@ internal static class UiPairingInputs
                 _events.Writer.TryWrite(JsonSerializer.SerializeToElement(new
                 {
                     version = 1, session_id = session, @event = "hello",
-                    capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture" }
+                    capabilities = new[] { "receiver_profiles", "software_stereo", "multi_room", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture" }
                 }));
             var name = command switch { "pair" => JsonSerializer.SerializeToElement(parameters).Boolean("password_required") == true ? "password_required" : "pin_required", "pair_pin" => "paired", "start" => "streaming", _ => null };
             if (name is not null) _events.Writer.TryWrite(JsonSerializer.SerializeToElement(new { version = 1, session_id = session, @event = name }));

@@ -191,18 +191,19 @@ impl ProbeOptions {
             "unknown audio source"
         );
         ensure!(
-            !self.peers.is_empty() && self.peers.len() <= 2,
-            "probe supports one device or one stereo pair"
+            !self.peers.is_empty() && (self.peers.len() <= 2 || self.group_mode == "multi_room"),
+            "probe supports one device, one stereo pair, or a multi-room group"
         );
         ensure!(
             self.peers.iter().all(|p| p.host.is_ipv4() && p.port > 0),
             "IPv4 endpoint required"
         );
-        if self.peers.len() == 2 {
-            ensure!(self.peers[0].host != self.peers[1].host, "duplicate peer");
+        let mut seen_peers = std::collections::HashSet::new();
+        for peer in &self.peers {
+            ensure!(seen_peers.insert(peer.host), "duplicate peer");
         }
         ensure!(
-            ["", "single", "native_stereo", "software_stereo"].contains(&self.group_mode.as_str()),
+            ["", "single", "native_stereo", "software_stereo", "multi_room"].contains(&self.group_mode.as_str()),
             "invalid group mode"
         );
         for peer in &self.peers {
@@ -227,6 +228,17 @@ impl ProbeOptions {
                         .iter()
                         .any(|p| p.profile.channel == crate::profile::Channel::Right),
                 "software stereo requires one left and one right member"
+            );
+        } else if self.group_mode == "multi_room" {
+            ensure!(
+                self.peers.len() >= 2,
+                "multi-room requires at least two members"
+            );
+            ensure!(
+                self.peers
+                    .iter()
+                    .all(|p| p.profile.channel == crate::profile::Channel::Stereo),
+                "multi-room members must use stereo channel routing"
             );
         } else {
             ensure!(
@@ -2178,7 +2190,7 @@ fn send_packets(
         .iter()
         .map(|m| (m.peer.host.to_string(), m.uri.clone(), m.conn.clone()))
         .collect::<Vec<_>>();
-    let volume_workers = if options.group_mode == "software_stereo" {
+    let volume_workers = if options.group_mode == "software_stereo" || options.group_mode == "multi_room" {
         volume_peers
             .iter()
             .cloned()
@@ -2834,6 +2846,7 @@ fn session_summary(
     // qualification call) falls back to the member count.
     let topology = match options.group_mode.as_str() {
         "software_stereo" => "software_stereo",
+        "multi_room" => "multi_room",
         "native_stereo" => "native_stereo",
         "single" => "single",
         _ if members.len() > 1 => "group",
@@ -6151,6 +6164,60 @@ mod tests {
         o.sample_rate = 48000;
         assert!(o.validate().is_ok());
         o.sample_rate = 96000;
+        assert!(o.validate().is_err());
+    }
+
+    #[test]
+    fn multi_room_options_validation() {
+        let make_peer = |ip: &str, ch: crate::profile::Channel| Peer {
+            receiver_id: "pod".into(),
+            host: ip.parse().unwrap(),
+            port: 7000,
+            codecs: vec![],
+            profile: crate::profile::Profile {
+                channel: ch,
+                sync_offset_ms: 0,
+                latency_ms: None,
+                timing: crate::profile::Timing::Auto,
+                codec: crate::profile::Codec::Auto,
+                follow_receiver_clock: false,
+                transport: crate::profile::Transport::Auto,
+                features: None,
+            },
+        };
+        let mut o = summary_options("test", "multi_room", 100);
+        o.source = "wav".into();
+        o.wav_path = PathBuf::from("test.wav");
+        o.peers = vec![
+            make_peer("192.168.1.10", crate::profile::Channel::Stereo),
+            make_peer("192.168.1.11", crate::profile::Channel::Stereo),
+            make_peer("192.168.1.12", crate::profile::Channel::Stereo),
+        ];
+        assert!(o.validate().is_ok());
+
+        let (member, _receiver, _server) = local_member();
+        let telemetry = crate::telemetry::SessionTelemetry::new();
+        let summary = session_summary(
+            &o,
+            std::slice::from_ref(&member),
+            &telemetry,
+            45,
+            Duration::from_millis(100),
+        );
+        assert_eq!(summary.topology, "multi_room");
+
+        // Duplicate IP should fail
+        o.peers[2].host = "192.168.1.10".parse().unwrap();
+        assert!(o.validate().is_err());
+        o.peers[2].host = "192.168.1.12".parse().unwrap();
+
+        // Non-stereo channel in multi_room should fail
+        o.peers[0].profile.channel = crate::profile::Channel::Left;
+        assert!(o.validate().is_err());
+        o.peers[0].profile.channel = crate::profile::Channel::Stereo;
+
+        // Less than 2 peers in multi_room should fail
+        o.peers.truncate(1);
         assert!(o.validate().is_err());
     }
 }
