@@ -2349,6 +2349,21 @@ fn send_packets(
                                 .preemption_signal(preemption::Signal::ClockLost);
                         }
                     }
+                } else if pending_clock_fault.is_some()
+                    && members
+                        .iter()
+                        .all(|m| !m.compat.uses_ptp() || timer.ready(m.peer.host))
+                {
+                    let hosts: Vec<_> = members
+                        .iter()
+                        .filter(|m| m.compat.uses_ptp())
+                        .map(|m| m.peer.host)
+                        .collect();
+                    emit(clock_status(timer, &hosts, "ready"));
+                    emit(
+                        json!({"event":"warning","channel":"clock","code":"recovery_original_fault","recovered":true,"message":"PTP exchanges resumed; timing recovered"}),
+                    );
+                    pending_clock_fault = None;
                 }
             }
             if pending_clock_fault.is_some() {
