@@ -23,6 +23,8 @@ struct Mock {
     packets: Arc<Mutex<Vec<Vec<u8>>>>,
     key: Arc<Mutex<Option<[u8; 32]>>>,
     anchor: Arc<Mutex<Option<plist::Value>>>,
+    /// Body of the last SETPEERSX request.
+    peers: Arc<Mutex<Option<plist::Value>>>,
     methods: Arc<Mutex<Vec<String>>>,
     /// `timingProtocol` of every session SETUP, in order.
     setups: Arc<Mutex<Vec<String>>>,
@@ -263,14 +265,16 @@ fn mock_with_cancel_and_model(
     let packets = Arc::new(Mutex::new(Vec::new()));
     let key = Arc::new(Mutex::new(None));
     let anchor = Arc::new(Mutex::new(None));
+    let peers = Arc::new(Mutex::new(None));
     let methods = Arc::new(Mutex::new(Vec::new()));
     let setups = Arc::new(Mutex::new(Vec::new()));
     let timing_peers = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
-    let (out, key_out, anchor_out, method_out, setup_out, timing_peer_out, done) = (
+    let (out, key_out, anchor_out, peers_out, method_out, setup_out, timing_peer_out, done) = (
         packets.clone(),
         key.clone(),
         anchor.clone(),
+        peers.clone(),
         methods.clone(),
         setups.clone(),
         timing_peers.clone(),
@@ -481,6 +485,8 @@ fn mock_with_cancel_and_model(
                 }
             } else if method == "SETRATEANCHORTIME" {
                 *anchor_out.lock().unwrap() = Some(request.plist().unwrap());
+            } else if method == "SETPEERSX" {
+                *peers_out.lock().unwrap() = Some(request.plist().unwrap());
             }
             if method == "GET" {
                 respond(&mut c, &request, &plist_bytes(&info));
@@ -506,6 +512,7 @@ fn mock_with_cancel_and_model(
         packets,
         key,
         anchor,
+        peers,
         methods,
         setups,
         timing_peers,
@@ -714,12 +721,26 @@ fn mixed_transports_share_sample_timeline_route_channels_and_close_together() {
     }
     assert_eq!(
         &left.methods.lock().unwrap()[..4],
-        &["SETUP", "RECORD", "SETPEERS", "SETUP"]
+        &["SETUP", "RECORD", "SETPEERSX", "SETUP"]
     );
     assert_eq!(
         &right.methods.lock().unwrap()[..4],
-        &["SETUP", "RECORD", "SETPEERS", "SETUP"]
+        &["SETUP", "RECORD", "SETPEERSX", "SETUP"]
     );
+    // SETPEERSX names the sender with its PTP clock, then every group member.
+    let hosts = [&left.peer, &right.peer].map(|p| plist::Value::String(p.host.to_string()));
+    for peers in [&left.peers, &right.peers] {
+        let peers = peers.lock().unwrap();
+        let peers: Vec<_> = (peers.as_ref().unwrap().as_array().unwrap().iter())
+            .map(|p| p.as_dictionary().unwrap())
+            .collect();
+        assert!(peers[0].contains_key("ClockID"));
+        assert!(peers[1..].iter().all(|p| !p.contains_key("ClockID")));
+        let addresses: Vec<_> = (peers[1..].iter())
+            .map(|p| p["Addresses"].as_array().unwrap()[0].clone())
+            .collect();
+        assert_eq!(addresses, hosts);
+    }
     // One clock domain even though the transports differ.
     assert_eq!(*left.setups.lock().unwrap(), ["PTP"]);
     assert_eq!(*right.setups.lock().unwrap(), ["PTP"]);

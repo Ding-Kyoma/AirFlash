@@ -724,9 +724,10 @@ impl Member {
         if let Some(group) = &options.group_id {
             setup.push(("groupUUID", string(group)));
         }
+        let timing_peer_id = Uuid::new_v4().to_string();
         if let Some(id) = clock_id {
             let peer_info = dictionary(vec![
-                ("ID", string(Uuid::new_v4().to_string())),
+                ("ID", string(timing_peer_id.clone())),
                 ("DeviceType", number(0)),
                 ("ClockID", number(id)),
                 ("SupportsClockPortMatchingOverride", Value::Boolean(false)),
@@ -760,15 +761,36 @@ impl Member {
             member.health.clone(),
         )?);
         member.record()?;
-        if clock_id.is_some() {
-            let mut peers: Vec<Value> = options
-                .peers
-                .iter()
-                .map(|p| string(p.host.to_string()))
-                .collect();
-            peers.push(string(local.to_string()));
+        if let Some(id) = clock_id {
+            // A HomePod mini 2 accepts a bare SETPEERS but never completes the PTP
+            // exchange; it needs the SETPEERSX timing-peer form.
+            let (method, peers) = if member.compat.ptp_expected() == Some(true) {
+                let timing_peer = |peer_id: String, clock: Option<u64>, address: String| {
+                    let mut fields = vec![("ID", string(peer_id)), ("DeviceType", number(0))];
+                    if let Some(clock) = clock {
+                        fields.push(("ClockID", number(clock)));
+                    }
+                    fields.push(("SupportsClockPortMatchingOverride", Value::Boolean(false)));
+                    fields.push(("Addresses", Value::Array(vec![string(address)])));
+                    dictionary(fields)
+                };
+                let mut peers =
+                    vec![timing_peer(timing_peer_id.clone(), Some(id), local.to_string())];
+                peers.extend(options.peers.iter().map(|p| {
+                    timing_peer(Uuid::new_v4().to_string(), None, p.host.to_string())
+                }));
+                ("SETPEERSX", peers)
+            } else {
+                let mut peers: Vec<Value> = options
+                    .peers
+                    .iter()
+                    .map(|p| string(p.host.to_string()))
+                    .collect();
+                peers.push(string(local.to_string()));
+                ("SETPEERS", peers)
+            };
             member.conn.lock().unwrap().plist_request(
-                "SETPEERS",
+                method,
                 &member.uri,
                 &Value::Array(peers),
             )?;
