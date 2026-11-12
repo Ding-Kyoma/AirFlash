@@ -530,9 +530,10 @@ impl PeerState {
         if self.last.is_some_and(|last| now < last) {
             return;
         }
-        if self
-            .last
-            .is_none_or(|last| now.duration_since(last) >= self.exchange_timeout())
+        if self.first.is_none()
+            || self
+                .last
+                .is_none_or(|last| now.duration_since(last) >= self.exchange_timeout())
         {
             self.exchanges = 0;
             self.first = Some(now);
@@ -743,7 +744,10 @@ fn followed_packet(s: &mut PeerState, data: &[u8], local_ns: u64, now: Instant, 
                 if previous.is_some_and(|old| (old - offset).abs() > 5_000_000.0) {
                     s.reject("offset_jump");
                     s.exchanges = 0;
-                    s.first = None;
+                    // Reinitialize `first` alongside `s.last = Some(now)`: leaving
+                    // `first = None` prevents `exchanged()` from ever setting it again
+                    // while packets continue arriving within `exchange_timeout()`.
+                    s.first = Some(now);
                     s.offset = None;
                 } else {
                     s.offset = previous;
@@ -1509,10 +1513,32 @@ mod tests {
 
         assert_eq!(s.packets.last_rejection, Some("offset_jump"));
         assert_eq!(s.exchanges, 0);
+        assert_eq!(s.first, Some(jump_at));
         assert!(!s.ready(jump_at));
         // Crucial invariant: s.last must NOT be None; it must record the packet exchange instant
         assert!(s.last.is_some());
         assert!(s.stale_for(jump_at).is_some_and(|stale| stale < Duration::from_millis(10)));
+
+        // Subsequent Sync/Follow_Up exchanges arriving every 100 ms (< exchange_timeout)
+        // must re-establish readiness once >= 3 exchanges and >= 250 ms have elapsed.
+        for offset_idx in 1..=3u16 {
+            let at = jump_at + Duration::from_millis(u64::from(offset_idx) * 100);
+            let seq = 3 + offset_idx;
+            let base = jump_base + u64::from(offset_idx) * 1_000_000_000;
+            let (sync, follow) = sync_pair(8, seq, base + 11_000_000);
+            followed_packet(&mut s, &sync, base + 100_000, at, 7);
+            followed_packet(&mut s, &follow, base + 110_000, at, 7);
+            assert_eq!(s.exchanges, u64::from(offset_idx));
+            if offset_idx < 3 {
+                assert!(!s.ready(at));
+            }
+        }
+        let recover_at = jump_at + Duration::from_millis(300);
+        assert!(s.ready(recover_at));
+        assert!(matches!(
+            s.map_offset(recover_at, Duration::from_secs(10)),
+            Some((_, false))
+        ));
     }
     #[test]
     fn follower_grants_require_pending_sequence_source_target_and_bounded_lease() {
