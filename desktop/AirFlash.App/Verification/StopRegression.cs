@@ -48,6 +48,9 @@ internal static class StopRegression
                 }
                 button.Command.Execute(null);
                 await Until(() => app.Snapshot.State == (connecting ? PlaybackState.Connecting : PlaybackState.Streaming));
+                var volumeControls = Descendants(panel).OfType<StackPanel>().Single(element => element.Name == "ReceiverVolumeControls" && ReferenceEquals(element.DataContext, row));
+                Check(volumeControls.IsVisible == !connecting,
+                    label + ": device volume is shown only after playback connects", checks);
                 if (connecting)
                 {
                     await store.SaveEntered!.Task.WaitAsync(TimeSpan.FromSeconds(3));
@@ -63,6 +66,8 @@ internal static class StopRegression
                 await Pump();
                 Check(app.IsStopping && app.StatusTitle == L.Get("Disconnecting…") && row.IsStopping && !button.IsEnabled,
                     label + ": immediate disconnect feedback replaces the old button state before cleanup completes", checks);
+                Check(volumeControls.Visibility == Visibility.Collapsed && volumeControls.DesiredSize.Height == 0,
+                    label + ": stopping immediately collapses the volume region before cleanup completes", checks);
                 Render(panel, Path.Combine(directory, connecting ? "cancelling-connection.png" : "stopping-playback.png"), 1);
                 Check(Descendants(button).OfType<System.Windows.Shapes.Path>().Any(p => p.Name == "DisconnectSpinner" && p.IsVisible),
                     label + ": the button displays a visible disconnect spinner; panel=" + panel.IsVisible + "; paths=" +

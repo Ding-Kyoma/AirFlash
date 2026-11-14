@@ -31,12 +31,17 @@ internal static class PairingHintRegression
             foreach (var pairing in new[] { false, true })
             {
                 await StartAttempt(pairing);
+                var volumeControls = Descendants(panel).OfType<StackPanel>().Single(element => element.Name == "ReceiverVolumeControls");
                 Check(app.ActionHint.Length == 0 && hint.Visibility == Visibility.Collapsed,
                     "connecting and pairing begin without a previous hint", checks);
+                Check(volumeControls.Visibility == Visibility.Collapsed && volumeControls.DesiredSize.Height == 0,
+                    "connecting and pairing hide all device volume controls and spacing", checks);
                 var notice = new EngineNotice("authentication_failed", receiver.Address, "authentication",
                     "pair setup failed: pairing rejected (TLV error [2]): Caused by: rejected by accessory", false);
                 EmitFault(notice);
                 await Until(() => app.Snapshot.State == PlaybackState.Error && app.ActionHint.Length > 0);
+                Check(volumeControls.Visibility == Visibility.Collapsed && volumeControls.DesiredSize.Height == 0,
+                    "connection and pairing errors keep device volume controls collapsed", checks);
                 Check(app.StatusDetail == L.Get(PairingKey) && app.ActionHint == L.Get(HintKey),
                     "playback and explicit pairing keep the existing error and add localized Home access guidance", checks);
                 Check(app.ErrorDetails == notice.Detail && app.Snapshot.Diagnostics?.LastFault == notice,
