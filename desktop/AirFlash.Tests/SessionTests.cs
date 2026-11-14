@@ -1258,6 +1258,29 @@ public sealed class SessionTests
         Assert.Equal("b", controller.Snapshot.Diagnostics!.Warnings![0].Host); Assert.True(audio.Muted);
     }
     [Fact]
+    public async Task ClockRecoveryWarningClearsTheOriginalFault()
+    {
+        var process = new FakeConnection();
+        await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast);
+        await controller.StartAsync(Pod(), Settings());
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+
+        process.EmitData(new
+        {
+            @event = "warning", channel = "clock", code = "recovery_original_fault",
+            host = "a", fault_code = "clock_lost", recovered = false, message = "PTP stopped"
+        });
+        await Until(() => controller.Snapshot.Diagnostics?.Warnings?.Count == 1);
+
+        process.EmitData(new
+        {
+            @event = "warning", channel = "clock", code = "recovery_original_fault",
+            host = "a", fault_code = "clock_lost", recovered = true, message = "PTP resumed"
+        });
+        await Until(() => controller.Snapshot.Diagnostics?.Warnings?.Count == 0);
+        Assert.Empty(controller.Snapshot.Diagnostics!.Warnings ?? []);
+    }
+    [Fact]
     public async Task ReconnectRetainsFailureAndMetricsUntilANewPlayback()
     {
         var first = new FakeConnection(); var second = new FakeConnection(); var third = new FakeConnection(); var factory = new FakeFactory(first, second, third);

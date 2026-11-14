@@ -280,6 +280,17 @@ fn clock_status(timer: &PtpMaster, hosts: &[IpAddr], phase: &str) -> Json {
         "event_port":319, "general_port":320,
     })
 }
+fn clock_warning(host: &str, recovered: bool) -> Json {
+    let message = if recovered {
+        "PTP exchanges resumed; timing recovered"
+    } else {
+        "PTP exchanges stopped; verifying receiver ownership before recovery"
+    };
+    json!({
+        "event":"warning", "channel":"clock", "code":"recovery_original_fault",
+        "host":host, "fault_code":"clock_lost", "recovered":recovered, "message":message,
+    })
+}
 fn dictionary(items: Vec<(&str, Value)>) -> Value {
     Value::Dictionary(
         items
@@ -2339,10 +2350,9 @@ fn send_packets(
                         .collect();
                     if pending_clock_fault.is_none() {
                         emit(clock_status(timer, &hosts, "lost"));
-                        emit(
-                            json!({"event":"warning","channel":"clock","code":"recovery_original_fault","host":host,"fault_code":"clock_lost","recovered":false,"message":"PTP exchanges stopped; verifying receiver ownership before recovery"}),
-                        );
-                        pending_clock_fault = Some(host.to_string());
+                        let host_text = host.to_string();
+                        emit(clock_warning(&host_text, false));
+                        pending_clock_fault = Some(host_text);
                         for member in members.iter() {
                             member
                                 .health
@@ -2360,9 +2370,8 @@ fn send_packets(
                         .map(|m| m.peer.host)
                         .collect();
                     emit(clock_status(timer, &hosts, "ready"));
-                    emit(
-                        json!({"event":"warning","channel":"clock","code":"recovery_original_fault","recovered":true,"message":"PTP exchanges resumed; timing recovered"}),
-                    );
+                    let host = pending_clock_fault.clone().unwrap_or_default();
+                    emit(clock_warning(&host, true));
                     pending_clock_fault = None;
                 }
             }
@@ -4082,6 +4091,17 @@ mod tests {
         worker.join().unwrap();
         probe_worker.join().unwrap();
         assert!(!methods.lock().unwrap().iter().any(|m| m == "TEARDOWN"));
+    }
+    #[test]
+    fn clock_warning_names_the_faulted_host_on_recovery() {
+        let fault = clock_warning("192.0.2.1", false);
+        assert_eq!(fault["host"], "192.0.2.1");
+        assert_eq!(fault["fault_code"], "clock_lost");
+
+        let recovered = clock_warning("192.0.2.1", true);
+        assert_eq!(recovered["host"], "192.0.2.1");
+        assert_eq!(recovered["fault_code"], "clock_lost");
+        assert_eq!(recovered["recovered"], true);
     }
     #[test]
     fn clock_failure_is_adjudicated_before_cleanup_and_keeps_the_original_fault() {
