@@ -59,7 +59,8 @@ public partial class ControlPanel : Window
             var maxDip = area.Rect.Height * .7 / area.Scale;
             var constraintsChanged = MaxHeight != maxDip || Width != CompactWidth;
             Width = CompactWidth;
-            DeviceScroll.MaxHeight = Math.Max(80, maxDip - 280);
+            // Fixed rows include the master volume label line; keep the scroll cap in sync so MaxHeight cannot clip them.
+            DeviceScroll.MaxHeight = Math.Max(80, maxDip - 304);
             MaxHeight = maxDip;
             if (constraintsChanged || ActualHeight <= 0) UpdateLayout();
             // Native placement converts this DIP width to monitor pixels once.
