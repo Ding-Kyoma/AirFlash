@@ -12,6 +12,7 @@ public partial class SettingsWindow : Window
     public SettingsViewModel ViewModel { get; }
     private readonly HashSet<ValidationError> _errors = [];
     private readonly Dictionary<int, FrameworkElement> _pages = [];
+    private SoundGlowWindow? _soundGlowWindow;
     public SettingsWindow(AppViewModel app)
     {
         InitializeComponent(); ViewModel = new(app); DataContext = ViewModel;
@@ -66,6 +67,20 @@ public partial class SettingsWindow : Window
     private void OnCoffeeClick(object sender, RoutedEventArgs args)
     {
         new CoffeeWindow { Owner = this }.ShowDialog();
+    }
+    private void OnSoundGlowClick(object sender, RoutedEventArgs args)
+    {
+        if (_soundGlowWindow is null)
+        {
+            _soundGlowWindow = new SoundGlowWindow(ViewModel.App)
+            {
+                Owner = this,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner
+            };
+            _soundGlowWindow.Closed += (_, _) => _soundGlowWindow = null;
+        }
+        _soundGlowWindow.Show();
+        _soundGlowWindow.Activate();
     }
     private void OnValidationError(object sender, ValidationErrorEventArgs args)
     {

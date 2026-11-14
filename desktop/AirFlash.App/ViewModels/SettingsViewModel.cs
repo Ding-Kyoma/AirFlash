@@ -9,7 +9,7 @@ namespace AirFlash.App.ViewModels;
 
 public sealed class SettingsViewModel : ObservableObject, IDisposable
 {
-    public const int AudioCapturePage = 1, StreamingPage = 2, EqualizerPage = 3, ReceiversPage = 4, MonitorPage = 5, NetworkPage = 6;
+    public const int AudioCapturePage = 1, StreamingPage = 2, EqualizerPage = 3, ReceiversPage = 4, MonitorPage = 5, NetworkPage = 6, SoundGlowPage = 7;
     private readonly Guid _equalizerOwner = Guid.NewGuid();
     public EqualizerEditor Equalizer { get; }
     private string _equalizerError = "";
@@ -68,9 +68,9 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
             if (value == ReceiversPage) LoadReceiverProfiles();
         }
     }
-    public string[] Pages { get; } = [L.Get("General"), L.Get("Audio capture"), L.Get("AirFlash streaming"), L.Get("Equalizer"), L.Get("Receivers"), L.Get("Monitor"), L.Get("Network"), L.Get("About")];
+    public string[] Pages { get; } = [L.Get("General"), L.Get("Audio capture"), L.Get("AirFlash streaming"), L.Get("Equalizer"), L.Get("Receivers"), L.Get("Monitor"), L.Get("Network"), L.Get("Sound Glow"), L.Get("About")];
     public string PageTitle => Pages[Math.Clamp(SelectedPage, 0, Pages.Length - 1)];
-    public string PageDescription => new[] { L.Get("Customize startup and appearance"), L.Get("Choose the audio source to send to HomePod"), L.Get("Balance responsiveness and connection stability"), L.Get("Shape the sound sent to all receivers"), L.Get("Manage receivers, connections and per-device settings"), L.Get("Live statistics for the current session"), L.Get("Choose where AirPlay receivers are discovered"), L.Get("Windows audio, wirelessly to HomePod") }[Math.Clamp(SelectedPage, 0, Pages.Length - 1)];
+    public string PageDescription => new[] { L.Get("Customize startup and appearance"), L.Get("Choose the audio source to send to HomePod"), L.Get("Balance responsiveness and connection stability"), L.Get("Shape the sound sent to all receivers"), L.Get("Manage receivers, connections and per-device settings"), L.Get("Live statistics for the current session"), L.Get("Choose where AirPlay receivers are discovered"), L.Get("Test HomePod light effects with synthetic covers and metadata."), L.Get("Windows audio, wirelessly to HomePod") }[Math.Clamp(SelectedPage, 0, Pages.Length - 1)];
     public ObservableCollection<AudioEndpoint> Endpoints { get; } = [];
     public ObservableCollection<DiscoveryAdapterOption> DiscoveryAdapters { get; } = [];
     private string _networkStatus = "";

@@ -421,5 +421,8 @@
   "Failed: {0}": "失敗：{0}",
   "This audio engine does not support the Sound Glow experiment.": "此音訊引擎不支援 Sound Glow 燈效實驗。",
   "Playback: {0} · Requested palette: {1}": "播放狀態：{0} · 請求的配色：{1}",
-  "Start streaming before testing Sound Glow.": "請先開始播放，再測試 Sound Glow。"
+  "Start streaming before testing Sound Glow.": "請先開始播放，再測試 Sound Glow。",
+  "Sound Glow": "Sound Glow",
+  "Test HomePod light effects with synthetic covers and metadata.": "使用虛構封面和歌曲資訊測試 HomePod 燈效。",
+  "Open Sound Glow experiment": "開啟 Sound Glow 燈效實驗"
 }
