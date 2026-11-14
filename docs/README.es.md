@@ -66,7 +66,7 @@ en Samsung, Mac y marcas mixtas no han sido certificadas por esta implementació
 2. Inicia AirFlash y espera a que se complete la lista de receptores.
 3. Selecciona la entrada completa `HomePod estéreo · 2/2` y pulsa reproducir.
 4. Completa el emparejamiento con PIN en **Configuración > Receptores** si el receptor lo solicita.
-   Si el emparejamiento falla con `emparejamiento rechazado (error TLV [2])`, abre la app Casa,
+   Si el emparejamiento falla con `pairing rejected (TLV error [2])`, abre la app Casa,
    establece el acceso a los altavoces en **Todos** y vuelve a intentarlo.
 5. Elige el dispositivo de captura y el perfil de latencia en Configuración cuando los valores predeterminados
    no sean adecuados.

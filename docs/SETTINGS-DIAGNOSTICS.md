@@ -24,7 +24,7 @@ on stop or reconnect, and appears in the copied summary. Raw fault details, moni
 history and the JSON diagnostic export are retained separately.
 
 Run the isolated fixture for each supported UI language (`en-US`, `zh-CN`, `zh-TW`,
-`de-DE`):
+`de-DE`, `es-ES`):
 
 ```powershell
 .\AirFlash.exe --ui-smoke --ui-pairing-hint-smoke --ui-language de-DE --output artifacts/pairing-hint-de/report.json
