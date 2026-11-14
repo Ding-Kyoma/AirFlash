@@ -530,9 +530,10 @@ impl PeerState {
         if self.last.is_some_and(|last| now < last) {
             return;
         }
-        if self
-            .last
-            .is_none_or(|last| now.duration_since(last) >= self.exchange_timeout())
+        if self.first.is_none()
+            || self
+                .last
+                .is_none_or(|last| now.duration_since(last) >= self.exchange_timeout())
         {
             self.exchanges = 0;
             self.first = Some(now);
@@ -743,14 +744,17 @@ fn followed_packet(s: &mut PeerState, data: &[u8], local_ns: u64, now: Instant, 
                 if previous.is_some_and(|old| (old - offset).abs() > 5_000_000.0) {
                     s.reject("offset_jump");
                     s.exchanges = 0;
-                    s.first = None;
-                    s.last = None;
+                    // Reinitialize `first` alongside `s.last = Some(now)`: leaving
+                    // `first = None` prevents `exchanged()` from ever setting it again
+                    // while packets continue arriving within `exchange_timeout()`.
+                    s.first = Some(now);
                     s.offset = None;
                 } else {
                     s.offset = previous;
                 }
                 s.offset = Some(s.offset.map_or(offset, |old| old * 0.875 + offset * 0.125));
                 s.offset_at = Some(now);
+                s.last = Some(now);
                 s.delay = None;
                 s.delay_age = None;
             } else {
@@ -1467,6 +1471,74 @@ mod tests {
         bad[4] = 1;
         assert!(!valid_packet(&bad));
         assert!(read_timestamp(&[255; 10]).is_none());
+    }
+    #[test]
+    fn offset_jump_preserves_last_exchange_and_recovers_within_grace() {
+        let now = Instant::now();
+        let mut s = PeerState {
+            follow: true,
+            ..Default::default()
+        };
+        followed_packet(&mut s, &announce(8, 0, 0), 0, now, 7);
+        for seq in 0..3u16 {
+            let at = now + Duration::from_millis(u64::from(seq) * 100);
+            let base = 1_000_000_000u64 + u64::from(seq) * 1_000_000_000;
+            let (sync, follow) = sync_pair(8, seq, base + 1_000_000);
+            followed_packet(&mut s, &sync, base + 100_000, at, 7);
+            followed_packet(&mut s, &follow, base + 110_000, at, 7);
+            s.delay = Some((seq, base + 200_000));
+            s.delay_age = Some(at);
+            let mut response = header(9, 54, 8, seq, 0x0408, 0);
+            timestamp(&mut response[34..44], base + 1_300_000);
+            response[44..52].copy_from_slice(&7u64.to_be_bytes());
+            response[52..54].copy_from_slice(&0x8005u16.to_be_bytes());
+            followed_packet(&mut s, &response, base + 400_000, at, 7);
+        }
+        assert!(s.ready(now + Duration::from_millis(300)));
+        assert_eq!(s.offset, Some(1_000_000.0));
+
+        // Inject an exchange with a > 5 ms offset jump (jump of 10 ms)
+        let jump_at = now + Duration::from_millis(400);
+        let jump_base = 4_000_000_000u64;
+        let (sync, follow) = sync_pair(8, 3, jump_base + 11_000_000);
+        followed_packet(&mut s, &sync, jump_base + 100_000, jump_at, 7);
+        followed_packet(&mut s, &follow, jump_base + 110_000, jump_at, 7);
+        s.delay = Some((3, jump_base + 200_000));
+        s.delay_age = Some(jump_at);
+        let mut response = header(9, 54, 8, 3, 0x0408, 0);
+        timestamp(&mut response[34..44], jump_base + 11_300_000);
+        response[44..52].copy_from_slice(&7u64.to_be_bytes());
+        response[52..54].copy_from_slice(&0x8005u16.to_be_bytes());
+        followed_packet(&mut s, &response, jump_base + 400_000, jump_at, 7);
+
+        assert_eq!(s.packets.last_rejection, Some("offset_jump"));
+        assert_eq!(s.exchanges, 0);
+        assert_eq!(s.first, Some(jump_at));
+        assert!(!s.ready(jump_at));
+        // Crucial invariant: s.last must NOT be None; it must record the packet exchange instant
+        assert!(s.last.is_some());
+        assert!(s.stale_for(jump_at).is_some_and(|stale| stale < Duration::from_millis(10)));
+
+        // Subsequent Sync/Follow_Up exchanges arriving every 100 ms (< exchange_timeout)
+        // must re-establish readiness once >= 3 exchanges and >= 250 ms have elapsed.
+        for offset_idx in 1..=3u16 {
+            let at = jump_at + Duration::from_millis(u64::from(offset_idx) * 100);
+            let seq = 3 + offset_idx;
+            let base = jump_base + u64::from(offset_idx) * 1_000_000_000;
+            let (sync, follow) = sync_pair(8, seq, base + 11_000_000);
+            followed_packet(&mut s, &sync, base + 100_000, at, 7);
+            followed_packet(&mut s, &follow, base + 110_000, at, 7);
+            assert_eq!(s.exchanges, u64::from(offset_idx));
+            if offset_idx < 3 {
+                assert!(!s.ready(at));
+            }
+        }
+        let recover_at = jump_at + Duration::from_millis(300);
+        assert!(s.ready(recover_at));
+        assert!(matches!(
+            s.map_offset(recover_at, Duration::from_secs(10)),
+            Some((_, false))
+        ));
     }
     #[test]
     fn follower_grants_require_pending_sequence_source_target_and_bounded_lease() {
