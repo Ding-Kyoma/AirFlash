@@ -612,7 +612,7 @@ internal static class UiSmoke
         public Task SendAsync(string session, string command, object? parameters, CancellationToken cancellation)
         {
             factory.Commands.Enqueue(JsonSerializer.SerializeToElement(new { command, @params = parameters }));
-            if (command == "hello") Emit(session, new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture", "forced_latency" }.Concat(factory.SupportsSoundGlow ? ["sound_glow_test"] : Array.Empty<string>()).Concat(factory.SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).ToArray() });
+            if (command == "hello") Emit(session, new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "multi_room", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture", "forced_latency" }.Concat(factory.SupportsSoundGlow ? ["sound_glow_test"] : Array.Empty<string>()).Concat(factory.SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).ToArray() });
             if (command == "pair") factory.EmitEvent = payload => Emit(session, payload);
             if (command == "start")
             {
@@ -627,7 +627,7 @@ internal static class UiSmoke
                         baseline_ms = data.Integer("latency_ms"), lead_extra_ms = 0, effective_latency_ms = data.Integer("latency_ms"), lead_ceiling_ms = 100, live_lead_supported = true });
                     else Emit(session, new { @event = "streaming" });
                 }
-                var hosts = data.Text("group_mode") == "software_stereo" ? data.GetProperty("peers").EnumerateArray().Select(p => p.Text("host")).ToArray() : [_host];
+                var hosts = data.Text("group_mode") is "software_stereo" or "multi_room" ? data.GetProperty("peers").EnumerateArray().Select(p => p.Text("host")).ToArray() : [_host];
                 foreach (var host in hosts)
                 {
                     _volumes[host] = host == _host ? 28 : 45;

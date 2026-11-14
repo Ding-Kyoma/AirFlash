@@ -293,7 +293,7 @@ public sealed class IpcFailureTests
             if (command == "hello")
             {
                 _session = session;
-                Current("hello", new { capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "standby_release", "receiver_ownership_guard", "member_volume", "receiver_password", "application_capture" } });
+                Current("hello", new { capabilities = new[] { "receiver_profiles", "software_stereo", "multi_room", "continuity", "buffered_audio", "standby_release", "receiver_ownership_guard", "member_volume", "receiver_password", "application_capture" } });
                 Started.TrySetResult();
             }
             if (command is "start" or "pair") { _session = session; Starting.TrySetResult(); }

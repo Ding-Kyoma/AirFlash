@@ -14,7 +14,9 @@ public static class SoftwareStereo
         }
         return settings.SoftwareGroups.Select(g =>
         {
-            var members = new[] { Member(g.LeftId, "left", g.LeftOffsetMs), Member(g.RightId, "right", g.RightOffsetMs) };
+            var members = g.IsMultiRoom && g.Members.Count > 0
+                ? g.Members.Select(m => Member(m.ReceiverId, "stereo", m.OffsetMs)).ToArray()
+                : [Member(g.LeftId, "left", g.LeftOffsetMs), Member(g.RightId, "right", g.RightOffsetMs)];
             // Q45: restoring a saved group goes through the same invariant as the
             // editor, but the invariant is three-valued. TryAdd accepts members
             // whose capability is Unknown (offline, no TXT, unparsable srcvers);
@@ -25,8 +27,8 @@ public static class SoftwareStereo
             var membership = new GroupMembership();
             foreach (var member in members) membership.TryAdd(member, out _);
             var homogeneous = !GroupMembership.HasProvenConflict(members);
-            var usable = homogeneous && members.All(m => m.Online && !m.IsGroup && m.StereoId.Length == 0) && members.Select(m => Receiver.PhysicalKey(m.DeviceId, m.Address)).Distinct().Count() == 2 && members.Select(m => m.Address).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 2;
-            return new Receiver(g.Id, g.Name, "") { IsSoftwareGroup = true, Online = usable, Members = homogeneous ? membership.Members.ToArray() : [] };
+            var usable = homogeneous && members.Length >= 2 && members.All(m => m.Online && !m.IsGroup && m.StereoId.Length == 0) && members.Select(m => Receiver.PhysicalKey(m.DeviceId, m.Address)).Distinct().Count() == members.Length && members.Select(m => m.Address).Distinct(StringComparer.OrdinalIgnoreCase).Count() == members.Length;
+            return new Receiver(g.Id, g.Name, "") { IsSoftwareGroup = true, GroupMode = g.IsMultiRoom ? "multi_room" : "software_stereo", Online = usable, Members = homogeneous ? membership.Members.ToArray() : [] };
         }).ToArray();
     }
 

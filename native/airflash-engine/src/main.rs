@@ -63,6 +63,7 @@ fn capabilities() -> Vec<&'static str> {
         "receiver_profiles",
         "receiver_capabilities",
         "software_stereo",
+        "multi_room",
         "continuity",
         "buffered_audio",
         "member_volume",
@@ -264,8 +265,8 @@ fn main() {
                         request.params.get("peers").cloned().unwrap_or(Value::Null),
                     )?;
                     anyhow::ensure!(
-                        !peers.is_empty() && peers.len() <= 2,
-                        "capability query requires one or two receivers"
+                        !peers.is_empty(),
+                        "capability query requires at least one receiver"
                     );
                     airflash_engine::receiver_capabilities::query_group(
                         &peers,

@@ -290,7 +290,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         var application = settings.CaptureMode == "application";
         return new()
         {
-            ["receiver"] = JsonSerializer.Serialize(new { mode = receiver.IsSoftwareGroup ? "software_stereo" : receiver.IsGroup ? "native_stereo" : "single",
+            ["receiver"] = JsonSerializer.Serialize(new { mode = receiver.IsSoftwareGroup ? (receiver.GroupMode.Length > 0 ? receiver.GroupMode : "software_stereo") : receiver.IsGroup ? "native_stereo" : "single",
                 group = receiver.IsGroup && !receiver.IsSoftwareGroup ? receiver.StereoId : null,
                 peers = receiver.Peers.OrderBy(m => m.Address, StringComparer.Ordinal).ThenBy(m => m.Port).Select(m => new { m.Address, m.Port, leader = receiver.IsGroup && m.IsLeader }) }),
             ["capture"] = JsonSerializer.Serialize(new { settings.CaptureMode, endpoint = settings.EffectiveEndpoint,
@@ -314,17 +314,23 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     }
     public async Task StartAsync(Receiver receiver, AppSettings settings, SessionStartIntent intent = SessionStartIntent.Manual)
     {
-        if (!receiver.Complete) throw new InvalidOperationException(L.Get("Both stereo pair members must be online."));
+        if (!receiver.Complete) throw new InvalidOperationException(receiver.GroupMode == "multi_room" ? L.Get("All multi-room members must be online.") : L.Get("Both stereo pair members must be online."));
         if (settings.Validate() is { } validation) throw new ArgumentException(validation, nameof(settings));
         if (LatencyPolicy.ForceConflict(settings, receiver) is { } conflict) throw new InvalidOperationException(conflict);
-        if (receiver.IsSoftwareGroup && (!receiver.Online || receiver.Members.Select(m => Receiver.PhysicalKey(m.DeviceId, m.Address)).Distinct().Count() != 2)) throw new InvalidOperationException(L.Get("Stereo groups require two distinct independent receivers."));
+        if (receiver.IsSoftwareGroup)
+        {
+            var distinctCount = receiver.Members.Select(m => Receiver.PhysicalKey(m.DeviceId, m.Address)).Distinct().Count();
+            var expectedCount = receiver.GroupMode == "multi_room" ? receiver.Members.Length : 2;
+            if (!receiver.Online || distinctCount != expectedCount || (receiver.GroupMode == "multi_room" && expectedCount < 2))
+                throw new InvalidOperationException(receiver.GroupMode == "multi_room" ? L.Get("Multi-room groups require distinct independent receivers.") : L.Get("Stereo groups require two distinct independent receivers."));
+        }
         await _serial.WaitAsync().ConfigureAwait(false);
         try { await StartLockedAsync(receiver, settings, null, intent == SessionStartIntent.Manual ? "user_play" : "automatic_play", intent: intent).ConfigureAwait(false); }
         finally { _serial.Release(); }
     }
     public async Task PairAsync(Receiver receiver, AppSettings settings, Func<Receiver, CancellationToken, Task<string?>> requestPin)
     {
-        if (!receiver.Complete) throw new InvalidOperationException(L.Get("Wait until both stereo pair members are online before pairing."));
+        if (!receiver.Complete) throw new InvalidOperationException(receiver.GroupMode == "multi_room" ? L.Get("Wait until all multi-room members are online before pairing.") : L.Get("Wait until both stereo pair members are online before pairing."));
         await _serial.WaitAsync().ConfigureAwait(false);
         try { await StartLockedAsync(receiver, settings, requestPin, "user_pair", intent: SessionStartIntent.Manual).ConfigureAwait(false); }
         finally { _serial.Release(); }
@@ -483,8 +489,9 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                     || receiver.IsGroup != previous.IsGroup || receiver.Id != migrations.GetValueOrDefault(previous.Id, previous.Id)) return;
                 var settings = _settings.Clone();
                 ReceiverCatalog.ApplyMigrations(settings, migrations, previous.Id);
-                if (receiver.Online && receiver.Complete && (!receiver.IsSoftwareGroup || receiver.Members.Select(m => Receiver.PhysicalKey(m.DeviceId, m.Address)).Distinct().Count() == 2
-                    && receiver.Members.Select(m => m.Address).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 2)) _discoveredReceiver = receiver;
+                var expectedDistinct = receiver.GroupMode == "multi_room" ? receiver.Members.Length : 2;
+                if (receiver.Online && receiver.Complete && (!receiver.IsSoftwareGroup || receiver.Members.Select(m => Receiver.PhysicalKey(m.DeviceId, m.Address)).Distinct().Count() == expectedDistinct
+                    && receiver.Members.Select(m => m.Address).Distinct(StringComparer.OrdinalIgnoreCase).Count() == expectedDistinct)) _discoveredReceiver = receiver;
                 Receiver Identity(Receiver active, Receiver discovered) => active with { Id = discovered.Id, Name = discovered.Name, DeviceId = discovered.DeviceId,
                     Model = discovered.Model, GroupName = discovered.GroupName, Aliases = discovered.Aliases };
                 var retained = Identity(previous, receiver);
@@ -711,6 +718,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         throw new EngineFailure(new("forced_latency_unsupported", "", "setup", L.Get("This audio engine does not support forced latency. Update the engine or turn off forced latency."), false));
                     if (settings.CaptureMode == "application") EngineHandshake.RequireCapabilities(hello, "application_capture");
                     if (receiver.IsSoftwareGroup) EngineHandshake.RequireCapabilities(hello, "member_volume");
+                    if (receiver.IsSoftwareGroup && receiver.GroupMode == "multi_room") EngineHandshake.RequireCapabilities(hello, "multi_room");
                     var capabilities = await ReceiverCapabilityCatalog.QueryConnectionAsync(connection, session, hello, receiver, cancellation).ConfigureAwait(false);
                     var selected = capabilities.Select(id => ProfileOptions(receiver, receiver.Peers.Single(p => p.Id == id), settings), settings.SampleRate(receiver));
                     if (capabilities.Members.Count > 0 && selected.Count == 0) throw new InvalidOperationException(L.Get("The receiver does not support this stream profile. Choose Automatic or a supported option in Receivers."));
@@ -727,7 +735,8 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                     await _equalizerWriter.WaitAsync(cancellation).ConfigureAwait(false);
                     try
                     {
-                        var startParameters = JsonSerializer.SerializeToNode(new { peers, group_mode = receiver.IsSoftwareGroup ? "software_stereo" : receiver.IsGroup ? "native_stereo" : "single", group_id = receiver.IsGroup && !receiver.IsSoftwareGroup ? receiver.StereoId : null, source = settings.CaptureMode == "application" ? "application" : "loopback", capture_application_path = settings.CaptureMode == "application" ? settings.CaptureApplicationPath : null, capture_process_id = settings.CaptureMode == "application" ? settings.CaptureApplicationInstance?.ProcessId : null, capture_process_started_at = settings.CaptureMode == "application" ? settings.CaptureApplicationInstance?.StartedAt : null, standby = StandbyParameters(settings, receiver.Id), duration_ms = 0, latency_ms = _adaptiveBase, gain = Gain(receiver), timing = "ptp", capture_endpoint = settings.EffectiveEndpoint, sample_rate = sampleRate, equalizer = EffectiveEqualizer().WireParameters() })!.AsObject();
+                        var groupMode = receiver.IsSoftwareGroup ? (receiver.GroupMode.Length > 0 ? receiver.GroupMode : "software_stereo") : receiver.IsGroup ? "native_stereo" : "single";
+                        var startParameters = JsonSerializer.SerializeToNode(new { peers, group_mode = groupMode, group_id = receiver.IsGroup && !receiver.IsSoftwareGroup ? receiver.StereoId : null, source = settings.CaptureMode == "application" ? "application" : "loopback", capture_application_path = settings.CaptureMode == "application" ? settings.CaptureApplicationPath : null, capture_process_id = settings.CaptureMode == "application" ? settings.CaptureApplicationInstance?.ProcessId : null, capture_process_started_at = settings.CaptureMode == "application" ? settings.CaptureApplicationInstance?.StartedAt : null, standby = StandbyParameters(settings, receiver.Id), duration_ms = 0, latency_ms = _adaptiveBase, gain = Gain(receiver), timing = "ptp", capture_endpoint = settings.EffectiveEndpoint, sample_rate = sampleRate, equalizer = EffectiveEqualizer().WireParameters() })!.AsObject();
                         if (forceLatency) startParameters["force_latency"] = true;
                         startParameters["intent"] = attemptIntent == SessionStartIntent.Manual ? "manual" : "automatic";
                         if (adaptiveMode && _confirmedLeadSupported)
