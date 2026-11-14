@@ -172,12 +172,12 @@
                     <StackPanel x:Name="ReceiverVolumeControls" Grid.Row="1" Grid.ColumnSpan="3" Visibility="{Binding ShowVolumeControls, Converter={StaticResource BoolVisibility}}">
                       <Grid Margin="0,9,0,0" Visibility="{Binding HasSingleVolume, Converter={StaticResource BoolVisibility}}">
                         <Grid.ColumnDefinitions>
-                          <ColumnDefinition Width="Auto" SharedSizeGroup="VolumeLabel"/>
+                          <ColumnDefinition Width="22"/>
                           <ColumnDefinition Width="*"/>
                           <ColumnDefinition Width="40"/>
                           <ColumnDefinition Width="Auto" SharedSizeGroup="VolumeMute"/>
                         </Grid.ColumnDefinitions>
-                        <!-- Always measured: a fixed slot keeps the shared label column and slider stable in every language. -->
+                        <!-- Always measured: a fixed 22 DIP slot keeps every device slider aligned with the master row. -->
                         <Grid x:Name="VolumeIndicator" Grid.Column="0" Width="16" Height="16" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,6,0" Background="Transparent" ToolTip="{Binding VolumeStatus}" ToolTipService.IsEnabled="{Binding VolumeAlert}">
                           <Viewbox Width="14" Height="14" Stretch="Uniform">
                             <Grid Width="24" Height="24">
@@ -260,18 +260,21 @@
         </Grid>
         <TextBlock Text="{Binding GlobalLatencyHint}" Style="{StaticResource Hint}" Margin="2,0,2,12" Visibility="{Binding GlobalLatencyHint, Converter={StaticResource NonEmpty}}"/>
         <Border Padding="12" Margin="0,0,0,10" CornerRadius="10" Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource LineBrush}" BorderThickness="1" Visibility="{Binding Settings.ShowMasterControl, Converter={StaticResource BoolVisibility}}">
-          <Grid>
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="Auto" SharedSizeGroup="VolumeLabel"/>
-              <ColumnDefinition Width="*"/>
-              <ColumnDefinition Width="40"/>
-              <ColumnDefinition Width="Auto" SharedSizeGroup="VolumeMute"/>
-            </Grid.ColumnDefinitions>
-            <TextBlock Text="{loc:Text 'Master volume'}" VerticalAlignment="Center" Margin="0,0,8,0" FontWeight="SemiBold"/>
-            <Slider Style="{StaticResource VolumeSlider}" Grid.Column="1" Minimum="0" Maximum="100" TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding MasterVolume, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Center" AutomationProperties.Name="{loc:Text 'Master volume'}" PreviewMouseLeftButtonDown="OnSliderPreviewMouseLeftButtonDown"/>
-            <TextBlock Grid.Column="2" Text="{Binding MasterVolume, StringFormat={}{0}%}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
-            <Button Grid.Column="3" Style="{StaticResource VolumeMuteButton}" Content="{Binding MuteLabel}" Command="{Binding MuteCommand}" AutomationProperties.Name="{Binding MuteLabel}"/>
-          </Grid>
+          <StackPanel>
+            <!-- Own row: a long localized label can never take width away from the slider. -->
+            <TextBlock x:Name="MasterVolumeLabel" Text="{loc:Text 'Master volume'}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{loc:Text 'Master volume'}" Margin="0,0,0,6"/>
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="22"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="40"/>
+                <ColumnDefinition Width="Auto" SharedSizeGroup="VolumeMute"/>
+              </Grid.ColumnDefinitions>
+              <Slider Style="{StaticResource VolumeSlider}" Grid.Column="1" Minimum="0" Maximum="100" TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding MasterVolume, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Center" AutomationProperties.Name="{loc:Text 'Master volume'}" PreviewMouseLeftButtonDown="OnSliderPreviewMouseLeftButtonDown"/>
+              <TextBlock Grid.Column="2" Text="{Binding MasterVolume, StringFormat={}{0}%}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+              <Button Grid.Column="3" Style="{StaticResource VolumeMuteButton}" Content="{Binding MuteLabel}" Command="{Binding MuteCommand}" AutomationProperties.Name="{Binding MuteLabel}"/>
+            </Grid>
+          </StackPanel>
         </Border>
       </StackPanel>
       <StackPanel Grid.Row="4" Margin="2,4,2,0">

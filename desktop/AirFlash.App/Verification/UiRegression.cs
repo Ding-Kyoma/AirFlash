@@ -557,10 +557,15 @@ internal static class UiRegression
         var master = sliders.Single(slider => AutomationProperties.GetName(slider) == L.Get("Master volume"));
         var device = sliders.Single(slider => AutomationProperties.GetName(slider) == L.Get("Device volume"));
         var masterRow = (Grid)master.Parent;
-        var title = masterRow.Children.OfType<TextBlock>().Single(text => Grid.GetColumn(text) == 0);
-        var gap = master.TranslatePoint(new(), masterRow).X - title.TranslatePoint(new(title.ActualWidth, 0), masterRow).X;
-        Check(Math.Abs(gap - 8) <= 1,
-            $"{label}: master volume uses only an 8 DIP gap after its localized label", checks);
+        var masterTitle = (TextBlock)panel.FindName("MasterVolumeLabel");
+        var masterTitleBottom = masterTitle.TranslatePoint(new(0, masterTitle.ActualHeight), panel).Y;
+        var masterTop = master.TranslatePoint(new(), panel).Y;
+        Check(masterTitle.IsVisible && masterTitle.Text == L.Get("Master volume")
+            && masterTitle.TextTrimming == TextTrimming.CharacterEllipsis
+            && masterTitleBottom <= masterTop + 1
+            && Math.Abs(masterRow.ColumnDefinitions[0].Width.Value - 22) <= 0.1
+            && Grid.GetColumn(master) == 1 && master.ActualWidth >= 160,
+            $"{label}: master volume label renders above a full-width slider row", checks);
 
         var deviceRow = (Grid)device.Parent;
         var indicator = UiSmoke.Descendants(deviceRow).OfType<Grid>().Single(element => element.Name == "VolumeIndicator");
@@ -572,6 +577,18 @@ internal static class UiRegression
         var cardHeight = card.ActualHeight;
         CheckIndicator(false, false, "confirmed");
         checks.Add($"{label}: volume layout measured at {VisualTreeHelper.GetDpi(panel).PixelsPerDip * 100:0}% physical display scaling");
+
+        var masterWidth = master.ActualWidth;
+        var panelHeight = panel.ActualHeight;
+        var originalTitle = masterTitle.Text;
+        masterTitle.Text = string.Concat(Enumerable.Repeat("Gesamtlautstärke ", 4));
+        await Pump();
+        Check(Math.Abs(master.ActualWidth - masterWidth) <= 1
+            && Math.Abs(device.ActualWidth - deviceWidth) <= 1
+            && Math.Abs(panel.ActualHeight - panelHeight) <= 1
+            && masterTitle.ActualWidth <= ((FrameworkElement)masterTitle.Parent).ActualWidth + 1,
+            $"{label}: a long localized master label cannot squeeze either volume track", checks);
+        masterTitle.Text = originalTitle; await Pump();
 
         device.SetCurrentValue(Slider.ValueProperty, 50d);
         await Until(() => row.VolumeSyncing); await Pump();
