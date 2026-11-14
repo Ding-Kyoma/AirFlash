@@ -304,12 +304,6 @@
       <StackPanel>
         <Border Style="{StaticResource Card}">
           <StackPanel>
-            <TextBlock Text="{loc:Text 'Negotiated stream and clock status (experimental)'}" FontWeight="SemiBold"/>
-            <TextBlock Text="{Binding App.MonitorNegotiated}" Style="{StaticResource Hint}" Margin="0,8,0,0"/>
-          </StackPanel>
-        </Border>
-        <Border Style="{StaticResource Card}">
-          <StackPanel>
             <TextBlock Text="{Binding App.StatusTitle}" FontSize="20" FontWeight="SemiBold"/>
             <TextBlock Text="{Binding App.StatusDetail}" Style="{StaticResource Hint}" Margin="0,8,0,0"/>
           </StackPanel>
@@ -400,6 +394,16 @@
           </StackPanel>
         </Border>
         <TextBlock Text="{loc:Text 'Local queue and transport statistics update about once per second. Resent packets are sent, not confirmed received. Delay parameters are not acoustic measurements. The last failure snapshot survives reconnection.'}" Style="{StaticResource Hint}"/>
+        <Border Style="{StaticResource Card}" Margin="0,14,0,14">
+          <Expander Header="{loc:Text 'Negotiated stream and clock status (experimental)'}" IsExpanded="False" Foreground="{DynamicResource TextBrush}">
+            <Expander.HeaderTemplate>
+              <DataTemplate>
+                <TextBlock Text="{Binding}" FontWeight="SemiBold" TextWrapping="Wrap"/>
+              </DataTemplate>
+            </Expander.HeaderTemplate>
+            <TextBlock Text="{Binding App.MonitorNegotiated}" Style="{StaticResource Hint}" Margin="0,8,0,0"/>
+          </Expander>
+        </Border>
       </StackPanel>
     </DataTemplate>
     <DataTemplate x:Key="Page6">
