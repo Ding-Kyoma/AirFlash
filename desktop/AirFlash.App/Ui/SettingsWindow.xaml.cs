@@ -12,7 +12,6 @@ public partial class SettingsWindow : Window
     public SettingsViewModel ViewModel { get; }
     private readonly HashSet<ValidationError> _errors = [];
     private readonly Dictionary<int, FrameworkElement> _pages = [];
-    private SoundGlowWindow? _soundGlowWindow;
     public SettingsWindow(AppViewModel app)
     {
         InitializeComponent(); ViewModel = new(app); DataContext = ViewModel;
@@ -29,7 +28,7 @@ public partial class SettingsWindow : Window
         ViewModel.PropertyChanged += (_, args) => { if (args.PropertyName == nameof(SettingsViewModel.SelectedPage)) ShowPage(); };
         IsVisibleChanged += (_, _) => UpdatePageVisibility();
         Closing += (_, args) => { if (ViewModel.IsApplying) args.Cancel = true; };
-        Closed += (_, _) => { app.SetReceiversPageVisible(false); app.SetMonitorVisible(false); ViewModel.Dispose(); };
+        Closed += (_, _) => { foreach (var panel in _pages.Values.OfType<SoundGlowPanel>()) panel.Dispose(); app.SetReceiversPageVisible(false); app.SetMonitorVisible(false); ViewModel.Dispose(); };
         ShowPage();
     }
     private void ShowPage()
@@ -67,20 +66,6 @@ public partial class SettingsWindow : Window
     private void OnCoffeeClick(object sender, RoutedEventArgs args)
     {
         new CoffeeWindow { Owner = this }.ShowDialog();
-    }
-    private void OnSoundGlowClick(object sender, RoutedEventArgs args)
-    {
-        if (_soundGlowWindow is null)
-        {
-            _soundGlowWindow = new SoundGlowWindow(ViewModel.App)
-            {
-                Owner = this,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner
-            };
-            _soundGlowWindow.Closed += (_, _) => _soundGlowWindow = null;
-        }
-        _soundGlowWindow.Show();
-        _soundGlowWindow.Activate();
     }
     private void OnValidationError(object sender, ValidationErrorEventArgs args)
     {

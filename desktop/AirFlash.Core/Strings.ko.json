@@ -413,7 +413,7 @@
   "Reconnected with normal song information. HomePod may retain the previous cover.": "일반 곡 정보로 다시 연결했습니다. HomePod에 이전 표지 이미지가 남을 수 있습니다.",
   "Try song information, then red and blue. Song information alone does not clear an old cover; reconnect first.": "곡 정보, 빨강, 파랑 순서로 시도하세요. 곡 정보만으로는 이전 표지가 지워지지 않으므로 먼저 다시 연결하세요.",
   "Open diagnostic logs": "진단 로그 열기",
-  "No test covers are sent by default. Accepted requests do not prove visible lighting. Closing stops cycling; the last cover may remain.": "기본적으로 테스트 표지는 전송하지 않습니다. 요청이 수락되어도 실제 조명을 확인한 것은 아닙니다. 닫으면 색상 순환이 중지되지만 마지막 표지가 남을 수 있습니다.",
+  "No test covers are sent by default. Accepted requests do not prove visible lighting. Leaving this page stops cycling; the last cover may remain.": "기본적으로 테스트 표지는 전송하지 않습니다. 요청이 수락되어도 실제 조명을 확인한 것은 아닙니다. 이 페이지를 떠나면 색상 순환이 중지되지만 마지막 표지가 남을 수 있습니다.",
   "Not sent": "전송 안 됨",
   "Requested: {0}; waiting for receiver response.": "요청: {0}; 수신기 응답을 기다리는 중입니다.",
   "Queued by the engine; receiver acceptance is not yet confirmed.": "엔진 큐에 추가했습니다. 수신기의 수락은 아직 확인되지 않았습니다.",
@@ -424,5 +424,5 @@
   "Start streaming before testing Sound Glow.": "Sound Glow를 테스트하기 전에 스트리밍을 시작하세요.",
   "Sound Glow": "Sound Glow",
   "Test HomePod light effects with synthetic covers and metadata.": "합성 표지와 메타데이터로 HomePod 조명 효과를 테스트합니다.",
-  "Open Sound Glow experiment": "Sound Glow 실험 열기"
+  "Log": "로그"
 }

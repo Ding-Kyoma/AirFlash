@@ -413,7 +413,7 @@
   "Reconnected with normal song information. HomePod may retain the previous cover.": "Подключение восстановлено с обычными сведениями о композиции. HomePod может сохранить предыдущую обложку.",
   "Try song information, then red and blue. Song information alone does not clear an old cover; reconnect first.": "Проверьте сведения о композиции, затем красный и синий цвета. Одни сведения не удаляют старую обложку; сначала переподключитесь.",
   "Open diagnostic logs": "Открыть журналы диагностики",
-  "No test covers are sent by default. Accepted requests do not prove visible lighting. Closing stops cycling; the last cover may remain.": "По умолчанию тестовые обложки не отправляются. Принятие запроса не подтверждает видимое свечение. Закрытие останавливает смену цветов; последняя обложка может остаться.",
+  "No test covers are sent by default. Accepted requests do not prove visible lighting. Leaving this page stops cycling; the last cover may remain.": "По умолчанию тестовые обложки не отправляются. Принятие запроса не подтверждает видимое свечение. При переходе с этой страницы смена цветов останавливается; последняя обложка может остаться.",
   "Not sent": "Не отправлено",
   "Requested: {0}; waiting for receiver response.": "Запрошено: {0}; ожидание ответа приёмника.",
   "Queued by the engine; receiver acceptance is not yet confirmed.": "Добавлено в очередь движка; принятие приёмником пока не подтверждено.",
@@ -424,5 +424,5 @@
   "Start streaming before testing Sound Glow.": "Начните трансляцию перед проверкой Sound Glow.",
   "Sound Glow": "Sound Glow",
   "Test HomePod light effects with synthetic covers and metadata.": "Проверьте световые эффекты с обложками и метаданными.",
-  "Open Sound Glow experiment": "Открыть эксперимент Sound Glow"
+  "Log": "Журнал"
 }

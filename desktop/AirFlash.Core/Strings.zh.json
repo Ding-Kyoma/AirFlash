@@ -413,7 +413,7 @@
   "Reconnected with normal song information. HomePod may retain the previous cover.": "已重连并恢复正常歌曲信息。HomePod 可能暂时保留旧封面。",
   "Try song information, then red and blue. Song information alone does not clear an old cover; reconnect first.": "建议依次测试歌曲信息、红色和蓝色。仅歌曲信息不会清除旧封面，请先重连。",
   "Open diagnostic logs": "打开诊断日志",
-  "No test covers are sent by default. Accepted requests do not prove visible lighting. Closing stops cycling; the last cover may remain.": "默认不发送测试封面。请求被接受不代表灯效已触发。关闭窗口会停止换色，最后封面可能保留。",
+  "No test covers are sent by default. Accepted requests do not prove visible lighting. Leaving this page stops cycling; the last cover may remain.": "默认不发送测试封面。请求被接受不代表灯效已触发。离开此页面会停止换色，最后封面可能保留。",
   "Not sent": "未发送",
   "Requested: {0}; waiting for receiver response.": "已请求：{0}；等待接收端响应。",
   "Queued by the engine; receiver acceptance is not yet confirmed.": "引擎已排队；尚未确认接收端接受。",
@@ -424,5 +424,5 @@
   "Start streaming before testing Sound Glow.": "请先开始播放，再测试 Sound Glow。",
   "Sound Glow": "Sound Glow",
   "Test HomePod light effects with synthetic covers and metadata.": "使用虚构封面和歌曲信息测试 HomePod 灯效。",
-  "Open Sound Glow experiment": "打开 Sound Glow 灯效实验"
+  "Log": "日志"
 }

@@ -55,6 +55,11 @@ internal static class UiScrolling
                         var scroll = window.PageScroll;
                         var page = window.PageContainer.Children.OfType<FrameworkElement>().Single(p => p.Visibility == Visibility.Visible);
                         var label = $"scroll {(dark ? "dark" : "light")} {size} page {pageIndex}";
+                        if (pageIndex == SettingsViewModel.SoundGlowPage)
+                        {
+                            var log = UiSmoke.Descendants(page).OfType<TextBox>().Single(t => t.Name == "SoundGlowLog");
+                            Observe(log.Height <= 180 && log.VerticalScrollBarVisibility == ScrollBarVisibility.Auto, $"{label}: Sound Glow log keeps a fixed scrolling height", checks, failures);
+                        }
                         var overflowing = scroll.ScrollableHeight > 1;
                         var vertical = scroll.Template.FindName("PART_VerticalScrollBar", scroll) as ScrollBar;
                         var contentBounds = Bounds(page, scroll);

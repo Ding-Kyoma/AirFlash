@@ -413,7 +413,7 @@
   "Reconnected with normal song information. HomePod may retain the previous cover.": "Mit normalen Titelinformationen neu verbunden. Der HomePod kann das vorherige Cover beibehalten.",
   "Try song information, then red and blue. Song information alone does not clear an old cover; reconnect first.": "Testen Sie Titelinformationen, dann Rot und Blau. Titelinformationen allein löschen alte Cover nicht; verbinden Sie sich vorher neu.",
   "Open diagnostic logs": "Diagnoseprotokolle öffnen",
-  "No test covers are sent by default. Accepted requests do not prove visible lighting. Closing stops cycling; the last cover may remain.": "Standardmäßig werden keine Testcover gesendet. Akzeptierte Anfragen bestätigen keinen sichtbaren Lichteffekt. Schließen beendet den Farbwechsel; das letzte Cover kann bleiben.",
+  "No test covers are sent by default. Accepted requests do not prove visible lighting. Leaving this page stops cycling; the last cover may remain.": "Standardmäßig werden keine Testcover gesendet. Akzeptierte Anfragen bestätigen keinen sichtbaren Lichteffekt. Beim Verlassen dieser Seite endet der Farbwechsel; das letzte Cover kann bleiben.",
   "Not sent": "Nicht gesendet",
   "Requested: {0}; waiting for receiver response.": "Angefordert: {0}; Antwort des Empfängers ausstehend.",
   "Queued by the engine; receiver acceptance is not yet confirmed.": "In der Engine eingereiht; Annahme durch den Empfänger noch nicht bestätigt.",
@@ -424,5 +424,5 @@
   "Start streaming before testing Sound Glow.": "Starten Sie die Wiedergabe, bevor Sie Sound Glow testen.",
   "Sound Glow": "Sound Glow",
   "Test HomePod light effects with synthetic covers and metadata.": "HomePod-Lichteffekte mit Testcovern und Metadaten prüfen.",
-  "Open Sound Glow experiment": "Sound Glow-Experiment öffnen"
+  "Log": "Protokoll"
 }

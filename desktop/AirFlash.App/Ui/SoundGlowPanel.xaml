@@ -1,0 +1,35 @@
+<UserControl x:Class="AirFlash.App.Ui.SoundGlowPanel"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:loc="clr-namespace:AirFlash.App.Ui"
+             UseLayoutRounding="True">
+  <StackPanel>
+    <Border Style="{StaticResource Card}">
+      <StackPanel>
+        <TextBlock Text="{loc:Text 'Sound Glow experiment'}" Style="{StaticResource SectionTitle}"/>
+        <TextBlock Text="{loc:Text 'Enable Sound Glow in the Home app, then stream audio. This experiment sends synthetic song information and test covers.'}" Style="{StaticResource Hint}"/>
+        <TextBlock x:Name="StateText" TextWrapping="Wrap" Margin="0,12,0,0" AutomationProperties.LiveSetting="Polite"/>
+        <Border x:Name="Swatch" Height="60" CornerRadius="6" Background="Gray" Margin="0,12,0,12"/>
+        <WrapPanel x:Name="Actions" IsEnabled="False">
+          <Button Content="{loc:Text 'Song information only'}" Tag="metadata_only" Click="OnPaletteClick" Margin="0,0,8,8" Padding="10,6"/>
+          <Button Content="{loc:Text 'Red'}" Tag="red" Click="OnPaletteClick" Margin="0,0,8,8" Padding="10,6"/>
+          <Button Content="{loc:Text 'Blue'}" Tag="blue" Click="OnPaletteClick" Margin="0,0,8,8" Padding="10,6"/>
+          <Button Content="{loc:Text 'Green'}" Tag="green" Click="OnPaletteClick" Margin="0,0,8,8" Padding="10,6"/>
+        </WrapPanel>
+        <CheckBox x:Name="Cycle" Content="{loc:Text 'Random color every 15 seconds'}" Margin="0,8,0,8" Checked="OnCycleChecked" Unchecked="OnCycleUnchecked" IsEnabled="False"/>
+        <Button x:Name="SoundGlowReset" Click="OnResetClick" HorizontalAlignment="Stretch" Margin="0,4,0,8" AutomationProperties.Name="{loc:Text 'Restore normal playback (stop and reconnect)'}">
+          <TextBlock Text="{loc:Text 'Restore normal playback (stop and reconnect)'}" TextWrapping="Wrap"/>
+        </Button>
+        <TextBlock Text="{loc:Text 'Try song information, then red and blue. Song information alone does not clear an old cover; reconnect first.'}" Style="{StaticResource Hint}" Margin="0,4,0,0"/>
+      </StackPanel>
+    </Border>
+    <Border Style="{StaticResource Card}">
+      <StackPanel>
+        <TextBlock Text="{loc:Text 'Log'}" Style="{StaticResource SectionTitle}"/>
+        <TextBox x:Name="SoundGlowLog" Height="160" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" VerticalContentAlignment="Top" AutomationProperties.Name="{loc:Text 'Log'}"/>
+        <Button Content="{loc:Text 'Open diagnostic logs'}" Click="OnOpenLogsClick" HorizontalAlignment="Left" Margin="0,10,0,0"/>
+        <TextBlock Text="{loc:Text 'No test covers are sent by default. Accepted requests do not prove visible lighting. Leaving this page stops cycling; the last cover may remain.'}" Style="{StaticResource Hint}" Margin="0,12,0,0"/>
+      </StackPanel>
+    </Border>
+  </StackPanel>
+</UserControl>

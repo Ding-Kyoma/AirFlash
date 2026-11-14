@@ -413,7 +413,7 @@
   "Reconnected with normal song information. HomePod may retain the previous cover.": "Reconnexion avec les informations musicales normales. Le HomePod peut conserver la pochette précédente.",
   "Try song information, then red and blue. Song information alone does not clear an old cover; reconnect first.": "Essayez les informations musicales, puis le rouge et le bleu. Les informations seules n’effacent pas une ancienne pochette ; reconnectez-vous d’abord.",
   "Open diagnostic logs": "Ouvrir les journaux de diagnostic",
-  "No test covers are sent by default. Accepted requests do not prove visible lighting. Closing stops cycling; the last cover may remain.": "Aucune pochette de test n’est envoyée par défaut. Les requêtes acceptées ne prouvent pas un éclairage visible. La fermeture arrête le cycle ; la dernière pochette peut rester.",
+  "No test covers are sent by default. Accepted requests do not prove visible lighting. Leaving this page stops cycling; the last cover may remain.": "Aucune pochette de test n’est envoyée par défaut. Les requêtes acceptées ne prouvent pas un éclairage visible. Quitter cette page arrête le cycle ; la dernière pochette peut rester.",
   "Not sent": "Non envoyé",
   "Requested: {0}; waiting for receiver response.": "Demandé : {0} ; en attente de la réponse du récepteur.",
   "Queued by the engine; receiver acceptance is not yet confirmed.": "Mis en file par le moteur ; l’acceptation par le récepteur n’est pas encore confirmée.",
@@ -424,5 +424,5 @@
   "Start streaming before testing Sound Glow.": "Démarrez la diffusion avant de tester Sound Glow.",
   "Sound Glow": "Sound Glow",
   "Test HomePod light effects with synthetic covers and metadata.": "Testez les effets lumineux avec pochettes et métadonnées.",
-  "Open Sound Glow experiment": "Ouvrir l’expérience Sound Glow"
+  "Log": "Journal"
 }
