@@ -45,6 +45,7 @@ struct Running {
     pending_pin: Option<std::sync::mpsc::Sender<zeroize::Zeroizing<String>>>,
     gain_limit: f64,
     force_latency: bool,
+    sound_glow: airflash_engine::sound_glow::Control,
     volume: airflash_engine::volume::Control,
     standby: airflash_engine::standby::Control,
     equalizer: Option<(airflash_engine::equalizer::Control, u32)>,
@@ -72,11 +73,27 @@ fn capabilities() -> Vec<&'static str> {
         "diagnostics",
         "forced_latency",
         "adaptive_lead_v2",
+        "sound_glow_test",
     ];
     if airflash_engine::applications::supported() {
         values.push("application_capture");
     }
     values
+}
+
+fn sound_glow_event(running: Option<&Running>, session: &str, params: Value) -> Value {
+    let sequence = params.get("sequence").cloned().unwrap_or(Value::Null);
+    let result = (|| -> anyhow::Result<()> {
+        let command: airflash_engine::sound_glow::Command = serde_json::from_value(params)?;
+        let active = running
+            .filter(|r| r.id == session && r.equalizer.is_some() && !r.cancel.is_cancelled())
+            .ok_or_else(|| anyhow::anyhow!("sound glow test requires an active live session"))?;
+        active.sound_glow.set(command)
+    })();
+    match result {
+        Ok(()) => json!({"event":"sound_glow_queued","sequence":sequence}),
+        Err(error) => json!({"event":"sound_glow_error","sequence":sequence,"message":error.to_string()}),
+    }
 }
 
 fn lead_event(running: Option<&Running>, session: &str, params: &Value) -> Value {
@@ -239,7 +256,7 @@ fn main() {
             "hello" => send(
                 &request.id,
                 &request.session_id,
-                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"experimental","live_loopback":true,"capabilities":capabilities(),"commands":["hello","get_receiver_capabilities","list_applications","start","probe","stop","set_gain","set_equalizer","set_standby","set_device_volume","set_lead","set_now_playing","pair","pair_pin"],"production_ready":false}),
+                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"experimental","live_loopback":true,"capabilities":capabilities(),"commands":["hello","get_receiver_capabilities","list_applications","start","probe","stop","set_gain","set_sound_glow","set_equalizer","set_standby","set_device_volume","set_lead","set_now_playing","pair","pair_pin"],"production_ready":false}),
             ),
             "get_receiver_capabilities" => {
                 let result = (|| -> anyhow::Result<_> {
@@ -351,6 +368,7 @@ fn main() {
                     airflash_engine::equalizer::Control::new(options.equalizer, rate).unwrap();
                 let worker_equalizer = equalizer.clone();
                 let live_equalizer = (request.command == "start").then_some((equalizer, rate));
+                let sound_glow = options.sound_glow.clone();
                 let worker = thread::spawn(move || {
                     let emit = |e| send(&request.id, &request.session_id, e);
                     if let Err(error) = probe_with_all_controls(
@@ -373,6 +391,7 @@ fn main() {
                     pending_pin: None,
                     gain_limit,
                     force_latency,
+                    sound_glow,
                     volume,
                     standby,
                     equalizer: live_equalizer,
@@ -412,6 +431,13 @@ fn main() {
                         );
                     }
                 }
+            }
+            "set_sound_glow" => {
+                send(
+                    &request.id,
+                    &request.session_id,
+                    sound_glow_event(running.as_ref(), &request.session_id, request.params),
+                );
             }
             "set_equalizer" => {
                 send(
@@ -588,6 +614,7 @@ fn main() {
                     pending_pin: Some(tx),
                     gain_limit: 0.0,
                     force_latency: false,
+                    sound_glow: airflash_engine::sound_glow::Control::default(),
                     volume: airflash_engine::volume::Control::default(),
                     standby: airflash_engine::standby::Control::default(),
                     equalizer: None,
@@ -645,10 +672,31 @@ mod tests {
             pending_pin: None,
             gain_limit: 1.0,
             force_latency: false,
+            sound_glow: airflash_engine::sound_glow::Control::default(),
             volume: airflash_engine::volume::Control::default(),
             standby: airflash_engine::standby::Control::default(),
             equalizer: Some((Control::new(Settings::default(), rate).unwrap(), rate)),
         }
+    }
+
+    #[test]
+    fn sound_glow_requires_current_live_session_and_monotonic_commands() {
+        let mut active = stored_start(44100);
+        let command = json!({"sequence":1,"palette":"red"});
+        assert_eq!(sound_glow_event(None, "eq-session", command.clone())["event"], "sound_glow_error");
+        assert_eq!(sound_glow_event(Some(&active), "stale-session", command.clone())["event"], "sound_glow_error");
+        assert!(!active.sound_glow.is_active());
+        assert_eq!(sound_glow_event(Some(&active), "eq-session", command.clone())["event"], "sound_glow_queued");
+        assert_eq!(sound_glow_event(Some(&active), "eq-session", command.clone())["event"], "sound_glow_error");
+        assert_eq!(sound_glow_event(Some(&active), "eq-session", json!({"sequence":2,"palette":"rainbow"}))["event"], "sound_glow_error");
+        active.cancel.cancel();
+        assert_eq!(sound_glow_event(Some(&active), "eq-session", json!({"sequence":2,"palette":"blue"}))["event"], "sound_glow_error");
+        active = stored_start(44100);
+        active.sound_glow.disable("test initialization failure".into());
+        assert_eq!(sound_glow_event(Some(&active), "eq-session", json!({"sequence":1,"palette":"green"}))["event"], "sound_glow_error");
+        assert!(!active.sound_glow.is_active());
+        active.equalizer = None;
+        assert_eq!(sound_glow_event(Some(&active), "eq-session", command)["event"], "sound_glow_error");
     }
 
     #[test]

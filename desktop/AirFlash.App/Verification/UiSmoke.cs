@@ -50,6 +50,16 @@ internal static class UiSmoke
             }
             catch (Exception error) { App.WriteOutput(args, new { ok = false, checks, error = error.ToString() }); return 1; }
         }
+        if (args.Contains("--ui-sound-glow-smoke"))
+        {
+            try
+            {
+                await SoundGlowRegression.RunAsync(checks, directory);
+                App.WriteOutput(args, new { ok = true, checks, note = "Sound Glow UI with simulated services; lighting is not hardware-verified." });
+                return 0;
+            }
+            catch (Exception error) { App.WriteOutput(args, new { ok = false, checks, error = error.ToString() }); return 1; }
+        }
         if (args.Contains("--ui-pairing-hint-smoke"))
         {
             try
@@ -584,6 +594,7 @@ internal static class UiSmoke
         public bool SupportsAdaptiveLead;
         public Action<object>? EmitEvent;
         public ConcurrentQueue<JsonElement> Commands { get; } = new();
+        public bool SupportsSoundGlow { get; init; } = true;
         public int CreatedCount, DisposedCount;
         public IEngineConnection Open()
         {
@@ -601,7 +612,7 @@ internal static class UiSmoke
         public Task SendAsync(string session, string command, object? parameters, CancellationToken cancellation)
         {
             factory.Commands.Enqueue(JsonSerializer.SerializeToElement(new { command, @params = parameters }));
-            if (command == "hello") Emit(session, new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture", "forced_latency" }.Concat(factory.SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).ToArray() });
+            if (command == "hello") Emit(session, new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture", "forced_latency" }.Concat(factory.SupportsSoundGlow ? ["sound_glow_test"] : Array.Empty<string>()).Concat(factory.SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).ToArray() });
             if (command == "pair") factory.EmitEvent = payload => Emit(session, payload);
             if (command == "start")
             {

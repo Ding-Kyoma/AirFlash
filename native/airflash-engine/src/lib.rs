@@ -34,3 +34,4 @@ pub mod applications;
 
 #[cfg(test)]
 mod test_net;
+pub mod sound_glow;

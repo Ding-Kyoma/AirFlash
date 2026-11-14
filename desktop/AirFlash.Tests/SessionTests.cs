@@ -405,6 +405,101 @@ public sealed class SessionTests
         Assert.Equal("Song", process.Commands.Single(c => c.Command == "set_now_playing").Parameters.Text("title"));
     }
     [Fact]
+    public async Task SoundGlowIsOptInAndReceiverRejectionDoesNotFailAudioSession()
+    {
+        var process = new FakeConnection();
+        var logs = new ConcurrentQueue<string>();
+        await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), logs.Enqueue,
+            Fast with { Read = SessionTiming.Default.Read });
+        await Assert.ThrowsAsync<InvalidOperationException>(() => controller.SendSoundGlowTestAsync("red"));
+        await Assert.ThrowsAsync<ArgumentException>(() => controller.SendSoundGlowTestAsync("rainbow"));
+        await controller.StartAsync(Pod(), Settings());
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.DoesNotContain(process.Commands, c => c.Command == "set_sound_glow");
+        await controller.SendSoundGlowTestAsync("red");
+        await controller.SendSoundGlowTestAsync("blue");
+        var commands = process.Commands.Where(c => c.Command == "set_sound_glow").ToArray();
+        Assert.Equal(2, commands.Length);
+        Assert.Equal("red", commands[0].Parameters.Text("palette"));
+        Assert.Equal("blue", commands[1].Parameters.Text("palette"));
+        Assert.True(commands[1].Parameters.Integer("sequence") > commands[0].Parameters.Integer("sequence"));
+        var feedback = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
+        controller.SoundGlowFeedback += item => feedback.TrySetResult(item);
+        process.EmitData(new { @event = "sound_glow_result", sequence = commands[1].Parameters.Integer("sequence"), accepted = false, part = "metadata", message = "415 Unsupported Media Type" });
+        var item = await feedback.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(item.Boolean("accepted"));
+        Assert.Equal(PlaybackState.Streaming, controller.Snapshot.State);
+        Assert.Contains(logs, line => line.Contains("415 Unsupported Media Type"));
+        await controller.StopAsync();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => controller.SendSoundGlowTestAsync("green"));
+    }
+    [Fact]
+    public async Task UnsupportedSoundGlowDoesNotPreventPlayback()
+    {
+        var process = new FakeConnection { SupportsSoundGlow = false };
+        await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast with { Read = SessionTiming.Default.Read });
+        await controller.StartAsync(Pod(), Settings());
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.False(controller.SoundGlowSupported);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => controller.SendSoundGlowTestAsync("red"));
+        Assert.DoesNotContain(process.Commands, c => c.Command == "set_sound_glow");
+        Assert.Equal(PlaybackState.Streaming, controller.Snapshot.State);
+    }
+
+    [Fact]
+    public async Task StopCancelsBlockedSoundGlowAndQueuedRequests()
+    {
+        var process = new FakeConnection();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        process.BeforeSend = async (command, cancellation) =>
+        {
+            if (command.Command != "set_sound_glow") return;
+            entered.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellation);
+        };
+        await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast with { Read = SessionTiming.Default.Read });
+        await controller.StartAsync(Pod(), Settings());
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var first = controller.SendSoundGlowTestAsync("red");
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        var second = controller.SendSoundGlowTestAsync("blue");
+        await controller.StopAsync().WaitAsync(TimeSpan.FromSeconds(2));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => first);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => second);
+        Assert.Equal(PlaybackState.Idle, controller.Snapshot.State);
+        Assert.DoesNotContain(process.Commands, c => c.Command == "set_sound_glow");
+    }
+
+    [Fact]
+    public async Task SoundGlowFiltersOldSequencesAndSessionsAndResetsOnReconnect()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection();
+        await using var controller = new SessionController(new FakeFactory(first, second), new FakeAudio(), timing: Fast with { Read = SessionTiming.Default.Read });
+        var received = new ConcurrentQueue<JsonElement>();
+        controller.SoundGlowFeedback += received.Enqueue;
+        await controller.StartAsync(Pod(), Settings());
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        await controller.SendSoundGlowTestAsync("red");
+        var oldSequence = first.Commands.Single(c => c.Command == "set_sound_glow").Parameters.Integer("sequence");
+        await controller.SendSoundGlowTestAsync("blue");
+        var sequence = first.Commands.Last(c => c.Command == "set_sound_glow").Parameters.Integer("sequence");
+        first.EmitData(new { @event = "sound_glow_result", sequence = oldSequence });
+        first.EmitData(new { @event = "sound_glow_result", sequence }, "old-session");
+        first.EmitData(new { @event = "sound_glow_result", sequence, host = "127.0.0.1", accepted = true });
+        first.EmitData(new { @event = "sound_glow_result", sequence, host = "127.0.0.2", accepted = false });
+        await Until(() => received.Count == 2);
+        Assert.Equal(new[] { "127.0.0.1", "127.0.0.2" }, received.Select(e => e.Text("host")));
+        await controller.StopAsync();
+        Assert.False(controller.SoundGlowSupported);
+        await controller.StartAsync(Pod(), Settings());
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.True(controller.SoundGlowSupported);
+        Assert.DoesNotContain(second.Commands, c => c.Command == "set_sound_glow");
+        await controller.PublishNowPlayingAsync(new("Normal song", "Artist", "", "", true, 10000, 1000));
+        Assert.Contains(second.Commands, c => c.Command == "set_now_playing" && c.Parameters.Text("title") == "Normal song");
+    }
+
+    [Fact]
     public async Task ClockStartupFailureRetainsPerPeerDiagnosticsAndEnginePathInLog()
     {
         var process = new FakeConnection(autoReady: false);
@@ -1555,6 +1650,7 @@ public sealed class SessionTests
         public bool Disposed { get; private set; }
         public bool RespondHello { get; init; } = true;
         public bool SupportsForcedLatency { get; init; } = true;
+        public bool SupportsSoundGlow { get; init; } = true;
         public bool SupportsAdaptiveLead { get; init; } = true;
         public bool SupportsOwnershipGuard { get; init; } = true;
         private int _latencyBase;
@@ -1578,7 +1674,7 @@ public sealed class SessionTests
                 case "set_gain": GainEntered?.TrySetResult(); if (GainGate is not null) await GainGate.Task.WaitAsync(cancellation); break;
             }
         }
-        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture" }.Where(c => SupportsOwnershipGuard || c != "receiver_ownership_guard").Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).Concat(SupportsForcedLatency ? ["forced_latency"] : Array.Empty<string>()).Concat(SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).ToArray() });
+        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture" }.Where(c => SupportsOwnershipGuard || c != "receiver_ownership_guard").Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).Concat(SupportsSoundGlow ? ["sound_glow_test"] : Array.Empty<string>()).Concat(SupportsForcedLatency ? ["forced_latency"] : Array.Empty<string>()).Concat(SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).ToArray() });
         public void ConfirmLead(int extra)
         {
             var command = Commands.Last(c => c.Command == "set_lead");

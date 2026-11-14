@@ -352,11 +352,22 @@ impl Connection {
         headers: &[(&str, String)],
         body: &[u8],
     ) -> Result<Message> {
+        self.request_cancellable(method, path, headers, body, None)
+    }
+    /// Optional worker cancellation leaves the session connection available.
+    pub fn request_cancellable(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, String)],
+        body: &[u8],
+        cancellation: Option<&Cancellation>,
+    ) -> Result<Message> {
         self.begin_request(method, path, headers, body)?;
         let deadline = Instant::now() + self.timeout;
         let response = loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let response = self.read_for(remaining, None)?.ok_or(WireError::ReadTimeout)
+            let response = self.read_for(remaining, cancellation)?.ok_or(WireError::ReadTimeout)
                 .with_context(|| format!("{method} {path}"))?;
             if response.method().is_some() {
                 ensure!(self.unsolicited.len() < 4, "unsolicited request flood");

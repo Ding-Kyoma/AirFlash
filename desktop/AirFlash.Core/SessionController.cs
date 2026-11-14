@@ -22,6 +22,42 @@ public sealed record SessionTiming(TimeSpan Connect, TimeSpan Read, TimeSpan Pin
 public sealed class SessionController(IEngineFactory factory, IAudioService audio, Action<string>? log = null, SessionTiming? timing = null, Action<DesktopSessionRecord>? sessionRecords = null, TimeProvider? clock = null) : IAsyncDisposable
 {
     private readonly SemaphoreSlim _serial = new(1, 1);
+    private long _soundGlowSequence;
+    private bool _soundGlowSupported;
+    private readonly SemaphoreSlim _soundGlowWriter = new(1, 1);
+    public bool SoundGlowSupported { get { lock (_sync) return _soundGlowSupported; } }
+    public event Action<JsonElement>? SoundGlowFeedback;
+    public async Task SendSoundGlowTestAsync(string palette, CancellationToken cancellation = default)
+    {
+        if (palette is not ("metadata_only" or "red" or "blue" or "green"))
+            throw new ArgumentException("Unknown test palette.", nameof(palette));
+        IEngineConnection connection; string session; CancellationToken lifetime; long epoch;
+        lock (_sync)
+        {
+            if (_snapshot.State != PlaybackState.Streaming || _connection is null || _sessionId is null || _lifetime is null)
+                throw new InvalidOperationException(L.Get("Start streaming before testing Sound Glow."));
+            if (!_soundGlowSupported)
+                throw new InvalidOperationException(L.Get("This audio engine does not support the Sound Glow experiment."));
+            connection = _connection; session = _sessionId; lifetime = _lifetime.Token; epoch = _generation;
+        }
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation, lifetime);
+        timeout.CancelAfter(TimeSpan.FromSeconds(2));
+        await _soundGlowWriter.WaitAsync(timeout.Token).ConfigureAwait(false);
+        try
+        {
+            long sequence;
+            lock (_sync)
+            {
+                timeout.Token.ThrowIfCancellationRequested();
+                if (epoch != _generation || !ReferenceEquals(connection, _connection) || _snapshot.State != PlaybackState.Streaming)
+                    throw new InvalidOperationException(L.Get("Start streaming before testing Sound Glow."));
+                sequence = ++_soundGlowSequence;
+            }
+            await connection.SendAsync(session, "set_sound_glow", new { sequence, palette }, timeout.Token).ConfigureAwait(false);
+            log?.Invoke($"Sound Glow test requested: sequence={sequence}; palette={palette}");
+        }
+        finally { _soundGlowWriter.Release(); }
+    }
     private readonly SemaphoreSlim _audioWriter = new(1, 1);
     private readonly SemaphoreSlim _diagnosticWriter = new(1, 1);
     private TaskCompletionSource<JsonElement?>? _diagnosticReply;
@@ -665,6 +701,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                     var deadline = DateTime.UtcNow + _timing.Connect;
                     await connection.SendAsync(session, "hello", null, cancellation).ConfigureAwait(false);
                     var hello = await ReadEventAsync(connection, session, _timing.Connect, cancellation).ConfigureAwait(false);
+                    lock (_sync) { if (epoch == _generation) _soundGlowSupported = EngineHandshake.HasCapability(hello, "sound_glow_test"); }
                     _confirmedLeadSupported = EngineHandshake.HasCapability(hello, "adaptive_lead_v2");
                     EngineHandshake.RequireStreamingCapabilities(hello);
                     EngineHandshake.RequireCapabilities(hello, "standby_release");
@@ -728,6 +765,16 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                             continue;
                         }
                         var kind = item.Text("event");
+                        if (kind.StartsWith("sound_glow_", StringComparison.Ordinal))
+                        {
+                            lock (_sync)
+                            {
+                                if (epoch != _generation || item.Integer("sequence") is { } sequence && sequence != _soundGlowSequence) continue;
+                            }
+                            log?.Invoke("Sound Glow: " + item.GetRawText());
+                            SoundGlowFeedback?.Invoke(item.Clone());
+                            continue;
+                        }
                         if (kind == "error") throw new EngineFailure(EngineNotice.Parse(item));
                         if (kind == "stopped") throw new IOException(L.Get("The audio session ended unexpectedly."));
                         if (kind == "diag_summary")
@@ -1006,8 +1053,8 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         public NetworkFailure(string message) : base(message) { }
     }
     private static bool IsAuthenticationFailure(string message) => new[] { "pairing", "srp", "verification", "credentials", "signature", "identity", "authentication" }.Any(word => message.Contains(word, StringComparison.OrdinalIgnoreCase));
-    private void SetConnection(IEngineConnection connection, string session) { lock (_sync) { _connection = connection; _sessionId = session; _equalizerReady = false; _sentStandby = null; } }
-    private void ClearConnection(IEngineConnection connection) { lock (_sync) if (ReferenceEquals(_connection, connection)) { _connection = null; _sessionId = null; _equalizerReady = false; _sentStandby = null; } }
+    private void SetConnection(IEngineConnection connection, string session) { lock (_sync) { _connection = connection; _sessionId = session; _equalizerReady = false; _sentStandby = null; _soundGlowSupported = false; } }
+    private void ClearConnection(IEngineConnection connection) { lock (_sync) if (ReferenceEquals(_connection, connection)) { _connection = null; _sessionId = null; _equalizerReady = false; _sentStandby = null; _soundGlowSupported = false; } }
     private static async Task RequestStopAsync(IEngineConnection connection, string session)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
