@@ -38,7 +38,11 @@ Windows taskbar and notification icons require native bitmap handles. `AppIconSe
 
 Settings, receiver speaker, play and stop icons are application-owned `Geometry` resources in `ControlPanel.xaml`, drawn with WPF `Path` elements. Their 24-unit design canvases scale uniformly to 18, 19 and 16 DIPs. Outline icons use rounded strokes; colors follow the current theme. Playback switches geometry using the receiver's existing `Active` state while retaining its command, tooltip and accessible name.
 
+The device volume row also uses fixed-size application vectors: a rotating accent arc while a receiver volume write is pending, and a warning glyph while the volume is unconfirmed or unreadable. Both are measured in a constant 16-DIP slot inside the row, so localized status text can never wrap or change the card height; the status wording is exposed through the icon tooltip and the volume slider's accessible help text.
+
 这些控件图标随应用编译打包，不依赖 `Segoe Fluent Icons`、`Segoe MDL2 Assets` 或其他图标字体；Windows 10 用户无需安装字体。修改它们时编辑面板的 Geometry 资源，应用 Logo 仍使用上述 SVG 生成流程。
+
+设备音量行还包含两个固定尺寸的应用内矢量：接收器音量写入等待确认时显示旋转强调色弧线，音量未确认或不可读时显示警告图标。两者都放在行内恒定的 16 DIP 槽位中，因此本地化状态文案不会换行，也不会改变卡片高度；状态文字通过图标工具提示和音量滑块的辅助功能帮助文本提供。
 
 ## Verification / 验收
 

@@ -5,6 +5,7 @@ using System.Windows.Automation.Provider;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using AirFlash.App.Services;
 using AirFlash.App.Ui;
@@ -515,7 +516,7 @@ internal static class UiRegression
                     return origin.X >= 0 && origin.X + element.ActualWidth <= panel.ActualWidth + 1;
                 }) && controls.OfType<Slider>().All(slider => slider.ActualWidth >= 60),
                     $"{label}: volume sliders, buttons and latency selector fit the compact panel", checks);
-                await CheckCompactVolumeLayoutAsync(panel, app, engine, receiver, label, checks, directory);
+                await CheckCompactVolumeLayoutAsync(panel, app, card, engine, receiver, label, checks, directory);
                 var writes = engine.Commands.Count(command => command.Text("command") == "set_device_volume");
                 engine.EmitEvent!(new { @event = "standby" });
                 await Until(() => app.Snapshot.State == PlaybackState.Standby); await Pump();
@@ -549,7 +550,7 @@ internal static class UiRegression
     private static StackPanel VolumeControls(ControlPanel panel, ReceiverViewModel row)
         => UiSmoke.Descendants(panel).OfType<StackPanel>().Single(element => element.Name == "ReceiverVolumeControls" && ReferenceEquals(element.DataContext, row));
 
-    private static async Task CheckCompactVolumeLayoutAsync(ControlPanel panel, AppViewModel app,
+    private static async Task CheckCompactVolumeLayoutAsync(ControlPanel panel, AppViewModel app, Border card,
         UiSmoke.MockFactory engine, Receiver receiver, string label, List<string> checks, string directory)
     {
         var sliders = UiSmoke.Descendants(panel).OfType<Slider>().Where(slider => slider.IsVisible).ToArray();
@@ -562,28 +563,34 @@ internal static class UiRegression
             $"{label}: master volume uses only an 8 DIP gap after its localized label", checks);
 
         var deviceRow = (Grid)device.Parent;
-        var status = deviceRow.Children.OfType<TextBlock>().Single(text => Grid.GetRow(text) == 1);
+        var indicator = UiSmoke.Descendants(deviceRow).OfType<Grid>().Single(element => element.Name == "VolumeIndicator");
+        var sync = UiSmoke.Descendants(indicator).OfType<System.Windows.Shapes.Path>().Single(path => path.Name == "VolumeSyncIcon");
+        var warning = UiSmoke.Descendants(indicator).OfType<System.Windows.Shapes.Path>().Single(path => path.Name == "VolumeWarningIcon");
         var row = (ReceiverViewModel)device.DataContext;
         var deviceWidth = device.ActualWidth;
         var rowHeight = deviceRow.ActualHeight;
-        CheckStatus(false, "confirmed");
+        var cardHeight = card.ActualHeight;
+        CheckIndicator(false, false, "confirmed");
         checks.Add($"{label}: volume layout measured at {VisualTreeHelper.GetDpi(panel).PixelsPerDip * 100:0}% physical display scaling");
 
         device.SetCurrentValue(Slider.ValueProperty, 50d);
-        await Until(() => row.VolumeStatus == L.Get("Synchronizing…")); await Pump();
-        CheckStatus(true, "pending");
+        await Until(() => row.VolumeSyncing); await Pump();
+        CheckIndicator(true, false, "pending");
+        CheckVector(sync, "VolumeSyncIconGeometry", "AccentBrush", "volume synchronization icon");
         UiSmoke.Render(panel, Path.Combine(directory, $"compact-volume-{label}-pending-125.png"), 1.25);
-        await Until(() => row.Volume == 50 && row.VolumeStatus.Length == 0); await Pump();
-        CheckStatus(false, "confirmed after edit");
+        await Until(() => row.Volume == 50 && !row.VolumeSyncing && row.VolumeStatus.Length == 0); await Pump();
+        CheckIndicator(false, false, "confirmed after edit");
         foreach (var state in new[] { "unconfirmed", "unsynced", "confirmed" })
         {
             engine.EmitEvent!(new { @event = "device_volume", host = receiver.Address, volume = state == "unsynced" ? (int?)null : 50,
                 sequence = app.ReceiverVolume(receiver.Id).Sequence, status = state, available = state != "unsynced" });
             await Until(() => app.ReceiverVolume(receiver.Id).Status == state); await Pump();
-            CheckStatus(state != "confirmed", state);
+            CheckIndicator(false, state != "confirmed", state);
+            if (state == "unconfirmed")
+                CheckVector(warning, "VolumeWarningIconGeometry", "ErrorBrush", "volume warning icon");
             if (state == "unsynced")
-                Check(device.IsVisible && !device.IsEnabled && status.IsVisible,
-                    $"{label}: a missing volume read disables the connected slider and keeps its synchronization hint visible", checks);
+                Check(device.IsVisible && !device.IsEnabled && warning.IsVisible,
+                    $"{label}: a missing volume read disables the connected slider and keeps its synchronization icon visible", checks);
         }
 
         foreach (var slider in new[] { master, device })
@@ -649,13 +656,39 @@ internal static class UiRegression
                 $"{label}: {AutomationProperties.GetName(slider)} '{button.Content}' fits while retaining a usable slider", checks);
         }
 
-        void CheckStatus(bool visible, string state)
+        void CheckIndicator(bool syncing, bool warningVisible, string state)
         {
             CheckAlignedSliders();
+            var alert = syncing || warningVisible;
             Check(Math.Abs(device.ActualWidth - deviceWidth) <= 1
-                && (visible ? status.IsVisible && status.TranslatePoint(new(), deviceRow).Y >= device.ActualHeight
-                    : status.Visibility == Visibility.Collapsed && Math.Abs(deviceRow.ActualHeight - rowHeight) <= 1),
-                $"{label}: {state} volume status sits below a stable-width slider and leaves no empty row", checks);
+                && Math.Abs(deviceRow.ActualHeight - rowHeight) <= 1
+                && Math.Abs(card.ActualHeight - cardHeight) <= 1
+                && deviceRow.RowDefinitions.Count == 0
+                && indicator.IsVisible && Math.Abs(indicator.ActualWidth - 16) <= 1 && Math.Abs(indicator.ActualHeight - 16) <= 1
+                && indicator.TranslatePoint(new(indicator.ActualWidth, 0), deviceRow).X <= device.TranslatePoint(new(), deviceRow).X + 1
+                && sync.IsVisible == syncing && warning.IsVisible == warningVisible
+                && ToolTipService.GetIsEnabled(indicator) == alert
+                && (string?)indicator.ToolTip == row.VolumeStatus
+                && AutomationProperties.GetHelpText(device) == row.VolumeStatus,
+                $"{label}: {state} volume status stays a fixed icon in the row, leaving the card, track and translated hint stable", checks);
+        }
+
+        void CheckVector(System.Windows.Shapes.Path icon, string geometryKey, string brushKey, string name)
+        {
+            var pen = new Pen(icon.Stroke, icon.StrokeThickness)
+            { StartLineCap = icon.StrokeStartLineCap, EndLineCap = icon.StrokeEndLineCap, LineJoin = icon.StrokeLineJoin };
+            var bounds = icon.RenderedGeometry.GetRenderBounds(pen);
+            var bitmap = new RenderTargetBitmap(24, 24, 96, 96, PixelFormats.Pbgra32);
+            bitmap.Render(icon);
+            var pixels = new byte[24 * 24 * 4]; bitmap.CopyPixels(pixels, 24 * 4, 0);
+            var brush = icon.Stroke as SolidColorBrush;
+            var expected = (SolidColorBrush)panel.FindResource(brushKey);
+            Check(ReferenceEquals(icon.Data, panel.FindResource(geometryKey)) && !icon.Data.IsEmpty()
+                && icon.IsVisible && icon.ActualWidth > 0 && icon.ActualHeight > 0 && !bounds.IsEmpty
+                && new Rect(0, 0, icon.ActualWidth, icon.ActualHeight).Contains(bounds)
+                && Enumerable.Range(0, 24 * 24).Any(index => pixels[index * 4 + 3] != 0)
+                && brush is not null && brush.Color == expected.Color,
+                $"{label}: {name} uses its built-in vector, renders nontransparent pixels and follows the current theme", checks);
         }
 
         void CheckAlignedSliders()

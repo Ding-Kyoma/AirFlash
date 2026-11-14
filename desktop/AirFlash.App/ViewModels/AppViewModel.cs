@@ -753,6 +753,10 @@ public sealed class ReceiverViewModel : ObservableObject
     public string VolumeStatus => DeviceVolume.Status switch {
         "pending" => L.Get("Synchronizing…"), "unconfirmed" => L.Get("Volume not confirmed"),
         "unsynced" => L.Get("Volume not synchronized"), _ => "" };
+    // The volume row renders fixed-size icons instead of status text so translations cannot wrap or add a row.
+    public bool VolumeSyncing => DeviceVolume.Status == "pending";
+    public bool VolumeWarning => DeviceVolume.Status is "unconfirmed" or "unsynced";
+    public bool VolumeAlert => VolumeSyncing || VolumeWarning;
     public bool CanSetVolume => DeviceVolume.Available;
     public bool HasSingleVolume => !Receiver.IsSoftwareGroup;
     public bool ShowVolumeControls => !IsStopping && _app.Snapshot.Receiver?.Id == Receiver.Id
@@ -775,7 +779,8 @@ public sealed class ReceiverViewModel : ObservableObject
         foreach (var row in MemberVolumes.Where(r => members.All(m => m.Id != r.Receiver.Id)).ToArray()) MemberVolumes.Remove(row);
         foreach (var member in members)
         { var row = MemberVolumes.FirstOrDefault(r => r.Receiver.Id == member.Id); if (row is null) MemberVolumes.Add(row = new(_app, member)); else row.Receiver = member; row.Refresh(); }
-        var values = new Dictionary<string, object?> { [nameof(IsStopping)] = IsStopping, [nameof(NeedsDisconnect)] = NeedsDisconnect, [nameof(PlaybackCommand)] = PlaybackCommand, [nameof(HasSingleVolume)] = HasSingleVolume, [nameof(ShowVolumeControls)] = ShowVolumeControls, [nameof(Name)] = Name, [nameof(Detail)] = Detail, [nameof(Volume)] = Volume, [nameof(VolumeText)] = VolumeText, [nameof(VolumeStatus)] = VolumeStatus, [nameof(CanSetVolume)] = CanSetVolume, [nameof(CanMute)] = CanMute, [nameof(Muted)] = Muted, [nameof(MuteLabel)] = MuteLabel, [nameof(Active)] = Active, [nameof(CanPlay)] = CanPlay, [nameof(PlayHint)] = PlayHint, [nameof(StateText)] = StateText };
+        var values = new Dictionary<string, object?> { [nameof(IsStopping)] = IsStopping, [nameof(NeedsDisconnect)] = NeedsDisconnect, [nameof(PlaybackCommand)] = PlaybackCommand, [nameof(HasSingleVolume)] = HasSingleVolume, [nameof(ShowVolumeControls)] = ShowVolumeControls, [nameof(Name)] = Name, [nameof(Detail)] = Detail, [nameof(Volume)] = Volume, [nameof(VolumeText)] = VolumeText, [nameof(VolumeStatus)] = VolumeStatus, [nameof(VolumeSyncing)] = VolumeSyncing,
+            [nameof(VolumeWarning)] = VolumeWarning, [nameof(VolumeAlert)] = VolumeAlert, [nameof(CanSetVolume)] = CanSetVolume, [nameof(CanMute)] = CanMute, [nameof(Muted)] = Muted, [nameof(MuteLabel)] = MuteLabel, [nameof(Active)] = Active, [nameof(CanPlay)] = CanPlay, [nameof(PlayHint)] = PlayHint, [nameof(StateText)] = StateText };
         foreach (var (name, value) in values)
             if (!_display.TryGetValue(name, out var old) || !Equals(old, value))
             {

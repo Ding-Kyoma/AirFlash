@@ -194,8 +194,8 @@ internal static class UiSmoke
             Check(!engine.Commands.Any(c => c.Text("command") == "set_device_volume"), "initial volume comes from receiver without a write", checks);
             var volumeRow = app.Receivers[0];
             volumeRow.Volume = 44;
-            await Until(() => volumeRow.VolumeStatus == L.Get("Synchronizing…"));
-            await Until(() => volumeRow.Volume == 44 && volumeRow.VolumeStatus.Length == 0);
+            await Until(() => volumeRow.VolumeSyncing);
+            await Until(() => volumeRow.Volume == 44 && !volumeRow.VolumeSyncing && volumeRow.VolumeStatus.Length == 0);
             Check(volumeRow.CanSetVolume && app.MasterVolume == 100, "delayed receiver confirmation preserves independent master volume", checks);
             await app.ToggleReceiverMuteAsync(volumeRow.Receiver.Id);
             await Until(() => volumeRow.Muted);
