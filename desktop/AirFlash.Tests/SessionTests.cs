@@ -85,6 +85,35 @@ public sealed class SessionTests
         Assert.Equal(3, factory.OpenCount);
     }
     [Theory]
+    [InlineData("engine_error")]
+    [InlineData("socket_error")]
+    public async Task TimelineExpiredRecoverySurvivesRetryableEngineFaultAndReconnects(string code)
+    {
+        var first = new FakeConnection();
+        var second = new FakeConnection(autoReady: false);
+        second.BeforeSend = (cmd, _) =>
+        {
+            if (cmd.CommandName == "start")
+                second.EmitData(new { @event = "error", code, retryable = true, message = "connect 192.168.0.x:7000" });
+            return Task.CompletedTask;
+        };
+        var third = new FakeConnection();
+        var factory = new FakeFactory(first, second, third);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        var settings = Settings();
+        settings.ForceReconnect = false;
+        await controller.StartAsync(Pod(), settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+
+        first.EmitData(new { @event = "error", code = "timeline_expired", retryable = true });
+
+        await third.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.Equal(PlaybackState.Streaming, controller.Snapshot.State);
+        Assert.Equal(3, factory.OpenCount);
+        Assert.Equal(2, controller.Snapshot.Diagnostics?.ReconnectCount ?? -1);
+    }
+    [Theory]
     [InlineData("custom", true, true)]
     [InlineData("custom", false, false)]
     [InlineData("adaptive", true, false)]
