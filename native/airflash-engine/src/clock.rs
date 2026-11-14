@@ -1020,6 +1020,27 @@ impl PtpMaster {
             .get(&host)
             .is_some_and(|s| s.ready(Instant::now()))
     }
+    /// Replay receiver exchanges through the packet parser without wall-clock
+    /// waits, so session tests can exercise offset jumps and recovery races.
+    #[cfg(test)]
+    pub(crate) fn replay_exchange(&self, host: IpAddr, seq: u16, offset: u64, at: Instant) {
+        let mut states = self.states.lock().unwrap();
+        let state = states.get_mut(&host).unwrap();
+        if state.clock_id.is_none() {
+            followed_packet(state, &announce(8, 0, 0), 0, at, self.clock_id);
+        }
+        let base = 1_000_000_000 + u64::from(seq) * 1_000_000_000;
+        let (sync, follow) = sync_pair(8, seq, base + offset);
+        followed_packet(state, &sync, base + 100_000, at, self.clock_id);
+        followed_packet(state, &follow, base + 110_000, at, self.clock_id);
+        state.delay = Some((seq, base + 200_000));
+        state.delay_age = Some(at);
+        let mut response = header(9, 54, 8, seq, 0x0408, 0);
+        timestamp(&mut response[34..44], base + offset + 300_000);
+        response[44..52].copy_from_slice(&self.clock_id.to_be_bytes());
+        response[52..54].copy_from_slice(&0x8005u16.to_be_bytes());
+        followed_packet(state, &response, base + 400_000, at, self.clock_id);
+    }
     pub fn timeline(&self, host: IpAddr, local_ns: u64) -> Result<(u64, u64)> {
         self.timeline_frozen(host, local_ns, Duration::ZERO)
             .map(|(id, network, _)| (id, network))
@@ -1517,7 +1538,10 @@ mod tests {
         assert!(!s.ready(jump_at));
         // Crucial invariant: s.last must NOT be None; it must record the packet exchange instant
         assert!(s.last.is_some());
-        assert!(s.stale_for(jump_at).is_some_and(|stale| stale < Duration::from_millis(10)));
+        assert!(
+            s.stale_for(jump_at)
+                .is_some_and(|stale| stale < Duration::from_millis(10))
+        );
 
         // Subsequent Sync/Follow_Up exchanges arriving every 100 ms (< exchange_timeout)
         // must re-establish readiness once >= 3 exchanges and >= 250 ms have elapsed.

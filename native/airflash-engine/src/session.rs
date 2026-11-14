@@ -280,15 +280,11 @@ fn clock_status(timer: &PtpMaster, hosts: &[IpAddr], phase: &str) -> Json {
         "event_port":319, "general_port":320,
     })
 }
-fn clock_warning(host: &str, recovered: bool) -> Json {
-    let message = if recovered {
-        "PTP exchanges resumed; timing recovered"
-    } else {
-        "PTP exchanges stopped; verifying receiver ownership before recovery"
-    };
+fn clock_warning(host: &str) -> Json {
     json!({
         "event":"warning", "channel":"clock", "code":"recovery_original_fault",
-        "host":host, "fault_code":"clock_lost", "recovered":recovered, "message":message,
+        "host":host, "fault_code":"clock_lost", "recovered":false,
+        "message":"PTP exchanges stopped; verifying receiver ownership before recovery",
     })
 }
 fn dictionary(items: Vec<(&str, Value)>) -> Value {
@@ -2351,7 +2347,7 @@ fn send_packets(
                     if pending_clock_fault.is_none() {
                         emit(clock_status(timer, &hosts, "lost"));
                         let host_text = host.to_string();
-                        emit(clock_warning(&host_text, false));
+                        emit(clock_warning(&host_text));
                         pending_clock_fault = Some(host_text);
                         for member in members.iter() {
                             member
@@ -2359,25 +2355,12 @@ fn send_packets(
                                 .preemption_signal(preemption::Signal::ClockLost);
                         }
                     }
-                } else if pending_clock_fault.is_some()
-                    && members
-                        .iter()
-                        .all(|m| !m.compat.uses_ptp() || timer.ready(m.peer.host))
-                {
-                    let hosts: Vec<_> = members
-                        .iter()
-                        .filter(|m| m.compat.uses_ptp())
-                        .map(|m| m.peer.host)
-                        .collect();
-                    emit(clock_status(timer, &hosts, "ready"));
-                    let host = pending_clock_fault.clone().unwrap_or_default();
-                    emit(clock_warning(&host, true));
-                    pending_clock_fault = None;
                 }
             }
             if pending_clock_fault.is_some() {
-                // Timing is unusable. Stop producing media while the bounded
-                // background probes settle; cancellation remains responsive.
+                // Fresh PTP alone cannot identify the session's owner. Keep
+                // media paused until the bounded ownership probes settle, even
+                // if timing recovers; cancellation remains responsive.
                 thread::sleep(Duration::from_millis(2));
                 continue;
             }
@@ -4093,15 +4076,247 @@ mod tests {
         assert!(!methods.lock().unwrap().iter().any(|m| m == "TEARDOWN"));
     }
     #[test]
-    fn clock_warning_names_the_faulted_host_on_recovery() {
-        let fault = clock_warning("192.0.2.1", false);
+    fn clock_warning_retains_the_original_fault_and_host() {
+        let fault = clock_warning("192.0.2.1");
         assert_eq!(fault["host"], "192.0.2.1");
         assert_eq!(fault["fault_code"], "clock_lost");
-
-        let recovered = clock_warning("192.0.2.1", true);
-        assert_eq!(recovered["host"], "192.0.2.1");
-        assert_eq!(recovered["fault_code"], "clock_lost");
-        assert_eq!(recovered["recovered"], true);
+        assert_eq!(fault["recovered"], false);
+    }
+    fn followed_test_clock(hosts: &[IpAddr]) -> PtpMaster {
+        PtpMaster::from_sockets(
+            hosts.to_vec(),
+            hosts.to_vec(),
+            Clock::new(),
+            UdpSocket::bind("127.0.0.1:0").unwrap(),
+            UdpSocket::bind("127.0.0.1:0").unwrap(),
+        )
+        .unwrap()
+    }
+    fn replay_ready_clock(timer: &PtpMaster, hosts: &[IpAddr], first_seq: u16, offset: u64) {
+        let now = Instant::now();
+        for index in 0..3u16 {
+            let at = now - Duration::from_millis(u64::from(2 - index) * 150);
+            for host in hosts {
+                timer.replay_exchange(*host, first_seq + index, offset, at);
+            }
+        }
+        assert!(hosts.iter().all(|host| timer.ready(*host)));
+    }
+    #[test]
+    fn offset_jump_within_grace_keeps_media_and_does_not_probe_ownership() {
+        let (mut member, receiver, server) = local_member();
+        member.compat = crate::profile::CompatProfile::derive(
+            &dictionary(vec![]),
+            &Profile {
+                timing: Timing::Ptp,
+                ..Default::default()
+            },
+            &[],
+            44100,
+            true,
+        )
+        .unwrap();
+        let host = member.peer.host;
+        member
+            .media
+            .connect_audio(receiver.local_addr().unwrap())
+            .unwrap();
+        let timer = std::sync::Arc::new(followed_test_clock(&[host]));
+        replay_ready_clock(&timer, &[host], 0, 1_000_000);
+        timer.timeline(host, 1_000_000_000).unwrap();
+        let (frozen, resume) = std::sync::mpsc::channel();
+        let recovery_timer = timer.clone();
+        let recovery = thread::spawn(move || {
+            resume.recv_timeout(Duration::from_secs(2)).unwrap();
+            thread::sleep(Duration::from_millis(310));
+            replay_ready_clock(&recovery_timer, &[host], 4, 11_000_000);
+        });
+        let mut members = vec![member];
+        let events = std::sync::Mutex::new(Vec::new());
+        let result = send_packets(
+            &summary_options("", "single", 1200),
+            &Cancellation::default(),
+            &std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0.0f32.to_bits())),
+            crate::volume::Control::default(),
+            None,
+            &crate::standby::Control::default(),
+            &Clock::new(),
+            None,
+            &mut members,
+            Some(&timer),
+            &mut preemption::TakeoverCounters::default(),
+            &vec![0; FRAMES * 2],
+            None,
+            &|event| {
+                if event["event"] == "streaming" {
+                    timer.replay_exchange(host, 3, 11_000_000, Instant::now());
+                    assert!(!timer.ready(host));
+                } else if event["code"] == "clock_frozen" && event["recovered"] == false {
+                    // Re-converge in the background while media keeps using
+                    // its frozen mapping, without stalling the sender itself.
+                    frozen.send(()).unwrap();
+                }
+                events.lock().unwrap().push(event);
+            },
+        );
+        recovery.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(members[0].media.metrics.packets_sent > 0);
+        assert!(!members[0].ownership_uncertain);
+        assert!(!members[0].health.ownership_uncertain());
+        assert!(members[0].probe_task.is_none());
+        let events = events.lock().unwrap();
+        for recovered in [false, true] {
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e["code"] == "clock_frozen" && e["recovered"] == recovered)
+            );
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["code"] == "recovery_original_fault")
+        );
+        drop(events);
+        drop(members);
+        drop(receiver);
+        server.join().unwrap();
+    }
+    #[test]
+    fn fresh_ptp_during_ownership_check_never_resumes_the_group() {
+        for signal in [
+            None,
+            Some(preemption::Signal::FeedbackLost),
+            Some(preemption::Signal::UnexpectedTeardown),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let probe_port = listener.local_addr().unwrap().port();
+            let probe_stop = Cancellation::default();
+            let stop = probe_stop.clone();
+            let probe_server = thread::spawn(move || {
+                while !stop.is_cancelled() {
+                    let socket = match listener.accept() {
+                        Ok((socket, _)) => socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(error) => panic!("status probe accept failed: {error}"),
+                    };
+                    let mut conn = Connection::from_stream(socket, stop.clone()).unwrap();
+                    let Ok(request) = conn.read() else { continue };
+                    assert!(request.first.starts_with("GET /info"));
+                    let mut body = Vec::new();
+                    dictionary(vec![(
+                        "statusFlags",
+                        Value::Integer(preemption::RECEIVER_SESSION_ACTIVE.into()),
+                    )])
+                    .to_writer_binary(&mut body)
+                    .unwrap();
+                    let mut response = format!(
+                        "RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n",
+                        request.headers["cseq"],
+                        body.len()
+                    )
+                    .into_bytes();
+                    response.extend(body);
+                    let _ = conn.write(&response);
+                }
+            });
+            let mut members = Vec::new();
+            let mut servers = Vec::new();
+            let mut health = Vec::new();
+            for host in ["127.0.0.1", "127.0.0.2"] {
+                let (mut member, receiver, server) = local_member();
+                member.peer.host = host.parse().unwrap();
+                member.peer.port = probe_port;
+                member
+                    .media
+                    .connect_audio(receiver.local_addr().unwrap())
+                    .unwrap();
+                member.compat = crate::profile::CompatProfile::derive(
+                    &dictionary(vec![]),
+                    &Profile {
+                        timing: Timing::Ptp,
+                        ..Default::default()
+                    },
+                    &[],
+                    44100,
+                    true,
+                )
+                .unwrap();
+                // Keep the receiver and RTSP worker alive until media stops.
+                servers.push((receiver, server));
+                health.push(member.health.clone());
+                members.push(member);
+            }
+            let hosts: Vec<_> = members.iter().map(|m| m.peer.host).collect();
+            let timer = followed_test_clock(&hosts);
+            let events = std::sync::Mutex::new(Vec::new());
+            let result = send_packets(
+                &summary_options("", "native_stereo", 4000),
+                &Cancellation::default(),
+                &std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0.0f32.to_bits())),
+                crate::volume::Control::default(),
+                None,
+                &crate::standby::Control::default(),
+                &Clock::new(),
+                None,
+                &mut members,
+                Some(&timer),
+                &mut preemption::TakeoverCounters::default(),
+                &vec![0; FRAMES * 2],
+                None,
+                &|event| {
+                    if event["code"] == "recovery_original_fault" {
+                        // Make every required clock ready before the next
+                        // media-loop iteration consumes the ClockLost signal.
+                        replay_ready_clock(&timer, &hosts, 0, 1_000_000);
+                        if let Some(signal) = signal {
+                            health[0].preemption_signal(signal);
+                        }
+                    }
+                    events.lock().unwrap().push(event);
+                },
+            );
+            let fault = result.unwrap_err().downcast::<Fault>().unwrap();
+            let expected = if matches!(signal, Some(preemption::Signal::UnexpectedTeardown)) {
+                "preempted"
+            } else {
+                "ownership_unconfirmed"
+            };
+            assert_eq!(fault.code, expected);
+            assert!(!fault.retryable);
+            assert!(hosts.iter().all(|host| timer.ready(*host)));
+            assert!(members.iter().all(|m| m.media.metrics.packets_sent == 0));
+            assert!(members.iter().all(|m| m.health.ownership_uncertain()));
+            let events = events.lock().unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e["code"] == "recovery_original_fault")
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| e["code"] == "recovery_original_fault" && e["recovered"] == true)
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| e["event"] == "clock_status" && e["phase"] == "ready")
+            );
+            drop(events);
+            drop(members);
+            probe_stop.cancel();
+            probe_server.join().unwrap();
+            for (receiver, server) in servers {
+                drop(receiver);
+                server.join().unwrap();
+            }
+        }
     }
     #[test]
     fn clock_failure_is_adjudicated_before_cleanup_and_keeps_the_original_fault() {
