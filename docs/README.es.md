@@ -50,7 +50,7 @@ o una herramienta similar, y enruta el audio que deseas transmitir hacia ese dis
 - Proporciona un ecualizador de diez bandas con ajustes predefinidos y previsualización en vivo en Configuración.
 - Captura una aplicación seleccionada o dispositivos de reproducción/grabación, incluidos dispositivos de audio virtuales.
 - Libera las sesiones de AirPlay tras un período de silencio configurable y se reconecta cuando el audio regresa.
-- Disponible como aplicación portable x64 para Windows con interfaz en inglés, chino simplificado, chino tradicional, alemán y español.
+- Disponible como aplicación portable x64 para Windows con interfaz en inglés, chino simplificado, chino tradicional, alemán, español, francés, italiano, portugués de Brasil, japonés, coreano y ruso.
 
 ## Plan de características
 

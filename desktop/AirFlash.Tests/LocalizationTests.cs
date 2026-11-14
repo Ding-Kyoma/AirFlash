@@ -25,7 +25,7 @@ public sealed class LocalizationTests
     [InlineData("es-419", "es")]
     [InlineData("ES", "es")]
     [InlineData("en-GB", "en")]
-    [InlineData("ja-JP", "en")]
+    [InlineData("nl-NL", "en")]
     [InlineData("", "en")]
     public void SelectsSupportedLanguageOrEnglishFallback(string preference, string expected)
         => Assert.Equal(expected, L.SelectLanguage([preference]));
@@ -34,10 +34,10 @@ public sealed class LocalizationTests
     public void RespectsUserPreferenceOrder()
     {
         Assert.Equal("en", L.SelectLanguage(["en-US", "zh-CN"]));
-        Assert.Equal("zh-TW", L.SelectLanguage(["fr-FR", "zh-TW", "en-US"]));
-        Assert.Equal("zh", L.SelectLanguage(["fr-FR", "zh-CN", "en-US"]));
-        Assert.Equal("de", L.SelectLanguage(["fr-FR", "de-CH", "en-US"]));
-        Assert.Equal("es", L.SelectLanguage(["fr-FR", "es-ES", "en-US"]));
+        Assert.Equal("zh-TW", L.SelectLanguage(["nl-NL", "zh-TW", "en-US"]));
+        Assert.Equal("zh", L.SelectLanguage(["nl-NL", "zh-CN", "en-US"]));
+        Assert.Equal("de", L.SelectLanguage(["nl-NL", "de-CH", "en-US"]));
+        Assert.Equal("es", L.SelectLanguage(["nl-NL", "es-ES", "en-US"]));
         Assert.Equal("en", L.SelectLanguage(["en-US", "de-DE"]));
         Assert.Equal("en", L.SelectLanguage([]));
     }

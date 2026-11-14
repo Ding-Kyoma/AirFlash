@@ -8,5 +8,11 @@
     <EmbeddedResource Include="Strings.zh-TW.json" WithCulture="false" LogicalName="AirFlash.Core.Strings.zh-TW.json"/>
     <EmbeddedResource Include="Strings.de.json" WithCulture="false" LogicalName="AirFlash.Core.Strings.de.json"/>
     <EmbeddedResource Include="Strings.es.json" WithCulture="false" LogicalName="AirFlash.Core.Strings.es.json"/>
+    <EmbeddedResource Include="Strings.fr.json" WithCulture="false" LogicalName="AirFlash.Core.Strings.fr.json"/>
+    <EmbeddedResource Include="Strings.it.json" WithCulture="false" LogicalName="AirFlash.Core.Strings.it.json"/>
+    <EmbeddedResource Include="Strings.pt.json" WithCulture="false" LogicalName="AirFlash.Core.Strings.pt.json"/>
+    <EmbeddedResource Include="Strings.ja.json" WithCulture="false" LogicalName="AirFlash.Core.Strings.ja.json"/>
+    <EmbeddedResource Include="Strings.ko.json" WithCulture="false" LogicalName="AirFlash.Core.Strings.ko.json"/>
+    <EmbeddedResource Include="Strings.ru.json" WithCulture="false" LogicalName="AirFlash.Core.Strings.ru.json"/>
   </ItemGroup>
 </Project>

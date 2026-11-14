@@ -27,7 +27,13 @@ public sealed class AsyncCommand(Func<Task> execute, Action<Exception> onError, 
 public sealed record Choice(object? Value, string Label);
 public static class Choices
 {
-    public static Choice[] Languages => [new("system", L.Get("System default")), new("zh", "简体中文"), new("de", "Deutsch"), new("es", "Español"), new("en", "English")];
+    public static Choice[] Languages =>
+    [
+        new("system", L.Get("System default")), new("zh", "简体中文"), new("zh-TW", "繁體中文"),
+        new("de", "Deutsch"), new("es", "Español"), new("fr", "Français"), new("it", "Italiano"),
+        new("pt", "Português (Brasil)"), new("ja", "日本語"), new("ko", "한국어"), new("ru", "Русский"),
+        new("en", "English")
+    ];
     public static Choice[] Themes => [new("system", L.Get("System default")), new("dark", L.Get("Dark")), new("light", L.Get("Light"))];
     public static Choice[] Latencies => LatenciesFor(null);
     public static Choice[] LatenciesFor(int? customMs) => [new("realtime", L.Get("Real-time · 120 ms")), new("normal", L.Get("Normal · 200 ms")), new("buffered", L.Get("Buffered · 500 ms")), new("custom", customMs is { } ms ? L.Format("Custom · {0} ms", ms) : L.Get("Custom"))];

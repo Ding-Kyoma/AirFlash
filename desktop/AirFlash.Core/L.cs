@@ -11,6 +11,12 @@ public static class L
     private static readonly Dictionary<string, string> ChineseTraditional = LoadStrings("AirFlash.Core.Strings.zh-TW.json");
     private static readonly Dictionary<string, string> German = LoadStrings("AirFlash.Core.Strings.de.json");
     private static readonly Dictionary<string, string> Spanish = LoadStrings("AirFlash.Core.Strings.es.json");
+    private static readonly Dictionary<string, string> French = LoadStrings("AirFlash.Core.Strings.fr.json");
+    private static readonly Dictionary<string, string> Italian = LoadStrings("AirFlash.Core.Strings.it.json");
+    private static readonly Dictionary<string, string> Portuguese = LoadStrings("AirFlash.Core.Strings.pt.json");
+    private static readonly Dictionary<string, string> Japanese = LoadStrings("AirFlash.Core.Strings.ja.json");
+    private static readonly Dictionary<string, string> Korean = LoadStrings("AirFlash.Core.Strings.ko.json");
+    private static readonly Dictionary<string, string> Russian = LoadStrings("AirFlash.Core.Strings.ru.json");
     private static Dictionary<string, string> _strings = [];
     public static bool IsChinese { get; private set; }
 
@@ -20,12 +26,19 @@ public static class L
         {
             if (preference.StartsWith("zh-TW", StringComparison.OrdinalIgnoreCase) ||
                 preference.StartsWith("zh-HK", StringComparison.OrdinalIgnoreCase) ||
-                preference.StartsWith("zh-MO", StringComparison.OrdinalIgnoreCase))
+                preference.StartsWith("zh-MO", StringComparison.OrdinalIgnoreCase) ||
+                preference.StartsWith("zh-Hant", StringComparison.OrdinalIgnoreCase))
                 return "zh-TW";
             var language = preference.Split('-')[0];
             if (language.Equals("zh", StringComparison.OrdinalIgnoreCase)) return "zh";
             if (language.Equals("de", StringComparison.OrdinalIgnoreCase)) return "de";
             if (language.Equals("es", StringComparison.OrdinalIgnoreCase)) return "es";
+            if (language.Equals("fr", StringComparison.OrdinalIgnoreCase)) return "fr";
+            if (language.Equals("it", StringComparison.OrdinalIgnoreCase)) return "it";
+            if (language.Equals("pt", StringComparison.OrdinalIgnoreCase)) return "pt";
+            if (language.Equals("ja", StringComparison.OrdinalIgnoreCase)) return "ja";
+            if (language.Equals("ko", StringComparison.OrdinalIgnoreCase)) return "ko";
+            if (language.Equals("ru", StringComparison.OrdinalIgnoreCase)) return "ru";
             if (language.Equals("en", StringComparison.OrdinalIgnoreCase)) return "en";
         }
         return "en";
@@ -41,6 +54,12 @@ public static class L
             "zh"    => ChineseSimplified,
             "de"    => German,
             "es"    => Spanish,
+            "fr"    => French,
+            "it"    => Italian,
+            "pt"    => Portuguese,
+            "ja"    => Japanese,
+            "ko"    => Korean,
+            "ru"    => Russian,
             _       => []
         };
         var culture = CultureInfo.GetCultureInfo(lang switch
@@ -49,6 +68,12 @@ public static class L
             "zh"    => "zh-CN",
             "de"    => "de-DE",
             "es"    => "es-ES",
+            "fr"    => "fr-FR",
+            "it"    => "it-IT",
+            "pt"    => "pt-BR",
+            "ja"    => "ja-JP",
+            "ko"    => "ko-KR",
+            "ru"    => "ru-RU",
             _       => "en-US"
         });
         CultureInfo.CurrentUICulture = culture;
