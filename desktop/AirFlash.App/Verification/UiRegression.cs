@@ -59,8 +59,8 @@ internal static class UiRegression
             Check(!await vm.ApplyAsync() && store.Saves == saves, "method guard rejects duplicate apply", checks);
             window.Close(); vm.CancelCommand.Execute(null);
             Check(window.IsVisible, "closing and cancel cannot interrupt a settings transaction", checks);
-            vm.SelectedPage = 1; await Pump();
-            Check(vm.SelectedPage == 1 && window.Navigation.IsEnabled, "navigation stays enabled during apply", checks);
+            vm.SelectedPage = SettingsViewModel.StreamingPage; await Pump();
+            Check(vm.SelectedPage == SettingsViewModel.StreamingPage && window.Navigation.IsEnabled, "navigation stays enabled during apply", checks);
             app.MasterVolume = 37;
             var flush = app.FlushVolumeAsync();
             store.SaveGate.TrySetResult();
