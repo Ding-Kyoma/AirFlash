@@ -461,7 +461,7 @@ internal static class UiSmoke
             Check(brush?.Color == expected, $"{icon.Name} follows the current theme color", checks);
             if (icon.Name == "PlaybackIcon")
             {
-                var button = Descendants(panel).OfType<Button>().Single(b => ReferenceEquals(b.Command, row!.ToggleCommand));
+                var button = Descendants(panel).OfType<Button>().Single(b => ReferenceEquals(b.Command, row!.PlaybackCommand));
                 Check(System.Windows.Automation.AutomationProperties.GetName(button) == row!.PlayHint
                     && (string?)button.ToolTip == row.PlayHint,
                     "playback vector retains the accessible name and tooltip for its current state", checks);
