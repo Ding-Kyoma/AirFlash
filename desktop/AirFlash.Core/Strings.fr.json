@@ -421,5 +421,8 @@
   "Failed: {0}": "Échec : {0}",
   "This audio engine does not support the Sound Glow experiment.": "Ce moteur audio ne prend pas en charge l’expérience Sound Glow.",
   "Playback: {0} · Requested palette: {1}": "Lecture : {0} · Palette demandée : {1}",
-  "Start streaming before testing Sound Glow.": "Démarrez la diffusion avant de tester Sound Glow."
+  "Start streaming before testing Sound Glow.": "Démarrez la diffusion avant de tester Sound Glow.",
+  "Sound Glow": "Sound Glow",
+  "Test HomePod light effects with synthetic covers and metadata.": "Testez les effets lumineux avec pochettes et métadonnées.",
+  "Open Sound Glow experiment": "Ouvrir l’expérience Sound Glow"
 }

@@ -159,6 +159,7 @@ internal static class UiSmoke
             Check(customLatency.Label == L.Format("Custom · {0} ms", app.Settings.CustomBufferMs), "global latency menu shows the configured custom delay", checks);
             Check(((IEnumerable<StreamChoice>)mode.ItemsSource).All(c => !Equals(c.Value, "adaptive")), "global latency menu omits the retired adaptive mode", checks);
             CheckPanelIcons(panel, app, checks);
+            Check(Descendants(panel).OfType<Button>().All(b => b.Content is not string text || text != L.Get("Sound Glow experiment")), "control panel no longer duplicates the Sound Glow experiment", checks);
             Render(panel, Path.Combine(directory, "panel-icons-idle.png"), 1);
             var settingsButton = Descendants(panel).OfType<Button>().Single(b => System.Windows.Automation.AutomationProperties.GetName(b) == L.Get("Settings"));
             Check(settingsButton.Focus() && settingsButton.IsKeyboardFocused, "vector settings button remains keyboard focusable", checks);
@@ -305,7 +306,7 @@ internal static class UiSmoke
                 settings.Show();
             }
             Check(app.MonitorMembers.Count == 1 && app.MonitorRecoveries == "2", "transport metrics reach monitoring view", checks);
-            checks.Add("eight pages rendered in light/dark; panel at 100/125/150/175/200 percent");
+            checks.Add("nine pages rendered in light/dark; panel at 100/125/150/175/200 percent");
             await app.StopAsync(); await Until(() => app.Snapshot.State == PlaybackState.Idle);
             settings.Hide(); panel.ShowPanel(); await Pump();
             CheckPanelIcons(panel, app, checks);

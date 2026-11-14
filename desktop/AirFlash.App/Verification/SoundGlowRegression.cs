@@ -67,6 +67,30 @@ internal static class SoundGlowRegression
             var oldWindow = new SoundGlowWindow(oldApp); oldWindow.Show(); await Pump();
             try { Check(Descendants(oldWindow).OfType<Button>().Where(b => b.Tag is string).All(b => !b.IsEnabled), "old engine: actions disabled while normal playback works", checks); }
             finally { oldWindow.Close(); }
+            var settings = new SettingsWindow(oldApp); settings.Show(); await Pump();
+            SoundGlowWindow? owned = null;
+            try
+            {
+                settings.ViewModel.SelectedPage = SettingsViewModel.SoundGlowPage; await Pump();
+                Check(settings.ViewModel.Pages[SettingsViewModel.SoundGlowPage] == L.Get("Sound Glow")
+                    && SettingsViewModel.SoundGlowPage == settings.ViewModel.Pages.Length - 2,
+                    "settings places Sound Glow directly above About", checks);
+                var open = Descendants(settings).OfType<Button>().Single(b => System.Windows.Automation.AutomationProperties.GetName(b) == L.Get("Open Sound Glow experiment"));
+                open.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await Pump();
+                owned = settings.OwnedWindows.OfType<SoundGlowWindow>().SingleOrDefault();
+                Check(owned is { IsVisible: true } && ReferenceEquals(owned.Owner, settings), "settings opens the Sound Glow experiment above itself", checks);
+                open.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await Pump();
+                Check(settings.OwnedWindows.OfType<SoundGlowWindow>().Count() == 1
+                    && ReferenceEquals(settings.OwnedWindows.OfType<SoundGlowWindow>().Single(), owned),
+                    "repeated entry clicks reuse one experiment window", checks);
+                owned!.Close(); await Pump();
+                Check(settings.IsVisible, "closing the experiment returns to settings", checks);
+                open.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await Pump();
+                owned = settings.OwnedWindows.OfType<SoundGlowWindow>().Single();
+            }
+            finally { settings.Close(); }
+            await Pump();
+            Check(owned is not null && !owned.IsVisible, "closing settings closes the experiment window", checks);
         }
         finally { L.Initialize(["en-US"]); ThemeService.SetForVerification(false); }
     }

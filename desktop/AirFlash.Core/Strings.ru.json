@@ -421,5 +421,8 @@
   "Failed: {0}": "Ошибка: {0}",
   "This audio engine does not support the Sound Glow experiment.": "Этот аудиодвижок не поддерживает эксперимент Sound Glow.",
   "Playback: {0} · Requested palette: {1}": "Воспроизведение: {0} · Запрошенная палитра: {1}",
-  "Start streaming before testing Sound Glow.": "Начните трансляцию перед проверкой Sound Glow."
+  "Start streaming before testing Sound Glow.": "Начните трансляцию перед проверкой Sound Glow.",
+  "Sound Glow": "Sound Glow",
+  "Test HomePod light effects with synthetic covers and metadata.": "Проверьте световые эффекты с обложками и метаданными.",
+  "Open Sound Glow experiment": "Открыть эксперимент Sound Glow"
 }

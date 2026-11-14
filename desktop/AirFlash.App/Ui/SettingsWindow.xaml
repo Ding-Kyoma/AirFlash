@@ -422,6 +422,19 @@
     </DataTemplate>
     <DataTemplate x:Key="Page7">
       <StackPanel>
+        <Border Style="{StaticResource Card}">
+          <StackPanel>
+            <TextBlock Text="{loc:Text 'Sound Glow experiment'}" Style="{StaticResource SectionTitle}"/>
+            <TextBlock Text="{loc:Text 'Enable Sound Glow in the Home app, then stream audio. This experiment sends synthetic song information and test covers.'}" Style="{StaticResource Hint}"/>
+            <Button Content="{loc:Text 'Open Sound Glow experiment'}" Click="OnSoundGlowClick" HorizontalAlignment="Left" Margin="0,14,0,0" AutomationProperties.Name="{loc:Text 'Open Sound Glow experiment'}"/>
+          </StackPanel>
+        </Border>
+        <TextBlock Text="{loc:Text 'Try song information, then red and blue. Song information alone does not clear an old cover; reconnect first.'}" Style="{StaticResource Hint}" Margin="0,0,0,12"/>
+        <TextBlock Text="{loc:Text 'No test covers are sent by default. Accepted requests do not prove visible lighting. Closing stops cycling; the last cover may remain.'}" Style="{StaticResource Hint}" Margin="0,0,0,12"/>
+      </StackPanel>
+    </DataTemplate>
+    <DataTemplate x:Key="Page8">
+      <StackPanel>
         <Border Style="{StaticResource Card}" Padding="24">
           <StackPanel>
             <TextBlock Text="AirFlash" FontSize="30" FontWeight="SemiBold" Foreground="{DynamicResource AccentBrush}"/>

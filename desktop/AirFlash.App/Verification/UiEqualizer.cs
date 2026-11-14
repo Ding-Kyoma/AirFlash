@@ -19,7 +19,8 @@ internal static class UiEqualizer
         try
         {
             var vm = window.ViewModel;
-            Check(vm.Pages.SequenceEqual(new[] { "General", "Audio capture", "AirFlash streaming", "Equalizer", "Receivers", "Monitor", "Network", "About" }.Select(L.Get)), "audio capture precedes streaming and the equalizer follows both", checks);
+            Check(vm.Pages.SequenceEqual(new[] { "General", "Audio capture", "AirFlash streaming", "Equalizer", "Receivers", "Monitor", "Network", "Sound Glow", "About" }.Select(L.Get)), "audio capture precedes streaming and the equalizer follows both", checks);
+            Check(SettingsViewModel.SoundGlowPage == vm.Pages.Length - 2 && vm.Pages[SettingsViewModel.SoundGlowPage] == L.Get("Sound Glow"), "Sound Glow sits directly above About", checks);
             vm.SelectedPage = SettingsViewModel.EqualizerPage; await Pump();
             Check(audio.Enumerations == 0 && !vm.Equalizer.Enabled && !vm.HasChanges, "equalizer opens disabled without enumerating audio", checks);
             var sliders = UiSmoke.Descendants(window).OfType<Slider>().Where(s => s.Orientation == Orientation.Vertical).ToArray();
