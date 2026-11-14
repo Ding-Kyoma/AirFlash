@@ -14,6 +14,7 @@ internal static class ReceiverSettingsRegression
     {
         await CapabilitiesAfterEngineStartupAsync(checks);
         await ProfilesAndLatencyAsync(checks, directory);
+        await MultiRoomAsync(checks);
         await ResetAsync(checks);
         await ResetFailuresAsync(checks);
     }
@@ -109,6 +110,39 @@ internal static class ReceiverSettingsRegression
             await app.StopAsync(); await Pump(); Check(app.CanEditGlobalLatency && latency.IsEnabled, "stopping a software group restores global latency editing", checks);
         }
         finally { window.Close(); panel.ShutdownPanel(); }
+    }
+    private static async Task MultiRoomAsync(List<string> checks)
+    {
+        var store = new MemoryStore();
+        var discovery = new MockDiscovery { Items = [new("a", "A", "127.0.0.1"), new("b", "B", "127.0.0.2"), new("c", "C", "127.0.0.3")] };
+        var engine = new MockFactory();
+        await using var app = new AppViewModel(store, discovery, new MockAutostart(), new MockAudio(), engine, Application.Current.Dispatcher);
+        app.SetPanelVisible(true); app.Start(); await app.Startup; await Pump();
+        var window = new SettingsWindow(app); window.ViewModel.SelectedPage = SettingsViewModel.ReceiversPage; window.Show(); await Pump();
+        var vm = window.ViewModel;
+        try
+        {
+            vm.AddMultiRoomGroupCommand.Execute(null); await Pump();
+            var editor = vm.Groups.Single(); editor.AddMemberCommand.Execute(null); await Pump();
+            Check(editor.Members.Count == 3, "multi-room editor adds a third speaker", checks);
+            editor.Members[2].OffsetMs = 40;
+            Check(await vm.ApplyAsync(), "multi-room group and member offsets persist", checks);
+            await Pump();
+            var removeButton = Descendants(window).OfType<Button>().Single(b => ReferenceEquals(b.Command, editor.Members[2].RemoveCommand));
+            Check(removeButton.IsEnabled, "multi-room member controls become editable after saving", checks);
+            editor.Members[2].OffsetMs = -25;
+            Check(await vm.ApplyAsync() && store.Saved.SoftwareGroups.Single().Members[2].OffsetMs == -25, "multi-room offsets remain editable after the first save", checks);
+            await Pump();
+            editor.Members[2].RemoveCommand.Execute(null);
+            Check(editor.Members.Count == 2 && editor.Members.All(row => !row.RemoveCommand.CanExecute(null)), "multi-room removal retains at least two speakers", checks);
+            editor.AddMemberCommand.Execute(null);
+            Check(await vm.ApplyAsync(), "multi-room membership remains editable after saving", checks);
+            await app.ToggleAsync(app.AllReceivers.Single(r => r.IsSoftwareGroup)); await Until(() => app.Snapshot.State == PlaybackState.Streaming);
+            var start = engine.Commands.Last(c => c.Text("command") == "start").GetProperty("params");
+            Check(start.Text("group_mode") == "multi_room" && start.GetProperty("peers").GetArrayLength() == 3, "multi-room playback starts every saved speaker", checks);
+            await app.StopAsync();
+        }
+        finally { window.Close(); }
     }
     private static async Task ResetAsync(List<string> checks)
     {

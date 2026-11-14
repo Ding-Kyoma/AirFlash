@@ -291,7 +291,11 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         AddGroupCommand.Refresh();
         AddMultiRoomGroupCommand.Refresh();
         ResetCommand.Refresh(); RefreshReceiverProfilesCommand.Refresh();
-        foreach (var group in Groups) { group.SwapCommand.Refresh(); group.RemoveCommand.Refresh(); group.RepairCommand.Refresh(); group.AddMemberCommand.Refresh(); }
+        foreach (var group in Groups)
+        {
+            group.SwapCommand.Refresh(); group.RemoveCommand.Refresh(); group.RepairCommand.Refresh(); group.AddMemberCommand.Refresh();
+            foreach (var member in group.Members) member.RemoveCommand.Refresh();
+        }
         foreach (var row in Receivers) row.Refresh();
     }
     public async Task<bool> ApplyAsync()
@@ -706,13 +710,11 @@ public sealed class ReceiverEditor : ObservableObject, IDisposable
     public void Refresh() { Notify(nameof(Name)); Notify(nameof(Detail)); Notify(nameof(IsManual)); PairCommand.Refresh(); RemoveCommand.Refresh(); RefreshProfiles(); }
     public void Dispose() => Options.PropertyChanged -= Changed;
 }
-public sealed class GroupMemberRow : ObservableObject
+public sealed class GroupMemberRow : ObservableObject, IDisposable
 {
     public GroupMemberConfig Config { get; }
     public ObservableCollection<Receiver> Candidates { get; }
-    private readonly Action _remove;
     private readonly Action _changed;
-    private readonly Func<bool> _canEdit;
     private readonly Func<GroupMemberConfig, string?, bool> _setMember;
 
     public string ReceiverId
@@ -746,9 +748,12 @@ public sealed class GroupMemberRow : ObservableObject
     public RelayCommand RemoveCommand { get; }
     public GroupMemberRow(GroupMemberConfig config, ObservableCollection<Receiver> candidates, Func<GroupMemberConfig, string?, bool> setMember, Action remove, Action changed, Func<bool> canEdit, Func<bool> canRemove)
     {
-        Config = config; Candidates = candidates; _setMember = setMember; _remove = remove; _changed = changed; _canEdit = canEdit;
+        Config = config; Candidates = candidates; _setMember = setMember; _changed = changed;
+        Config.PropertyChanged += ConfigChanged;
         RemoveCommand = new(remove, () => canEdit() && canRemove());
     }
+    private void ConfigChanged(object? sender, PropertyChangedEventArgs args) => Notify(args.PropertyName);
+    public void Dispose() => Config.PropertyChanged -= ConfigChanged;
 }
 
 public sealed class SoftwareGroupEditor : ObservableObject, IDisposable
@@ -786,6 +791,10 @@ public sealed class SoftwareGroupEditor : ObservableObject, IDisposable
 
     public void RefreshMembership()
     {
+        if (IsMultiRoom && (Members.Count != Group.Members.Count
+            || Members.Where((row, index) => !ReferenceEquals(row.Config, Group.Members[index])).Any()))
+            RefreshMemberRows();
+        AddMemberCommand.Refresh();
         var ids = Group.MemberIds.Where(id => id.Length > 0).ToArray();
         var resolved = ids.Select(Resolve).ToArray();
         var membership = new GroupMembership();
@@ -881,6 +890,7 @@ public sealed class SoftwareGroupEditor : ObservableObject, IDisposable
 
     private void RefreshMemberRows()
     {
+        foreach (var row in Members) row.Dispose();
         Members.Clear();
         foreach (var config in Group.Members)
         {
@@ -922,5 +932,9 @@ public sealed class SoftwareGroupEditor : ObservableObject, IDisposable
         _changed();
     }
 
-    public void Dispose() => Group.PropertyChanged -= Changed;
+    public void Dispose()
+    {
+        Group.PropertyChanged -= Changed;
+        foreach (var row in Members) row.Dispose();
+    }
 }
