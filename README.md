@@ -2,7 +2,8 @@
 
 <p align="center">
   <a href="README.md">English</a> ·
-  <a href="docs/README.zh-CN.md">简体中文</a>
+  <a href="docs/README.zh-CN.md">简体中文</a> ·
+  <a href="docs/README.es.md">Español</a>
 </p>
 
 <p align="center">
@@ -49,7 +50,7 @@ or a similar tool, and route the audio you want to stream to that endpoint.
 - Provides a ten-band equalizer with presets and live preview in Settings.
 - Captures a selected application or playback/recording endpoints, including virtual audio devices.
 - Releases AirPlay sessions after configurable silence and reconnects when audio returns.
-- Available as a portable Windows x64 app with English, Simplified Chinese, Traditional Chinese, and German UI.
+- Available as a portable Windows x64 app with English, Simplified Chinese, Traditional Chinese, German, and Spanish UI.
 
 ## Feature plan
 

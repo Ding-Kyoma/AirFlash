@@ -20,6 +20,10 @@ public sealed class LocalizationTests
     [InlineData("de-AT", "de")]
     [InlineData("de-CH", "de")]
     [InlineData("DE", "de")]
+    [InlineData("es-ES", "es")]
+    [InlineData("es-MX", "es")]
+    [InlineData("es-419", "es")]
+    [InlineData("ES", "es")]
     [InlineData("en-GB", "en")]
     [InlineData("ja-JP", "en")]
     [InlineData("", "en")]
@@ -33,6 +37,7 @@ public sealed class LocalizationTests
         Assert.Equal("zh-TW", L.SelectLanguage(["fr-FR", "zh-TW", "en-US"]));
         Assert.Equal("zh", L.SelectLanguage(["fr-FR", "zh-CN", "en-US"]));
         Assert.Equal("de", L.SelectLanguage(["fr-FR", "de-CH", "en-US"]));
+        Assert.Equal("es", L.SelectLanguage(["fr-FR", "es-ES", "en-US"]));
         Assert.Equal("en", L.SelectLanguage(["en-US", "de-DE"]));
         Assert.Equal("en", L.SelectLanguage([]));
     }
@@ -53,9 +58,10 @@ public sealed class LocalizationTests
         {
             ["zh"] = "请在家庭App中，将扬声器访问权限设置为所有人，然后重试。",
             ["zh-TW"] = "請在「家庭」App 中，將揚聲器存取權限設為「所有人」，然後再試一次。",
-            ["de"] = "Legen Sie in der Home-App den Lautsprecherzugriff auf „Alle“ fest, und versuchen Sie es dann erneut."
+            ["de"] = "Legen Sie in der Home-App den Lautsprecherzugriff auf „Alle“ fest, und versuchen Sie es dann erneut.",
+            ["es"] = "En la app Casa, establece el acceso a los altavoces en «Todos» y vuelve a intentarlo."
         };
-        foreach (var (resource, language) in new[] { ("zh", "zh-CN"), ("zh-TW", "zh-TW"), ("de", "de-DE") })
+        foreach (var (resource, language) in new[] { ("zh", "zh-CN"), ("zh-TW", "zh-TW"), ("de", "de-DE"), ("es", "es-ES") })
         {
             using var stream = typeof(L).Assembly.GetManifestResourceStream($"AirFlash.Core.Strings.{resource}.json")!;
             var translations = JsonSerializer.Deserialize<Dictionary<string, string>>(stream)!;
@@ -119,6 +125,35 @@ public sealed class LocalizationTests
             L.Initialize(["de-DE"]);
             Assert.Equal("Einstellungen…", L.Get("Settings…"));
             Assert.Equal("HomePod · Ziel 2 ms", L.Format("{0} · target {1} ms", "HomePod", 2));
+        }
+        finally { L.Initialize(["en-US"]); }
+    }
+
+    [Fact]
+    public void SpanishCatalogMatchesEnglishCatalogAndPreservesFormatArguments()
+    {
+        using var englishStream = typeof(L).Assembly.GetManifestResourceStream("AirFlash.Core.Strings.zh.json")!;
+        using var spanishStream = typeof(L).Assembly.GetManifestResourceStream("AirFlash.Core.Strings.es.json")!;
+        var baseline = JsonSerializer.Deserialize<Dictionary<string, string>>(englishStream)!;
+        var spanish = JsonSerializer.Deserialize<Dictionary<string, string>>(spanishStream)!;
+        Assert.Equal(baseline.Keys.Order(), spanish.Keys.Order());
+        Assert.Equal("Configuración…", spanish["Settings…"]);
+        foreach (var (key, translated) in spanish)
+        {
+            Assert.False(string.IsNullOrWhiteSpace(translated));
+            Assert.Equal(System.Text.CompositeFormat.Parse(key).MinimumArgumentCount,
+                System.Text.CompositeFormat.Parse(translated).MinimumArgumentCount);
+        }
+    }
+
+    [Fact]
+    public void SpanishIsUsedByTheRuntime()
+    {
+        try
+        {
+            L.Initialize(["es-ES"]);
+            Assert.Equal("Configuración…", L.Get("Settings…"));
+            Assert.Equal("HomePod · objetivo 2 ms", L.Format("{0} · target {1} ms", "HomePod", 2));
         }
         finally { L.Initialize(["en-US"]); }
     }
