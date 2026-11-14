@@ -18,11 +18,12 @@ public sealed record Receiver(string Id, string Name, string Address, int Port =
     public bool RequiresPassword { get; init; }
     public bool FollowReceiverClock { get; init; }
     public bool IsSoftwareGroup { get; init; }
+    public string GroupMode { get; init; } = "";
     public string Channel { get; init; } = "stereo";
     public int SyncOffsetMs { get; init; }
     public string[] Aliases { get; init; } = [];
     public bool IsGroup => IsSoftwareGroup || Members.Length > 0 || Id.StartsWith("stereo:", StringComparison.Ordinal);
-    public bool Complete => !IsGroup || Members.Length == 2 && Members.All(m => m.Online && !m.IsGroup && (!IsSoftwareGroup || m.StereoId.Length == 0));
+    public bool Complete => !IsGroup || (IsSoftwareGroup ? Members.Length >= 2 : Members.Length == 2) && Members.All(m => m.Online && !m.IsGroup && (!IsSoftwareGroup || m.StereoId.Length == 0));
     /// <summary>TXT-only four-state label; missing features never become classic.</summary>
     public AirPlayCapability Support => AirPlayCapabilityClassifier.Classify(Features, SourceVersion);
     /// <summary>WAC's routing predicate: TXT bit 40 and <c>srcvers &gt;= 354.54.6</c>.</summary>
@@ -35,7 +36,7 @@ public sealed record Receiver(string Id, string Name, string Address, int Port =
         _ => L.Get("AirPlay 2 support unknown")
     };
     private string BaseDetail => Model.Length > 0 ? Model : L.Get("AirFlash receiver");
-    public string Detail => IsSoftwareGroup ? L.Get("Software stereo · experimental") : IsGroup ? L.Format("HomePod stereo · {0}/2", Members.Length) : $"{BaseDetail} · {CapabilityDetail}";
+    public string Detail => IsSoftwareGroup ? (GroupMode == "multi_room" ? (Members.Length > 0 ? L.Format("Multi-room · {0} speakers", Members.Length) : L.Get("Multi-room")) : L.Get("Software stereo · experimental")) : IsGroup ? L.Format("HomePod stereo · {0}/2", Members.Length) : $"{BaseDetail} · {CapabilityDetail}";
     [JsonIgnore] public IEnumerable<Receiver> Peers => IsGroup ? Members : [this];
     public string TransportKey => string.Join(";", Peers.OrderBy(p => p.Address, StringComparer.Ordinal).ThenBy(p => p.Port).Select(p => $"{p.Address}:{p.Port}:{(IsGroup && p.IsLeader)}:{p.Channel}:{p.SyncOffsetMs}"));
     public static string PhysicalKey(string identity, string address) => string.IsNullOrWhiteSpace(identity) ? address : ReceiverIdentity.Normalize(identity);

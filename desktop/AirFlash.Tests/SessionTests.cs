@@ -1430,6 +1430,41 @@ public sealed class SessionTests
         Assert.True(first.Disposed); Assert.Equal(2, second.Commands.Single(c => c.Command == "start").Parameters.GetProperty("peers").GetArrayLength()); Assert.DoesNotContain(first.Commands, c => c.Command == "set_device_volume");
     }
     [Fact]
+    public async Task MultiRoomGroupSerializesAllMembersAndStartsMultiRoomStreaming()
+    {
+        var first = new FakeConnection(); var factory = new FakeFactory(first);
+        var settings = Settings();
+        var group = new SoftwareStereoGroup
+        {
+            Id = "software:multi",
+            Name = "Whole Home",
+            GroupMode = "multi_room",
+            Members = [
+                new() { ReceiverId = "a", OffsetMs = 0 },
+                new() { ReceiverId = "b", OffsetMs = -20 },
+                new() { ReceiverId = "c", OffsetMs = 35 }
+            ]
+        };
+        settings.SoftwareGroups.Add(group);
+        var catalog = new[] { Pod("a"), Pod("b") with { Address = "127.0.0.2" }, Pod("c") with { Address = "127.0.0.3" } };
+        var receiver = SoftwareStereo.Resolve(catalog, settings).Single();
+        Assert.True(receiver.Complete && receiver.Online);
+        Assert.Equal("Multi-room · 3 speakers", receiver.Detail);
+
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        await controller.StartAsync(receiver, settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+
+        var start = first.Commands.Single(c => c.Command == "start").Parameters;
+        Assert.Equal("multi_room", start.Text("group_mode"));
+        Assert.Equal(3, start.GetProperty("peers").GetArrayLength());
+        for (var i = 0; i < 3; i++)
+            Assert.Equal("stereo", start.GetProperty("peers")[i].GetProperty("profile").Text("channel"));
+        Assert.Equal(0, start.GetProperty("peers")[0].GetProperty("profile").Integer("sync_offset_ms"));
+        Assert.Equal(-20, start.GetProperty("peers")[1].GetProperty("profile").Integer("sync_offset_ms"));
+        Assert.Equal(35, start.GetProperty("peers")[2].GetProperty("profile").Integer("sync_offset_ms"));
+    }
+    [Fact]
     public async Task SoftwareGroupMemberVolumeTargetsOnlyItsHostAndGroupRemovalStopsPlayback()
     {
         var connection = new FakeConnection(); var (receiver, settings) = SoftwareGroup(); await using var controller = new SessionController(new FakeFactory(connection), new FakeAudio(), timing: Fast);
@@ -1578,7 +1613,7 @@ public sealed class SessionTests
                 case "set_gain": GainEntered?.TrySetResult(); if (GainGate is not null) await GainGate.Task.WaitAsync(cancellation); break;
             }
         }
-        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture" }.Where(c => SupportsOwnershipGuard || c != "receiver_ownership_guard").Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).Concat(SupportsForcedLatency ? ["forced_latency"] : Array.Empty<string>()).Concat(SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).ToArray() });
+        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "multi_room", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture" }.Where(c => SupportsOwnershipGuard || c != "receiver_ownership_guard").Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).Concat(SupportsForcedLatency ? ["forced_latency"] : Array.Empty<string>()).Concat(SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).ToArray() });
         public void ConfirmLead(int extra)
         {
             var command = Commands.Last(c => c.Command == "set_lead");

@@ -108,6 +108,7 @@ public static class ReceiverCatalog
         {
             group.LeftId = migrations.GetValueOrDefault(group.LeftId, group.LeftId);
             group.RightId = migrations.GetValueOrDefault(group.RightId, group.RightId);
+            foreach (var member in group.Members) member.ReceiverId = migrations.GetValueOrDefault(member.ReceiverId, member.ReceiverId);
         }
     }
 
