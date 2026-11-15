@@ -967,6 +967,9 @@ public sealed class SessionTests
         var process = new FakeConnection(false);
         await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast);
         await controller.StartAsync(Pod(), Settings()); await Until(() => controller.Snapshot.State == PlaybackState.Connecting);
+        // The engine session is assigned by hello, which runs on the background start task.
+        // Emitting before it would carry an empty session id and be discarded by the read loop.
+        await process.Started.Task.WaitAsync(TimeSpan.FromSeconds(3));
         process.EmitData(new { @event = "device_volume", host = "127.0.0.1", volume = 33, sequence = 0, status = "confirmed", available = true });
         await Until(() => controller.Snapshot.DeviceVolume?.Actual == 33);
         Assert.Equal(PlaybackState.Connecting, controller.Snapshot.State);
