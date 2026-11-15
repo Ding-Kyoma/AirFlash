@@ -6,7 +6,8 @@ namespace AirFlash.Core;
 
 public enum PlaybackState { Idle, Connecting, Streaming, Standby, Pairing, Error, Preempted }
 public enum SessionStartIntent { Manual, Automatic }
-public sealed record StreamMetrics(double? CaptureToSendP95 = null, double? MaxQueueAge = null, long? Underruns = null, long? DroppedFrames = null, int? InputRate = null);
+public sealed record StreamMetrics(double? CaptureToSendP95 = null, double? MaxQueueAge = null, long? Underruns = null, long? DroppedFrames = null, int? InputRate = null,
+    long? Rebinds = null, long? SilentProbes = null, long? RebindStorms = null);
 public sealed record SessionSnapshot(PlaybackState State, Receiver? Receiver = null, string Message = "", StreamMetrics? Metrics = null, int TargetLatency = 0, PlaybackDiagnostics? Diagnostics = null, int StreamRate = 0, DeviceVolumeState? DeviceVolume = null, IReadOnlyDictionary<string, DeviceVolumeState>? MemberVolumes = null)
 {
     public bool IsActive => State is PlaybackState.Connecting or PlaybackState.Streaming or PlaybackState.Standby or PlaybackState.Pairing;
@@ -238,6 +239,12 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     /// </summary>
     private bool AcceptsVolumeReads() => Snapshot.State is PlaybackState.Connecting or PlaybackState.Streaming or PlaybackState.Standby;
     private PlaybackDiagnostics _diagnostics = new();
+    // Periodic health sampling: every latency mode, not only adaptive. The
+    // counters are compared with the previous minute to keep the advisory line
+    // about what changed rather than about a lifetime total.
+    private long _healthUptimeMs;
+    private long _advisoryUptimeMs;
+    private HealthSample? _previousHealth;
     private async Task SetMemberVolumeAsync(string memberId, int value)
     {
         long epoch, sequence; string host, session; IEngineConnection connection; CancellationToken token;
@@ -936,6 +943,29 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                             }
                             AcceptLatency(item);
                             lock (_sync) { if (epoch != _generation) continue; _diagnostics = _diagnostics with { Transport = metrics }; }
+                            // One health line per minute in every latency mode; the
+                            // adaptive ladder keeps its own line below.
+                            if (metrics.SessionUptimeMs is { } reportedUptimeMs && reportedUptimeMs >= 0)
+                            {
+                                var uptimeMs = (long)reportedUptimeMs;
+                                // A reconnect restarts the engine's uptime; start over.
+                                if (uptimeMs < _healthUptimeMs) { _healthUptimeMs = 0; _advisoryUptimeMs = 0; _previousHealth = null; }
+                                else if (SessionHealth.Due(uptimeMs, _healthUptimeMs))
+                                {
+                                    _healthUptimeMs = uptimeMs;
+                                    var sample = HealthSample.From(metrics, Snapshot.Metrics, Snapshot.TargetLatency);
+                                    log?.Invoke($"Session health: {sample.Describe()}");
+                                    var tight = SessionHealth.LooksTight(sample, _previousHealth);
+                                    _previousHealth = sample;
+                                    // Fixed targets cannot raise their own headroom, so the
+                                    // log states the case instead of changing playback.
+                                    if (tight && AdaptivePlan() is null && SessionHealth.AdvisoryDue(uptimeMs, _advisoryUptimeMs))
+                                    {
+                                        _advisoryUptimeMs = uptimeMs;
+                                        log?.Invoke($"Fixed latency looks tight: {sample.Describe()}");
+                                    }
+                                }
+                            }
                             if (AdaptivePlan() is not null)
                             {
                                 bool fresh; lock (_sync) fresh = _adaptive.Observe(metrics);
@@ -946,7 +976,8 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         }
                         else if (kind == "capture_metrics" && item.TryGetProperty("metrics", out var metrics))
                         {
-                            var parsed = new StreamMetrics(metrics.Number("capture_to_send_p95_ms"), metrics.Number("max_queue_age_ms"), metrics.Integer("underrun_packets"), metrics.Integer("dropped_frames"), metrics.Integer("input_rate") is { } rate ? (int)rate : null);
+                            var parsed = new StreamMetrics(metrics.Number("capture_to_send_p95_ms"), metrics.Number("max_queue_age_ms"), metrics.Integer("underrun_packets"), metrics.Integer("dropped_frames"), metrics.Integer("input_rate") is { } rate ? (int)rate : null,
+                                metrics.Integer("rebinds"), metrics.Integer("silent_probes"), metrics.Integer("rebind_storms"));
                             var current = Snapshot;
                             Publish(epoch, current.State, current.Message, metrics: parsed);
                         }

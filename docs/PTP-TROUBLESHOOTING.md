@@ -66,6 +66,36 @@ reported, include that line and the `clock_status` snapshot. UDP 319/320 must
 reach the engine for the follow exchange, so the firewall checks below still
 apply.
 
+## Clock loss during playback
+
+A receiver that stops answering PTP after the stream started is a different
+case from a startup failure. The sender keeps using the last offset for a ten
+second grace window, so a single dropped exchange is invisible. Past the grace
+window the session reports `clock_status lost` and a `clock_warning`, then checks
+ownership of the receiver before deciding what happens next.
+
+In 0.6.3 that ownership check could not succeed: the receiver reported
+`statusFlags` with `ReceiverSessionActive` (bit 17) set for the session we were
+still holding, but the check folded "ownership uncertain" into "we do not hold
+it", classified the answer as `busy_elsewhere`, and stopped with
+`ownership_unconfirmed` plus
+`Session automatic recovery blocked; manual_reconnect_required=true`. The only
+way out was a manual reconnect, even though the media itself was healthy.
+
+Current builds keep the session through clock and feedback symptoms:
+
+- fresh PTP resumes the stream (`clock_status ready`, `clock_recovered`);
+- a receiver that stays silent past the grace window ends the attempt with the
+  retryable `clock_lost` fault, and the desktop reconnects on its own;
+- ownership stays latched to this sender, so `ownership_unconfirmed` no longer
+  appears for a receiver that is still ours.
+
+If a receiver keeps losing PTP while media is healthy, the link is the problem:
+`feedback_rtt_ms` in the per-minute `Session health` line shows a control-plane
+round trip above its usual 4–6 ms, and `clock_jitter_us` shows the offset
+moving. A short Wi-Fi stall, a roaming event or access-point power save produces
+exactly that. See `AUDIO-CRACKLE-DIAGNOSIS.md` for the audio-side symptoms.
+
 ## Windows Firewall
 
 The process owning PTP sockets is

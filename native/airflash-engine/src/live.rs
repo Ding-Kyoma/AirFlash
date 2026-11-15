@@ -36,14 +36,29 @@ use windows::{
 const REBIND_MAX_FAILURES: u32 = 3;
 /// Pause between rebind attempts so a vanished device does not spin the thread.
 const REBIND_BACKOFF: Duration = Duration::from_millis(250);
-/// A silent stream only becomes a rebind probe after two seconds, and at most
-/// once per minute. Non-silent audio returns the probe budget immediately.
-const SILENT_PROBE_WINDOW: Duration = Duration::from_secs(2);
-const SILENT_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+/// A stream that delivers nothing at all only becomes a rebind probe after ten
+/// seconds of contiguous silence. A short burst of stale samples does not
+/// restore the budget: only thirty seconds of contiguous audible audio re-arms
+/// the probe, and repeated probes back off along `SILENT_PROBE_INTERVALS`.
+const SILENT_PROBE_WINDOW: Duration = Duration::from_secs(10);
+const SILENT_PROBE_REARM: Duration = Duration::from_secs(30);
+/// Gaps between consecutive silence probes: one minute, then five, then twenty.
+/// A probe that did not restore sustained audio must not run every two seconds;
+/// that pattern replayed the stale loopback tail and rebuilt the pipeline
+/// forever instead of leaving a merely idle endpoint alone.
+const SILENT_PROBE_INTERVALS: [Duration; 3] = [
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+    Duration::from_secs(1200),
+];
 /// Without packets, wait this long after the last one before counting silence.
-/// A render endpoint that simply has nothing playing is left alone: the probe
-/// additionally requires that a discontinuity or rebind already happened.
+/// Zero-filled packets mean the endpoint is alive and never trigger a probe.
 const NO_PACKET_SILENCE_AFTER: Duration = Duration::from_millis(250);
+/// Three successful rebinds inside this window mean the endpoint is not being
+/// recovered by them, so the capture log says so once per `STORM_WARNING_GAP`.
+const REBIND_STORM_WINDOW: Duration = Duration::from_secs(60);
+const REBIND_STORM_COUNT: usize = 3;
+const STORM_WARNING_GAP: Duration = Duration::from_secs(300);
 const WARNING_QUEUE_CAP: usize = 16;
 
 #[derive(Clone, Copy)]
@@ -79,9 +94,16 @@ pub struct Metrics {
     /// Application instances currently captured; one for an endpoint stream.
     #[serde(default)]
     pub capture_instances: u32,
-    /// Silence probes that triggered a rebind (at most one per minute).
+    /// Silence probes that triggered a rebind (one per backoff interval).
     #[serde(default)]
     pub silent_probes: u64,
+    /// `capture_rebind_storm` warnings raised: the endpoint kept being reopened
+    /// without sustained audio returning, so the rebinds were not recovery.
+    #[serde(default)]
+    pub rebind_storms: u64,
+    /// Most successful rebinds seen inside one `REBIND_STORM_WINDOW`.
+    #[serde(default)]
+    pub rebind_window_max: u32,
     /// Why the last rebind happened (`process_exit`, `endpoint_lost`,
     /// `silent_probe`, `stream_error`).
     #[serde(default)]
@@ -751,30 +773,64 @@ impl RebindBudget {
 
 /// Energy is only used as a probe. The cheap case (a shared-mode loopback that
 /// was already reopened) emits no packets and loses nothing, so the rate limit
-/// matters more than the threshold: never probe twice in a minute, and never
-/// before a real break or rebind has shown that this session can self-heal.
+/// matters more than the threshold: never probe twice inside one backoff
+/// interval, and only after this stream has produced audio and then went quiet.
+///
+/// What the capture loop saw since the previous iteration. `Idle` means the
+/// endpoint simply had nothing ready yet and must not move any timer: the loop
+/// polls far faster than a renderer produces packets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeInput {
+    Idle,
+    Audible,
+    /// Nothing arrived past `NO_PACKET_SILENCE_AFTER`, or every delivered
+    /// sample was zero. The endpoint is either gone or intentionally muted.
+    Muted,
+}
+/// Deliberately sticky silence gate. Clearing the budget on a single non-zero
+/// sample made a silent endpoint re-probe forever: every rebind delivered a
+/// burst of the stale loopback tail, which looked like "audio is back" and
+/// re-armed the probe, then the silence that followed fired it again four
+/// seconds later — the 2.4 s rebind storm in the 2026-11 logs.
 struct SilenceProbe {
     window: Duration,
-    interval: Duration,
+    intervals: [Duration; 3],
     silent_since: Option<Instant>,
     last_probe: Option<Instant>,
+    audible_since: Option<Instant>,
+    ever_audible: bool,
+    silent_probes: usize,
 }
 impl SilenceProbe {
-    fn new(window: Duration, interval: Duration) -> Self {
+    fn new(window: Duration, intervals: [Duration; 3]) -> Self {
         Self {
             window,
-            interval,
+            intervals,
             silent_since: None,
             last_probe: None,
+            audible_since: None,
+            ever_audible: false,
+            silent_probes: 0,
         }
     }
-    fn observe(&mut self, now: Instant, silent: bool, after_discontinuity: bool) -> bool {
-        if !silent {
-            self.silent_since = None;
-            self.last_probe = None;
-            return false;
+    /// Returns true when the missing audio has lasted long enough to justify
+    /// one rebind.
+    fn observe(&mut self, now: Instant, input: ProbeInput) -> bool {
+        match input {
+            ProbeInput::Idle => return false,
+            ProbeInput::Audible => {
+                self.silent_since = None;
+                let since = *self.audible_since.get_or_insert(now);
+                if now.saturating_duration_since(since) >= SILENT_PROBE_REARM {
+                    self.ever_audible = true;
+                    self.silent_probes = 0;
+                    self.last_probe = None;
+                }
+                return false;
+            }
+            ProbeInput::Muted => self.audible_since = None,
         }
-        if !after_discontinuity {
+        if !self.ever_audible {
             self.silent_since = None;
             return false;
         }
@@ -782,14 +838,19 @@ impl SilenceProbe {
         if now.saturating_duration_since(since) < self.window {
             return false;
         }
+        // The first probe uses the one-minute gap; each probe that did not
+        // restore sustained audio moves the ladder one step down.
+        let step = self.silent_probes.saturating_sub(1).min(self.intervals.len() - 1);
+        let interval = self.intervals[step];
         if self
             .last_probe
-            .is_some_and(|last| now.saturating_duration_since(last) < self.interval)
+            .is_some_and(|last| now.saturating_duration_since(last) < interval)
         {
             return false;
         }
         self.last_probe = Some(now);
         self.silent_since = Some(now);
+        self.silent_probes = self.silent_probes.saturating_add(1);
         true
     }
 }
@@ -1192,7 +1253,11 @@ fn capture(
     }
     let _ = ready.send(Ok(()));
     let mut budget = RebindBudget::new(REBIND_MAX_FAILURES);
-    let mut probe = SilenceProbe::new(SILENT_PROBE_WINDOW, SILENT_PROBE_INTERVAL);
+    let mut probe = SilenceProbe::new(SILENT_PROBE_WINDOW, SILENT_PROBE_INTERVALS);
+    // Successful rebinds that are still inside the storm window, plus the last
+    // storm warning so a genuinely dead endpoint does not log every rebind.
+    let mut rebind_times: VecDeque<Instant> = VecDeque::with_capacity(8);
+    let mut storm_warned_at: Option<Instant> = None;
     let mut discontinuity_seen = false;
     let mut last_packet = Instant::now();
     while !stop.load(Ordering::Acquire) {
@@ -1266,12 +1331,20 @@ fn capture(
             }
         }
         if trigger.is_none() && budget.can_attempt() {
-            let silent = if packets > 0 {
-                !audio
+            // Only a stream that delivers nothing at all is probed. Packets that
+            // are digitally silent mean the endpoint is alive (a paused player
+            // renders zeros); reopening it recovers nothing and only replays the
+            // stale loopback tail, which is how the 2026-11 rebind storm kept
+            // itself alive at a 2.4 s cadence.
+            let absent = now.saturating_duration_since(last_packet) > NO_PACKET_SILENCE_AFTER;
+            let input = if audio {
+                ProbeInput::Audible
+            } else if packets == 0 && !absent {
+                ProbeInput::Idle
             } else {
-                now.saturating_duration_since(last_packet) > NO_PACKET_SILENCE_AFTER
+                ProbeInput::Muted
             };
-            if probe.observe(now, silent, discontinuity_seen) {
+            if probe.observe(now, input) {
                 state.lock().unwrap().metrics.silent_probes += 1;
                 trigger = Some("silent_probe");
             }
@@ -1279,6 +1352,9 @@ fn capture(
         let Some(reason) = trigger else {
             continue;
         };
+        // How long the endpoint had been quiet when the probe fired: the log line
+        // separates a real loss from a probe that only replayed a stale tail.
+        let silent_ms = now.saturating_duration_since(last_packet).as_millis();
         // Rebind, not a queue flush: drop the old streams, keep the samples that
         // were already encoded and only reset the resampler input.
         clear_pipeline(&mut pipeline, Some(&mut mixer));
@@ -1324,6 +1400,32 @@ fn capture(
                         s.metrics.rebind_failures = failures;
                         s.metrics.last_rebind_reason = Some(reason.into());
                     }
+                    // A rebind is only recovery if audio comes back. Three inside
+                    // a minute say the endpoint is being reopened in a loop, so
+                    // the log names the storm instead of repeating the same line.
+                    let stamp = Instant::now();
+                    rebind_times.push_back(stamp);
+                    while rebind_times
+                        .front()
+                        .is_some_and(|oldest| {
+                            stamp.saturating_duration_since(*oldest) > REBIND_STORM_WINDOW
+                        })
+                    {
+                        rebind_times.pop_front();
+                    }
+                    let window = rebind_times.len() as u32;
+                    let storm = window >= REBIND_STORM_COUNT as u32
+                        && storm_warned_at.is_none_or(|last| {
+                            stamp.saturating_duration_since(last) >= STORM_WARNING_GAP
+                        });
+                    {
+                        let mut s = state.lock().unwrap();
+                        s.metrics.rebind_window_max = s.metrics.rebind_window_max.max(window);
+                        if storm {
+                            storm_warned_at = Some(stamp);
+                            s.metrics.rebind_storms += 1;
+                        }
+                    }
                     if reason == "process_exit" {
                         warn(
                             state,
@@ -1338,12 +1440,29 @@ fn capture(
                             .take()
                             .map(|message| format!(": {message}"))
                             .unwrap_or_default();
+                        let quiet = if reason == "silent_probe" {
+                            format!("; silent {silent_ms} ms")
+                        } else {
+                            String::new()
+                        };
                         warn(
                             state,
                             "capture_endpoint_reopened",
                             true,
                             format!(
-                                "Capture stream reopened after {reason}{detail} ({count} instance(s))"
+                                "Capture stream reopened after {reason}{detail} ({count} instance(s)){quiet}; rebinds {window} in {} s",
+                                REBIND_STORM_WINDOW.as_secs()
+                            ),
+                        );
+                    }
+                    if storm {
+                        warn(
+                            state,
+                            "capture_rebind_storm",
+                            false,
+                            format!(
+                                "Capture stream rebound {window} times in {} s after {reason} (silent {silent_ms} ms); the endpoint is probably muted, not lost",
+                                REBIND_STORM_WINDOW.as_secs()
                             ),
                         );
                     }
@@ -1460,26 +1579,117 @@ pub(crate) mod tests {
         assert_eq!(budget.failures, 4);
     }
 
+    fn probe() -> SilenceProbe {
+        SilenceProbe::new(
+            Duration::from_secs(10),
+            [
+                Duration::from_secs(60),
+                Duration::from_secs(300),
+                Duration::from_secs(1200),
+            ],
+        )
+    }
+
     #[test]
-    fn silence_probe_needs_the_window_a_prior_break_and_one_probe_per_minute() {
+    fn silence_probe_waits_for_audible_audio_then_the_full_window() {
         let start = Instant::now();
-        let mut probe = SilenceProbe::new(Duration::from_secs(2), Duration::from_secs(60));
-        // Playback has not started: no discontinuity, so silence is never a probe.
-        for seconds in [0, 1, 2, 10, 120] {
-            assert!(!probe.observe(start + Duration::from_secs(seconds), true, false));
+        let mut probe = probe();
+        // A stream that never produced audio is never probed, however long the
+        // endpoint sits idle: a fresh loopback has no stale tail to replay.
+        for seconds in [0, 5, 30, 120] {
+            assert!(!probe.observe(start + Duration::from_secs(seconds), ProbeInput::Muted));
         }
-        // A real break happened: the two-second window starts now.
-        assert!(!probe.observe(start, true, true));
-        assert!(!probe.observe(start + Duration::from_millis(1999), true, true));
-        assert!(probe.observe(start + Duration::from_secs(2), true, true));
-        // One probe per minute, measured from the probe itself.
-        assert!(!probe.observe(start + Duration::from_secs(3), true, true));
-        assert!(!probe.observe(start + Duration::from_secs(61), true, true));
-        assert!(probe.observe(start + Duration::from_secs(62), true, true));
-        // Non-silent audio clears the run and the probe budget.
-        assert!(!probe.observe(start + Duration::from_secs(63), false, true));
-        assert!(!probe.observe(start + Duration::from_secs(64), true, true));
-        assert!(probe.observe(start + Duration::from_secs(66), true, true));
+        // Idle polls between packets must not move either timer.
+        assert!(!probe.observe(start + Duration::from_secs(1), ProbeInput::Idle));
+        // Thirty seconds of contiguous audio arm the probe; 29 is not enough.
+        assert!(!probe.observe(start + Duration::from_secs(100), ProbeInput::Audible));
+        assert!(!probe.observe(start + Duration::from_secs(129), ProbeInput::Audible));
+        assert!(!probe.observe(start + Duration::from_secs(130), ProbeInput::Audible));
+        // Ten seconds of contiguous silence are required, not ten seconds since
+        // the last audible packet.
+        assert!(!probe.observe(start + Duration::from_secs(131), ProbeInput::Muted));
+        assert!(!probe.observe(start + Duration::from_secs(140), ProbeInput::Muted));
+        assert!(probe.observe(start + Duration::from_secs(141), ProbeInput::Muted));
+    }
+
+    #[test]
+    fn a_short_stale_burst_does_not_restore_the_probe_budget() {
+        let start = Instant::now();
+        let mut probe = probe();
+        probe.observe(start, ProbeInput::Audible);
+        probe.observe(start + Duration::from_secs(30), ProbeInput::Audible);
+        assert!(!probe.observe(start + Duration::from_secs(30), ProbeInput::Muted));
+        assert!(probe.observe(start + Duration::from_secs(40), ProbeInput::Muted));
+        // The rebound stream replays ~50 ms of the stale loopback tail, then goes
+        // quiet again. That burst used to clear `last_probe` and restart the
+        // two-second window, which is exactly the 2.36 s storm cadence.
+        assert!(!probe.observe(start + Duration::from_secs(41), ProbeInput::Audible));
+        assert!(!probe.observe(
+            start + Duration::from_millis(41_050),
+            ProbeInput::Muted
+        ));
+        assert!(!probe.observe(start + Duration::from_secs(50), ProbeInput::Muted));
+        assert!(!probe.observe(start + Duration::from_secs(99), ProbeInput::Muted));
+        assert!(probe.observe(start + Duration::from_secs(100), ProbeInput::Muted));
+    }
+
+    #[test]
+    fn repeated_silent_probes_back_off_to_five_then_twenty_minutes() {
+        let start = Instant::now();
+        let mut probe = probe();
+        probe.observe(start, ProbeInput::Audible);
+        probe.observe(start + Duration::from_secs(30), ProbeInput::Audible);
+        probe.observe(start + Duration::from_secs(30), ProbeInput::Muted);
+        assert!(probe.observe(start + Duration::from_secs(40), ProbeInput::Muted));
+        assert!(!probe.observe(start + Duration::from_secs(99), ProbeInput::Muted));
+        assert!(probe.observe(start + Duration::from_secs(100), ProbeInput::Muted));
+        assert!(!probe.observe(start + Duration::from_secs(399), ProbeInput::Muted));
+        assert!(probe.observe(start + Duration::from_secs(400), ProbeInput::Muted));
+        assert!(!probe.observe(start + Duration::from_secs(1599), ProbeInput::Muted));
+        assert!(probe.observe(start + Duration::from_secs(1600), ProbeInput::Muted));
+    }
+
+    #[test]
+    fn sustained_audio_resets_the_probe_budget() {
+        let start = Instant::now();
+        let mut probe = probe();
+        probe.observe(start, ProbeInput::Audible);
+        probe.observe(start + Duration::from_secs(30), ProbeInput::Audible);
+        probe.observe(start + Duration::from_secs(30), ProbeInput::Muted);
+        assert!(probe.observe(start + Duration::from_secs(40), ProbeInput::Muted));
+        assert!(!probe.observe(start + Duration::from_secs(99), ProbeInput::Muted));
+        assert!(probe.observe(start + Duration::from_secs(100), ProbeInput::Muted));
+        // Audio really returns for half a minute: the ladder restarts at a minute.
+        assert!(!probe.observe(start + Duration::from_secs(200), ProbeInput::Audible));
+        assert!(!probe.observe(start + Duration::from_secs(230), ProbeInput::Audible));
+        assert!(!probe.observe(start + Duration::from_secs(231), ProbeInput::Muted));
+        assert!(probe.observe(start + Duration::from_secs(241), ProbeInput::Muted));
+    }
+
+    #[test]
+    fn the_storm_pattern_produces_a_handful_of_probes_not_hundreds() {
+        // 11-08 15:48–16:15: every probe reopened the stream, the fresh binding
+        // replayed a ~50 ms stale burst of the loopback tail, then the endpoint
+        // went quiet again. The old state machine treated that burst as "audio is
+        // back", re-armed, waited two seconds and probed again: 2.36 s cadence for
+        // 27 minutes. Here the window and the interval ladder must absorb it.
+        let start = Instant::now();
+        let mut probe = probe();
+        assert!(!probe.observe(start, ProbeInput::Audible));
+        assert!(!probe.observe(start + Duration::from_secs(30), ProbeInput::Audible));
+        let mut fired = 0;
+        let mut clock = Duration::from_secs(30);
+        let deadline = Duration::from_secs(30 + 27 * 60);
+        while clock < deadline {
+            if probe.observe(start + clock, ProbeInput::Muted) {
+                fired += 1;
+                // The rebind itself replays the stale tail, then silence returns.
+                clock += Duration::from_millis(50);
+                assert!(!probe.observe(start + clock, ProbeInput::Audible));
+            }
+            clock += Duration::from_millis(100);
+        }
+        assert!((1..=4).contains(&fired), "probe fired {fired} times");
     }
 
     #[test]
