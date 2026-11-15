@@ -545,6 +545,14 @@ Q18 指出用 `features` **bit 41** 判 PTP 是错的（WAC 的二进制里 `1L<
   `poll_preemption` 返回 `PreemptionPoll::None`，不 `poison` 控制连接、不增加
   连续计数，照常走 `health.check()` / `check_control(media_healthy)` 这些原有的
   非抢占路径；会话结束时仍然正常回发 `TEARDOWN`。
+  **施工回归（2026-11，0.6.3 用户日志）**：实现曾把 `ownership_uncertain`
+  再与进 `prepare_preemption` 的 `media_healthy` / `we_hold_session`，导致
+  时钟/feedback 抖动后 `OursActive` 在结构上不可达，探测必然把 bit17 读成
+  `BusyElsewhere`，最终变成 `ownership_unconfirmed`；`FallThrough` 也没有清
+  latch，清理阶段因此跳过 TEARDOWN。现在探测输入只保留 `rtp_healthy` 与
+  `ended`（`Tracker::we_hold_session` 仍是唯一推导），`FallThrough` 清除
+  `ownership_uncertain`，`ClockLost` 在归属确认且 PTP 恢复后继续媒体；确认
+  归属前不会恢复（保留 71da825 的约束）。
 - **判决表**（`action_for` / `action_for_result` 的纯函数部分；状态机会在其上
   再套二次确认和 busy 退避队列）：
   | 探测结果 | 首次动作 | 确认后 |
