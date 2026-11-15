@@ -67,6 +67,16 @@ fn read(connection: &mut Connection) -> Result<u8> {
         .context("invalid initialVolume type")?;
     from_db(db)
 }
+fn write(connection: &mut Connection, uri: &str, percent: u8) -> Result<()> {
+    connection
+        .request(
+            "SET_PARAMETER",
+            uri,
+            &[("Content-Type", "text/parameters".into())],
+            format!("volume: {:.6}\r\n", to_db(percent)).as_bytes(),
+        )
+        .map(|_| ())
+}
 #[derive(Default)]
 struct Pending {
     command: Option<Command>,
@@ -107,24 +117,52 @@ pub struct Worker {
 }
 impl Worker {
     /// Peers are ordered with the stereo leader first by the desktop controller.
-    pub fn start(peers: Vec<Peer>, control: Control) -> Result<Self> {
-        Self::start_scoped(peers, control, String::new())
+    /// The initial volume, when present, is written before this call returns so
+    /// the receiver is already at the remembered level when streaming starts.
+    pub fn start(peers: Vec<Peer>, control: Control, initial: Option<u8>) -> Result<Self> {
+        Self::start_scoped(peers, control, String::new(), initial)
     }
-    pub fn start_member(peer: Peer, control: Control) -> Result<Self> {
+    pub fn start_member(peer: Peer, control: Control, initial: Option<u8>) -> Result<Self> {
         let host = peer.0.clone();
-        Self::start_scoped(vec![peer], control, host)
+        Self::start_scoped(vec![peer], control, host, initial)
     }
-    fn start_scoped(peers: Vec<Peer>, control: Control, scope: String) -> Result<Self> {
+    fn start_scoped(
+        peers: Vec<Peer>,
+        control: Control,
+        scope: String,
+        initial: Option<u8>,
+    ) -> Result<Self> {
         ensure!(!peers.is_empty(), "volume worker requires a receiver");
         let stop = Cancellation::default();
         let done = stop.clone();
         let (tx, events) = mpsc::sync_channel(32);
+        let mut initial_errors = Vec::new();
+        if let Some(percent) = initial {
+            for (host, uri, connection) in &peers {
+                if let Err(error) = write(&mut connection.lock().unwrap(), uri, percent) {
+                    initial_errors.push(format!("{host}: {error:#}"));
+                }
+            }
+        }
+        let seeded = initial.map(|percent| Pending {
+            command: Some(Command {
+                sequence: 0,
+                percent,
+            }),
+            sent: Some(Instant::now()),
+            write_failed: !initial_errors.is_empty(),
+            settled: false,
+        });
         let worker = thread::Builder::new().name("airplay-volume".into()).spawn(move || {
-            let mut pending = Pending::default();
+            let mut pending = seeded.unwrap_or_default();
+            let mut initial_errors = initial_errors;
             let mut next = Instant::now();
             while !done.is_cancelled() {
                 let command = if scope.is_empty() {control.latest()} else {control.for_host(&scope)};
-                let changed = command.map(|c| c.sequence) != pending.command.map(|c| c.sequence);
+                // A seeded initial command must survive until a real control
+                // command replaces it; an empty control is not a change.
+                let changed = command
+                    .is_some_and(|c| pending.command.map(|c| c.sequence) != Some(c.sequence));
                 if !changed && Instant::now() < next {
                     thread::sleep(Duration::from_millis(20));
                     continue;
@@ -135,16 +173,14 @@ impl Worker {
                     if let Some(command) = command {
                         for (host, uri, connection) in &peers {
                             if done.is_cancelled() { return; }
-                            let result = connection.lock().unwrap().request("SET_PARAMETER", uri,
-                                &[("Content-Type", "text/parameters".into())],
-                                format!("volume: {:.6}\r\n", to_db(command.percent)).as_bytes());
-                            if let Err(error) = result {
+                            if let Err(error) = write(&mut connection.lock().unwrap(), uri, command.percent) {
                                 pending.write_failed = true;
                                 errors.push(format!("{host}: {error:#}"));
                             }
                         }
                     }
                 }
+                errors.append(&mut initial_errors);
                 let mut values = Vec::new();
                 for (host, _, connection) in &peers {
                     if done.is_cancelled() { return; }

@@ -37,7 +37,7 @@ public sealed class SettingsTests
             MasterVolume = 41, LastReceiverId = "a", DiscoveryInterfaceId = "01db7c77-1016-49cb-8f5c-f5c194425d15",
             Extra = new() { ["future_option"] = JsonSerializer.SerializeToElement(new { enabled = true }) }
         };
-        source.Options("a").Volume = 52; source.Options("a").Hidden = true;
+        source.Options("a").Volume = 52; source.Options("a").LastVolume = 63; source.Options("a").Hidden = true;
         source.ManualReceivers.Add(new("a", "Speaker", "127.0.0.1", 7000));
         var target = new AppSettings(); var options = target.Options("a"); target.Options("removed");
         var manual = target.ManualReceivers;
@@ -45,7 +45,16 @@ public sealed class SettingsTests
         Assert.Same(options, target.Options("a")); Assert.Same(manual, target.ManualReceivers);
         Assert.False(target.Receivers.ContainsKey("removed")); Assert.True(SettingsMerge.Equal(source, target));
         source.Options("a").Volume = 99; source.Extra.Clear();
-        Assert.Equal(52, target.Options("a").Volume); Assert.True(target.Extra!.ContainsKey("future_option"));
+        Assert.Equal(52, target.Options("a").Volume); Assert.Equal(63, target.Options("a").LastVolume); Assert.True(target.Extra!.ContainsKey("future_option"));
+    }
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(101)]
+    public void RememberedVolumeMustBeBetweenZeroAndOneHundred(int value)
+    {
+        var settings = new AppSettings();
+        settings.Options("a").LastVolume = value;
+        Assert.NotNull(settings.Validate());
     }
     [Fact]
     public async Task AsynchronousSaveKeepsAtomicMigrationAndUnknownFields()

@@ -925,6 +925,54 @@ public sealed class SessionTests
         Assert.Equal(JsonValueKind.Array, command.Parameters.GetProperty("peers")[0].GetProperty("codecs").ValueKind);
     }
     [Fact]
+    public async Task RememberedVolumeIsSentWhenTheEngineSupportsRestoration()
+    {
+        var process = new FakeConnection(); var factory = new FakeFactory(process);
+        await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        var settings = Settings(); settings.Options("a").LastVolume = 37;
+        await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var peer = process.Commands.Single(c => c.Command == "start").Parameters.GetProperty("peers")[0];
+        Assert.Equal(37d, peer.Number("volume"));
+    }
+    [Fact]
+    public async Task OldEngineAndFirstConnectionDoNotReceiveAVolume()
+    {
+        var settings = Settings(); settings.Options("a").LastVolume = 37;
+        var old = new FakeConnection { SupportsInitialVolume = false };
+        await using var oldController = new SessionController(new FakeFactory(old), new FakeAudio(), timing: Fast);
+        await oldController.StartAsync(Pod(), settings); await Until(() => oldController.Snapshot.State == PlaybackState.Streaming);
+        Assert.False(old.Commands.Single(c => c.Command == "start").Parameters.GetProperty("peers")[0].TryGetProperty("volume", out _));
+
+        var fresh = new FakeConnection();
+        await using var freshController = new SessionController(new FakeFactory(fresh), new FakeAudio(), timing: Fast);
+        await freshController.StartAsync(Pod(), Settings()); await Until(() => freshController.Snapshot.State == PlaybackState.Streaming);
+        Assert.False(fresh.Commands.Single(c => c.Command == "start").Parameters.GetProperty("peers")[0].TryGetProperty("volume", out _));
+        Assert.DoesNotContain(fresh.Commands, c => c.Command == "set_device_volume");
+    }
+    [Fact]
+    public async Task SoftwareGroupMembersRestoreTheirOwnRememberedVolumes()
+    {
+        var process = new FakeConnection();
+        var (receiver, settings) = SoftwareGroup();
+        settings.Options("a").LastVolume = 31; settings.Options("b").LastVolume = 62;
+        await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast);
+        await controller.StartAsync(receiver, settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var peers = process.Commands.Single(c => c.Command == "start").Parameters.GetProperty("peers").EnumerateArray().ToArray();
+        Assert.Equal(31d, peers.Single(p => p.Text("receiver_id") == "a").Number("volume"));
+        Assert.Equal(62d, peers.Single(p => p.Text("receiver_id") == "b").Number("volume"));
+    }
+    [Fact]
+    public async Task DeviceVolumeReadIsAcceptedWhileConnecting()
+    {
+        var process = new FakeConnection(false);
+        await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast);
+        await controller.StartAsync(Pod(), Settings()); await Until(() => controller.Snapshot.State == PlaybackState.Connecting);
+        process.EmitData(new { @event = "device_volume", host = "127.0.0.1", volume = 33, sequence = 0, status = "confirmed", available = true });
+        await Until(() => controller.Snapshot.DeviceVolume?.Actual == 33);
+        Assert.Equal(PlaybackState.Connecting, controller.Snapshot.State);
+        Assert.DoesNotContain(process.Commands, c => c.Command == "set_device_volume");
+    }
+    [Fact]
     public async Task ChangingStreamRateRestartsSessionWithNewRate()
     {
         var first = new FakeConnection(); var second = new FakeConnection(); var factory = new FakeFactory(first, second); await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
@@ -1687,6 +1735,7 @@ public sealed class SessionTests
         public bool SupportsForcedLatency { get; init; } = true;
         public bool SupportsSoundGlow { get; init; } = true;
         public bool SupportsAdaptiveLead { get; init; } = true;
+        public bool SupportsInitialVolume { get; init; } = true;
         public bool SupportsOwnershipGuard { get; init; } = true;
         private int _latencyBase;
         private long _streamEpoch = 1;
@@ -1709,7 +1758,7 @@ public sealed class SessionTests
                 case "set_gain": GainEntered?.TrySetResult(); if (GainGate is not null) await GainGate.Task.WaitAsync(cancellation); break;
             }
         }
-        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "multi_room", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture" }.Where(c => SupportsOwnershipGuard || c != "receiver_ownership_guard").Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).Concat(SupportsSoundGlow ? ["sound_glow_test"] : Array.Empty<string>()).Concat(SupportsForcedLatency ? ["forced_latency"] : Array.Empty<string>()).Concat(SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).ToArray() });
+        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "multi_room", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture" }.Where(c => SupportsOwnershipGuard || c != "receiver_ownership_guard").Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).Concat(SupportsSoundGlow ? ["sound_glow_test"] : Array.Empty<string>()).Concat(SupportsForcedLatency ? ["forced_latency"] : Array.Empty<string>()).Concat(SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).Concat(SupportsInitialVolume ? ["initial_volume"] : Array.Empty<string>()).ToArray() });
         public void ConfirmLead(int extra)
         {
             var command = Commands.Last(c => c.Command == "set_lead");

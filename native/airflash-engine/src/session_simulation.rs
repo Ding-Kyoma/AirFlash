@@ -258,6 +258,7 @@ fn mock_with_cancel_and_model(
             latency_ms: Some(if buffered { 120 } else { 200 }),
             ..Default::default()
         },
+        volume: None,
     };
     let event_port = event.local_addr().unwrap().port();
     let packets = Arc::new(Mutex::new(Vec::new()));

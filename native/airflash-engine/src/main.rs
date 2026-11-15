@@ -67,6 +67,7 @@ fn capabilities() -> Vec<&'static str> {
         "continuity",
         "buffered_audio",
         "member_volume",
+        "initial_volume",
         "receiver_password",
         "standby_release",
         "receiver_ownership_guard",

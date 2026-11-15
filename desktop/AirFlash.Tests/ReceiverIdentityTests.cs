@@ -99,6 +99,7 @@ public sealed class ReceiverIdentityTests
         var settings = new AppSettings();
         settings.Options("AA:BB:CC:DD:EE:01").Hidden = true;
         settings.Options("192.0.2.10:7000").Volume = 45;
+        settings.Options("192.0.2.10:7000").LastVolume = 51;
         settings.Options("AA-BB-CC-DD-EE-02").StandbySeconds = 25;
         settings.Options("stereo:pair").LatencyMode = "buffered";
         var migrated = ReceiverCatalog.Reconcile(ReceiverAggregator.Build([
@@ -108,6 +109,7 @@ public sealed class ReceiverIdentityTests
         Assert.Equal("stereo:pair", group.Id); Assert.True(group.Complete);
         Assert.True(migrated.Settings.ReadOptions("aabbccddee01").Hidden);
         Assert.Equal(45, migrated.Settings.ReadOptions("aabbccddee01").Volume);
+        Assert.Equal(51, migrated.Settings.ReadOptions("aabbccddee01").LastVolume);
         Assert.Equal(25, migrated.Settings.ReadOptions("aabbccddee02").StandbySeconds);
         Assert.False(migrated.Settings.ReadOptions(group.Id).Hidden);
         Assert.Equal("buffered", migrated.Settings.ReadOptions(group.Id).LatencyMode);

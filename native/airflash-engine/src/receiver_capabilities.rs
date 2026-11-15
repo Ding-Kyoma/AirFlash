@@ -193,6 +193,7 @@ mod tests {
                     transport: Transport::Auto,
                     ..Default::default()
                 },
+                volume: None,
             },
             worker,
         )
@@ -283,6 +284,7 @@ mod tests {
             port: address.port(),
             codecs: vec![],
             profile: Profile::default(),
+            volume: None,
         };
         let capabilities = query(&peer, Cancellation::default()).unwrap();
         assert!(capabilities.known);

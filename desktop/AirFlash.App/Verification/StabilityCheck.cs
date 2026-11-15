@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Threading;
 using AirFlash.App.Services;
@@ -22,6 +23,7 @@ internal static class StabilityCheck
             }
             await VerifyDelayedDiscoveryAsync(false, checks);
             await VerifyDelayedDiscoveryAsync(true, checks);
+            await VerifyRememberedVolumeAsync(checks);
             App.WriteOutput(args, new { ok = true, checks, note = "Simulated discovery, audio, startup and engine; no real speaker access." });
             return 0;
         }
@@ -163,6 +165,53 @@ internal static class StabilityCheck
                 label + ": passive panel refresh does not send duplicate standby commands", checks);
         }
         finally { panel.ShutdownPanel(); }
+    }
+
+    private static async Task VerifyRememberedVolumeAsync(List<string> checks)
+    {
+        var receiver = new Receiver("volume-check", "Volume", "127.0.0.1");
+        var store = new UiSmoke.MemoryStore();
+        var discovery = new UiSmoke.MockDiscovery { Items = [receiver] };
+        var engine = new UiSmoke.MockFactory();
+        engine.DeviceVolumes[receiver.Address] = 28;
+        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+        app.SetPanelVisible(true);
+        app.Start(); await app.Startup;
+        await Until(() => app.AllReceivers.Count == 1);
+        await app.ToggleAsync(app.AllReceivers.Single());
+        await Until(() => app.Snapshot.State == PlaybackState.Streaming && app.Receivers.Single().Volume == 28);
+        var first = LastStart(engine).GetProperty("peers")[0];
+        Check(!first.TryGetProperty("volume", out _), "first connection keeps the receiver volume", checks);
+        await Until(() => app.Settings.ReadOptions(receiver.Id).LastVolume == 28);
+        await app.FlushVolumeAsync();
+        Check(store.Saved.ReadOptions(receiver.Id).LastVolume == 28, "confirmed device volume is remembered in settings", checks);
+
+        // A physical change while disconnected must not replace the remembered value.
+        engine.DeviceVolumes[receiver.Address] = 5;
+        await StopAndStartAsync(app);
+        Check(LastStart(engine).GetProperty("peers")[0].Integer("volume") == 28, "reconnect sends the remembered volume", checks);
+        await Until(() => app.Receivers.Single().Volume == 28 && !app.Receivers.Single().VolumeSyncing);
+        Check(engine.DeviceVolumes[receiver.Address] == 28, "the engine applies the remembered volume before the volume read", checks);
+
+        // Mute is device volume 0, not a remembered volume; reconnect is audible again.
+        await app.ToggleReceiverMuteAsync(receiver.Id);
+        await Until(() => app.Receivers.Single().Volume == 0 && !app.Receivers.Single().VolumeSyncing);
+        await app.FlushVolumeAsync();
+        Check(app.Settings.ReadOptions(receiver.Id).LastVolume == 28, "mute does not replace the remembered volume", checks);
+        await StopAndStartAsync(app);
+        Check(LastStart(engine).GetProperty("peers")[0].Integer("volume") == 28, "reconnect after mute restores the audible volume", checks);
+        await Until(() => app.Receivers.Single().Volume == 28 && !app.Receivers.Single().VolumeSyncing);
+    }
+
+    private static JsonElement LastStart(UiSmoke.MockFactory engine)
+        => engine.Commands.Last(c => c.Text("command") == "start").GetProperty("params");
+
+    private static async Task StopAndStartAsync(AppViewModel app)
+    {
+        await app.ToggleAsync(app.AllReceivers.Single());
+        await Until(() => app.Snapshot.State == PlaybackState.Idle);
+        await app.ToggleAsync(app.AllReceivers.Single());
+        await Until(() => app.Snapshot.State == PlaybackState.Streaming);
     }
 
     private static void Check(bool value, string name, List<string> checks)

@@ -424,6 +424,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         var title = StatusTitle; var detail = StatusDetail; var errors = ErrorDetails; var hint = ActionHint;
         var previous = _snapshot;
         _snapshot = snapshot;
+        RememberSessionVolume(snapshot);
         if (Session.RequiresManualReconnect) _autoSuppressed = true;
         RefreshGlobalLatency();
         Notify(nameof(Snapshot)); Notify(nameof(LatencyDetail)); Notify(nameof(PanelStatusDetail));
@@ -554,7 +555,39 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         }
         else await Session.SetDeviceVolumeAsync(id, 0);
     }
-    public Task SetReceiverVolumeAsync(string id, int value) => Session.SetDeviceVolumeAsync(id, value);
+    public Task SetReceiverVolumeAsync(string id, int value)
+    {
+        RememberDeviceVolume(id, value);
+        return Session.SetDeviceVolumeAsync(id, value);
+    }
+    /// <summary>
+    /// Remember the last confirmed device volume so the next session can restore
+    /// it before streaming starts. Zero is the mute state, not a volume, and
+    /// never overwrites the last audible level.
+    /// </summary>
+    private void RememberSessionVolume(SessionSnapshot snapshot)
+    {
+        if (snapshot.State is not (PlaybackState.Streaming or PlaybackState.Standby)) return;
+        if (snapshot.Receiver is { IsSoftwareGroup: true })
+        {
+            if (snapshot.MemberVolumes is not { } members) return;
+            foreach (var (id, state) in members)
+                if (state.Status == "confirmed") RememberDeviceVolume(id, state.Actual);
+            return;
+        }
+        if (snapshot.Receiver is { } receiver && snapshot.DeviceVolume is { Status: "confirmed" } volume)
+            RememberDeviceVolume(receiver.Id, volume.Actual);
+    }
+    private void RememberDeviceVolume(string id, int? value)
+    {
+        if (_closing || _resetting || value is not > 0) return;
+        if (_snapshot.State is not (PlaybackState.Streaming or PlaybackState.Standby)) return;
+        if (_snapshot.Receiver is not { } receiver) return;
+        var active = receiver.IsSoftwareGroup ? _snapshot.MemberVolumes?.ContainsKey(id) == true : receiver.Id == id;
+        if (!active || _settings.ReadOptions(id).LastVolume == value) return;
+        _settings.Options(id).LastVolume = value;
+        VolumeChanged();
+    }
     private void VolumeChanged() { _editRevision++; _volumeDirty = true; _volumeTimer.Stop(); if (!_closing) _volumeTimer.Start(); }
     public async Task FlushVolumeAsync()
     {

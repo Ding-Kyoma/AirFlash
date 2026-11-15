@@ -8,7 +8,7 @@ public sealed class ReceiverOptions : ObservableObject
 {
     public void CopyFrom(ReceiverOptions source)
     {
-        AutoConnect = source.AutoConnect; Hidden = source.Hidden; Volume = source.Volume;
+        AutoConnect = source.AutoConnect; Hidden = source.Hidden; Volume = source.Volume; LastVolume = source.LastVolume;
         LatencyMode = source.LatencyMode; CustomBufferMs = source.CustomBufferMs; ForceLatency = source.ForceLatency; StandbySeconds = source.StandbySeconds;
         Codec = source.Codec; SampleRate = source.SampleRate; Transport = source.Transport; Timing = source.Timing;
     }
@@ -18,6 +18,12 @@ public sealed class ReceiverOptions : ObservableObject
     public bool Hidden { get => _Hidden; set => Set(ref _Hidden, value); }
     private int? _Volume = null;
     public int? Volume { get => _Volume; set => Set(ref _Volume, value); }
+    /// <summary>
+    /// Last audible device volume observed for this receiver. Restored at the
+    /// start of the next session; null means the receiver has no history yet.
+    /// </summary>
+    private int? _LastVolume = null;
+    public int? LastVolume { get => _LastVolume; set => Set(ref _LastVolume, value); }
     private string? _LatencyMode = null;
     public string? LatencyMode { get => _LatencyMode; set => Set(ref _LatencyMode, value); }
     private bool? _ForceLatency;
@@ -189,6 +195,7 @@ public sealed class AppSettings : ObservableObject
             if (options.Codec is not ("auto" or "pcm" or "alac") || options.Transport is not ("auto" or "realtime" or "buffered") || options.Timing is not ("auto" or "ptp" or "ntp" or "follow")) return L.Get("Invalid receiver stream profile.");
             if (options.SampleRate is not null && !SampleRates.Contains(options.SampleRate)) return L.Get("Select a valid stream sample rate.");
             if (options.Volume is < 0 or > 100) return L.Get("Device volume must be between 0 and 100.");
+            if (options.LastVolume is < 0 or > 100) return L.Get("Device volume must be between 0 and 100.");
             if (options.LatencyMode is not null && !Modes.Contains(options.LatencyMode)) return L.Get("Invalid device latency mode.");
             if (options.CustomBufferMs is < 0 or > 2000) return L.Get("Device custom latency must be between 0 and 2000 ms.");
             if (options.StandbySeconds is { } seconds && (!double.IsFinite(seconds) || seconds is < 5 or > 300)) return L.Get("Device standby threshold must be between 5 and 300 seconds.");

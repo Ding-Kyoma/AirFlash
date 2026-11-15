@@ -231,6 +231,12 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         // Hold the state lock through publication so an old state cannot replace stop/reconnect.
         lock (_sync) { if (epoch == _generation) Publish(epoch, _snapshot.State, _snapshot.Message); }
     }
+    /// <summary>
+    /// Device volume reads are accepted while an attempt is preparing or active,
+    /// so a restored initial value racing the streaming event is not dropped.
+    /// Writes stay limited to Streaming/Standby.
+    /// </summary>
+    private bool AcceptsVolumeReads() => Snapshot.State is PlaybackState.Connecting or PlaybackState.Streaming or PlaybackState.Standby;
     private PlaybackDiagnostics _diagnostics = new();
     private async Task SetMemberVolumeAsync(string memberId, int value)
     {
@@ -272,6 +278,16 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             follow_receiver_clock = options.Timing == "follow" || options.Timing == "auto" && member.FollowReceiverClock, features = member.Features,
             channel = receiver.IsSoftwareGroup ? member.Channel : "stereo", sync_offset_ms = receiver.IsSoftwareGroup ? member.SyncOffsetMs : 0,
             latency_ms = adaptiveTarget ?? InitialLatency(receiver, member, settings, negotiated) };
+    }
+    /// <summary>
+    /// The last audible volume to restore for this peer. Single receivers and
+    /// native stereo groups share one group-level value; software group members
+    /// remember their own hardware volume.
+    /// </summary>
+    private static int? RememberedVolume(Receiver receiver, Receiver member, AppSettings settings)
+    {
+        var options = settings.ReadOptions(receiver.IsSoftwareGroup ? member.Id : receiver.Id);
+        return options.LastVolume is > 0 and var volume ? volume : null;
     }
     private static int InitialLatency(Receiver receiver, Receiver member, AppSettings settings, ReceiverProfile? negotiated)
     {
@@ -712,6 +728,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                     _confirmedLeadSupported = EngineHandshake.HasCapability(hello, "adaptive_lead_v2");
                     EngineHandshake.RequireStreamingCapabilities(hello);
                     EngineHandshake.RequireCapabilities(hello, "standby_release");
+                    var restoreVolume = EngineHandshake.HasCapability(hello, "initial_volume");
                     if (!EngineHandshake.HasCapability(hello, "receiver_ownership_guard"))
                         throw new EngineFailure(new("ownership_guard_required", "", "ipc", L.Get("Incompatible engine protocol version."), false));
                     if (forceLatency && !EngineHandshake.HasCapability(hello, "forced_latency"))
@@ -729,9 +746,18 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                     _adaptiveBase = adaptiveMode ? Math.Max(_adaptiveInitial, _adaptive.RecoveryTarget ?? 0) : _adaptiveInitial;
                     lock (_sync) _adaptive.BeginAttempt(_adaptiveBase);
                     foreach (var member in receiver.Peers.OrderByDescending(p => p.IsLeader))
-                        peers.Add(new { receiver_id = member.Id, host = hosts[member.Id], port = member.Port,
-                            codecs = member.Codecs.Select(x => (int)x).ToArray(),
-                            profile = PeerProfile(receiver, member, settings, selected.FirstOrDefault(s => s.ReceiverId == member.Id)?.Profile, adaptiveMode ? _adaptiveBase : null) });
+                    {
+                        var peer = new Dictionary<string, object?>
+                        {
+                            ["receiver_id"] = member.Id, ["host"] = hosts[member.Id], ["port"] = member.Port,
+                            ["codecs"] = member.Codecs.Select(x => (int)x).ToArray(),
+                            ["profile"] = PeerProfile(receiver, member, settings, selected.FirstOrDefault(s => s.ReceiverId == member.Id)?.Profile, adaptiveMode ? _adaptiveBase : null)
+                        };
+                        // Only send the field when the engine understands it, so an
+                        // older engine keeps reading the receiver's own volume.
+                        if (restoreVolume && RememberedVolume(receiver, member, settings) is { } volume) peer["volume"] = volume;
+                        peers.Add(peer);
+                    }
                     await _equalizerWriter.WaitAsync(cancellation).ConfigureAwait(false);
                     try
                     {
@@ -856,12 +882,12 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                             startedAt = 0; deadline = DateTime.UtcNow + _timing.Connect;
                             Publish(epoch, PlaybackState.Connecting, L.Get("Audio detected; reconnecting…"));
                         }
-                        else if (kind == "device_volume" && startedAt != 0 && receiver.IsSoftwareGroup)
+                        else if (kind == "device_volume" && AcceptsVolumeReads() && receiver.IsSoftwareGroup)
                         {
                             lock (_sync) { if (epoch != _generation) continue; var id = _memberHosts.FirstOrDefault(p => p.Value == item.Text("host")).Key; if (id is not null) _memberVolumes[id] = (_memberVolumes.GetValueOrDefault(id) ?? new()).Receive(item); }
                             PublishCurrent(epoch);
                         }
-                        else if (kind == "device_volume" && startedAt != 0 && item.Text("host") == volumeHost)
+                        else if (kind == "device_volume" && AcceptsVolumeReads() && item.Text("host") == volumeHost)
                         {
                             lock (_sync)
                             {

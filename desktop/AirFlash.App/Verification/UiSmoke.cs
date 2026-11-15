@@ -595,6 +595,8 @@ internal static class UiSmoke
         public bool SupportsAdaptiveLead;
         public Action<object>? EmitEvent;
         public ConcurrentQueue<JsonElement> Commands { get; } = new();
+        /// <summary>Simulated per-host hardware volume, shared across connections.</summary>
+        public ConcurrentDictionary<string, int> DeviceVolumes { get; } = new();
         public bool SupportsSoundGlow { get; init; } = true;
         public int CreatedCount, DisposedCount;
         public IEngineConnection Open()
@@ -613,14 +615,23 @@ internal static class UiSmoke
         public Task SendAsync(string session, string command, object? parameters, CancellationToken cancellation)
         {
             factory.Commands.Enqueue(JsonSerializer.SerializeToElement(new { command, @params = parameters }));
-            if (command == "hello") Emit(session, new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "multi_room", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture", "forced_latency" }.Concat(factory.SupportsSoundGlow ? ["sound_glow_test"] : Array.Empty<string>()).Concat(factory.SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).ToArray() });
+            if (command == "hello") Emit(session, new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "multi_room", "continuity", "buffered_audio", "member_volume", "initial_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture", "forced_latency" }.Concat(factory.SupportsSoundGlow ? ["sound_glow_test"] : Array.Empty<string>()).Concat(factory.SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).ToArray() });
             if (command == "pair") factory.EmitEvent = payload => Emit(session, payload);
             if (command == "start")
             {
-                _host = JsonSerializer.SerializeToElement(parameters).GetProperty("peers")[0].Text("host");
                 var data = JsonSerializer.SerializeToElement(parameters);
+                _host = data.GetProperty("peers")[0].Text("host");
                 foreach (var peer in data.GetProperty("peers").EnumerateArray())
-                    Emit(session, new { @event = "negotiated", receiver_id = peer.Text("receiver_id"), host = peer.Text("host"), port = peer.Integer("port"), codec = "alac", transport = "realtime", timing = "ptp", clock_role = peer.GetProperty("profile").Boolean("follow_receiver_clock") == true ? "follow" : "sender", sample_rate = data.Integer("sample_rate") });
+                {
+                    var host = peer.Text("host");
+                    var fallback = host == _host ? 28 : 45;
+                    var volume = peer.TryGetProperty("volume", out var requested) && requested.ValueKind == JsonValueKind.Number
+                        ? (int)requested.GetDouble()
+                        : factory.DeviceVolumes.GetValueOrDefault(host, fallback);
+                    _volumes[host] = volume;
+                    factory.DeviceVolumes[host] = volume;
+                    Emit(session, new { @event = "negotiated", receiver_id = peer.Text("receiver_id"), host, port = peer.Integer("port"), codec = "alac", transport = "realtime", timing = "ptp", clock_role = peer.GetProperty("profile").Boolean("follow_receiver_clock") == true ? "follow" : "sender", sample_rate = data.Integer("sample_rate") });
+                }
                 factory.EmitEvent = payload => Emit(session, payload);
                 if (factory.AutoReady)
                 {
@@ -630,10 +641,7 @@ internal static class UiSmoke
                 }
                 var hosts = data.Text("group_mode") is "software_stereo" or "multi_room" ? data.GetProperty("peers").EnumerateArray().Select(p => p.Text("host")).ToArray() : [_host];
                 foreach (var host in hosts)
-                {
-                    _volumes[host] = host == _host ? 28 : 45;
                     Emit(session, new { @event = "device_volume", host, volume = _volumes[host], sequence = 0, status = "confirmed", available = true });
-                }
                 _metrics = new(); var token = _metrics.Token;
                 _ = Task.Run(async () => { try { while (!token.IsCancellationRequested) { Emit(session, new { @event = "capture_metrics", metrics = new { capture_to_send_p95_ms = 10.8, max_queue_age_ms = 11.8, underrun_packets = 0, dropped_frames = 0, input_rate = 48000 } }); Emit(session, new { @event = "transport_metrics", session_uptime_ms = 123456, sender_late_recoveries = 2, skipped_packets = 10, members = new[] { new { host = "192.0.2.1", media = new { packets_sent = 12000, media_send_errors = 1, sync_send_errors = 0, retransmit_requests = 6, retransmits_sent = 5, retransmit_missing = 0, retransmit_expired = 1, retransmit_queue_drops = 0, retransmit_send_errors = 0, receiver_latency_ms = 150, receiver_latency_estimated = true }, health = new { feedback_rtt_ms = 4.2, feedback_failures = 0, feedback_delayed = false } } } }); await Task.Delay(350, token); } } catch (OperationCanceledException) { } }, CancellationToken.None);
             }
@@ -644,7 +652,7 @@ internal static class UiSmoke
                 var host = data.Text("host"); if (host.Length == 0) host = _host;
                 Emit(session, new { @event = "device_volume", host, volume = _volumes[host], sequence, status = "pending", available = true });
                 _ = Task.Run(async () => {
-                    await Task.Delay(350); _volumes[host] = value;
+                    await Task.Delay(350); _volumes[host] = value; factory.DeviceVolumes[host] = value;
                     Emit(session, new { @event = "device_volume", host, volume = _volumes[host], sequence, status = "confirmed", available = true });
                 });
             }

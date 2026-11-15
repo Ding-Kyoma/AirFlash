@@ -96,7 +96,7 @@ fn initial_read_physical_change_pair_write_and_delayed_confirmation() {
     let (leader, volume, sets1, stop1, server1) = fake(28, false);
     let (member, _, sets2, stop2, server2) = fake(25, false);
     let control = Control::default();
-    let worker = Worker::start(vec![leader, member], control.clone()).unwrap();
+    let worker = Worker::start(vec![leader, member], control.clone(), None).unwrap();
     let initial = worker.events.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(initial["volume"], 28);
     assert_eq!(sets1.load(Ordering::Relaxed), 0);
@@ -126,12 +126,32 @@ fn initial_read_physical_change_pair_write_and_delayed_confirmation() {
 #[test]
 fn unsupported_query_does_not_invent_volume() {
     let (peer, _, sets, stop, server) = fake(28, true);
-    let worker = Worker::start(vec![peer], Control::default()).unwrap();
+    let worker = Worker::start(vec![peer], Control::default(), None).unwrap();
     let event = worker.events.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(event["volume"].is_null());
     assert_eq!(event["available"], false);
     assert_eq!(event["status"], "unsynced");
     assert_eq!(sets.load(Ordering::Relaxed), 0);
+    stop.cancel();
+    drop(worker);
+    server.join().unwrap();
+}
+#[test]
+fn remembered_volume_is_written_before_the_first_event() {
+    let (peer, volume, sets, stop, server) = fake(28, false);
+    let worker = Worker::start(vec![peer], Control::default(), Some(40)).unwrap();
+    // The write is synchronous: it completes before the worker's first event and
+    // therefore before streaming begins in the live session.
+    assert_eq!(sets.load(Ordering::Relaxed), 1);
+    let first = worker.events.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(first["sequence"], 0);
+    assert_eq!(first["status"], "pending");
+    assert_eq!(first["volume"], 28);
+    let confirmed = worker.events.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(confirmed["sequence"], 0);
+    assert_eq!(confirmed["status"], "confirmed");
+    assert_eq!(confirmed["volume"], 40);
+    assert_eq!(volume.load(Ordering::Relaxed), 40);
     stop.cancel();
     drop(worker);
     server.join().unwrap();

@@ -80,7 +80,7 @@ schema v3 新增 `software_groups`，接收端选项增加 `codec`、`sample_rat
 ```
 
 原生 IPC 仍为 v1，先 `hello` 检查 `receiver_profiles`、`software_stereo`、`continuity`、
-`buffered_audio`、`member_volume`、`receiver_password` 能力。
+`buffered_audio`、`member_volume`、`initial_volume`、`receiver_password` 能力。
 新增 `receiver_capabilities` 能力及 `get_receiver_capabilities` 查询命令：参数为带稳定
 `receiver_id` 的 `peers`，只读取 `/info`，不会配对或启动音频会话；返回 `members` 中各成员的
 能力矩阵，每项包含请求的编码、传输、时钟、采样率，以及 `selected_codec`、
@@ -93,13 +93,17 @@ schema v3 新增 `software_groups`，接收端选项增加 `codec`、`sample_rat
 ```json
 {
   "peers": [
-    {"host":"192.0.2.10","port":7000,"profile":{"codec":"auto","transport":"auto","timing":"ptp","channel":"left","sync_offset_ms":-80,"latency_ms":200}},
-    {"host":"192.0.2.11","port":7000,"profile":{"codec":"pcm","transport":"realtime","timing":"ntp","channel":"right","sync_offset_ms":25,"latency_ms":200}}
+    {"host":"192.0.2.10","port":7000,"volume":35,"profile":{"codec":"auto","transport":"auto","timing":"ptp","channel":"left","sync_offset_ms":-80,"latency_ms":200}},
+    {"host":"192.0.2.11","port":7000,"volume":35,"profile":{"codec":"pcm","transport":"realtime","timing":"ntp","channel":"right","sync_offset_ms":25,"latency_ms":200}}
   ],
   "group_mode":"software_stereo",
   "source":"loopback","duration_ms":0,"sample_rate":48000,"latency_ms":200,"gain":0.5
 }
 ```
+
+`peers[].volume`（0–100，可选）在 `start` 处理期间、`streaming` 事件和首个音频包之前同步写入
+接收器硬件音量；省略时保持接收器当前音量，因此旧调用语义不变。桌面端仅在 `hello` 包含
+`initial_volume` 时发送该字段，值取上次会话确认过的非零音量；0 表示静音，不作为历史值保存。
 
 `set_device_volume` 可指定成员 `host`，省略时保留原生组统一硬件音量语义。
 `pair` 可指定 `password_required:true`；收到 `password_required` 后用 `pair_pin` 的

@@ -36,6 +36,11 @@ pub struct Peer {
     pub codecs: Vec<u8>,
     #[serde(default)]
     pub profile: crate::profile::Profile,
+    /// Last audible volume supplied by the desktop for this session. Written
+    /// before the streaming event and the first audio packet; omitted when the
+    /// receiver has no remembered volume.
+    #[serde(default)]
+    pub volume: Option<u8>,
 }
 fn default_port() -> u16 {
     7000
@@ -216,6 +221,10 @@ impl ProbeOptions {
             ensure!(
                 peer.profile.latency_ms.is_none_or(|v| v <= 2000),
                 "latency must be 0..2000 ms"
+            );
+            ensure!(
+                peer.volume.is_none_or(|volume| volume <= 100),
+                "volume must be 0..100"
             );
         }
         if self.group_mode == "software_stereo" {
@@ -2265,13 +2274,16 @@ fn send_packets(
         .map(|m| (m.peer.host.to_string(), m.uri.clone(), m.conn.clone()))
         .collect::<Vec<_>>();
     let volume_workers = if options.group_mode == "software_stereo" || options.group_mode == "multi_room" {
-        volume_peers
+        members
             .iter()
-            .cloned()
-            .map(|p| crate::volume::Worker::start_member(p, volume.clone()))
+            .zip(volume_peers.iter().cloned())
+            .map(|(member, peer)| {
+                crate::volume::Worker::start_member(peer, volume.clone(), member.peer.volume)
+            })
             .collect::<Result<Vec<_>>>()?
     } else {
-        vec![crate::volume::Worker::start(volume_peers.clone(), volume)?]
+        let initial = members.iter().find_map(|member| member.peer.volume);
+        vec![crate::volume::Worker::start(volume_peers.clone(), volume, initial)?]
     };
     let metadata_timeline =
         crate::metadata::Timeline::new(members[0].media.packetizer.timestamp, rate);
@@ -4097,6 +4109,7 @@ mod tests {
                 port,
                 codecs: vec![],
                 profile: crate::profile::Profile::default(),
+                volume: None,
             },
             conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
             events: None,
@@ -4696,6 +4709,7 @@ mod tests {
                     port: addr.port(),
                     codecs: vec![],
                     profile: Default::default(),
+                    volume: None,
                 })
                 .collect();
             let result = require_free_receivers(&peers, &Cancellation::default(), &|_| {});
@@ -6606,6 +6620,7 @@ mod tests {
                 port: 7000,
                 codecs: Vec::new(),
                 profile: crate::profile::Profile::default(),
+                volume: None,
             }],
             wav_path: PathBuf::new(),
             source: "wav".into(),
@@ -6637,6 +6652,11 @@ mod tests {
         assert!(o.validate().is_err());
         o.gain = 0.1;
         assert!(o.validate().is_ok());
+        o.peers[0].volume = Some(101);
+        assert!(o.validate().is_err());
+        o.peers[0].volume = Some(100);
+        assert!(o.validate().is_ok());
+        o.peers[0].volume = None;
         o.equalizer.enabled = true;
         assert!(o.validate().is_err());
         o.source = "loopback".into();
@@ -6672,6 +6692,7 @@ mod tests {
                 transport: crate::profile::Transport::Auto,
                 features: None,
             },
+            volume: None,
         };
         let mut o = summary_options("test", "multi_room", 100);
         o.source = "wav".into();

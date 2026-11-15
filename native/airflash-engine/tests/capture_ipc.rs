@@ -46,6 +46,7 @@ fn capabilities_and_capture_validation_preserve_finite_probe_boundary() {
         "continuity",
         "buffered_audio",
         "member_volume",
+        "initial_volume",
     ] {
         assert!(capabilities.contains(&json!(capability)));
     }
