@@ -14,18 +14,22 @@ internal sealed class CoffeeWindow : Window
         ResizeMode = ResizeMode.NoResize; ShowInTaskbar = false; UseLayoutRounding = true;
         WindowThemeService.Track(this);
         AppIconService.Track(this);
-        SourceInitialized += (_, _) => NativeWindowPlacement.CenterDialog(this);
+        SourceInitialized += (_, _) => { if (Owner is not null) NativeWindowPlacement.CenterDialog(this); };
+
+        var chinese = L.IsChinese;
+        var asset = chinese ? "PayQrcode.png" : "PayPalQrcode.jpg";
+        var descriptionKey = chinese ? "WeChat and Alipay payment QR codes" : "PayPal payment QR code";
 
         var panel = new Grid { Margin = new(24) };
         panel.RowDefinitions.Add(new RowDefinition { Height = new(1, GridUnitType.Star) });
         panel.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         var image = new Image
         {
-            Source = new BitmapImage(new Uri("pack://application:,,,/AirFlash;component/Assets/PayQrcode.png", UriKind.Absolute)),
+            Source = new BitmapImage(new Uri($"pack://application:,,,/AirFlash;component/Assets/{asset}", UriKind.Absolute)),
             Stretch = Stretch.Uniform,
             Margin = new(0, 0, 0, 16)
         };
-        System.Windows.Automation.AutomationProperties.SetName(image, L.Get("WeChat and Alipay payment QR codes"));
+        System.Windows.Automation.AutomationProperties.SetName(image, L.Get(descriptionKey));
         RenderOptions.SetBitmapScalingMode(image, BitmapScalingMode.HighQuality);
         panel.Children.Add(image);
         var close = new Button { Content = L.Get("Thanks~"), IsCancel = true, IsDefault = true, MinWidth = 78, HorizontalAlignment = HorizontalAlignment.Right };
