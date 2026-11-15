@@ -38,6 +38,12 @@ internal static class UiRegression
             await Pump();
             Check(catalogChanges == 0 && audio.Enumerations == 0, "unchanged discovery does not refresh catalogs", checks);
 
+            vm.SelectedPage = vm.Pages.Length - 1; await Pump();
+            var coffeeButton = UiSmoke.Descendants(window).OfType<Button>().Single(b => b.Name == "CoffeeButton");
+            Check(coffeeButton.Visibility == Visibility.Visible && Equals(coffeeButton.Content, L.Get("Buy the author a cup of milk tea~")),
+                "About page exposes the donation button regardless of language", checks);
+            vm.SelectedPage = 0; await Pump();
+
             var retries = UiSmoke.Descendants(window).OfType<TextBox>().Single(t => System.Windows.Automation.AutomationProperties.GetName(t) == L.Get("Maximum retry attempts"));
             retries.Text = "invalid"; await Pump(); vm.SelectedPage = SettingsViewModel.AudioCapturePage;
             await Until(() => !vm.IsEndpointLoading); await Pump(); vm.SelectedPage = 0;
@@ -214,6 +220,37 @@ internal static class UiRegression
         await RunStereoIdentityRegressionAsync(checks, directory);
         await RunSoftwareStereoRegressionAsync(checks, directory);
         await ReceiverSettingsRegression.RunAsync(checks, directory);
+        await RunPaymentQrRegressionAsync(checks, directory);
+    }
+    private static async Task RunPaymentQrRegressionAsync(List<string> checks, string directory)
+    {
+        var originallyChinese = L.IsChinese;
+        try
+        {
+            foreach (var (language, asset, descriptionKey) in new[]
+            {
+                ("zh-CN", "PayQrcode.png", "WeChat and Alipay payment QR codes"),
+                ("en-US", "PayPalQrcode.jpg", "PayPal payment QR code")
+            })
+            {
+                L.Initialize([language]);
+                var coffee = new CoffeeWindow(); coffee.Show(); await Pump();
+                var image = UiSmoke.Descendants(coffee).OfType<Image>().Single();
+                var bitmap = (BitmapImage)image.Source;
+                await Until(() => bitmap.PixelWidth > 0);
+                Check(bitmap.UriSource?.OriginalString.EndsWith(asset, StringComparison.Ordinal) == true,
+                    $"{language} donation QR uses the embedded {asset}", checks);
+                Check(System.Windows.Automation.AutomationProperties.GetName(image) == L.Get(descriptionKey),
+                    $"{language} donation QR exposes a localized accessible name", checks);
+                var panel = (Grid)coffee.Content;
+                var close = panel.Children.OfType<Button>().Single();
+                Check(close.TranslatePoint(new Point(0, 0), panel).Y + close.ActualHeight <= panel.ActualHeight + 0.5,
+                    $"{language} donation dialog keeps its close button fully visible", checks);
+                UiSmoke.Render(coffee, Path.Combine(directory, $"coffee-{language}.png"), 1);
+                coffee.Close(); await Pump();
+            }
+        }
+        finally { L.Initialize([originallyChinese ? "zh-CN" : "en-US"]); }
     }
     private static async Task RunSoftwareStereoRegressionAsync(List<string> checks, string directory)
     {
