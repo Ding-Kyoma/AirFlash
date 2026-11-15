@@ -275,6 +275,13 @@ impl Health {
     pub fn ownership_uncertain(&self) -> bool {
         self.0.lock().unwrap().ownership_uncertain
     }
+    /// The ownership probe settled on `ours_active`: the receiver is still
+    /// serving this session, so a timing or feedback symptom was not a
+    /// takeover. Clear the cleanup guard so an ordinary stop tears the session
+    /// down instead of leaking it.
+    pub fn clear_ownership_uncertain(&self) {
+        self.0.lock().unwrap().ownership_uncertain = false;
+    }
     /// Take the symptoms collected since the previous poll.
     pub fn take_preemption_signals(&self) -> Vec<Signal> {
         std::mem::take(&mut self.0.lock().unwrap().preemption_signals)
