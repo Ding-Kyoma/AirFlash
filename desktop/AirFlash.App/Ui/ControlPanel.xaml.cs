@@ -24,6 +24,7 @@ public partial class ControlPanel : Window
     public TrayService? Tray { get; set; }
     public event Action? SettingsRequested;
     public event Action<int>? LatencySettingsRequested;
+    public event Action? UpdateRequested;
     public event Action? QuitRequested;
     public ControlPanel(AppViewModel viewModel)
     {
@@ -109,6 +110,7 @@ public partial class ControlPanel : Window
     private void OnPopupOpened(object? sender, EventArgs args) => MenuOpen = true;
     private void OnPopupClosed(object? sender, EventArgs args) { MenuOpen = false; if (!IsActive) Hide(); }
     private void OnSettings(object sender, RoutedEventArgs args) => SettingsRequested?.Invoke();
+    private void OnUpdate(object sender, RoutedEventArgs args) => UpdateRequested?.Invoke();
     private void OnLatencySettings(object sender, RoutedEventArgs args)
         => LatencySettingsRequested?.Invoke(_viewModel.CanEditGlobalLatency ? SettingsViewModel.StreamingPage : SettingsViewModel.ReceiversPage);
     private void OnQuit(object sender, RoutedEventArgs args) => QuitRequested?.Invoke();

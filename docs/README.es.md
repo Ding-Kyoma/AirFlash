@@ -163,8 +163,9 @@ AirFlash utiliza intencionalmente almacenamiento limpio de la aplicación bajo `
 `%LOCALAPPDATA%/AirFlash`. No lee configuraciones, credenciales o cachés del motor creadas por el nombre de
 producto anterior; los usuarios deben configurar y emparejar nuevamente tras instalar AirFlash.
 
-Utiliza **Configuración > Acerca de > Buscar actualizaciones** para buscar una versión estable y abrir su página
-de descarga. Las comprobaciones solo se ejecutan cuando se solicitan.
+AirFlash busca una versión estable al iniciar de forma predeterminada; puedes desactivarlo en **Configuración > General**.
+Utiliza **Configuración > Acerca de > Buscar actualizaciones** para buscar manualmente y abrir la página de descarga.
+Cuando hay una versión más reciente, el panel de control muestra una entrada **Actualizar** que abre la página Acerca de.
 
 El perfil de tiempo real tiene como objetivo 120 ms; los tiempos objetivo y de transporte local no son mediciones
 de latencia acústica de extremo a extremo.

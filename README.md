@@ -169,7 +169,7 @@ and `%LOCALAPPDATA%/AirFlash`. It does not read configuration, credentials, or
 engine caches created by the previous product name; users must configure and pair
 again after installing AirFlash.
 
-Use **Settings > About > Check for updates** to check for a stable release and open its download page. Checks run only when requested.
+AirFlash checks for a stable release at startup by default; turn this off under **Settings > General**. Use **Settings > About > Check for updates** to check manually and open the download page. When a newer release is available, the control panel shows an **Update** entry next to the AirFlash title that opens the About page.
 
 The real-time profile targets 120 ms; target and local transport timings are not measurements of end-to-end acoustic latency.
 

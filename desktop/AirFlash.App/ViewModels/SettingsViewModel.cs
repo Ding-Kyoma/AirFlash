@@ -9,13 +9,12 @@ namespace AirFlash.App.ViewModels;
 
 public sealed class SettingsViewModel : ObservableObject, IDisposable
 {
-    public const int AudioCapturePage = 1, StreamingPage = 2, EqualizerPage = 3, ReceiversPage = 4, MonitorPage = 5, NetworkPage = 6, SoundGlowPage = 7;
+    public const int AudioCapturePage = 1, StreamingPage = 2, EqualizerPage = 3, ReceiversPage = 4, MonitorPage = 5, NetworkPage = 6, SoundGlowPage = 7, AboutPage = 8;
     private readonly Guid _equalizerOwner = Guid.NewGuid();
     public EqualizerEditor Equalizer { get; }
     private string _equalizerError = "";
     public string EqualizerError { get => _equalizerError; private set => Set(ref _equalizerError, value); }
-    private static readonly System.Net.Http.HttpClient UpdateClient = new() { MaxResponseContentBufferSize = 1024 * 1024 };
-    public UpdateCheckState Updates { get; } = new(new UpdateService(UpdateClient), Version.Parse(AppPaths.Version));
+    public UpdateCheckState Updates => App.Updates;
     public AsyncCommand CheckUpdatesCommand { get; }
     public RelayCommand OpenDownloadCommand { get; }
     public AppViewModel App { get; }
@@ -98,6 +97,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     public RelayCommand LicensesCommand { get; }
     public SettingsViewModel(AppViewModel app)
     {
+        App = app; Draft = app.Settings.Clone(); _baseline = Draft.Clone();
         CheckUpdatesCommand = new(Updates.CheckAsync, _ => { });
         OpenDownloadCommand = new(() =>
         {
@@ -108,7 +108,6 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
             }
             catch (Exception error) { ShowError(error); }
         });
-        App = app; Draft = app.Settings.Clone(); _baseline = Draft.Clone();
         ResetCommand = new(ResetAsync, ShowError, () => CanEdit && !App.IsClosing);
         RefreshReceiverProfilesCommand = new(() => { _profileCache.Clear(); LoadReceiverProfiles(); }, () => CanEdit && App.EngineReady && !App.IsClosing);
         Equalizer = new(Draft.Equalizer, EqualizerSampleRate, EqualizerChanged);
@@ -552,7 +551,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         if (_disposed) return;
         App.Session.EqualizerFeedback -= EqualizerFeedback; Equalizer.Dispose();
         _ = ClearPreviewAsync();
-        Updates.Dispose(); _disposed = true; App.CatalogChanged -= RefreshCatalog; App.Endpoints.Changed -= UpdateEndpoints;
+        _disposed = true; App.CatalogChanged -= RefreshCatalog; App.Endpoints.Changed -= UpdateEndpoints;
         _profileStop.Cancel();
         _profileStop.Dispose();
         NetworkChange.NetworkAddressChanged -= NetworkChanged; NetworkChange.NetworkAvailabilityChanged -= NetworkAvailabilityChanged;

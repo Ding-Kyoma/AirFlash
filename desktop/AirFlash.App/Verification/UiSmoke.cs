@@ -1,3 +1,5 @@
+using System.Net;
+using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Collections.Concurrent;
 using System.Text.Json;
@@ -112,7 +114,9 @@ internal static class UiSmoke
         }
         object? iconEnvironment = null;
         var store = new MemoryStore(); var engine = new MockFactory();
-        await using var app = new AppViewModel(store, new MockDiscovery(), new MockAutostart(), new MockAudio(), engine, Application.Current.Dispatcher) { EngineVersion = "0.1.0（模拟）" };
+        using var updateClient = new HttpClient(new UpdateHandler());
+        var updates = new UpdateCheckState(new UpdateService(updateClient), Version.TryParse(AppPaths.Version, out var currentVersion) ? currentVersion : new Version(0, 0, 0));
+        await using var app = new AppViewModel(store, new MockDiscovery(), new MockAutostart(), new MockAudio(), engine, Application.Current.Dispatcher, updates: updates) { EngineVersion = "0.1.0（模拟）" };
         var panel = new ControlPanel(app); SettingsWindow? settings = null;
         // Verification must never bind the production GUID to a test executable path.
         var guidIndex = Array.IndexOf(args, "--tray-guid");
@@ -160,6 +164,17 @@ internal static class UiSmoke
             Check(((IEnumerable<StreamChoice>)mode.ItemsSource).All(c => !Equals(c.Value, "adaptive")), "global latency menu omits the retired adaptive mode", checks);
             CheckPanelIcons(panel, app, checks);
             Check(Descendants(panel).OfType<Button>().All(b => b.Content is not string text || text != L.Get("Sound Glow experiment")), "control panel no longer duplicates the Sound Glow experiment", checks);
+            var updateButton = Descendants(panel).OfType<Button>().Single(b => System.Windows.Automation.AutomationProperties.GetName(b) == L.Get("Update"));
+            Check(updateButton.Visibility != Visibility.Visible, "update entry remains hidden until a newer release is found", checks);
+            await app.CheckUpdatesAtStartupAsync(); await Pump(); panel.UpdateLayout();
+            Check(updateButton.Visibility == Visibility.Visible && updateButton.IsVisible, "startup update check surfaces the localized update entry", checks);
+            Check(Descendants(updateButton).OfType<TextBlock>().Any(text => text.Text == L.Get("Update")), "update entry shows its localized label", checks);
+            var updateRequested = false;
+            void OnUpdateRequested() => updateRequested = true;
+            panel.UpdateRequested += OnUpdateRequested;
+            Invoke(updateButton); await Pump();
+            panel.UpdateRequested -= OnUpdateRequested;
+            Check(updateRequested, "update entry requests the About page", checks);
             Render(panel, Path.Combine(directory, "panel-icons-idle.png"), 1);
             var settingsButton = Descendants(panel).OfType<Button>().Single(b => System.Windows.Automation.AutomationProperties.GetName(b) == L.Get("Settings"));
             Check(settingsButton.Focus() && settingsButton.IsKeyboardFocused, "vector settings button remains keyboard focusable", checks);
@@ -270,6 +285,12 @@ internal static class UiSmoke
             Check(app.Receivers.Any(r => r.Receiver.Id == firstId), "unhide receiver", checks);
             settings.Close(); settings = new(app); settings.Show(); await Pump();
             Check(settings.ViewModel.Receivers.Count >= 3, "nullable overrides reopen", checks);
+            settings.ViewModel.SelectedPage = SettingsViewModel.AboutPage; await Pump();
+            Check(settings.ViewModel.Pages[SettingsViewModel.AboutPage] == L.Get("About")
+                && Descendants(settings).OfType<Button>().Any(b => (string?)b.Content == L.Get("Check for updates")),
+                "About page exposes manual update actions", checks);
+            Check(Descendants(settings).OfType<Button>().Any(b => (string?)b.Content == L.Get("Open download page") && b.IsVisible),
+                "About page shares the startup update result", checks);
             foreach (var dark in new[] { false, true })
             {
                 ThemeService.SetForVerification(dark); await Pump();
@@ -507,6 +528,14 @@ internal static class UiSmoke
         var visual = window is Window host ? (FrameworkElement)host.Content : window;
         var image = new RenderTargetBitmap((int)Math.Ceiling(visual.ActualWidth * scale), (int)Math.Ceiling(visual.ActualHeight * scale), 96 * scale, 96 * scale, PixelFormats.Pbgra32); image.Render(visual);
         var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(image)); using var output = File.Create(file); encoder.Save(output);
+    }
+    private sealed class UpdateHandler : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("""{"tag_name":"v999.0.0","draft":false,"prerelease":false}""")
+            });
     }
     internal sealed class MemoryStore : ISettingsStore
     {

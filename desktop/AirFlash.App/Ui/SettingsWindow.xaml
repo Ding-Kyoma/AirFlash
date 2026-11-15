@@ -7,6 +7,7 @@
           <StackPanel>
             <TextBlock Text="{loc:Text 'Startup and connection'}" Style="{StaticResource SectionTitle}"/>
             <CheckBox Content="{loc:Text 'Start when signing in to Windows'}" IsChecked="{Binding Draft.StartAtLogin}"/>
+            <CheckBox Content="{loc:Text 'Check for updates on startup'}" IsChecked="{Binding Draft.CheckUpdatesOnStartup}"/>
             <CheckBox Content="{loc:Text 'Connect automatically when a receiver is found'}" IsChecked="{Binding Draft.AutoConnectOnDiscover}"/>
             <CheckBox Content="{loc:Text 'Reconnect automatically after a disconnect'}" IsChecked="{Binding Draft.ForceReconnect}"/>
             <StackPanel Orientation="Horizontal" IsEnabled="{Binding Draft.ForceReconnect}">

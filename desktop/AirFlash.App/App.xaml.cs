@@ -89,12 +89,13 @@ public partial class App : Application
             _viewModel = new(store, new WindowsDiscovery(log: AppPaths.Log), new Autostart(), audio, factory, Dispatcher, _engine);
             _viewModel.ResetCompleted += Quit;
             _panel = new(_viewModel); MainWindow = _panel;
-            _panel.SettingsRequested += ShowSettings; _panel.LatencySettingsRequested += ShowSettingsPage; _panel.QuitRequested += Quit;
+            AttachPanel(_panel);
             _tray = new(_panel, _viewModel, ShowSettings, Quit); _panel.Tray = _tray;
             _instance.Listen(() => Dispatcher.BeginInvoke(() => { if (_settings is not null) _settings.Activate(); else _panel.ShowPanel(); }));
             _viewModel.SettingsChanged += OnSettingsChanged;
             _viewModel.Start();
             if (!args.Args.Contains("--startup")) _panel.ShowPanel();
+            _ = _viewModel.CheckUpdatesAtStartupAsync();
             AppPaths.Log("WPF host started, JSONL v1. Startup stage=shell ready");
             await _engine.InitializeAsync();
         }
@@ -126,13 +127,21 @@ public partial class App : Application
             _settings?.Close();
             _tray?.Dispose(); _panel?.ShutdownPanel();
             _panel = new(_viewModel); MainWindow = _panel;
-            _panel.SettingsRequested += ShowSettings; _panel.LatencySettingsRequested += ShowSettingsPage; _panel.QuitRequested += Quit;
+            AttachPanel(_panel);
             _tray = new(_panel, _viewModel, ShowSettings, Quit); _panel.Tray = _tray;
             foreach (var row in _viewModel.Receivers) row.Refresh();
             if (showSettings) { ShowSettings(); _settings!.ViewModel.SelectedPage = page; }
             else if (showPanel) _panel.ShowPanel();
         }, System.Windows.Threading.DispatcherPriority.ContextIdle);
     }
+    private void AttachPanel(ControlPanel panel)
+    {
+        panel.SettingsRequested += ShowSettings;
+        panel.LatencySettingsRequested += ShowSettingsPage;
+        panel.UpdateRequested += ShowAbout;
+        panel.QuitRequested += Quit;
+    }
+    private void ShowAbout() => ShowSettingsPage(SettingsViewModel.AboutPage);
     private void ShowSettings() => ShowSettings(null);
     private void ShowSettingsPage(int page) => ShowSettings(page);
     private void ShowSettings(int? page)

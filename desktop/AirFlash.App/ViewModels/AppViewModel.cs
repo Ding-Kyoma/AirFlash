@@ -13,6 +13,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private readonly Dispatcher _dispatcher;
     private readonly EngineInitialization? _engine;
     private readonly IRestartService _restart;
+    private static readonly System.Net.Http.HttpClient UpdateClient = new() { MaxResponseContentBufferSize = 1024 * 1024 };
     private bool _resetting, _resetCompleted;
     public IReceiverCapabilityCatalog ReceiverCapabilities { get; }
     public event Action? ResetCompleted;
@@ -40,6 +41,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private readonly Dictionary<string, string> _monitorValues = [];
     public EndpointCatalog Endpoints { get; }
     public IApplicationCatalog Applications { get; }
+    public UpdateCheckState Updates { get; }
     public bool IsClosing => _closing;
     public SessionController Session { get; }
     public NowPlayingPump NowPlaying { get; }
@@ -140,10 +142,11 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand MuteCommand { get; }
     public event Action? SettingsChanged;
     public event Action? CatalogChanged;
-    public AppViewModel(ISettingsStore store, IDiscoveryService discovery, IAutostart autostart, IAudioService audio, IEngineFactory factory, Dispatcher dispatcher, EngineInitialization? engine = null, IApplicationCatalog? applications = null, IReceiverCapabilityCatalog? receiverCapabilities = null, IRestartService? restart = null)
+    public AppViewModel(ISettingsStore store, IDiscoveryService discovery, IAutostart autostart, IAudioService audio, IEngineFactory factory, Dispatcher dispatcher, EngineInitialization? engine = null, IApplicationCatalog? applications = null, IReceiverCapabilityCatalog? receiverCapabilities = null, IRestartService? restart = null, UpdateCheckState? updates = null)
     {
         _engine = engine;
         _restart = restart ?? new RestartService();
+        Updates = updates ?? new UpdateCheckState(new UpdateService(UpdateClient), Version.TryParse(AppPaths.Version, out var version) ? version : new Version(0, 0, 0));
         ReceiverCapabilities = receiverCapabilities ?? new ReceiverCapabilityCatalog(factory);
         RetryEngineCommand = new(() => _engine?.InitializeAsync() ?? Task.CompletedTask, ShowError, () => EngineFailed && !_closing);
         if (_engine is not null) _engine.Changed += EngineChanged;
@@ -206,6 +209,12 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         _startup = StartAsync();
     }
     public Task Startup => _startup;
+    internal async Task CheckUpdatesAtStartupAsync()
+    {
+        if (_closing || !_settings.CheckUpdatesOnStartup) return;
+        try { await Updates.CheckAsync(); }
+        catch (Exception error) { AppPaths.Log("Startup update check failed: " + error); }
+    }
     private async Task StartAsync()
     {
         await _settingsGate.WaitAsync();
@@ -743,7 +752,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public ValueTask DisposeAsync() => new(_disposeTask ??= DisposeCoreAsync());
     private async Task DisposeCoreAsync()
     {
-        _closing = true; _volumeTimer.Stop(); _autoTimer.Stop(); _startupDiscoveryTimer.Stop(); _discoverySearchTimer.Stop(); _discovery.Dispose();
+        _closing = true; Updates.Dispose(); _volumeTimer.Stop(); _autoTimer.Stop(); _startupDiscoveryTimer.Stop(); _discoverySearchTimer.Stop(); _discovery.Dispose();
         _nowPlayingStop.Cancel();
         await _nowPlayingWork;
         _nowPlayingStop.Dispose();

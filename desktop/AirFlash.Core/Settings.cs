@@ -99,6 +99,8 @@ public sealed class AppSettings : ObservableObject
     public int SchemaVersion { get; set; } = CurrentSchemaVersion;
     private bool _StartAtLogin = false;
     public bool StartAtLogin { get => _StartAtLogin; set => Set(ref _StartAtLogin, value); }
+    private bool _CheckUpdatesOnStartup = true;
+    public bool CheckUpdatesOnStartup { get => _CheckUpdatesOnStartup; set => Set(ref _CheckUpdatesOnStartup, value); }
     private bool _MuteWhileStreaming = true;
     public bool MuteWhileStreaming { get => _MuteWhileStreaming; set => Set(ref _MuteWhileStreaming, value); }
     private bool _AutoConnectOnDiscover = false;
@@ -229,7 +231,7 @@ public sealed class AppSettings : ObservableObject
     public void CopyFrom(AppSettings source)
     {
         SchemaVersion = source.SchemaVersion;
-        StartAtLogin = source.StartAtLogin; MuteWhileStreaming = source.MuteWhileStreaming;
+        StartAtLogin = source.StartAtLogin; CheckUpdatesOnStartup = source.CheckUpdatesOnStartup; MuteWhileStreaming = source.MuteWhileStreaming;
         AutoConnectOnDiscover = source.AutoConnectOnDiscover; ForceReconnect = source.ForceReconnect;
         MaxReconnectAttempts = source.MaxReconnectAttempts; UiLanguage = source.UiLanguage; Theme = source.Theme;
         DiscoveryInterfaceId = source.DiscoveryInterfaceId;

@@ -30,7 +30,7 @@ public sealed class SettingsTests
     {
         var source = new AppSettings
         {
-            StartAtLogin = true, MuteWhileStreaming = false, AutoConnectOnDiscover = false,
+            StartAtLogin = true, CheckUpdatesOnStartup = false, MuteWhileStreaming = false, AutoConnectOnDiscover = false,
             ForceReconnect = false, MaxReconnectAttempts = 12, UiLanguage = "zh", Theme = "dark",
             LatencyMode = "custom", CustomBufferMs = 650, StandbyEnabled = true,
             StandbySilenceSeconds = 22, CaptureMode = "endpoint", CaptureEndpoint = "b",
@@ -43,6 +43,7 @@ public sealed class SettingsTests
         var manual = target.ManualReceivers;
         target.CopyFrom(source);
         Assert.Same(options, target.Options("a")); Assert.Same(manual, target.ManualReceivers);
+        Assert.False(target.CheckUpdatesOnStartup);
         Assert.False(target.Receivers.ContainsKey("removed")); Assert.True(SettingsMerge.Equal(source, target));
         source.Options("a").Volume = 99; source.Extra.Clear();
         Assert.Equal(52, target.Options("a").Volume); Assert.Equal(63, target.Options("a").LastVolume); Assert.True(target.Extra!.ContainsKey("future_option"));
@@ -106,12 +107,23 @@ public sealed class SettingsTests
     {
         var settings = new AppSettings();
         Assert.False(settings.StartAtLogin);
+        Assert.True(settings.CheckUpdatesOnStartup);
         Assert.False(settings.AutoConnectOnDiscover);
         Assert.False(settings.ForceReconnect);
         Assert.Equal(5, settings.MaxReconnectAttempts);
         Assert.Equal("system", settings.UiLanguage);
         Assert.Equal("system", settings.Theme);
         Assert.Null(settings.Validate());
+    }
+    [Fact]
+    public void CheckUpdatesOnStartupDefaultsOnForExistingConfigurations()
+    {
+        var existing = JsonSerializer.Deserialize<AppSettings>("""{"schema_version":5}""", AppSettings.JsonOptions)!;
+        Assert.True(existing.CheckUpdatesOnStartup);
+        var disabled = JsonSerializer.Deserialize<AppSettings>("""{"schema_version":5,"check_updates_on_startup":false}""", AppSettings.JsonOptions)!;
+        Assert.False(disabled.CheckUpdatesOnStartup);
+        Assert.False(disabled.Clone().CheckUpdatesOnStartup);
+        Assert.Contains("\"check_updates_on_startup\": true", JsonSerializer.Serialize(new AppSettings(), AppSettings.JsonOptions));
     }
     [Fact]
     public void DiscoveryInterfaceDefaultsToAllAndSurvivesSerialization()
