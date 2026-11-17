@@ -17,8 +17,10 @@ HARNESS = r"""
 $ErrorActionPreference = 'Stop'
 $script:releaseCase = $env:AIRFLASH_TEST_CASE | ConvertFrom-Json
 $script:pushes = [Collections.Generic.List[object]]::new()
+$script:gitCalls = [Collections.Generic.List[object]]::new()
 function git {
     $global:LASTEXITCODE = 0
+    $script:gitCalls.Add(@($args))
     switch ($args[2]) {
         'branch' { $script:releaseCase.branch }
         'status' { if ($script:releaseCase.dirty) { ' M tracked.txt' } }
@@ -44,8 +46,12 @@ $statePath = Join-Path $env:AIRFLASH_TEST_ROOT 'artifacts/release-version.txt'
 $state = if (Test-Path -LiteralPath $statePath) {
     (Get-Content -LiteralPath $statePath -Raw).Trim()
 } else { $null }
+$rawState = if (Test-Path -LiteralPath $statePath) {
+    Get-Content -LiteralPath $statePath -Raw
+} else { $null }
 [pscustomobject]@{
     version = $version; error = $errorMessage; state = $state; pushes = $script:pushes.ToArray()
+    raw_state = $rawState; git_calls = $script:gitCalls.ToArray()
 } | ConvertTo-Json -Depth 5 -Compress
 """
 
@@ -60,7 +66,8 @@ def reserve(tmp_path, *, source="0.2.0", local=None, refs=None, **overrides):
     if local is not None:
         state = tmp_path / "artifacts" / "release-version.txt"
         state.parent.mkdir()
-        state.write_text(local, encoding="utf-8")
+        with state.open("x", encoding="utf-8", newline="") as output:
+            output.write(local)
     case = {
         "branch": "main",
         "dirty": False,
@@ -90,7 +97,10 @@ def reserve(tmp_path, *, source="0.2.0", local=None, refs=None, **overrides):
     return json.loads(result.stdout)
 
 
-@pytest.mark.parametrize("requested, expected", [("0.3.0", "0.3.0"), ("", "0.2.19")])
+@pytest.mark.parametrize(
+    "requested, expected",
+    [("0.3.0", "0.3.0"), ("255.255.65534", "255.255.65534"), ("", "0.2.19")],
+)
 def test_fresh_version_is_reserved_atomically(tmp_path, requested, expected):
     result = reserve(tmp_path, new_version=requested)
     assert result["error"] is None
@@ -113,6 +123,30 @@ def test_invalid_or_used_version_never_pushes(tmp_path, version):
     assert result["error"]
     assert result["pushes"] == []
     assert result["state"] is None
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["0.3.0\n", "0.3.0\r\n", "０.３.０", "0.3.65535", "255.255.65535"],
+)
+def test_invalid_application_version_is_rejected_before_any_git_or_state_write(tmp_path, version):
+    result = reserve(tmp_path, new_version=version)
+    assert result["error"], result
+    assert result["git_calls"] == [], result
+    assert result["pushes"] == [], result
+    assert result["raw_state"] is None, result
+
+
+@pytest.mark.parametrize("version", ["0.3.0\n", "0.3.0\r\n", "0.3.65535"])
+def test_invalid_pre_reserved_version_preserves_state_without_any_git(tmp_path, version):
+    result = reserve(
+        tmp_path, reserved=version, local=version, actions=True,
+        refs=[f"{HEAD}\trefs/tags/reserved/{version}"],
+    )
+    assert result["error"], result
+    assert result["git_calls"] == [], result
+    assert result["pushes"] == [], result
+    assert result["raw_state"] == version, result
 
 
 @pytest.mark.parametrize("ref", ["reserved/0.3.0", "v0.3.0", "reserved/0.3.1"])
@@ -193,15 +227,23 @@ def test_preview_channel_still_reserves_without_publishing(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "previous, expected", [("0.2.65535", "0.3.0"), ("0.255.65535", "1.0.0")],
+    "previous, expected",
+    [
+        ("0.2.65534", "0.3.0"), ("0.255.65534", "1.0.0"),
+        # Existing MSI-only reservations remain a version floor.
+        ("0.2.65535", "0.3.0"), ("0.255.65535", "1.0.0"),
+    ],
 )
-def test_automatic_increment_obeys_msi_component_limits(tmp_path, previous, expected):
+def test_automatic_increment_obeys_application_limits_and_historical_msi_floors(
+    tmp_path, previous, expected
+):
     result = reserve(tmp_path, refs=[f"{HEAD}\trefs/tags/reserved/{previous}"])
     assert result["error"] is None
     assert result["version"] == expected
 
 
-def test_exhausted_msi_range_never_pushes(tmp_path):
-    result = reserve(tmp_path, refs=[f"{HEAD}\trefs/tags/reserved/255.255.65535"])
+@pytest.mark.parametrize("previous", ["255.255.65534", "255.255.65535"])
+def test_exhausted_application_range_never_pushes(tmp_path, previous):
+    result = reserve(tmp_path, refs=[f"{HEAD}\trefs/tags/reserved/{previous}"])
     assert "range exhausted" in result["error"]
     assert result["pushes"] == []

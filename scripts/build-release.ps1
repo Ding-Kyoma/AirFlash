@@ -15,7 +15,7 @@ try {
     . (Join-Path $PSScriptRoot 'release-version.ps1')
     $releaseVersion = Reserve-ReleaseVersion $repoRoot $ReservedVersion $ReleaseChannel -NewVersion $NewVersion
     Write-Host "Building AirFlash $releaseVersion"
-    $informationalVersion = if ($ReleaseChannel -eq 'preview') { "$releaseVersion-rc.1" } else { $releaseVersion }
+    $informationalVersion = Get-AirFlashReleaseArtifactVersion -Version $releaseVersion -ReleaseChannel $ReleaseChannel
     New-AirFlashPackage -Context $dotnetContext -Version $releaseVersion -InformationalVersion $informationalVersion `
         -BuildDirectory (Join-Path $repoRoot 'build') -OutputDirectory (Join-Path $repoRoot 'dist') `
         -CompatibilityArtifacts (Join-Path $repoRoot 'artifacts/compatibility') -Console:$Console

@@ -21,7 +21,7 @@ function Get-AirFlashDotnetContext {
         )
         $hostPath = $sdkCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
         if (-not $hostPath) {
-            $dotnetCommand = Get-Command dotnet -CommandType Application -ErrorAction SilentlyContinue
+            $dotnetCommand = Get-Command dotnet -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
             if (-not $dotnetCommand) {
                 throw 'No .NET host found in checkout/integration artifacts/dotnet or on PATH. Install the SDK required by desktop/global.json: https://dotnet.microsoft.com/download/dotnet/10.0'
             }

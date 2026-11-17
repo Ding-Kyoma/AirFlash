@@ -4,10 +4,10 @@ function Reserve-ReleaseVersion([string]$Root, [string]$RequestedVersion = '', [
     foreach ($value in @($RequestedVersion, $NewVersion)) {
         if (-not $value) { continue }
         [Version]$parsed = $null
-        if ($value -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or
+        if ($value -notmatch '\A(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\z' -or
             -not [Version]::TryParse($value, [ref]$parsed) -or
-            $parsed.Major -gt 255 -or $parsed.Minor -gt 255 -or $parsed.Build -gt 65535) {
-            throw 'Version must be canonical X.Y.Z within MSI limits (255.255.65535).'
+            $parsed.Major -gt 255 -or $parsed.Minor -gt 255 -or $parsed.Build -gt 65534) {
+            throw 'Version must be canonical X.Y.Z within MSI and assembly limits (255.255.65534).'
         }
     }
     if ($Channel -notin @('stable', 'preview')) { throw 'Unknown release channel.' }
@@ -51,9 +51,11 @@ function Reserve-ReleaseVersion([string]$Root, [string]$RequestedVersion = '', [
             $version = $NewVersion
         } else {
             $major = $previous.Major; $minor = $previous.Minor; $patch = $previous.Build + 1
-            if ($patch -gt 65535) { $patch = 0; $minor++ }
+            # AssemblyVersion uses this number too; 65535 cannot be compiled.
+            # Continue treating historical MSI-only tags as version floors.
+            if ($patch -gt 65534) { $patch = 0; $minor++ }
             if ($minor -gt 255) { $minor = 0; $major++ }
-            if ($major -gt 255) { throw 'MSI version range exhausted.' }
+            if ($major -gt 255) { throw 'MSI and assembly version range exhausted.' }
             $version = '{0}.{1}.{2}' -f $major, $minor, $patch
         }
         # Empty expected ref makes creation atomic even when another publisher races us.

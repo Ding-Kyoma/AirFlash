@@ -1,15 +1,55 @@
 # Shared packaging pipeline used by the development and release entry points.
+function Assert-AirFlashBuildDirectory {
+    param([string]$RepoRoot, [string]$Path, [switch]$IncludeContents)
+
+    $root = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($RepoRoot))
+    $target = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Path))
+    # Both package entry points reuse the checkout spelling. Keep it exact
+    # because a case-sensitive parent can contain two distinct checkouts.
+    if ($root -eq [IO.Path]::GetPathRoot($root) -or
+        -not $target.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::Ordinal)) {
+        throw "Unsafe cleanup target: $target"
+    }
+    $rootItem = Get-Item -LiteralPath $root -Force -ErrorAction Stop
+    if (-not $rootItem.PSIsContainer) { throw "Repository is not a directory: $root" }
+
+    # GetFullPath is lexical. Inspect ancestors before descending through them,
+    # including linked checkout aliases and parents of a missing cleanup leaf.
+    $ancestors = [Collections.Generic.Stack[string]]::new()
+    for ($part = $target; $part; $part = [IO.Path]::GetDirectoryName($part)) { $ancestors.Push($part) }
+    $targetItem = $null
+    foreach ($part in $ancestors) {
+        try { $item = Get-Item -LiteralPath $part -Force -ErrorAction Stop }
+        catch [Management.Automation.ItemNotFoundException] { continue }
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "Refusing cleanup through a reparse point: $part. Use a physical checkout path."
+        }
+        if (-not $item.PSIsContainer) { throw "Cleanup path is not a directory: $part" }
+        if ($part -eq $target) { $targetItem = $item }
+    }
+    if ($IncludeContents -and $targetItem) {
+        $directories = [Collections.Generic.Stack[IO.DirectoryInfo]]::new()
+        $directories.Push($targetItem)
+        while ($directories.Count) {
+            foreach ($item in Get-ChildItem -LiteralPath $directories.Pop().FullName -Force -ErrorAction Stop) {
+                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                    throw "Refusing cleanup containing a reparse point: $($item.FullName)"
+                }
+                if ($item.PSIsContainer) { $directories.Push($item) }
+            }
+        }
+    }
+}
+
 function Remove-AirFlashBuildDirectory {
     param([string]$RepoRoot, [string]$Path)
 
-    $root = [IO.Path]::GetFullPath($RepoRoot).TrimEnd('\')
+    Assert-AirFlashBuildDirectory -RepoRoot $RepoRoot -Path $Path -IncludeContents
     $target = [IO.Path]::GetFullPath($Path)
-    if (-not $target.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase) -or $target -eq $root) {
-        throw "Unsafe cleanup target: $target"
-    }
     if (Test-Path -LiteralPath $target) {
-        $item = Get-Item -LiteralPath $target
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Refusing cleanup of junction: $target" }
+        # Recheck ancestors immediately before removal. These pathname checks
+        # cannot make deletion atomic against another process changing the tree.
+        Assert-AirFlashBuildDirectory -RepoRoot $RepoRoot -Path $target
         Remove-Item -LiteralPath $target -Recurse -Force
     }
 }
@@ -18,11 +58,21 @@ function Assert-AirFlashNumericVersion {
     param([string]$Version)
 
     [Version]$parsed = $null
-    if ($Version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or
+    # The same numeric value becomes MSI ProductVersion and AssemblyVersion.
+    # Assembly metadata reserves 65535, so the shared build component stops at 65534.
+    if ($Version -notmatch '\A(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\z' -or
         -not [Version]::TryParse($Version, [ref]$parsed) -or
-        $parsed.Major -gt 255 -or $parsed.Minor -gt 255 -or $parsed.Build -gt 65535) {
-        throw 'Version must be canonical X.Y.Z within MSI limits (255.255.65535).'
+        $parsed.Major -gt 255 -or $parsed.Minor -gt 255 -or $parsed.Build -gt 65534) {
+        throw 'Version must be canonical X.Y.Z within MSI and assembly limits (255.255.65534).'
     }
+}
+
+function Get-AirFlashReleaseArtifactVersion {
+    param([string]$Version, [ValidateSet('stable','preview')][string]$ReleaseChannel = 'stable')
+
+    Assert-AirFlashNumericVersion $Version
+    if ($ReleaseChannel -eq 'preview') { return "$Version-rc.1" }
+    return $Version
 }
 
 function New-AirFlashPackage {
@@ -45,6 +95,9 @@ function New-AirFlashPackage {
     $build = [IO.Path]::GetFullPath($BuildDirectory)
     $output = [IO.Path]::GetFullPath($OutputDirectory)
     $compatibility = [IO.Path]::GetFullPath($CompatibilityArtifacts)
+    # An unsafe output directory must leave the previous build available.
+    # Each removal still checks its own tree immediately before cleanup.
+    Assert-AirFlashBuildDirectory -RepoRoot $repoRoot -Path $output -IncludeContents
     Remove-AirFlashBuildDirectory $repoRoot $build
     Remove-AirFlashBuildDirectory $repoRoot $output
     New-Item -ItemType Directory -Path (Join-Path $repoRoot 'artifacts') -Force | Out-Null

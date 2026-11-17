@@ -24,13 +24,13 @@ $fileVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($appExe)
 $exeVersion = '{0}.{1}.{2}' -f $fileVersion.FileMajorPart, $fileVersion.FileMinorPart, $fileVersion.FileBuildPart
 if (-not $ProductVersion) { $ProductVersion = $exeVersion }
 [Version]$parsedProductVersion = $null
-if ($ProductVersion -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or
+if ($ProductVersion -notmatch '\A(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\z' -or
     -not [Version]::TryParse($ProductVersion, [ref]$parsedProductVersion) -or
     $parsedProductVersion.Major -gt 255 -or $parsedProductVersion.Minor -gt 255 -or $parsedProductVersion.Build -gt 65535) {
     throw 'ProductVersion must be canonical X.Y.Z within MSI limits (255.255.65535).'
 }
 if (-not $ArtifactVersion) { $ArtifactVersion = $ProductVersion }
-if ($ArtifactVersion -notmatch '^[A-Za-z0-9][A-Za-z0-9.+-]*$') { throw 'ArtifactVersion contains unsupported filename characters.' }
+if ($ArtifactVersion -notmatch '\A[A-Za-z0-9][A-Za-z0-9.+-]*\z') { throw 'ArtifactVersion contains unsupported filename characters.' }
 if ($exeVersion -ne $ProductVersion) { throw "EXE version mismatch: $exeVersion (expected $ProductVersion)." }
 
 . (Join-Path $PSScriptRoot 'dotnet-common.ps1')
