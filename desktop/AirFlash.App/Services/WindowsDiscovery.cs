@@ -6,7 +6,7 @@ namespace AirFlash.App.Services;
 // Logical deadlines do not settle resource owners. Browse needs its documented
 // final callback; production resolve needs observed exit of its helper process.
 // Only a current epoch/token may change advertised or cached receiver state.
-public sealed partial class WindowsDiscovery : IDiscoveryService, IDiscoveryDiagnostics
+public sealed partial class WindowsDiscovery : IDiscoveryService, IDiscoveryNotifications, IDiscoveryDiagnostics
 {
     private const uint PendingStatus = 9506;
     private readonly object _sync = new();
@@ -48,7 +48,8 @@ public sealed partial class WindowsDiscovery : IDiscoveryService, IDiscoveryDiag
     private bool _running;
     private Work? _deferredNativeWork;
     public event Action<IReadOnlyList<Receiver>>? Changed;
-    public event Action<DiscoveryFailure>? Failed;
+    public event Action<string>? Failed;
+    public event Action<DiscoveryFailure>? FailureReported;
     public event Action<DiscoveryResolveAttempt>? ResolveSucceeded;
     public event Action<bool>? RunningChanged;
 
@@ -682,15 +683,20 @@ public sealed partial class WindowsDiscovery : IDiscoveryService, IDiscoveryDiag
             {
                 lock (_sync) { if (_disposed) return; }
                 Log(failure.Message);
-                bool superseded;
-                lock (_sync)
+                // Either event can reenter discovery and invalidate this attempt.
+                bool Current()
                 {
-                    if (_disposed) return;
-                    superseded = failure.Attempt is { } attempt && (attempt.Epoch != _epoch
-                        || _records.TryGetValue(attempt.Instance, out var cached) && cached.ResolveSequence > attempt.Sequence
-                            && cached.Record.ServiceType.Equals(attempt.ServiceType, StringComparison.OrdinalIgnoreCase));
+                    lock (_sync)
+                    {
+                        if (_disposed) return false;
+                        if (failure.Attempt is not { } attempt) return true;
+                        return attempt.Epoch == _epoch && (!_records.TryGetValue(attempt.Instance, out var cached)
+                            || cached.ResolveSequence <= attempt.Sequence
+                            || !cached.Record.ServiceType.Equals(attempt.ServiceType, StringComparison.OrdinalIgnoreCase));
+                    }
                 }
-                if (!superseded) InvokeObservers(Failed, failure, "failure");
+                InvokeObservers(Failed, failure.Message, "failure", Current);
+                InvokeObservers(FailureReported, failure, "failure", Current);
             }
         }
         finally { DrainDeferredNative(); }
@@ -741,12 +747,15 @@ public sealed partial class WindowsDiscovery : IDiscoveryService, IDiscoveryDiag
         catch (Exception error) { TraceObserverFailure("log", error); }
     }
 
-    private static void InvokeObservers<T>(Action<T>? observers, T value, string channel)
+    private static void InvokeObservers<T>(Action<T>? observers, T value, string channel, Func<bool>? current = null)
     {
         if (observers is null) return;
         foreach (Action<T> observer in observers.GetInvocationList())
+        {
+            if (current is not null && !current()) return;
             try { observer(value); }
             catch (Exception error) { TraceObserverFailure(channel, error); }
+        }
     }
 
     private static void TraceObserverFailure(string channel, Exception error)

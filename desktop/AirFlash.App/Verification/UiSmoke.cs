@@ -547,7 +547,7 @@ internal static class UiSmoke
             Check(app.EngineFailed && !receiver.ToggleCommand.CanExecute(null) && !row.PairCommand.CanExecute(null), "failed engine disables playback and pairing", checks);
             Check(app.RetryEngineCommand.CanExecute(null) && settings.CancelCommand.CanExecute(null), "failed engine preserves retry and settings", checks);
             using var missingDns = new WindowsDiscovery(dnsAvailable: () => false);
-            string? failure = null; missingDns.Failed += value => failure = value.Message; missingDns.Start();
+            string? failure = null; missingDns.Failed += value => failure = value; missingDns.Start();
             Check(failure is not null, "missing DNS-SD produces a recoverable diagnostic", checks);
             app.ShowError(new IOException("simulated discovery failure")); await Pump();
             Render(panel, Path.Combine(directory, "startup-failure.png"), 1);
@@ -812,7 +812,7 @@ internal static class UiSmoke
         public Task MuteAsync(string? endpointId) => FailMute ? Task.FromException(new IOException("mock mute failed")) : Task.CompletedTask;
         public Task RestoreAsync() { Restores++; return Task.CompletedTask; }
     }
-    internal sealed class MockDiscovery : IDiscoveryService, IDiscoveryDiagnostics
+    internal sealed class MockDiscovery : IDiscoveryService, IDiscoveryNotifications, IDiscoveryDiagnostics
     {
         private readonly object _diagnosticLock = new();
         private readonly DiscoveryHistory _history = new();
@@ -842,10 +842,15 @@ internal static class UiSmoke
         public int Starts { get; private set; }
         public int Stops { get; private set; }
         public event Action<IReadOnlyList<Receiver>>? Changed;
-        public event Action<DiscoveryFailure>? Failed;
+        public event Action<string>? Failed;
+        public event Action<DiscoveryFailure>? FailureReported;
         public event Action<DiscoveryResolveAttempt>? ResolveSucceeded;
         public void PublishFailure(string message) => PublishFailure(new DiscoveryFailure(message));
-        public void PublishFailure(DiscoveryFailure failure) => Failed?.Invoke(failure);
+        public void PublishFailure(DiscoveryFailure failure)
+        {
+            Failed?.Invoke(failure.Message);
+            FailureReported?.Invoke(failure);
+        }
         public void PublishResolution(DiscoveryResolveAttempt resolution) => ResolveSucceeded?.Invoke(resolution);
         public void Start() { if (Running) return; Running = true; Starts++; RunningChanged?.Invoke(true); Publish(); }
         public void Stop() { if (!Running) return; Running = false; Stops++; RunningChanged?.Invoke(false); }

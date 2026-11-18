@@ -247,7 +247,7 @@ public sealed class ResolveProcessTests
         var errors = new ConcurrentQueue<string>();
         var firstBatch = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var allPublished = new TaskCompletionSource<IReadOnlyList<Receiver>>(TaskCreationOptions.RunContinuationsAsynchronously);
-        discovery.Failed += failure => errors.Enqueue(failure.Message);
+        discovery.Failed += errors.Enqueue;
         discovery.Changed += rows =>
         {
             if (rows.Count == 8) firstBatch.TrySetResult();
@@ -307,7 +307,7 @@ public sealed class ResolveProcessTests
         var baseline = ResolveProcessDnsServiceApi.ProcessOwnerCount;
         var errors = new ConcurrentQueue<string>();
         var published = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        discovery.Failed += failure => errors.Enqueue(failure.Message);
+        discovery.Failed += errors.Enqueue;
         discovery.Changed += rows => { if (rows.Count == 1) published.TrySetResult(); };
         try
         {

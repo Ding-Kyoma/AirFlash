@@ -133,6 +133,9 @@ internal static class UiSettingsRecovery
         Check(discovery.StartCount == 0, "valid settings: an inactive hidden panel does not browse without automatic demand", checks);
         app.SetPanelVisible(true); await Pump();
         Check(app.Notice.Length == 0 && store.LoadWarning is null, "valid settings: repeated migration load does not produce a recovery warning", checks);
+        const string discoveryWarning = "Synthetic legacy discovery warning";
+        discovery.PublishFailure(discoveryWarning); await Pump();
+        Check(app.HasNotice && app.Notice == discoveryWarning, "a provider implementing only the original discovery contract can report a warning", checks);
         Check(discovery.SelectedInterface == offlineInterface && app.Settings.DiscoveryInterfaceId == offlineInterface && discovery.Publications == 1 && app.AllReceivers.Count == 1 && app.AllReceivers[0].IsManual, "valid settings: an unavailable selected interface is retained without fallback while manual receivers remain", checks);
         Check(app.Settings.ManualReceivers.Single() == initial.ManualReceivers.Single() && app.Settings.ReadOptions("manual:fixture").AutoConnect is null && app.Settings.ReadOptions("manual:fixture").CustomBufferMs is null && app.Settings.ReadOptions("manual:fixture").LatencyMode is null, "valid settings: manual records and nullable legacy receiver overrides survive both loads", checks);
         Check(app.Settings.Extra!["unknown_root"].GetProperty("keep").GetString() == "root" && app.Settings.Equalizer.Extra!["unknown_eq"].GetProperty("keep").GetString() == "eq" && app.Settings.Equalizer.Enabled && app.Settings.Equalizer.PreampDb == -3.5 && app.Settings.Equalizer.BandGainsDb[0] == 7.5, "valid settings: unknown root/equalizer fields and the curve survive construction", checks);
@@ -185,8 +188,8 @@ internal static class UiSettingsRecovery
         private bool _requested;
         public string SelectedInterface { get; private set; } = "";
         public event Action<IReadOnlyList<Receiver>>? Changed;
-        public event Action<DiscoveryFailure>? Failed { add { } remove { } }
-        public event Action<DiscoveryResolveAttempt>? ResolveSucceeded { add { } remove { } }
+        public event Action<string>? Failed;
+        public void PublishFailure(string message) => Failed?.Invoke(message);
         public event Action<bool>? RunningChanged;
         public void SetInterface(string id) => SelectedInterface = id;
         public void Start()

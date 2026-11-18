@@ -275,7 +275,7 @@ public partial class App : Application
         IReadOnlyList<Receiver> receivers = [];
         var errors = new List<string>();
         void Changed(IReadOnlyList<Receiver> value) { lock (gate) receivers = value; }
-        void Failed(DiscoveryFailure failure) { lock (gate) errors.Add(failure.Message); }
+        void Failed(string message) { lock (gate) errors.Add(message); }
         discovery.Changed += Changed;
         discovery.Failed += Failed;
         try

@@ -15,7 +15,7 @@ public sealed class WindowsDiscoveryTests
     public void MissingDnsEntryPointsReportsFailureWithoutOpeningQueries()
     {
         var api = new FakeDns(); using var discovery = Create(api, dnsAvailable: () => false);
-        string? failure = null; discovery.Failed += value => failure = value.Message;
+        string? failure = null; discovery.Failed += value => failure = value;
         discovery.Start(); Assert.NotNull(failure); Assert.Empty(api.Operations);
         Assert.Equal(0, discovery.Snapshot.ActiveQueries);
     }

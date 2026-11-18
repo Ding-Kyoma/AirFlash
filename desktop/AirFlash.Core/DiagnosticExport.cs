@@ -29,6 +29,10 @@ public static class DiagnosticExport
         return controller.CaptureDiagnosticsAsync(cancellation);
     }
 
+    /// <summary>Build a bundle from runtime information and a redacted snapshot.</summary>
+    public static string Compose(string appVersion, string engineVersion, JsonElement? snapshot)
+        => Compose(appVersion, engineVersion, snapshot, null, null);
+
     /// <summary>Build a bundle from runtime information, a redacted snapshot, and
     /// optional recent numeric counter changes.</summary>
     public static string Compose(string appVersion, string engineVersion, JsonElement? snapshot,

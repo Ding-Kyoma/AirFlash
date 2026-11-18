@@ -272,12 +272,16 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         };
         // WindowsDiscovery logs failures before publishing them. Present the
         // notice without repeating the synchronous file append on the dispatcher.
-        _discovery.Failed += DiscoveryFailed;
-        _discovery.ResolveSucceeded += resolution => _dispatcher.BeginInvoke(() =>
+        if (_discovery is IDiscoveryNotifications notifications)
         {
-            if (!_closing && _discoveryNotice is { Attempt: { } failure } && failure.Epoch <= resolution.Epoch
-                && failure.Sequence < resolution.Sequence && failure.SameService(resolution)) Notice = "";
-        });
+            notifications.FailureReported += DiscoveryFailed;
+            notifications.ResolveSucceeded += resolution => _dispatcher.BeginInvoke(() =>
+            {
+                if (!_closing && _discoveryNotice is { Attempt: { } failure } && failure.Epoch <= resolution.Epoch
+                    && failure.Sequence < resolution.Sequence && failure.SameService(resolution)) Notice = "";
+            });
+        }
+        else _discovery.Failed += message => DiscoveryFailed(new DiscoveryFailure(message));
         _discovery.RunningChanged += running => _dispatcher.BeginInvoke(() =>
         {
             if (_closing) return;

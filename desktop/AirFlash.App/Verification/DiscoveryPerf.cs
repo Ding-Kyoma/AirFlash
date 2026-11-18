@@ -10,7 +10,7 @@ internal static class DiscoveryPerf
         using var process = Process.GetCurrentProcess();
         using var discovery = new WindowsDiscovery(log: AppPaths.Log);
         var failures = new List<string>(); var receiverCount = 0;
-        discovery.Failed += failure => { lock (failures) failures.Add(failure.Message); };
+        discovery.Failed += message => { lock (failures) failures.Add(message); };
         discovery.Changed += items => Volatile.Write(ref receiverCount, items.Count);
         var samples = new List<object>();
         async Task Sample(string phase, int seconds)

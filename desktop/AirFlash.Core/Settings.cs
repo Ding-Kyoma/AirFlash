@@ -170,7 +170,8 @@ public sealed class AppSettings : ObservableObject
     }
     public double Gain(string id) => Math.Clamp(MasterVolume, 0, 100) / 100d;
     public string? SampleRate(Receiver receiver) => receiver.IsSoftwareGroup ? SoftwareGroups.Single(g => g.Id == receiver.Id).SampleRate : ReadOptions(receiver.Id).SampleRate;
-    public bool UsesDeviceLatency(Receiver receiver, string? globalMode = null) => (receiver.IsSoftwareGroup ? receiver.Peers : [receiver]).Any(r =>
+    public bool UsesDeviceLatency(Receiver receiver) => UsesDeviceLatency(receiver, null);
+    public bool UsesDeviceLatency(Receiver receiver, string? globalMode) => (receiver.IsSoftwareGroup ? receiver.Peers : [receiver]).Any(r =>
     {
         var options = ReadOptions(r.Id);
         return options.LatencyMode is not null || options.ForceLatency is not null || (globalMode ?? LatencyMode) == "custom" && options.CustomBufferMs is not null;

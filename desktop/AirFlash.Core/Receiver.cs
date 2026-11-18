@@ -197,12 +197,17 @@ public sealed record DiscoveryFailure(string Message, DiscoveryFailureReason Rea
 public interface IDiscoveryService : IDisposable
 {
     event Action<IReadOnlyList<Receiver>>? Changed;
-    event Action<DiscoveryFailure>? Failed;
-    event Action<DiscoveryResolveAttempt>? ResolveSucceeded;
+    event Action<string>? Failed;
     event Action<bool>? RunningChanged;
     void Start();
     void Stop();
     void SetInterface(string id);
+}
+/// <summary>Optional discovery events for consumers that can attribute and clear individual resolve warnings.</summary>
+public interface IDiscoveryNotifications
+{
+    event Action<DiscoveryFailure>? FailureReported;
+    event Action<DiscoveryResolveAttempt>? ResolveSucceeded;
 }
 public interface IAudioService
 {
