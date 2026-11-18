@@ -381,6 +381,76 @@ mod tests {
         );
     }
 
+    /// The converse of the test below: playback, which the desktop always starts
+    /// with a top-level `timing: "ptp"`, accepts nothing the prediction did not
+    /// offer. An explicit PTP on AirPlay 1 evidence used to slip through.
+    #[test]
+    fn playback_accepts_exactly_the_offered_profiles() {
+        for features in [None, Some(0), Some(1 << 41)] {
+            for evidence_features in [None, Some(0), Some(1 << 41)] {
+                for follow_receiver_clock in [false, true] {
+                    let formats = Formats {
+                        realtime: Some(crate::rtp::audio_format(false, 44100)),
+                        buffered: Some(crate::rtp::audio_format(true, 48000)),
+                        features,
+                    };
+                    let evidence = Profile {
+                        features: evidence_features,
+                        follow_receiver_clock,
+                        ..Profile::default()
+                    };
+                    let items = choices(&fingerprint(formats, &evidence), &evidence);
+                    for rate in [44100, 48000] {
+                        for (codec_name, codec) in [
+                            ("auto", Codec::Auto),
+                            ("pcm", Codec::Pcm),
+                            ("alac", Codec::Alac),
+                        ] {
+                            for (transport_name, transport) in [
+                                ("auto", Transport::Auto),
+                                ("realtime", Transport::Realtime),
+                                ("buffered", Transport::Buffered),
+                            ] {
+                                for (timing_name, timing) in [
+                                    ("auto", Timing::Auto),
+                                    ("ptp", Timing::Ptp),
+                                    ("ntp", Timing::Ntp),
+                                    ("follow", Timing::Ptp),
+                                ] {
+                                    if timing_name == "follow" && !follow_receiver_clock {
+                                        continue;
+                                    }
+                                    let profile = Profile {
+                                        codec,
+                                        transport,
+                                        timing,
+                                        follow_receiver_clock: timing_name == "follow"
+                                            || timing_name == "auto" && follow_receiver_clock,
+                                        ..evidence.clone()
+                                    };
+                                    // What `Member::connect` passes for this peer.
+                                    let inherited = profile.inherits_ptp("ptp");
+                                    let accepted = fingerprint(formats, &evidence)
+                                        .negotiate(&profile, rate, inherited)
+                                        .is_ok();
+                                    let offered = items.iter().any(|item| {
+                                        item.codec == codec_name
+                                            && item.transport == transport_name
+                                            && item.timing == timing_name
+                                            && item.sample_rate == rate
+                                    });
+                                    assert_eq!(
+                                        accepted, offered,
+                                        "{codec_name}/{transport_name}/{timing_name}@{rate}; features={features:?}, evidence={evidence:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     #[test]
     fn clock_capability_predictions_match_playback_roles_and_feature_sources() {
         for features in [None, Some(0), Some(1 << 41)] {

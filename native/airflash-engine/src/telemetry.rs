@@ -71,6 +71,17 @@ impl Histogram {
     pub fn count(&self) -> u64 {
         self.count
     }
+    /// Add every sample of `other`, as if each had been observed here.
+    pub fn merge(&mut self, other: &Self) {
+        for (bucket, hits) in self.buckets.iter_mut().zip(other.buckets) {
+            *bucket = bucket.saturating_add(hits);
+        }
+        self.count += other.count;
+        self.below += other.below;
+        self.above += other.above;
+        self.sum_ms += other.sum_ms;
+        self.max_ms = self.max_ms.max(other.max_ms);
+    }
     pub fn mean_ms(&self) -> f64 {
         if self.count == 0 {
             0.0
@@ -158,6 +169,10 @@ pub enum TimelineResetReason {
     TrackChange,
     UserSeek,
     ReceiverRejectedFlush,
+    /// A new receiver session replaced the old one inside the same playback
+    /// run. The engine no longer records it: under `receiver_ownership_guard`
+    /// a takeover ends the run instead of reconnecting in-session. The bucket
+    /// stays because the CSV layout is fixed.
     SessionRestart,
     /// The only reliable drift signal: delivery was confirmed to have failed.
     ConfirmedTransportFailure,
@@ -693,11 +708,15 @@ pub struct SessionTelemetry {
     pub underruns_idle: u64,
     /// Capture frames discarded because they were stale (input drops).
     pub input_drops: u64,
-    /// Frames dropped between decode and the sender.
+    /// Reserved, always 0. Kept for name parity with the reference sender's
+    /// snapshot (Q20); AirFlash captures PCM and has no decode stage between
+    /// capture and the sender. Capture-side drops are [`Self::input_drops`].
     pub decode_drops: u64,
     /// WASAPI discontinuity flags that were not ignored as benign wraparound.
     pub capture_glitches: u64,
-    /// Event-channel messages that could not be parsed into a command.
+    /// Receiver event messages evicted from member inboxes before the send loop
+    /// drained them. One message can contain several commands or a volume report.
+    /// Unparseable event bodies are acknowledged and ignored, not counted.
     pub events_dropped: u64,
     pub servo_engagements: u64,
     pub servo_releases: u64,
@@ -721,6 +740,13 @@ pub struct SessionTelemetry {
     pub lateness: Histogram,
     pub lateness_interval: Histogram,
     pub capture_age: Histogram,
+    /// `retransmit_gap`: how far behind the live edge each nonempty realtime
+    /// request reached, in milliseconds of audio (next sequence minus the first
+    /// requested sequence, times the packet duration), summed over members.
+    /// Reported percentiles clip at 200 ms. `above_ceiling` counts the clipped
+    /// samples and `max_ms` retains the maximum.
+    /// Named after the reference sender's `rtx_gap_hist` (Q20), whose exact
+    /// definition was not recovered. Buffered (TCP) streams have no requests.
     pub rtx_gap: Histogram,
 }
 impl SessionTelemetry {

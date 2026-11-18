@@ -23,6 +23,16 @@ pub struct Profile {
     #[serde(default)]
     pub latency_ms: Option<u32>,
 }
+impl Profile {
+    /// Whether this profile takes the request's top-level `timing` (only the
+    /// finite probe leaves per-peer timing unset). The desktop always sends a
+    /// top-level `ptp` but sets every peer's timing; letting it reach an
+    /// explicit choice would accept PTP on a receiver whose evidence
+    /// `get_receiver_capabilities` rejected.
+    pub fn inherits_ptp(&self, top_level_timing: &str) -> bool {
+        self.timing == Timing::Inherit && top_level_timing == "ptp"
+    }
+}
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Codec {
@@ -415,6 +425,13 @@ impl CompatFingerprint {
     /// automatic transport stays on the realtime stream when the group chose
     /// NTP, because buffered audio is a PTP-only transport. A one-member plan
     /// changes nothing: single receivers keep their characterized behaviour.
+    ///
+    /// `inherited_ptp` is the PTP request this profile inherits from the
+    /// session. It decides [`Timing::Inherit`] and, as the characterization
+    /// table pins, also admits an explicit [`Timing::Ptp`] the receiver does not
+    /// advertise. Session code derives it with [`Profile::inherits_ptp`], so a
+    /// profile with its own timing is judged on the receiver's evidence alone,
+    /// exactly as `get_receiver_capabilities` predicts it (with `false`).
     pub fn negotiate_planned(
         &self,
         plan: TimingPlan,
@@ -990,6 +1007,48 @@ mod tests {
             .negotiate(&auto, 44100, true)
             .unwrap()
             .uses_ptp()
+        );
+    }
+    #[test]
+    fn top_level_ptp_only_decides_inherited_profiles() {
+        // AirPlay 1 evidence: no AirPlay 2 bit and no model that expects PTP.
+        let airplay1 = Formats {
+            realtime: Some(1 << 18),
+            features: Some(0),
+            ..Default::default()
+        };
+        let inherited = Profile {
+            codec: Codec::Auto,
+            ..Default::default()
+        };
+        assert_eq!(inherited.timing, Timing::Inherit);
+        let explicit = Profile {
+            timing: Timing::Ptp,
+            ..inherited.clone()
+        };
+        // The desktop always sends a top-level `ptp` but sets each peer's timing.
+        assert!(!explicit.inherits_ptp("ptp"));
+        let error = airplay1
+            .negotiate(&explicit, &[], 44100, explicit.inherits_ptp("ptp"))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("PTP timing is not advertised"),
+            "a top-level ptp must not unlock PTP the receiver does not advertise: {error}"
+        );
+        // The finite probe sends no per-peer timing; there the top level decides.
+        assert!(inherited.inherits_ptp("ptp"));
+        assert!(!inherited.inherits_ptp("ntp"));
+        assert!(
+            airplay1
+                .negotiate(&inherited, &[], 44100, inherited.inherits_ptp("ptp"))
+                .unwrap()
+                .uses_ptp()
+        );
+        assert!(
+            !airplay1
+                .negotiate(&inherited, &[], 44100, inherited.inherits_ptp("ntp"))
+                .unwrap()
+                .uses_ptp()
         );
     }
     #[test]

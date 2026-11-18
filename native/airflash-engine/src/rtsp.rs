@@ -82,6 +82,9 @@ impl Message {
         plist::Value::from_reader(std::io::Cursor::new(&self.body)).context("invalid binary plist")
     }
 }
+pub(crate) fn is_teardown_request(method: &str) -> bool {
+    method == "TEARDOWN"
+}
 const MAX_HEADER: usize = 16 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
 pub struct Connection {
@@ -95,6 +98,7 @@ pub struct Connection {
     cancel: Cancellation,
     timeout: Duration,
     unsolicited: VecDeque<Message>,
+    pending_teardown: Arc<AtomicBool>,
     close_requested: bool,
 }
 impl Connection {
@@ -119,6 +123,7 @@ impl Connection {
             cancel,
             timeout: Duration::from_secs(4),
             unsolicited: VecDeque::new(),
+            pending_teardown: Arc::new(AtomicBool::new(false)),
             close_requested: false,
         })
     }
@@ -298,11 +303,33 @@ impl Connection {
         self.read_for(self.timeout, None)?
             .ok_or_else(|| WireError::ReadTimeout.into())
     }
-    /// Receiver-initiated requests that arrived while a worker was waiting for a
-    /// response. They are kept aside so the response matching can continue, and
-    /// the feedback loop can inspect them without racing SET_PARAMETER.
+    /// Receiver-initiated requests that arrived while waiting for a response.
+    pub(crate) fn has_unsolicited(&self) -> bool {
+        !self.unsolicited.is_empty()
+    }
+    /// Lets the sender see already parsed TEARDOWNs without acquiring the
+    /// control-connection lock or waiting for an in-flight request to finish.
+    pub(crate) fn pending_teardown(&self) -> Arc<AtomicBool> {
+        self.pending_teardown.clone()
+    }
+    /// Remove the requests held aside during response matching.
     pub fn take_unsolicited(&mut self) -> Vec<Message> {
-        self.unsolicited.drain(..).collect()
+        let messages = self.unsolicited.drain(..).collect();
+        if self.pending_teardown.load(Ordering::Relaxed) {
+            self.pending_teardown.store(false, Ordering::Release);
+        }
+        messages
+    }
+    /// Transfer a queued TEARDOWN to session health before clearing the pending
+    /// flag. The caller holds the connection lock, so a new request cannot
+    /// arrive between the transfer and the clear.
+    pub(crate) fn drain_unsolicited(&mut self, on_teardown: impl FnOnce()) -> bool {
+        let teardown = self.pending_teardown.load(Ordering::Relaxed);
+        if teardown {
+            on_teardown();
+        }
+        drop(self.take_unsolicited());
+        teardown
     }
     /// The peer asked for `Connection: close` on some message. Read-and-clear so
     /// one header is reported once.
@@ -337,7 +364,11 @@ impl Connection {
         self.write(&bytes)
     }
     pub fn stale_response(&self, response: &Message) -> bool {
-        response.headers.get("cseq").and_then(|s| s.parse::<u32>().ok()).is_some_and(|seq| seq < self.cseq)
+        response
+            .headers
+            .get("cseq")
+            .and_then(|s| s.parse::<u32>().ok())
+            .is_some_and(|seq| seq < self.cseq)
     }
     pub fn validate_cseq(&self, response: &Message) -> Result<()> {
         if let Some(seq) = response.headers.get("cseq") {
@@ -367,14 +398,21 @@ impl Connection {
         let deadline = Instant::now() + self.timeout;
         let response = loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let response = self.read_for(remaining, cancellation)?.ok_or(WireError::ReadTimeout)
+            let response = self
+                .read_for(remaining, cancellation)?
+                .ok_or(WireError::ReadTimeout)
                 .with_context(|| format!("{method} {path}"))?;
-            if response.method().is_some() {
+            if let Some(method) = response.method() {
+                if is_teardown_request(method) {
+                    self.pending_teardown.store(true, Ordering::Release);
+                }
                 ensure!(self.unsolicited.len() < 4, "unsolicited request flood");
                 self.unsolicited.push_back(response);
                 continue;
             }
-            if !self.stale_response(&response) { break response; }
+            if !self.stale_response(&response) {
+                break response;
+            }
         };
         self.validate_cseq(&response)?;
         ensure!(

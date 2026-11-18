@@ -124,14 +124,22 @@ fn feedback_retries_only_complete_transient_responses() {
             health.check().unwrap();
             assert_eq!(health.snapshot().feedback_failures, 2);
         } else {
-            let fault = health.control_degraded().expect("transient retries exhausted");
+            let fault = health
+                .control_degraded()
+                .expect("transient retries exhausted");
             assert!(fault.retryable);
             assert_eq!(fault.channel, "feedback");
             assert_eq!(fault.code, "feedback_rejected");
             // Control-plane faults no longer end a session whose media is healthy.
             assert!(health.check().is_ok());
-            assert!(health.check_control(true).is_ok(), "healthy media keeps playing");
-            assert!(health.check_control(false).is_err(), "media stopped: now it is fatal");
+            assert!(
+                health.check_control(true).is_ok(),
+                "healthy media keeps playing"
+            );
+            assert!(
+                health.check_control(false).is_err(),
+                "media stopped: now it is fatal"
+            );
             assert_eq!(health.snapshot().feedback_failures, 3);
             assert!(health.take_preemption_signals().is_empty());
             // A rebuilt channel clears the verdict without touching the session.
@@ -536,38 +544,114 @@ fn retransmit_flood_is_bounded_and_does_not_prevent_new_audio() {
 
 #[test]
 fn events_report_real_eof_and_stop_without_waiting_for_idle_timeout() {
-    let (conn, peer) = pair(); let health = Health::default();
-    let worker = EventWorker::start(conn, "test".into(), health.clone(), Cancellation::default()).unwrap();
+    let (conn, peer) = pair();
+    let health = Health::default();
+    let worker =
+        EventWorker::start(conn, "test".into(), health.clone(), Cancellation::default()).unwrap();
     // Losing the event channel degrades the control plane; it must not fail the
     // session outright, because the media stream is independent.
-    drop(peer); until(|| health.control_degraded().is_some() || health.check().is_err());
+    drop(peer);
+    until(|| health.control_degraded().is_some() || health.check().is_err());
     let fault = health.control_degraded().expect("event channel degraded");
-    assert_eq!(fault.code,"peer_closed"); assert_eq!(fault.channel,"events"); assert!(fault.retryable);
+    assert_eq!(fault.code, "peer_closed");
+    assert_eq!(fault.channel, "events");
+    assert!(fault.retryable);
     assert!(health.check().is_ok(), "media stays untouched");
-    assert!(health.check_control(true).is_ok(), "healthy media keeps playing");
-    assert!(health.check_control(false).is_err(), "media stopped: now it is fatal");
+    assert!(
+        health.check_control(true).is_ok(),
+        "healthy media keeps playing"
+    );
+    assert!(
+        health.check_control(false).is_err(),
+        "media stopped: now it is fatal"
+    );
     drop(worker);
     let (conn, _peer) = pair();
-    let worker = EventWorker::start(conn, "test".into(), Health::default(), Cancellation::default()).unwrap();
-    let now=Instant::now(); drop(worker); assert!(now.elapsed()<Duration::from_millis(250));
+    let worker = EventWorker::start(
+        conn,
+        "test".into(),
+        Health::default(),
+        Cancellation::default(),
+    )
+    .unwrap();
+    let now = Instant::now();
+    drop(worker);
+    assert!(now.elapsed() < Duration::from_millis(250));
 }
 #[test]
 fn requested_packets_arrive_as_original_ciphertext_out_of_order_and_across_wrap() {
-    let (mut m,a,c)=media(); m.configure_latency(Duration::from_secs(2),false);
-    a.set_read_timeout(Some(Duration::from_secs(1))).unwrap(); c.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-    let mut originals=std::collections::BTreeMap::new(); let h=Health::default(); let mut buffer=[0;2048];
-    for value in [1,2,3] {
-        m.send(&vec![value;PCM_BYTES],false,Instant::now(),Instant::now(),&h).unwrap();
-        let n=a.recv(&mut buffer).unwrap(); originals.insert(u16::from_be_bytes([buffer[2],buffer[3]]),buffer[..n].to_vec());
+    let (mut m, a, c) = media();
+    m.configure_latency(Duration::from_secs(2), false);
+    a.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let mut originals = std::collections::BTreeMap::new();
+    let h = Health::default();
+    let mut buffer = [0; 2048];
+    for value in [1, 2, 3] {
+        m.send(
+            &vec![value; PCM_BYTES],
+            false,
+            Instant::now(),
+            Instant::now(),
+            &h,
+        )
+        .unwrap();
+        let n = a.recv(&mut buffer).unwrap();
+        originals.insert(
+            u16::from_be_bytes([buffer[2], buffer[3]]),
+            buffer[..n].to_vec(),
+        );
     }
-    let next_seq=m.packetizer.seq;
-    let address=std::net::SocketAddr::from(([127,0,0,1],m.control_port().unwrap()));
-    for seq in [0u16,65535,65534,0] {
-        let [hi,lo]=seq.to_be_bytes(); c.send_to(&[0x80,0xd5,0,1,hi,lo,0,1],address).unwrap();
-        let before=m.metrics.retransmits_sent;
-        until(||{m.service_retransmits();m.metrics.retransmits_sent>before});
-        let n=c.recv(&mut buffer).unwrap(); assert_eq!(&buffer[..2],&[0x80,0xd6]);
-        assert_eq!(&buffer[4..n],originals.get(&seq).unwrap());
+    let next_seq = m.packetizer.seq;
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], m.control_port().unwrap()));
+    for seq in [0u16, 65535, 65534, 0] {
+        let [hi, lo] = seq.to_be_bytes();
+        c.send_to(&[0x80, 0xd5, 0, 1, hi, lo, 0, 1], address)
+            .unwrap();
+        let before = m.metrics.retransmits_sent;
+        until(|| {
+            m.service_retransmits();
+            m.metrics.retransmits_sent > before
+        });
+        let n = c.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..2], &[0x80, 0xd6]);
+        assert_eq!(&buffer[4..n], originals.get(&seq).unwrap());
     }
-    assert_eq!(m.packetizer.seq,next_seq); assert_eq!(m.metrics.retransmits_sent,4);
+    assert_eq!(m.packetizer.seq, next_seq);
+    assert_eq!(m.metrics.retransmits_sent, 4);
+}
+
+#[test]
+fn retransmit_requests_record_how_far_behind_the_live_edge_they_reach() {
+    let (mut m, _a, c) = media();
+    m.configure_latency(Duration::from_secs(2), false);
+    let h = Health::default();
+    // Sequences 65534, 65535 and 0 are sent; the next one is 1.
+    for _ in 0..3 {
+        m.send(
+            &vec![0; PCM_BYTES],
+            false,
+            Instant::now(),
+            Instant::now(),
+            &h,
+        )
+        .unwrap();
+    }
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], m.control_port().unwrap()));
+    // Two requests behind the live edge across the wrap contribute samples.
+    // A request at the live edge and a request for zero packets do not.
+    for (seq, count) in [(0u16, 1u8), (65534, 1), (1, 1), (65535, 0)] {
+        let [hi, lo] = seq.to_be_bytes();
+        c.send_to(&[0x80, 0xd5, 0, 1, hi, lo, 0, count], address)
+            .unwrap();
+    }
+    until(|| {
+        m.service_retransmits();
+        m.metrics.retransmit_requests == 4
+    });
+    assert_eq!(m.metrics.retransmit_requested_packets, 3);
+    let packet_ms = 352.0 * 1000.0 / f64::from(RATE);
+    assert_eq!(m.rtx_gap.count(), 2);
+    assert!((m.rtx_gap.percentile_ms(1.0) - 3.0 * packet_ms).abs() < 1e-9);
+    assert!((m.rtx_gap.mean_ms() - 2.0 * packet_ms).abs() < 1e-9);
 }

@@ -22,7 +22,7 @@ use std::{
 use windows::{
     Win32::{
         Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
-        Foundation::{CloseHandle, WAIT_TIMEOUT},
+        Foundation::{CloseHandle, WAIT_EVENT, WAIT_FAILED, WAIT_TIMEOUT},
         Media::Audio::*,
         System::{
             Com::{StructuredStorage::*, *},
@@ -37,7 +37,7 @@ const REBIND_MAX_FAILURES: u32 = 3;
 /// Pause between rebind attempts so a vanished device does not spin the thread.
 const REBIND_BACKOFF: Duration = Duration::from_millis(250);
 /// A stream that delivers nothing at all only becomes a rebind probe after ten
-/// seconds of contiguous silence. A short burst of stale samples does not
+/// seconds without packets past the normal poll grace. A short burst of stale samples does not
 /// restore the budget: only thirty seconds of contiguous audible audio re-arms
 /// the probe, and repeated probes back off along `SILENT_PROBE_INTERVALS`.
 const SILENT_PROBE_WINDOW: Duration = Duration::from_secs(10);
@@ -54,8 +54,7 @@ const SILENT_PROBE_INTERVALS: [Duration; 3] = [
 /// Without packets, wait this long after the last one before counting silence.
 /// Zero-filled packets mean the endpoint is alive and never trigger a probe.
 const NO_PACKET_SILENCE_AFTER: Duration = Duration::from_millis(250);
-/// Three successful rebinds inside this window mean the endpoint is not being
-/// recovered by them, so the capture log says so once per `STORM_WARNING_GAP`.
+/// Report three successful rebinds inside this window once per `STORM_WARNING_GAP`.
 const REBIND_STORM_WINDOW: Duration = Duration::from_secs(60);
 const REBIND_STORM_COUNT: usize = 3;
 const STORM_WARNING_GAP: Duration = Duration::from_secs(300);
@@ -66,6 +65,10 @@ struct Frame {
     left: f32,
     right: f32,
     qpc: u64,
+}
+struct QueuedFrame {
+    frame: Frame,
+    splice_before: bool,
 }
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Metrics {
@@ -80,6 +83,12 @@ pub struct Metrics {
     pub mmcss_priority_set: bool,
     pub dropped_frames: u64,
     pub underrun_packets: u64,
+    /// Missing capture frame slots at the output rate, before equalization.
+    #[serde(default)]
+    pub padded_frames: u64,
+    /// Shared pulls missing every capture slot, excluding scheduled silence.
+    #[serde(default)]
+    pub fully_padded_packets: u64,
     pub capture_frames: u64,
     pub max_queue_age_ms: f64,
     pub capture_to_send_p95_ms: Option<f64>,
@@ -109,6 +118,17 @@ pub struct Metrics {
     #[serde(default)]
     pub last_rebind_reason: Option<String>,
 }
+impl Metrics {
+    /// Keep the legacy waiting-event shape when no capture worker exists.
+    pub fn unavailable_snapshot() -> serde_json::Value {
+        let mut metrics = serde_json::json!(Self::default());
+        if let Some(fields) = metrics.as_object_mut() {
+            fields.remove("padded_frames");
+            fields.remove("fully_padded_packets");
+        }
+        metrics
+    }
+}
 /// A `{"event":"warning"}`-shaped state change raised by the capture thread.
 /// The session owns the JSON framing because the capture thread has no emitter.
 #[derive(Clone, Debug)]
@@ -121,8 +141,10 @@ struct State {
     splice: crate::continuity::Splice,
     quantizer: crate::continuity::Quantizer,
     boundary_pending: bool,
+    rebind_boundary_pending: bool,
+    last_pull_ended_missing: bool,
     equalizer: crate::equalizer::Processor,
-    frames: VecDeque<Frame>,
+    frames: VecDeque<QueuedFrame>,
     capacity: usize,
     target: usize,
     error: Option<String>,
@@ -142,14 +164,15 @@ impl State {
             self.boundary_pending = true;
             self.metrics.last_discontinuity = Some("queue_overflow".into());
         }
-        self.frames.push_back(frame);
+        self.frames.push_back(QueuedFrame {
+            frame,
+            splice_before: std::mem::take(&mut self.rebind_boundary_pending),
+        });
     }
-    /// A rebind keeps everything already encoded in `frames`: those samples are
-    /// still valid and discarding them would only add a hole. Only the resampler
-    /// input (owned by the capture thread) is flushed, and a splice boundary is
-    /// recorded so the receiver can conceal the gap cleanly.
+    /// Keep queued output from the old stream. Splice when the sender reaches
+    /// the first frame produced by the reopened stream.
     fn note_rebind(&mut self, reason: &str) {
-        self.boundary_pending = true;
+        self.rebind_boundary_pending = true;
         self.metrics.discontinuities += 1;
         self.metrics.last_discontinuity = Some(reason.into());
     }
@@ -222,6 +245,8 @@ impl Loopback {
             splice: crate::continuity::Splice::new(rate),
             quantizer: crate::continuity::Quantizer::new(),
             boundary_pending: false,
+            rebind_boundary_pending: false,
+            last_pull_ended_missing: false,
             equalizer: crate::equalizer::Processor::new(equalizer.initial(), rate),
             frames: VecDeque::with_capacity(capacity),
             capacity,
@@ -325,23 +350,35 @@ impl Loopback {
         let mut out = Vec::with_capacity(FRAMES * 4);
         let mut marker = None;
         let now = qpc_ns();
-        let mut underrun = false;
+        let mut padded = 0u64;
+        // A trim or a return from missing audio already splices at the queue head.
+        let splice_at_head = s.boundary_pending || s.last_pull_ended_missing;
         if s.boundary_pending {
             s.splice.boundary();
             s.boundary_pending = false;
         }
-        for _ in 0..FRAMES {
+        for index in 0..FRAMES {
             let missing = force_silence || s.frames.is_empty();
-            let frame = if let Some(f) = if force_silence {
+            let frame = if let Some(queued) = if force_silence {
                 None
             } else {
                 s.frames.pop_front()
             } {
-                f
+                if queued.splice_before && (index != 0 || !splice_at_head) {
+                    s.splice.boundary();
+                }
+                let age = now.saturating_sub(queued.frame.qpc) as f64 / 1e6;
+                s.metrics.max_queue_age_ms = s.metrics.max_queue_age_ms.max(age);
+                if s.ages.len() == 4000 {
+                    s.ages.pop_front();
+                }
+                s.ages.push_back(age);
+                queued.frame
             } else {
-                underrun |= !force_silence;
                 if force_silence {
                     s.metrics.scheduled_silence_frames += 1;
+                } else {
+                    padded += 1;
                 }
                 s.metrics.silence_pad_frames += 1;
                 Frame {
@@ -353,19 +390,19 @@ impl Loopback {
             if frame.left.abs().max(frame.right.abs()) > 0.004 {
                 marker.get_or_insert(frame.qpc);
             }
-            let age = now.saturating_sub(frame.qpc) as f64 / 1e6;
-            s.metrics.max_queue_age_ms = s.metrics.max_queue_age_ms.max(age);
-            if s.ages.len() == 4000 {
-                s.ages.pop_front();
-            }
-            s.ages.push_back(age);
             let processed = s.equalizer.frame([frame.left, frame.right]);
             for value in s.splice.frame(processed, gain, missing) {
                 out.extend(s.quantizer.quantize(value).to_be_bytes());
             }
         }
-        if underrun {
+        // While this pull holds the lock, missing slots can only be a suffix.
+        s.last_pull_ended_missing = force_silence || padded != 0;
+        if padded != 0 {
             s.metrics.underrun_packets += 1;
+            s.metrics.padded_frames = s.metrics.padded_frames.saturating_add(padded);
+            if padded == FRAMES as u64 {
+                s.metrics.fully_padded_packets = s.metrics.fully_padded_packets.saturating_add(1);
+            }
         }
         s.metrics.transition_count = s.splice.transitions;
         Ok((out, marker))
@@ -374,7 +411,11 @@ impl Loopback {
     pub fn discard_stale(&self) {
         let mut s = self.state.lock().unwrap();
         let cutoff = qpc_ns().saturating_sub(20_000_000);
-        while s.frames.front().is_some_and(|frame| frame.qpc < cutoff) || s.frames.len() > s.target
+        while s
+            .frames
+            .front()
+            .is_some_and(|queued| queued.frame.qpc < cutoff)
+            || s.frames.len() > s.target
         {
             s.frames.pop_front();
             s.metrics.dropped_frames += 1;
@@ -382,13 +423,12 @@ impl Loopback {
         s.boundary_pending = true;
         s.metrics.last_discontinuity = Some("scheduler_recovery".into());
     }
-    /// Age of the oldest queued capture frame: how stale the audio about to be
-    /// sent already is. Feeds the `capture_age` telemetry histogram.
-    pub fn sample_age_ms(&self) -> f64 {
+    /// Age of the oldest capture frame queued at a sender deadline. An empty
+    /// queue has no observation for the `capture_age` histogram.
+    pub fn sample_age_ms(&self) -> Option<f64> {
         let s = self.state.lock().unwrap();
-        s.frames
-            .front()
-            .map_or(0.0, |f| qpc_ns().saturating_sub(f.qpc) as f64 / 1e6)
+        let queued = s.frames.front()?;
+        Some(qpc_ns().saturating_sub(queued.frame.qpc) as f64 / 1e6)
     }
     /// `(queued, capacity)` in source frames.
     pub fn depth(&self) -> (usize, usize) {
@@ -396,9 +436,13 @@ impl Loopback {
         (s.frames.len(), s.capacity)
     }
     pub fn metrics(&self) -> Metrics {
-        let s = self.state.lock().unwrap();
-        let mut metrics = s.metrics.clone();
-        let mut ages: Vec<_> = s.ages.iter().copied().collect();
+        let (mut metrics, mut ages) = {
+            let s = self.state.lock().unwrap();
+            (
+                s.metrics.clone(),
+                s.ages.iter().copied().collect::<Vec<_>>(),
+            )
+        };
         ages.sort_by(f64::total_cmp);
         metrics.capture_to_send_p95_ms = ages.get(ages.len() * 95 / 100).copied();
         metrics
@@ -689,12 +733,8 @@ fn bind_target(target: &Target, stream_rate: u32, stop: &AtomicBool) -> Result<V
                 }
             }
             let candidates = crate::applications::matching(path)?;
-            let plan = crate::applications::bind_plan(
-                path,
-                &candidates,
-                *pinned,
-                MAX_CAPTURE_INSTANCES,
-            );
+            let plan =
+                crate::applications::bind_plan(path, &candidates, *pinned, MAX_CAPTURE_INSTANCES);
             ensure!(!plan.is_empty(), "no running instance of {path}");
             let mut bindings = Vec::with_capacity(plan.len());
             let mut last_error = None;
@@ -705,8 +745,9 @@ fn bind_target(target: &Target, stream_rate: u32, stop: &AtomicBool) -> Result<V
                 }
             }
             if bindings.is_empty() {
-                return Err(last_error
-                    .unwrap_or_else(|| anyhow::anyhow!("no running instance of {path}")));
+                return Err(
+                    last_error.unwrap_or_else(|| anyhow::anyhow!("no running instance of {path}"))
+                );
             }
             Ok(bindings)
         }
@@ -736,6 +777,22 @@ impl ReadFailure {
             message: format!("{error:#}"),
         }
     }
+}
+
+fn drain_after_capture_wait(
+    waited: WAIT_EVENT,
+    stop: &AtomicBool,
+    process_exited: bool,
+    drain: impl FnOnce() -> std::result::Result<(), ReadFailure>,
+) -> Result<Option<ReadFailure>> {
+    if stop.load(Ordering::Acquire) || (waited == WAIT_TIMEOUT && process_exited) {
+        return Ok(None);
+    }
+    if waited == WAIT_FAILED {
+        return Err(windows::core::Error::from_win32()).context("waiting for capture events");
+    }
+    // A timed-out event wait can still leave readable packets in the endpoint buffer.
+    Ok(drain().err())
 }
 
 /// Bounded work done without a successful rebind. A successful rebind resets
@@ -771,21 +828,29 @@ impl RebindBudget {
     }
 }
 
-/// Energy is only used as a probe. The cheap case (a shared-mode loopback that
-/// was already reopened) emits no packets and loses nothing, so the rate limit
-/// matters more than the threshold: never probe twice inside one backoff
-/// interval, and only after this stream has produced audio and then went quiet.
-///
 /// What the capture loop saw since the previous iteration. `Idle` means the
 /// endpoint simply had nothing ready yet and must not move any timer: the loop
 /// polls far faster than a renderer produces packets.
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum ProbeInput {
     Idle,
     Audible,
-    /// Nothing arrived past `NO_PACKET_SILENCE_AFTER`, or every delivered
-    /// sample was zero. The endpoint is either gone or intentionally muted.
-    Muted,
+    DigitalSilence,
+    Missing,
+}
+impl ProbeInput {
+    fn from_capture(received_packet: bool, audio: bool, since_packet: Duration) -> Self {
+        if received_packet {
+            if audio {
+                Self::Audible
+            } else {
+                Self::DigitalSilence
+            }
+        } else if since_packet > NO_PACKET_SILENCE_AFTER {
+            Self::Missing
+        } else {
+            Self::Idle
+        }
+    }
 }
 /// Deliberately sticky silence gate. Clearing the budget on a single non-zero
 /// sample made a silent endpoint re-probe forever: every rebind delivered a
@@ -828,7 +893,11 @@ impl SilenceProbe {
                 }
                 return false;
             }
-            ProbeInput::Muted => self.audible_since = None,
+            ProbeInput::DigitalSilence => {
+                self.interrupt();
+                return false;
+            }
+            ProbeInput::Missing => self.audible_since = None,
         }
         if !self.ever_audible {
             self.silent_since = None;
@@ -840,7 +909,10 @@ impl SilenceProbe {
         }
         // The first probe uses the one-minute gap; each probe that did not
         // restore sustained audio moves the ladder one step down.
-        let step = self.silent_probes.saturating_sub(1).min(self.intervals.len() - 1);
+        let step = self
+            .silent_probes
+            .saturating_sub(1)
+            .min(self.intervals.len() - 1);
         let interval = self.intervals[step];
         if self
             .last_probe
@@ -852,6 +924,10 @@ impl SilenceProbe {
         self.silent_since = Some(now);
         self.silent_probes = self.silent_probes.saturating_add(1);
         true
+    }
+    fn interrupt(&mut self) {
+        self.silent_since = None;
+        self.audible_since = None;
     }
 }
 
@@ -1026,19 +1102,19 @@ fn clear_pipeline(pipeline: &mut Pipeline, mixer: Option<&mut Mixer>) {
 
 /// The existing true-discontinuity behaviour: drop samples that belong to the
 /// broken stream, but keep the already-encoded queue semantics intact.
-fn mark_discontinuity(state: &Arc<Mutex<State>>, seen: &mut bool) {
+fn mark_discontinuity(state: &Arc<Mutex<State>>) {
     let mut shared = state.lock().unwrap();
     shared.metrics.dropped_frames += shared.frames.len() as u64;
     shared.frames.clear();
     shared.boundary_pending = true;
     shared.metrics.discontinuities += 1;
     shared.metrics.last_discontinuity = Some("wasapi_discontinuity".into());
-    *seen = true;
 }
 
 #[allow(clippy::too_many_arguments)]
 fn drain_single(
     binding: &mut Binding,
+    stop: &AtomicBool,
     pipeline: &mut Pipeline,
     packets: &mut usize,
     audio: &mut bool,
@@ -1048,9 +1124,10 @@ fn drain_single(
     drift: &Arc<Mutex<crate::servo::DriftEstimator>>,
     regulator: &mut crate::servo::QueueRegulator,
     last_tick: &mut Instant,
-    discontinuity_seen: &mut bool,
 ) -> std::result::Result<(), ReadFailure> {
-    while unsafe { binding.reader.GetNextPacketSize() }.map_err(ReadFailure::windows)? > 0 {
+    while !stop.load(Ordering::Acquire)
+        && unsafe { binding.reader.GetNextPacketSize() }.map_err(ReadFailure::windows)? > 0
+    {
         let (mut data, mut frames, mut flags, mut position, mut qpc) =
             (std::ptr::null_mut(), 0, 0, 0, 0);
         unsafe {
@@ -1077,7 +1154,7 @@ fn drain_single(
                 state.lock().unwrap().metrics.discontinuities_ignored += 1;
             } else {
                 clear_pipeline(pipeline, None);
-                mark_discontinuity(state, discontinuity_seen);
+                mark_discontinuity(state);
             }
         }
         binding.last_end = Some(position.saturating_add(u64::from(frames)));
@@ -1120,6 +1197,7 @@ fn drain_single(
 #[allow(clippy::too_many_arguments)]
 fn drain_multi(
     bindings: &mut [Binding],
+    stop: &AtomicBool,
     pipeline: &mut Pipeline,
     mixer: &mut Mixer,
     packets: &mut usize,
@@ -1130,12 +1208,13 @@ fn drain_multi(
     drift: &Arc<Mutex<crate::servo::DriftEstimator>>,
     regulator: &mut crate::servo::QueueRegulator,
     last_tick: &mut Instant,
-    discontinuity_seen: &mut bool,
 ) -> std::result::Result<(), ReadFailure> {
     let mut round_end: Option<u64> = None;
     for binding in bindings.iter_mut() {
         let mut binding_end = None;
-        while unsafe { binding.reader.GetNextPacketSize() }.map_err(ReadFailure::windows)? > 0 {
+        while !stop.load(Ordering::Acquire)
+            && unsafe { binding.reader.GetNextPacketSize() }.map_err(ReadFailure::windows)? > 0
+        {
             let (mut data, mut frames, mut flags, mut position, mut qpc) =
                 (std::ptr::null_mut(), 0, 0, 0, 0);
             unsafe {
@@ -1159,7 +1238,7 @@ fn drain_multi(
                     state.lock().unwrap().metrics.discontinuities_ignored += 1;
                 } else {
                     clear_pipeline(pipeline, Some(&mut *mixer));
-                    mark_discontinuity(state, discontinuity_seen);
+                    mark_discontinuity(state);
                 }
             }
             binding.last_end = Some(position.saturating_add(u64::from(frames)));
@@ -1192,9 +1271,8 @@ fn drain_multi(
             *last_packet = Instant::now();
             *packets += 1;
             state.lock().unwrap().metrics.capture_frames += frames as u64;
-            binding_end = Some(
-                timestamp.saturating_add(frames as u64 * 1_000_000_000 / binding.rate as u64),
-            );
+            binding_end =
+                Some(timestamp.saturating_add(frames as u64 * 1_000_000_000 / binding.rate as u64));
         }
         if let Some(end) = binding_end {
             round_end = Some(round_end.map_or(end, |current| current.min(end)));
@@ -1258,7 +1336,6 @@ fn capture(
     // storm warning so a genuinely dead endpoint does not log every rebind.
     let mut rebind_times: VecDeque<Instant> = VecDeque::with_capacity(8);
     let mut storm_warned_at: Option<Instant> = None;
-    let mut discontinuity_seen = false;
     let mut last_packet = Instant::now();
     while !stop.load(Ordering::Acquire) {
         // One liveness probe per loop iteration, not per packet.
@@ -1276,11 +1353,11 @@ fn capture(
         let mut packets = 0usize;
         let mut audio = false;
         let mut read_message = None;
-        let mut read_failure = None;
-        if waited != WAIT_TIMEOUT {
-            let result = if bindings.len() == 1 {
+        let read_failure = drain_after_capture_wait(waited, &stop, trigger.is_some(), || {
+            if bindings.len() == 1 {
                 drain_single(
                     &mut bindings[0],
+                    &stop,
                     &mut pipeline,
                     &mut packets,
                     &mut audio,
@@ -1290,11 +1367,11 @@ fn capture(
                     drift,
                     &mut regulator,
                     &mut last_tick,
-                    &mut discontinuity_seen,
                 )
             } else {
                 drain_multi(
                     &mut bindings,
+                    &stop,
                     &mut pipeline,
                     &mut mixer,
                     &mut packets,
@@ -1305,53 +1382,30 @@ fn capture(
                     drift,
                     &mut regulator,
                     &mut last_tick,
-                    &mut discontinuity_seen,
                 )
-            };
-            if let Err(failure) = result {
-                read_failure = Some(failure);
             }
+        })?;
+        if stop.load(Ordering::Acquire) {
+            break;
         }
         if let Some(failure) = read_failure {
             trigger = Some(failure.reason);
             read_message = Some(failure.message);
         }
         let now = Instant::now();
-        if trigger.is_none()
-            && packets == 0
-            && now.saturating_duration_since(last_packet) > Duration::from_secs(2)
-        {
-            // A silent render endpoint emits no packets. Ask each stream whether
-            // it still exists; a disconnected one is a rebind, not a fatal error.
-            for binding in &bindings {
-                if let Err(error) = unsafe { binding.reader.GetNextPacketSize() } {
-                    trigger = Some(ReadFailure::windows(error).reason);
-                    break;
-                }
-            }
-        }
-        if trigger.is_none() && budget.can_attempt() {
-            // Only a stream that delivers nothing at all is probed. Packets that
-            // are digitally silent mean the endpoint is alive (a paused player
-            // renders zeros); reopening it recovers nothing and only replays the
-            // stale loopback tail, which is how the 2026-11 rebind storm kept
-            // itself alive at a 2.4 s cadence.
-            let absent = now.saturating_duration_since(last_packet) > NO_PACKET_SILENCE_AFTER;
-            let input = if audio {
-                ProbeInput::Audible
-            } else if packets == 0 && !absent {
-                ProbeInput::Idle
-            } else {
-                ProbeInput::Muted
-            };
-            if probe.observe(now, input) {
-                state.lock().unwrap().metrics.silent_probes += 1;
-                trigger = Some("silent_probe");
-            }
+        let input = ProbeInput::from_capture(
+            packets > 0,
+            audio,
+            now.saturating_duration_since(last_packet),
+        );
+        if trigger.is_none() && budget.can_attempt() && probe.observe(now, input) {
+            state.lock().unwrap().metrics.silent_probes += 1;
+            trigger = Some("silent_probe");
         }
         let Some(reason) = trigger else {
             continue;
         };
+        probe.interrupt();
         // How long the endpoint had been quiet when the probe fired: the log line
         // separates a real loss from a probe that only replayed a stale tail.
         let silent_ms = now.saturating_duration_since(last_packet).as_millis();
@@ -1400,17 +1454,13 @@ fn capture(
                         s.metrics.rebind_failures = failures;
                         s.metrics.last_rebind_reason = Some(reason.into());
                     }
-                    // A rebind is only recovery if audio comes back. Three inside
-                    // a minute say the endpoint is being reopened in a loop, so
-                    // the log names the storm instead of repeating the same line.
+                    // Several rebinds close together are worth reporting even
+                    // when each individual open succeeded.
                     let stamp = Instant::now();
                     rebind_times.push_back(stamp);
-                    while rebind_times
-                        .front()
-                        .is_some_and(|oldest| {
-                            stamp.saturating_duration_since(*oldest) > REBIND_STORM_WINDOW
-                        })
-                    {
+                    while rebind_times.front().is_some_and(|oldest| {
+                        stamp.saturating_duration_since(*oldest) > REBIND_STORM_WINDOW
+                    }) {
                         rebind_times.pop_front();
                     }
                     let window = rebind_times.len() as u32;
@@ -1461,12 +1511,11 @@ fn capture(
                             "capture_rebind_storm",
                             false,
                             format!(
-                                "Capture stream rebound {window} times in {} s after {reason} (silent {silent_ms} ms); the endpoint is probably muted, not lost",
+                                "Capture stream rebound {window} times in {} s after {reason} (last packet {silent_ms} ms ago)",
                                 REBIND_STORM_WINDOW.as_secs()
                             ),
                         );
                     }
-                    discontinuity_seen = true;
                     last_packet = Instant::now();
                     break;
                 }
@@ -1509,6 +1558,72 @@ fn capture(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+
+    #[test]
+    fn capture_wait_drains_queued_audio_after_a_signal_or_timeout() {
+        for (waited, frames, amplitude) in [
+            (WAIT_OBJECT_0, FRAMES, 0.01),
+            (WAIT_TIMEOUT, FRAMES, 0.01),
+            (WAIT_TIMEOUT, FRAMES, 0.0),
+            (WAIT_TIMEOUT, 0, 0.0),
+        ] {
+            let source = source();
+            let stop = AtomicBool::new(false);
+            let mut pending_frames = frames;
+            let mut drains = 0;
+            let failure = drain_after_capture_wait(waited, &stop, false, || {
+                drains += 1;
+                enqueue(&source, std::mem::take(&mut pending_frames), amplitude);
+                Ok(())
+            })
+            .unwrap();
+            assert!(failure.is_none());
+            assert_eq!(drains, 1);
+            assert_eq!(pending_frames, 0);
+            let (_, marker) = source.packet(1.0).unwrap();
+            assert_eq!(marker.is_some(), amplitude > 0.0);
+            assert_eq!(source.metrics().padded_frames, (FRAMES - frames) as u64);
+        }
+    }
+
+    #[test]
+    fn capture_wait_skips_drain_for_stop_or_an_exited_process_on_timeout() {
+        let stop = AtomicBool::new(false);
+        assert!(
+            drain_after_capture_wait(WAIT_TIMEOUT, &stop, true, || panic!("process exited"))
+                .unwrap()
+                .is_none()
+        );
+        stop.store(true, Ordering::Release);
+        assert!(
+            drain_after_capture_wait(WAIT_OBJECT_0, &stop, false, || panic!("capture stopped"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn capture_wait_distinguishes_wait_failure_from_endpoint_invalidation() {
+        let stop = AtomicBool::new(false);
+        let waited = unsafe { WaitForMultipleObjects(&[HANDLE::default()], false, 0) };
+        assert_eq!(waited, WAIT_FAILED);
+        let failure = drain_after_capture_wait(waited, &stop, false, || panic!("wait failed"))
+            .err()
+            .expect("a failed wait must end capture");
+        assert_eq!(failure.to_string(), "waiting for capture events");
+        let error = failure.downcast_ref::<windows::core::Error>().unwrap();
+        assert_eq!(error.code().0 as u32, 0x8007_0006); // HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)
+
+        let read_failure = drain_after_capture_wait(WAIT_TIMEOUT, &stop, false, || {
+            Err(ReadFailure::windows(windows::core::Error::from_hresult(
+                AUDCLNT_E_DEVICE_INVALIDATED,
+            )))
+        })
+        .unwrap()
+        .expect("endpoint invalidation must reach the rebind path");
+        assert_eq!(read_failure.reason, "endpoint_lost");
+    }
 
     #[test]
     fn discontinuity_is_only_real_when_the_device_position_jumps() {
@@ -1596,20 +1711,44 @@ pub(crate) mod tests {
         let mut probe = probe();
         // A stream that never produced audio is never probed, however long the
         // endpoint sits idle: a fresh loopback has no stale tail to replay.
-        for seconds in [0, 5, 30, 120] {
-            assert!(!probe.observe(start + Duration::from_secs(seconds), ProbeInput::Muted));
+        for seconds in [0, 5, 30, 90] {
+            assert!(!probe.observe(start + Duration::from_secs(seconds), ProbeInput::Missing));
         }
         // Idle polls between packets must not move either timer.
-        assert!(!probe.observe(start + Duration::from_secs(1), ProbeInput::Idle));
+        assert!(!probe.observe(start + Duration::from_secs(91), ProbeInput::Idle));
         // Thirty seconds of contiguous audio arm the probe; 29 is not enough.
         assert!(!probe.observe(start + Duration::from_secs(100), ProbeInput::Audible));
         assert!(!probe.observe(start + Duration::from_secs(129), ProbeInput::Audible));
         assert!(!probe.observe(start + Duration::from_secs(130), ProbeInput::Audible));
         // Ten seconds of contiguous silence are required, not ten seconds since
         // the last audible packet.
-        assert!(!probe.observe(start + Duration::from_secs(131), ProbeInput::Muted));
-        assert!(!probe.observe(start + Duration::from_secs(140), ProbeInput::Muted));
-        assert!(probe.observe(start + Duration::from_secs(141), ProbeInput::Muted));
+        assert!(!probe.observe(start + Duration::from_secs(131), ProbeInput::Missing));
+        assert!(!probe.observe(start + Duration::from_secs(140), ProbeInput::Missing));
+        assert!(probe.observe(start + Duration::from_secs(141), ProbeInput::Missing));
+    }
+
+    #[test]
+    fn captured_digital_silence_does_not_trigger_a_rebind_probe() {
+        let start = Instant::now();
+        let mut probe = probe();
+        probe.observe(start, ProbeInput::Audible);
+        probe.observe(start + SILENT_PROBE_REARM, ProbeInput::Audible);
+        for seconds in 31..125 {
+            assert!(!probe.observe(
+                start + Duration::from_secs(seconds),
+                ProbeInput::from_capture(true, false, Duration::ZERO)
+            ));
+        }
+
+        let missing = ProbeInput::from_capture(
+            false,
+            false,
+            NO_PACKET_SILENCE_AFTER + Duration::from_millis(1),
+        );
+        let missing_since = start + Duration::from_secs(125);
+        assert!(!probe.observe(missing_since, missing));
+        let missing = ProbeInput::from_capture(false, false, SILENT_PROBE_WINDOW);
+        assert!(probe.observe(missing_since + SILENT_PROBE_WINDOW, missing));
     }
 
     #[test]
@@ -1618,19 +1757,16 @@ pub(crate) mod tests {
         let mut probe = probe();
         probe.observe(start, ProbeInput::Audible);
         probe.observe(start + Duration::from_secs(30), ProbeInput::Audible);
-        assert!(!probe.observe(start + Duration::from_secs(30), ProbeInput::Muted));
-        assert!(probe.observe(start + Duration::from_secs(40), ProbeInput::Muted));
+        assert!(!probe.observe(start + Duration::from_secs(30), ProbeInput::Missing));
+        assert!(probe.observe(start + Duration::from_secs(40), ProbeInput::Missing));
         // The rebound stream replays ~50 ms of the stale loopback tail, then goes
         // quiet again. That burst used to clear `last_probe` and restart the
         // two-second window, which is exactly the 2.36 s storm cadence.
         assert!(!probe.observe(start + Duration::from_secs(41), ProbeInput::Audible));
-        assert!(!probe.observe(
-            start + Duration::from_millis(41_050),
-            ProbeInput::Muted
-        ));
-        assert!(!probe.observe(start + Duration::from_secs(50), ProbeInput::Muted));
-        assert!(!probe.observe(start + Duration::from_secs(99), ProbeInput::Muted));
-        assert!(probe.observe(start + Duration::from_secs(100), ProbeInput::Muted));
+        assert!(!probe.observe(start + Duration::from_millis(41_050), ProbeInput::Missing));
+        assert!(!probe.observe(start + Duration::from_secs(50), ProbeInput::Missing));
+        assert!(!probe.observe(start + Duration::from_secs(99), ProbeInput::Missing));
+        assert!(probe.observe(start + Duration::from_secs(100), ProbeInput::Missing));
     }
 
     #[test]
@@ -1639,14 +1775,14 @@ pub(crate) mod tests {
         let mut probe = probe();
         probe.observe(start, ProbeInput::Audible);
         probe.observe(start + Duration::from_secs(30), ProbeInput::Audible);
-        probe.observe(start + Duration::from_secs(30), ProbeInput::Muted);
-        assert!(probe.observe(start + Duration::from_secs(40), ProbeInput::Muted));
-        assert!(!probe.observe(start + Duration::from_secs(99), ProbeInput::Muted));
-        assert!(probe.observe(start + Duration::from_secs(100), ProbeInput::Muted));
-        assert!(!probe.observe(start + Duration::from_secs(399), ProbeInput::Muted));
-        assert!(probe.observe(start + Duration::from_secs(400), ProbeInput::Muted));
-        assert!(!probe.observe(start + Duration::from_secs(1599), ProbeInput::Muted));
-        assert!(probe.observe(start + Duration::from_secs(1600), ProbeInput::Muted));
+        probe.observe(start + Duration::from_secs(30), ProbeInput::Missing);
+        assert!(probe.observe(start + Duration::from_secs(40), ProbeInput::Missing));
+        assert!(!probe.observe(start + Duration::from_secs(99), ProbeInput::Missing));
+        assert!(probe.observe(start + Duration::from_secs(100), ProbeInput::Missing));
+        assert!(!probe.observe(start + Duration::from_secs(399), ProbeInput::Missing));
+        assert!(probe.observe(start + Duration::from_secs(400), ProbeInput::Missing));
+        assert!(!probe.observe(start + Duration::from_secs(1599), ProbeInput::Missing));
+        assert!(probe.observe(start + Duration::from_secs(1600), ProbeInput::Missing));
     }
 
     #[test]
@@ -1655,15 +1791,15 @@ pub(crate) mod tests {
         let mut probe = probe();
         probe.observe(start, ProbeInput::Audible);
         probe.observe(start + Duration::from_secs(30), ProbeInput::Audible);
-        probe.observe(start + Duration::from_secs(30), ProbeInput::Muted);
-        assert!(probe.observe(start + Duration::from_secs(40), ProbeInput::Muted));
-        assert!(!probe.observe(start + Duration::from_secs(99), ProbeInput::Muted));
-        assert!(probe.observe(start + Duration::from_secs(100), ProbeInput::Muted));
+        probe.observe(start + Duration::from_secs(30), ProbeInput::Missing);
+        assert!(probe.observe(start + Duration::from_secs(40), ProbeInput::Missing));
+        assert!(!probe.observe(start + Duration::from_secs(99), ProbeInput::Missing));
+        assert!(probe.observe(start + Duration::from_secs(100), ProbeInput::Missing));
         // Audio really returns for half a minute: the ladder restarts at a minute.
         assert!(!probe.observe(start + Duration::from_secs(200), ProbeInput::Audible));
         assert!(!probe.observe(start + Duration::from_secs(230), ProbeInput::Audible));
-        assert!(!probe.observe(start + Duration::from_secs(231), ProbeInput::Muted));
-        assert!(probe.observe(start + Duration::from_secs(241), ProbeInput::Muted));
+        assert!(!probe.observe(start + Duration::from_secs(231), ProbeInput::Missing));
+        assert!(probe.observe(start + Duration::from_secs(241), ProbeInput::Missing));
     }
 
     #[test]
@@ -1681,7 +1817,7 @@ pub(crate) mod tests {
         let mut clock = Duration::from_secs(30);
         let deadline = Duration::from_secs(30 + 27 * 60);
         while clock < deadline {
-            if probe.observe(start + clock, ProbeInput::Muted) {
+            if probe.observe(start + clock, ProbeInput::Missing) {
                 fired += 1;
                 // The rebind itself replays the stale tail, then silence returns.
                 clock += Duration::from_millis(50);
@@ -1777,23 +1913,22 @@ pub(crate) mod tests {
         );
     }
     const CAPACITY: usize = crate::rtp::RATE as usize * 60 / 1000;
-    const TARGET: usize = crate::rtp::RATE as usize * 20 / 1000;
     pub(crate) fn source() -> Loopback {
-        let equalizer_control =
-            crate::equalizer::Control::new(crate::equalizer::Settings::default(), crate::rtp::RATE)
-                .unwrap();
+        source_with(crate::rtp::RATE, crate::equalizer::Settings::default())
+    }
+    fn source_with(rate: u32, settings: crate::equalizer::Settings) -> Loopback {
+        let equalizer_control = crate::equalizer::Control::new(settings, rate).unwrap();
         Loopback {
             state: Arc::new(Mutex::new(State {
-                splice: crate::continuity::Splice::new(crate::rtp::RATE),
+                splice: crate::continuity::Splice::new(rate),
                 quantizer: crate::continuity::Quantizer::new(),
                 boundary_pending: false,
-                equalizer: crate::equalizer::Processor::new(
-                    equalizer_control.initial(),
-                    crate::rtp::RATE,
-                ),
+                rebind_boundary_pending: false,
+                last_pull_ended_missing: false,
+                equalizer: crate::equalizer::Processor::new(equalizer_control.initial(), rate),
                 frames: VecDeque::new(),
-                capacity: CAPACITY,
-                target: TARGET,
+                capacity: rate as usize * 60 / 1000,
+                target: rate as usize * 20 / 1000,
                 error: None,
                 ended: false,
                 metrics: Metrics::default(),
@@ -1804,7 +1939,7 @@ pub(crate) mod tests {
             servo: Arc::new(Mutex::new(crate::servo::LatenessServo::default())),
             drift: Arc::new(Mutex::new(crate::servo::DriftEstimator::new(
                 Duration::from_secs(30),
-                crate::rtp::RATE as f64,
+                f64::from(rate),
             ))),
             worker: None,
             equalizer_control,
@@ -1843,6 +1978,263 @@ pub(crate) mod tests {
         assert_eq!(source.last_audio(), activity);
         source.discard_stale();
         assert_eq!(source.last_audio(), activity);
+    }
+    fn enqueue(source: &Loopback, count: usize, sample: f32) {
+        let mut state = source.state.lock().unwrap();
+        let qpc = qpc_ns();
+        for _ in 0..count {
+            state.push_frame(Frame {
+                left: sample,
+                right: sample,
+                qpc,
+            });
+        }
+    }
+    #[test]
+    fn capture_age_ignores_padding_and_scheduled_silence() {
+        for rate in [44100, 48000] {
+            let source = source_with(rate, crate::equalizer::Settings::default());
+            source.packet(0.1).unwrap();
+            assert_eq!(source.metrics().capture_to_send_p95_ms, None);
+
+            // Genuine captured digital silence still has a capture timestamp.
+            enqueue(&source, 3, 0.0);
+            source.silence_packet(0.1).unwrap();
+            assert_eq!(source.depth().0, 3);
+            assert_eq!(source.metrics().capture_to_send_p95_ms, None);
+
+            source.packet(0.1).unwrap();
+            assert_eq!(source.state.lock().unwrap().ages.len(), 3);
+            let captured = source.metrics();
+            assert!(captured.capture_to_send_p95_ms.is_some());
+            assert_eq!(captured.padded_frames, (2 * FRAMES - 3) as u64);
+            assert_eq!(captured.fully_padded_packets, 1);
+
+            // Synthetic silence must not evict previous capture observations.
+            for _ in 0..12 {
+                source.silence_packet(0.1).unwrap();
+            }
+            assert_eq!(source.state.lock().unwrap().ages.len(), 3);
+            assert_eq!(
+                source.metrics().capture_to_send_p95_ms,
+                captured.capture_to_send_p95_ms
+            );
+        }
+    }
+    #[test]
+    fn sender_deadline_sample_distinguishes_an_empty_queue_from_zero_age() {
+        let source = source();
+        assert_eq!(source.sample_age_ms(), None);
+        {
+            let mut state = source.state.lock().unwrap();
+            // A future timestamp gives an exact zero after saturating subtraction.
+            for qpc in [u64::MAX, 0] {
+                state.push_frame(Frame {
+                    left: 0.0,
+                    right: 0.0,
+                    qpc,
+                });
+            }
+        }
+        assert_eq!(source.sample_age_ms(), Some(0.0));
+        source.packet(0.1).unwrap();
+        assert_eq!(source.sample_age_ms(), None);
+    }
+    #[test]
+    fn padding_counts_missing_output_frames_at_both_rates() {
+        for rate in [44100, 48000] {
+            for count in [0, FRAMES - 1, FRAMES] {
+                let source = source_with(rate, crate::equalizer::Settings::default());
+                enqueue(&source, count, 0.01);
+                let (packet, marker) = source.packet(0.1).unwrap();
+                assert_eq!(packet.len(), FRAMES * 4);
+                assert_eq!(marker.is_some(), count > 0);
+                let metrics = source.metrics();
+                assert_eq!(metrics.padded_frames, (FRAMES - count) as u64);
+                assert_eq!(metrics.fully_padded_packets, if count == 0 { 1 } else { 0 });
+                assert_eq!(metrics.underrun_packets, if count < FRAMES { 1 } else { 0 });
+                assert!(source.state.lock().unwrap().frames.is_empty());
+            }
+        }
+    }
+    #[test]
+    fn padding_accumulates_across_missing_and_resumed_capture_without_input_rate_math() {
+        for rate in [44100, 48000] {
+            let source = source_with(rate, crate::equalizer::Settings::default());
+            {
+                let mut state = source.state.lock().unwrap();
+                state.metrics.input_rate = 96000;
+                state.metrics.capture_frames = 100_000;
+            }
+            enqueue(&source, FRAMES - 1, 0.01);
+            assert!(source.packet(0.1).unwrap().0.iter().any(|byte| *byte != 0));
+            assert_eq!(source.metrics().padded_frames, 1);
+            source.packet(0.1).unwrap();
+            let before_resume = source.metrics();
+            enqueue(&source, FRAMES, 0.01);
+            assert!(source.packet(0.1).unwrap().0.iter().any(|byte| *byte != 0));
+            let after_resume = source.metrics();
+            assert_eq!(after_resume.padded_frames, FRAMES as u64 + 1);
+            assert_eq!(after_resume.fully_padded_packets, 1);
+            assert_eq!(after_resume.underrun_packets, 2);
+            assert_eq!(after_resume.padded_frames, before_resume.padded_frames);
+            assert_eq!(
+                after_resume.fully_padded_packets,
+                before_resume.fully_padded_packets
+            );
+            assert_eq!(after_resume.input_rate, 96000);
+            assert_eq!(after_resume.capture_frames, 100_000);
+        }
+    }
+    #[test]
+    fn captured_silence_and_zero_gain_are_not_padding() {
+        for rate in [44100, 48000] {
+            for (sample, gain) in [(0.0, 0.1), (0.5, 0.0)] {
+                let source = source_with(rate, crate::equalizer::Settings::default());
+                enqueue(&source, FRAMES, sample);
+                let (packet, marker) = source.packet(gain).unwrap();
+                assert!(packet.iter().all(|byte| *byte == 0));
+                assert_eq!(marker.is_some(), sample > 0.004);
+                let metrics = source.metrics();
+                assert_eq!(metrics.padded_frames, 0);
+                assert_eq!(metrics.fully_padded_packets, 0);
+                assert_eq!(metrics.underrun_packets, 0);
+            }
+        }
+    }
+    #[test]
+    fn fully_padded_input_can_have_an_equalizer_tail_without_an_audio_marker() {
+        for rate in [44100, 48000] {
+            let mut settings = crate::equalizer::Settings {
+                enabled: true,
+                ..Default::default()
+            };
+            settings.band_gains_db[0] = 12.0;
+            let source = source_with(rate, settings);
+            enqueue(&source, 1, 0.5);
+            assert!(source.packet(1.0).unwrap().1.is_some());
+            let last_audio = source.metrics().last_audio_qpc_ns;
+            let (tail, marker) = source.packet(1.0).unwrap();
+            assert!(tail.iter().any(|byte| *byte != 0));
+            assert!(marker.is_none());
+            let metrics = source.metrics();
+            assert_eq!(metrics.padded_frames, FRAMES as u64 * 2 - 1);
+            assert_eq!(metrics.fully_padded_packets, 1);
+            assert_eq!(metrics.underrun_packets, 2);
+            assert_eq!(metrics.last_audio_qpc_ns, last_audio);
+        }
+    }
+    #[test]
+    fn padding_counters_saturate_and_serialize_without_wrapping_or_counting_reads() {
+        for rate in [44100, 48000] {
+            let source = source_with(rate, crate::equalizer::Settings::default());
+            {
+                let mut state = source.state.lock().unwrap();
+                state.metrics.padded_frames = u64::MAX - 100;
+                state.metrics.fully_padded_packets = u64::MAX - 1;
+            }
+            source.packet(0.1).unwrap();
+            source.packet(0.1).unwrap();
+            for _ in 0..2 {
+                let metrics = source.metrics();
+                assert_eq!(metrics.padded_frames, u64::MAX);
+                assert_eq!(metrics.fully_padded_packets, u64::MAX);
+                assert_eq!(metrics.underrun_packets, 2);
+                let event = serde_json::json!({ "event": "capture_metrics", "metrics": metrics });
+                let wire = serde_json::to_vec(&event).unwrap();
+                let received: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+                assert_eq!(
+                    received["metrics"]["padded_frames"].as_u64(),
+                    Some(u64::MAX)
+                );
+                assert_eq!(
+                    received["metrics"]["fully_padded_packets"].as_u64(),
+                    Some(u64::MAX)
+                );
+                assert_eq!(received["metrics"]["underrun_packets"].as_u64(), Some(2));
+            }
+        }
+    }
+    #[test]
+    fn capture_error_preserves_padding_snapshot_and_a_fresh_attempt_starts_at_zero() {
+        for rate in [44100, 48000] {
+            let source = source_with(rate, crate::equalizer::Settings::default());
+            source.packet(0.1).unwrap();
+            let before_fault = source.metrics();
+            enqueue(&source, 1, 0.01);
+            source.state.lock().unwrap().error = Some("synthetic capture failure".into());
+            assert!(source.packet(0.1).is_err());
+            let after_fault = source.metrics();
+            assert_eq!(after_fault.padded_frames, before_fault.padded_frames);
+            assert_eq!(
+                after_fault.fully_padded_packets,
+                before_fault.fully_padded_packets
+            );
+            assert_eq!(after_fault.underrun_packets, before_fault.underrun_packets);
+            assert_eq!(source.state.lock().unwrap().frames.len(), 1);
+            let fresh = source_with(rate, crate::equalizer::Settings::default());
+            assert_eq!(fresh.metrics().padded_frames, 0);
+            assert_eq!(fresh.metrics().fully_padded_packets, 0);
+            assert_eq!(fresh.metrics().underrun_packets, 0);
+            assert_eq!(before_fault.padded_frames, FRAMES as u64);
+            assert_eq!(before_fault.fully_padded_packets, 1);
+        }
+    }
+    #[test]
+    fn scheduled_warmup_and_final_fade_are_not_missing_capture() {
+        for rate in [44100, 48000] {
+            for count in [0, FRAMES - 1, FRAMES] {
+                let source = source_with(rate, crate::equalizer::Settings::default());
+                enqueue(&source, count, 0.01);
+                for gain in [0.1, 0.0] {
+                    source.silence_packet(gain).unwrap();
+                    let metrics = source.metrics();
+                    assert_eq!(metrics.padded_frames, 0);
+                    assert_eq!(metrics.fully_padded_packets, 0);
+                    assert_eq!(metrics.underrun_packets, 0);
+                    assert_eq!(source.state.lock().unwrap().frames.len(), count);
+                }
+                assert_eq!(
+                    source.metrics().scheduled_silence_frames,
+                    (FRAMES * 2) as u64
+                );
+                assert_eq!(source.metrics().silence_pad_frames, (FRAMES * 2) as u64);
+                source.packet(0.1).unwrap();
+                assert_eq!(source.metrics().padded_frames, (FRAMES - count) as u64);
+                assert_eq!(
+                    source.metrics().fully_padded_packets,
+                    if count == 0 { 1 } else { 0 }
+                );
+                assert_eq!(
+                    source.metrics().scheduled_silence_frames,
+                    (FRAMES * 2) as u64
+                );
+            }
+        }
+    }
+    #[test]
+    fn stereo_channel_fanout_does_not_count_another_capture_pull() {
+        for rate in [44100, 48000] {
+            let source = source_with(rate, crate::equalizer::Settings::default());
+            let (pcm, _) = source.packet(0.1).unwrap();
+            for channel in [
+                crate::profile::Channel::Left,
+                crate::profile::Channel::Right,
+            ] {
+                assert_eq!(channel.map(&pcm).len(), FRAMES * 4);
+            }
+            let metrics = source.metrics();
+            assert_eq!(metrics.padded_frames, FRAMES as u64);
+            assert_eq!(metrics.fully_padded_packets, 1);
+            assert_eq!(metrics.underrun_packets, 1);
+            // Paused standby/discard operations retain this capture worker. A new
+            // application capture creates another Loopback with fresh counters.
+            source.discard_stale();
+            assert_eq!(source.metrics().padded_frames, FRAMES as u64);
+            let fresh = source_with(rate, crate::equalizer::Settings::default());
+            assert_eq!(fresh.metrics().padded_frames, 0);
+            assert_eq!(fresh.metrics().fully_padded_packets, 0);
+        }
     }
     #[test]
     fn underrun_pads_silence_and_can_resume_audio() {
@@ -1886,8 +2278,14 @@ pub(crate) mod tests {
         // Output is TPDF-dithered, so a single sample may sit one LSB either side.
         let left = i16::from_be_bytes([last[0], last[1]]);
         let right = i16::from_be_bytes([last[2], last[3]]);
-        assert!((i32::from(left) - i32::from(expected)).abs() <= 1, "{left} vs {expected}");
-        assert!((i32::from(right) + i32::from(expected)).abs() <= 1, "{right} vs -{expected}");
+        assert!(
+            (i32::from(left) - i32::from(expected)).abs() <= 1,
+            "{left} vs {expected}"
+        );
+        assert!(
+            (i32::from(right) + i32::from(expected)).abs() <= 1,
+            "{right} vs -{expected}"
+        );
         assert!(marker.is_some());
     }
     #[test]
@@ -1911,8 +2309,80 @@ pub(crate) mod tests {
         assert_eq!(source.metrics().underrun_packets, 1);
     }
     #[test]
+    fn rebind_splices_at_the_first_new_frame_inside_a_packet() {
+        for rate in [44100, 48000] {
+            let source = source_with(rate, crate::equalizer::Settings::default());
+            let join = 23;
+            enqueue(&source, FRAMES, 0.25);
+            source.packet(1.0).unwrap();
+            let before = source.metrics().transition_count;
+
+            enqueue(&source, FRAMES + join, 0.25);
+            source.state.lock().unwrap().note_rebind("silent_probe");
+            enqueue(&source, FRAMES, -0.25);
+            source.packet(1.0).unwrap();
+            let before_join = source.metrics().transition_count;
+
+            let (pcm, _) = source.packet(1.0).unwrap();
+            let left =
+                |frame: usize| i32::from(i16::from_be_bytes([pcm[frame * 4], pcm[frame * 4 + 1]]));
+            let jump = (left(join) - left(join - 1)).abs();
+            assert!(
+                jump <= 2,
+                "PCM jumped {jump} LSB at the rebind join at {rate} Hz"
+            );
+            assert!(left(join - 1) > 8000 && left(FRAMES - 1) < -8000);
+            assert_eq!(before_join, before);
+            assert_eq!(source.metrics().transition_count, before + 1);
+            assert_eq!(source.metrics().padded_frames, 0);
+        }
+    }
+    #[test]
+    fn queued_rebind_splices_survive_scheduled_silence() {
+        let source = source();
+        enqueue(&source, FRAMES, 0.25);
+        source.packet(1.0).unwrap();
+        enqueue(&source, FRAMES, 0.25);
+        for sample in [-0.25, 0.25] {
+            source.state.lock().unwrap().note_rebind("silent_probe");
+            enqueue(&source, FRAMES, sample);
+        }
+
+        source.silence_packet(1.0).unwrap();
+        let before = source.metrics().transition_count;
+        // One missing-to-present splice for the old audio, then one per rebind.
+        for added in 1..=3 {
+            source.packet(1.0).unwrap();
+            assert_eq!(source.metrics().transition_count, before + added);
+        }
+    }
+    #[test]
+    fn a_rebind_at_the_queue_head_reuses_the_existing_splice() {
+        for missing in [false, true] {
+            let source = source();
+            enqueue(&source, FRAMES, 0.25);
+            source.packet(1.0).unwrap();
+            if !missing {
+                enqueue(&source, 1, 0.25);
+            }
+            source.state.lock().unwrap().note_rebind("silent_probe");
+            // In the trim case, overflow drops the last old frame and puts the
+            // first new frame at the head with an immediate splice pending.
+            enqueue(&source, if missing { FRAMES } else { CAPACITY }, -0.25);
+            if missing {
+                source.silence_packet(1.0).unwrap();
+            }
+            let before = source.metrics().transition_count;
+            source.packet(1.0).unwrap();
+            assert_eq!(source.metrics().transition_count, before + 1);
+            assert_eq!(source.metrics().dropped_frames, if missing { 0 } else { 1 });
+        }
+    }
+    #[test]
     fn rebind_keeps_already_encoded_frames_and_only_marks_a_boundary() {
         let source = source();
+        source.packet(0.1).unwrap();
+        let before = source.metrics().transition_count;
         {
             let mut s = source.state.lock().unwrap();
             for _ in 0..FRAMES {
@@ -1923,20 +2393,33 @@ pub(crate) mod tests {
                 });
             }
             let queued = s.frames.len();
-            let before = s.metrics.discontinuities;
-            assert!(!s.boundary_pending);
+            let discontinuities = s.metrics.discontinuities;
             s.note_rebind("process_exit");
             // Reopening the capture endpoint must not throw away valid audio.
             assert_eq!(s.frames.len(), queued);
             assert_eq!(s.metrics.dropped_frames, 0);
-            assert!(s.boundary_pending);
-            assert_eq!(s.metrics.discontinuities, before + 1);
+            assert_eq!(s.metrics.discontinuities, discontinuities + 1);
             assert_eq!(
                 s.metrics.last_discontinuity.as_deref(),
                 Some("process_exit")
             );
         }
         assert!(source.packet(0.1).unwrap().0.iter().any(|b| *b != 0));
+        let metrics = source.metrics();
+        assert_eq!(metrics.transition_count, before + 1);
+        assert_eq!(metrics.padded_frames, FRAMES as u64);
+        assert_eq!(metrics.fully_padded_packets, 1);
+        assert_eq!(metrics.underrun_packets, 1);
+    }
+    #[test]
+    fn waiting_without_a_worker_does_not_report_measured_zero_padding() {
+        let waiting = Metrics::unavailable_snapshot();
+        assert!(waiting.get("padded_frames").is_none());
+        assert!(waiting.get("fully_padded_packets").is_none());
+        assert_eq!(waiting["underrun_packets"].as_u64(), Some(0));
+        let active = serde_json::json!(source().metrics());
+        assert_eq!(active["padded_frames"].as_u64(), Some(0));
+        assert_eq!(active["fully_padded_packets"].as_u64(), Some(0));
     }
     #[test]
     fn capture_warnings_are_queued_and_drained_once() {

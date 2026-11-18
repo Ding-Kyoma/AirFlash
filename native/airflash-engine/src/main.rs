@@ -94,7 +94,9 @@ fn sound_glow_event(running: Option<&Running>, session: &str, params: Value) -> 
     })();
     match result {
         Ok(()) => json!({"event":"sound_glow_queued","sequence":sequence}),
-        Err(error) => json!({"event":"sound_glow_error","sequence":sequence,"message":error.to_string()}),
+        Err(error) => {
+            json!({"event":"sound_glow_error","sequence":sequence,"message":error.to_string()})
+        }
     }
 }
 
@@ -258,7 +260,7 @@ fn main() {
             "hello" => send(
                 &request.id,
                 &request.session_id,
-                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"experimental","live_loopback":true,"capabilities":capabilities(),"commands":["hello","get_receiver_capabilities","list_applications","start","probe","stop","set_gain","set_sound_glow","set_equalizer","set_standby","set_device_volume","set_lead","set_now_playing","pair","pair_pin"],"production_ready":false}),
+                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"experimental","live_loopback":true,"capabilities":capabilities(),"commands":["hello","get_receiver_capabilities","list_applications","start","probe","stop","set_gain","set_sound_glow","set_equalizer","set_standby","set_device_volume","set_lead","set_now_playing","pair","pair_pin","diag_summary"],"production_ready":false}),
             ),
             "get_receiver_capabilities" => {
                 let result = (|| -> anyhow::Result<_> {
@@ -685,20 +687,58 @@ mod tests {
     fn sound_glow_requires_current_live_session_and_monotonic_commands() {
         let mut active = stored_start(44100);
         let command = json!({"sequence":1,"palette":"red"});
-        assert_eq!(sound_glow_event(None, "eq-session", command.clone())["event"], "sound_glow_error");
-        assert_eq!(sound_glow_event(Some(&active), "stale-session", command.clone())["event"], "sound_glow_error");
+        assert_eq!(
+            sound_glow_event(None, "eq-session", command.clone())["event"],
+            "sound_glow_error"
+        );
+        assert_eq!(
+            sound_glow_event(Some(&active), "stale-session", command.clone())["event"],
+            "sound_glow_error"
+        );
         assert!(!active.sound_glow.is_active());
-        assert_eq!(sound_glow_event(Some(&active), "eq-session", command.clone())["event"], "sound_glow_queued");
-        assert_eq!(sound_glow_event(Some(&active), "eq-session", command.clone())["event"], "sound_glow_error");
-        assert_eq!(sound_glow_event(Some(&active), "eq-session", json!({"sequence":2,"palette":"rainbow"}))["event"], "sound_glow_error");
+        assert_eq!(
+            sound_glow_event(Some(&active), "eq-session", command.clone())["event"],
+            "sound_glow_queued"
+        );
+        assert_eq!(
+            sound_glow_event(Some(&active), "eq-session", command.clone())["event"],
+            "sound_glow_error"
+        );
+        assert_eq!(
+            sound_glow_event(
+                Some(&active),
+                "eq-session",
+                json!({"sequence":2,"palette":"rainbow"})
+            )["event"],
+            "sound_glow_error"
+        );
         active.cancel.cancel();
-        assert_eq!(sound_glow_event(Some(&active), "eq-session", json!({"sequence":2,"palette":"blue"}))["event"], "sound_glow_error");
+        assert_eq!(
+            sound_glow_event(
+                Some(&active),
+                "eq-session",
+                json!({"sequence":2,"palette":"blue"})
+            )["event"],
+            "sound_glow_error"
+        );
         active = stored_start(44100);
-        active.sound_glow.disable("test initialization failure".into());
-        assert_eq!(sound_glow_event(Some(&active), "eq-session", json!({"sequence":1,"palette":"green"}))["event"], "sound_glow_error");
+        active
+            .sound_glow
+            .disable("test initialization failure".into());
+        assert_eq!(
+            sound_glow_event(
+                Some(&active),
+                "eq-session",
+                json!({"sequence":1,"palette":"green"})
+            )["event"],
+            "sound_glow_error"
+        );
         assert!(!active.sound_glow.is_active());
         active.equalizer = None;
-        assert_eq!(sound_glow_event(Some(&active), "eq-session", command)["event"], "sound_glow_error");
+        assert_eq!(
+            sound_glow_event(Some(&active), "eq-session", command)["event"],
+            "sound_glow_error"
+        );
     }
 
     #[test]
