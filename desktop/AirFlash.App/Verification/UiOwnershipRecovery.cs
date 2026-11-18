@@ -16,7 +16,7 @@ internal static class UiOwnershipRecovery
             settings.ForceReconnect = true; settings.MuteWhileStreaming = true; store.Save(settings);
             var receiver = new Receiver("ownership-test", "Ownership test", "192.0.2.10");
             var discovery = new MockDiscovery { Items = [receiver] }; var audio = new MockAudio(); var engine = new MockFactory();
-            await using var app = new AppViewModel(store, discovery, new MockAutostart(), audio, engine, Application.Current.Dispatcher);
+            await using var app = new AppViewModel(store, discovery, new MockAutostart(), audio, engine, Application.Current.Dispatcher, isolatedVerification: true);
             app.SetPanelVisible(true); app.Start(); await app.Startup;
             await app.TryAutoConnectAsync();
             await Until(() => app.Snapshot.State == PlaybackState.Streaming);
@@ -34,6 +34,19 @@ internal static class UiOwnershipRecovery
             await app.ApplyAsync(baseline, draft); discovery.Publish(); await app.TryAutoConnectAsync();
             Check(engine.CreatedCount == 1 && app.CanReconnect,
                 code + " survives rediscovery and automatic-connection settings refresh", checks);
+            var availability = new List<bool>();
+            app.ReconnectCommand.CanExecuteChanged += (_, _) => availability.Add(app.ReconnectCommand.CanExecute(null));
+            await app.ApplyDiscoveryAsync([]);
+            Check(!app.CanReconnect && !app.ReconnectCommand.CanExecute(null) && availability.Contains(false),
+                code + " withdraws manual reconnect while the receiver is unavailable", checks);
+            app.ReconnectCommand.Execute(null);
+            Check(engine.CreatedCount == 1 && app.Session.RequiresManualReconnect,
+                code + " keeps manual recovery pending without starting an unavailable receiver", checks);
+            availability.Clear();
+            await app.ApplyDiscoveryAsync([receiver]);
+            await app.TryAutoConnectAsync();
+            Check(app.CanReconnect && app.ReconnectCommand.CanExecute(null) && availability.Contains(true) && engine.CreatedCount == 1,
+                code + " restores manual reconnect when the receiver returns without starting automatically", checks);
             app.ReconnectCommand.Execute(null);
             await Until(() => engine.CreatedCount == 2 && app.Snapshot.State == PlaybackState.Streaming);
             Check(engine.Commands.Last(c => c.Text("command") == "start").GetProperty("params").Text("intent") == "manual"

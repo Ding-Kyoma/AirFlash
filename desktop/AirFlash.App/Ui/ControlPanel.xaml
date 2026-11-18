@@ -86,8 +86,20 @@
         <Button Grid.Column="2" Style="{StaticResource IconButton}" ToolTip="{loc:Text 'Quit'}" AutomationProperties.Name="{loc:Text 'Quit'}" Click="OnQuit" Margin="0,0,0,0"><Viewbox Width="18" Height="18"><Path Data="M 10,3 L 3,3 3,21 10,21 M 8,12 L 22,12 M 17,7 L 22,12 17,17" Stroke="{DynamicResource TextBrush}" StrokeThickness="1.6" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"/></Viewbox></Button>
       </Grid>
       <StackPanel Grid.Row="1">
-      <Border Padding="10" CornerRadius="6" Background="{DynamicResource TintBrush}" Margin="0,0,0,12" Visibility="{Binding Notice, Converter={StaticResource NonEmpty}}">
-        <TextBlock Text="{Binding Notice}" Style="{StaticResource Hint}"/>
+      <Border x:Name="MuteRecoveryBanner" Padding="10" CornerRadius="6" Background="{DynamicResource TintBrush}" Margin="0,0,0,12" Visibility="{Binding HasMuteRecovery, Converter={StaticResource BoolVisibility}}">
+        <StackPanel>
+          <TextBlock Text="{Binding MuteRecoveryMessage}" Style="{StaticResource Hint}"/>
+          <Button x:Name="ReviewMuteRecoveryButton" Content="{loc:Text 'Review local audio'}" Command="{Binding ReviewMuteRecoveryCommand}" HorizontalAlignment="Left" Margin="0,8,0,0"/>
+        </StackPanel>
+      </Border>
+      <Border x:Name="NoticeBanner" Padding="10" CornerRadius="6" Background="{DynamicResource TintBrush}" Margin="0,0,0,12" Visibility="{Binding HasNotice, Converter={StaticResource BoolVisibility}}">
+        <Grid>
+          <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+          <TextBlock Text="{Binding Notice}" Style="{StaticResource Hint}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+          <Button x:Name="DismissNoticeButton" Grid.Column="1" Command="{Binding DismissNoticeCommand}" Style="{StaticResource IconButton}" Width="28" Height="28" MinHeight="28" VerticalAlignment="Top" ToolTip="{loc:Text 'Dismiss notification'}" AutomationProperties.Name="{loc:Text 'Dismiss notification'}">
+            <Path Data="M 3,3 L 13,13 M 13,3 L 3,13" Width="12" Height="12" Stretch="Uniform" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType={x:Type Button}}}" StrokeThickness="1.6" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+          </Button>
+        </Grid>
       </Border>
       <Border Padding="10" CornerRadius="6" Background="{DynamicResource TintBrush}" Margin="0,0,0,12" Visibility="{Binding EngineMessage, Converter={StaticResource NonEmpty}}">
         <StackPanel>
@@ -97,6 +109,11 @@
       </Border>
       </StackPanel>
       <ScrollViewer x:Name="DeviceScroll" Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" MaxHeight="480">
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
         <StackPanel>
           <Border x:Name="EmptyState" Padding="18,28">
             <Border.Style>
@@ -261,6 +278,12 @@
             </ItemsControl.ItemTemplate>
           </ItemsControl>
         </StackPanel>
+          <!-- The Fluent scrollbar overlays the viewport. Reserve room only while it is shown. -->
+          <Border x:Name="DeviceScrollGutter" Grid.Column="1"
+                  Width="{DynamicResource {x:Static SystemParameters.VerticalScrollBarWidthKey}}"
+                  Margin="8,0,0,0" IsHitTestVisible="False"
+                  Visibility="{Binding ComputedVerticalScrollBarVisibility, ElementName=DeviceScroll}"/>
+        </Grid>
       </ScrollViewer>
       <StackPanel Grid.Row="3">
         <Grid Margin="2,4,2,14" Visibility="{Binding Settings.ShowStreamingModes, Converter={StaticResource BoolVisibility}}">
@@ -290,10 +313,15 @@
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="40"/>
                 <ColumnDefinition Width="Auto" SharedSizeGroup="VolumeMute"/>
+                <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
               <Slider Style="{StaticResource VolumeSlider}" Grid.Column="1" Minimum="0" Maximum="100" TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding MasterVolume, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Center" AutomationProperties.Name="{loc:Text 'Master volume'}" PreviewMouseLeftButtonDown="OnSliderPreviewMouseLeftButtonDown"/>
               <TextBlock Grid.Column="2" Text="{Binding MasterVolume, StringFormat={}{0}%}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
               <Button Grid.Column="3" Style="{StaticResource VolumeMuteButton}" Content="{Binding MuteLabel}" Command="{Binding MuteCommand}" AutomationProperties.Name="{Binding MuteLabel}"/>
+              <Border Grid.Column="4" IsHitTestVisible="False"
+                      Width="{Binding ActualWidth, ElementName=DeviceScrollGutter}"
+                      Margin="{Binding Margin, ElementName=DeviceScrollGutter}"
+                      Visibility="{Binding Visibility, ElementName=DeviceScrollGutter}"/>
             </Grid>
           </StackPanel>
         </Border>

@@ -13,7 +13,7 @@ internal static class UiEqualizer
     public static async Task RunAsync(List<string> checks, string directory)
     {
         var store = new UiSmoke.MemoryStore(); var audio = new UiSmoke.MockAudio(); var engine = new UiSmoke.MockFactory();
-        await using var app = new AppViewModel(store, new UiSmoke.MockDiscovery(), new UiSmoke.MockAutostart(), audio, engine, Application.Current.Dispatcher);
+        await using var app = new AppViewModel(store, new UiSmoke.MockDiscovery(), new UiSmoke.MockAutostart(), audio, engine, Application.Current.Dispatcher, isolatedVerification: true);
         app.SetPanelVisible(true); app.Start(); await app.Startup;
         var window = new SettingsWindow(app); window.Show(); await Pump();
         try
@@ -25,8 +25,12 @@ internal static class UiEqualizer
             Check(audio.Enumerations == 0 && !vm.Equalizer.Enabled && !vm.HasChanges, "equalizer opens disabled without enumerating audio", checks);
             var sliders = UiSmoke.Descendants(window).OfType<Slider>().Where(s => s.Orientation == Orientation.Vertical).ToArray();
             Check(sliders.Length == 10 && sliders.All(s => !s.IsEnabled && s.TickFrequency == 0.5 && s.Minimum == -12 && s.Maximum == 12), "ten disabled half-decibel frequency sliders", checks);
-            await app.ToggleAsync(app.AllReceivers.First(r => r.Online));
-            await Until(() => app.Snapshot.State == PlaybackState.Streaming);
+            var receiver = app.AllReceivers.First(r => r.Online && !r.IsGroup);
+            await app.ToggleAsync(receiver);
+            // The confirmed initial volume belongs to startup, before the EQ test's save baseline.
+            await Until(() => app.Snapshot.State == PlaybackState.Streaming && app.Settings.ReadOptions(receiver.Id).LastVolume == 28);
+            await app.FlushVolumeAsync();
+            Check(store.Saved.ReadOptions(receiver.Id).LastVolume == 28, "initial device volume is saved before the equalizer preview", checks);
             var starts = engine.CreatedCount; var saves = store.Saves;
             var enabled = UiSmoke.Descendants(window).OfType<CheckBox>().Single(c => (string?)c.Content == L.Get("Enable equalizer"));
             enabled.IsChecked = true;
@@ -36,7 +40,8 @@ internal static class UiEqualizer
             sliders[0].Value = 7.5;
             var preamp = UiSmoke.Descendants(window).OfType<Slider>().Single(s => s.Orientation == Orientation.Horizontal);
             preamp.Value = -3.5;
-            await Until(() => LatestGain(engine) == 7.5);
+            await Until(() => LatestGain(engine) == 7.5 && LatestEqualizer(engine).Number("preamp_db") == -3.5);
+            await app.FlushVolumeAsync();
             Check(vm.Equalizer.SelectedPreset == "custom" && vm.Draft.Equalizer.PreampDb == -3.5 && store.Saves == saves && !app.Settings.Equalizer.Enabled && engine.CreatedCount == starts, "sliders preview custom sound without saving or reconnecting", checks);
             vm.Equalizer.ResetCommand.Execute(null); await Until(() => LatestGain(engine) == 0);
             Check(vm.Equalizer.Enabled && vm.Equalizer.SelectedPreset == "0" && vm.Draft.Equalizer.PreampDb == 0, "reset keeps enabled state and clears gains", checks);
@@ -75,8 +80,10 @@ internal static class UiEqualizer
         }
         finally { window.Close(); }
     }
-    private static double? LatestGain(UiSmoke.MockFactory engine) => engine.Commands.LastOrDefault(c => c.Text("command") == "set_equalizer") is { ValueKind: JsonValueKind.Object } command
-        ? command.GetProperty("params").GetProperty("equalizer").GetProperty("band_gains_db")[0].GetDouble() : null;
+    private static JsonElement LatestEqualizer(UiSmoke.MockFactory engine) => engine.Commands.LastOrDefault(c => c.Text("command") == "set_equalizer") is { ValueKind: JsonValueKind.Object } command
+        ? command.GetProperty("params").GetProperty("equalizer") : default;
+    private static double? LatestGain(UiSmoke.MockFactory engine) => LatestEqualizer(engine) is { ValueKind: JsonValueKind.Object } equalizer
+        ? equalizer.GetProperty("band_gains_db")[0].GetDouble() : null;
     private static void Check(bool value, string name, List<string> checks) { if (!value) throw new InvalidOperationException(name); checks.Add(name); }
     private static async Task Pump() { await Application.Current.Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle); await Task.Delay(80); }
     private static async Task Until(Func<bool> condition) { using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5)); while (!condition()) await Task.Delay(20, timeout.Token); await Pump(); }

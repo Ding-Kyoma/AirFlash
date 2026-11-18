@@ -15,6 +15,7 @@ public partial class SoundGlowPanel : UserControl, IDisposable
         nameof(App), typeof(AppViewModel), typeof(SoundGlowPanel),
         new PropertyMetadata(null, (sender, args) => ((SoundGlowPanel)sender).SetApp(args.NewValue as AppViewModel)));
     private readonly DispatcherTimer _timer = new() { Interval = TimeSpan.FromSeconds(15) };
+    private readonly CancellationTokenSource _lifetime = new();
     private AppViewModel? _app;
     private string? _lastPalette;
     private bool _busy, _disposed;
@@ -41,6 +42,8 @@ public partial class SoundGlowPanel : UserControl, IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        _lifetime.Cancel();
+        _lifetime.Dispose();
         _timer.Stop();
         _timer.Tick -= OnTimerTick;
         IsVisibleChanged -= OnVisibleChanged;
@@ -79,15 +82,12 @@ public partial class SoundGlowPanel : UserControl, IDisposable
 
     private async void OnResetClick(object sender, RoutedEventArgs args)
     {
-        if (_busy || _disposed || _app is null) return;
+        if (_busy || _disposed || _app is not { IsClosing: false } app) return;
         Cycle.IsChecked = false; _busy = true; UpdateState();
         try
         {
-            var receiver = _app.Session.Snapshot.Receiver;
-            await _app.Session.StopAsync();
+            if (!await app.Session.TryRestartForSoundGlowAsync(_lifetime.Token) || _disposed) return;
             _lastPalette = null; Swatch.Background = Brushes.Gray;
-            if (!_disposed && receiver is not null) await _app.Session.StartAsync(receiver, _app.Settings.Clone());
-            Append(L.Get("Reconnected with normal song information. HomePod may retain the previous cover."));
         }
         catch (Exception error) { Append(error.Message); }
         finally { _busy = false; if (!_disposed) UpdateState(); }

@@ -19,8 +19,12 @@ internal static class PairingHintRegression
     {
         var receiver = new Receiver("hint-manual", "Pairing hint test", "192.0.2.10") { IsManual = true };
         var engine = new MockFactory { AutoReady = false };
-        await using var app = new AppViewModel(new MemoryStore(), new MockDiscovery { Items = [receiver] },
-            new MockAutostart(), new MockAudio(), engine, Application.Current.Dispatcher);
+        var store = new MemoryStore();
+        var initial = store.Load();
+        initial.ManualReceivers.Add(new(receiver.Id, receiver.Name, receiver.Address, receiver.Port));
+        store.Save(initial);
+        await using var app = new AppViewModel(store, new MockDiscovery { Items = [] },
+            new MockAutostart(), new MockAudio(), engine, Application.Current.Dispatcher, isolatedVerification: true);
         app.SetPanelVisible(true); app.Start(); await app.Startup;
         var panel = new ControlPanel(app) { MenuOpen = true };
         panel.ShowPanel(); await Pump();
@@ -113,7 +117,7 @@ internal static class PairingHintRegression
             engine.EmitEvent = null;
             if (pairing) await app.Session.PairAsync(receiver, app.Settings.Clone(),
                 (_, _) => throw new InvalidOperationException("This synthetic rejection must not request a PIN."));
-            else await app.ToggleAsync(receiver);
+            else await app.ToggleAsync(app.AllReceivers.Single(row => row.Id == receiver.Id && row.IsManual));
             await Until(() => engine.EmitEvent is not null && app.Snapshot.State is PlaybackState.Connecting or PlaybackState.Pairing);
         }
         void EmitFault(EngineNotice notice) => engine.EmitEvent!(new

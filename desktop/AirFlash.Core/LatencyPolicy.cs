@@ -5,13 +5,26 @@ namespace AirFlash.Core;
 /// How much audio AirFlash holds at the receiver, and how far it may be tightened.
 /// </summary>
 /// <remarks>
-/// Adaptive solo ALAC/PTP and stereo playback request a 50 ms starting lead.
-/// These are scheduling targets, not measured acoustic latency or guaranteed
-/// device minima. The desktop walks the ladder upward after repeated trouble;
-/// a fresh session resets the target. Stable playback does not trigger downshifts.
+/// Users choose a fixed preset: <c>realtime</c> (120 ms), <c>normal</c> (200 ms),
+/// <c>buffered</c> (500 ms) or <c>custom</c> (0–2000 ms), optionally forced (see
+/// <see cref="Forced"/>). Those resolve through <see cref="AppSettings.Latency(string)"/>
+/// and never use the ladder below.
+/// <para>
+/// <see cref="Mode"/> (<c>"adaptive"</c>) is an internal policy, not a user preset:
+/// the settings and receiver menus omit it and <c>SettingsStore</c> rewrites a
+/// persisted <c>"adaptive"</c> to <c>"normal"</c> on load and save. It is still
+/// accepted by <see cref="AppSettings.Validate"/> and drives
+/// <see cref="SessionController"/>'s adaptive-lead path whenever an
+/// <see cref="AppSettings"/> instance sets it in code, which the unit tests do.
+/// In that mode solo ALAC/PTP and stereo playback request a 50 ms starting lead
+/// and the desktop walks the ladder upward after repeated trouble; a fresh session
+/// resets the target and stable playback never downshifts. These are scheduling
+/// targets, not measured acoustic latency or guaranteed device minima.
+/// </para>
 /// </remarks>
 public static class LatencyPolicy
 {
+    /// <summary>The internal adaptive policy's mode value; never offered to users.</summary>
     public const string Mode = "adaptive";
     private static IEnumerable<Receiver> Targets(Receiver receiver) => receiver.IsSoftwareGroup ? receiver.Peers : [receiver];
     public static bool Forced(AppSettings settings, Receiver receiver) => Targets(receiver).Any(r => settings.ForcesLatency(r.Id));
@@ -64,7 +77,8 @@ public static class LatencyPolicy
             if (ladder[i] < current && ladder[i] >= plan.Floor) return ladder[i];
         return Math.Max(current, plan.Floor);
     }
-    /// <summary>Effective lead for a receiver given its negotiated profile.</summary>
+    /// <summary>Effective starting lead for a receiver: the adaptive plan's initial
+    /// value under <see cref="Mode"/>, otherwise the fixed preset or custom value.</summary>
     public static int Effective(AppSettings settings, Receiver receiver)
     {
         ArgumentNullException.ThrowIfNull(settings);

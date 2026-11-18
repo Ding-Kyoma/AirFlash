@@ -22,7 +22,7 @@ public sealed class IpcFailureTests
     public async Task ExactProcessRejectionKeepsItsFaultAndTerminatesTheOwnedAttempt(string phase, bool originalMute)
     {
         var connection = new Connection(); var factory = new Factory(connection); var audio = new Audio(originalMute);
-        await using var controller = new SessionController(factory, audio, timing: Timing);
+        await using var controller = TestSessionController.Create(factory, audio, timing: Timing);
         var fault = Signal(); var streaming = Signal();
         controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Error) fault.TrySetResult(); if (snapshot.State == PlaybackState.Streaming) streaming.TrySetResult(); };
         if (phase == "pairing") await controller.PairAsync(Receiver(), Settings(), (_, _) => throw new InvalidOperationException("No PIN request is scripted"));
@@ -69,7 +69,7 @@ public sealed class IpcFailureTests
     public async Task NearMatchGlobalAndStaleEnvelopesRemainFiltered(string envelope)
     {
         var connection = new Connection(); var factory = new Factory(connection);
-        await using var controller = new SessionController(factory, new Audio(false), timing: Timing);
+        await using var controller = TestSessionController.Create(factory, new Audio(false), timing: Timing);
         var streaming = Signal(); controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Streaming) streaming.TrySetResult(); };
         await controller.StartAsync(Receiver(), Settings()); await connection.Starting.Task.WaitAsync(Limit);
         connection.Raw(envelope); connection.Current("streaming");
@@ -78,13 +78,105 @@ public sealed class IpcFailureTests
         await controller.StopAsync(); Assert.True(connection.Disposed);
     }
 
+    [Theory] [InlineData(false)] [InlineData(true)]
+    public async Task NearMatchBeforeHelloOnlyFailsWhenPlaybackArrivesPrematurely(bool prematureStreaming)
+    {
+        var connection = new Connection(autoHello: false); var factory = new Factory(connection); var audio = new Audio(false);
+        await using var controller = TestSessionController.Create(factory, audio, timing: Timing);
+        var streaming = Signal();
+        var fault = new TaskCompletionSource<SessionSnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
+        controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Streaming) streaming.TrySetResult(); if (snapshot.State == PlaybackState.Error) fault.TrySetResult(snapshot); };
+        try
+        {
+            var settings = Settings(); settings.ForceReconnect = false;
+            await controller.StartAsync(Receiver(), settings);
+            var restores = audio.Restores;
+            // Explicitly hold hello so the injected events precede it.
+            await connection.Started.Task.WaitAsync(Limit);
+            var envelope = JsonSerializer.Deserialize<Dictionary<string, object?>>(Rejection)!;
+            envelope.Remove("event"); connection.Raw(JsonSerializer.Serialize(envelope));
+            if (prematureStreaming) connection.Current("streaming");
+            connection.PublishHello();
+            if (prematureStreaming)
+            {
+                var failed = await fault.Task.WaitAsync(Limit);
+                Assert.Equal(PlaybackState.Error, failed.State);
+                Assert.Equal("host_error", failed.Diagnostics?.LastFault?.Code); Assert.Equal("desktop", failed.Diagnostics?.LastFault?.Channel);
+                Assert.Null(failed.Diagnostics?.LastFault?.Retryable);
+                Assert.Equal(L.Get("Incompatible engine protocol version."), failed.Diagnostics?.LastFault?.Message);
+                Assert.Equal(failed.Diagnostics?.LastFault?.Detail, failed.Message);
+                await audio.WhenRestoredAtLeastAsync(restores + 2).WaitAsync(Limit);
+                Assert.False(streaming.Task.IsCompleted); Assert.False(connection.Starting.Task.IsCompleted);
+                Assert.DoesNotContain("start", connection.Commands); Assert.Contains("stop", connection.Commands);
+            }
+            else
+            {
+                await AwaitPhaseAsync(connection.Starting.Task, fault.Task, "the Start command");
+                connection.Current("streaming"); await AwaitPhaseAsync(streaming.Task, fault.Task, "Streaming");
+                Assert.Null(controller.Snapshot.Diagnostics?.LastFault); Assert.True(audio.Muted);
+            }
+        }
+        finally { await controller.StopAsync(); }
+        Assert.Equal(PlaybackState.Idle, controller.Snapshot.State);
+        Assert.True(connection.Disposed); Assert.False(audio.Muted); Assert.Equal(1, factory.OpenCount);
+    }
+
+    [Theory] [InlineData(false)] [InlineData(true)]
+    public async Task QuietPlaybackStillExpiresTheFiniteReadWatchdogAndRestoresMute(bool originalMute)
+    {
+        var connection = new Connection(); var factory = new Factory(connection); var audio = new Audio(originalMute);
+        var clock = new ManualDeadlineClock();
+        var readTimeout = TimeSpan.FromSeconds(1);
+        await using var controller = TestSessionController.Create(factory, audio, timing: Timing with { Read = readTimeout }, clock: clock);
+        var streaming = new TaskCompletionSource<(bool Muted, int Restores)>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fault = new TaskCompletionSource<SessionSnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var silentRead = Signal();
+        controller.Changed += snapshot =>
+        {
+            if (snapshot.State == PlaybackState.Streaming) streaming.TrySetResult((audio.Muted, audio.Restores));
+            if (snapshot.State == PlaybackState.Error) fault.TrySetResult(snapshot);
+        };
+        // Hello and Streaming occupy reads one and two. Await the next read's
+        // entry before advancing virtual time so the watchdog is armed.
+        connection.ReadStarted = read => { if (read == 3) silentRead.TrySetResult(); };
+        try
+        {
+            var settings = Settings(); settings.ForceReconnect = false;
+            await controller.StartAsync(Receiver(), settings); await AwaitPhaseAsync(connection.Starting.Task, fault.Task, "the Start command");
+            connection.Current("streaming"); await AwaitPhaseAsync(streaming.Task, fault.Task, "Streaming");
+            var started = await streaming.Task;
+            Assert.True(started.Muted);
+            await silentRead.Task.WaitAsync(Limit);
+            Assert.False(fault.Task.IsCompleted);
+            clock.WakeAfter(readTimeout, expectedDue: readTimeout);
+            var failed = await fault.Task.WaitAsync(Limit);
+            Assert.Equal("host_error", failed.Diagnostics?.LastFault?.Code); Assert.Equal("desktop", failed.Diagnostics?.LastFault?.Channel);
+            Assert.Equal(L.Get("The audio engine response timed out."), failed.Diagnostics?.LastFault?.Message);
+            await audio.WhenRestoredAtLeastAsync(started.Restores + 2).WaitAsync(Limit);
+            Assert.True(connection.Disposed); Assert.Contains("stop", connection.Commands);
+            Assert.Equal(originalMute, audio.Muted); Assert.Equal(1, factory.OpenCount);
+        }
+        finally { await controller.StopAsync(); }
+        Assert.Equal(PlaybackState.Idle, controller.Snapshot.State);
+    }
+
+    private static async Task AwaitPhaseAsync(Task phase, Task<SessionSnapshot> fault, string expected)
+    {
+        if (await Task.WhenAny(phase, fault).WaitAsync(Limit) == fault)
+        {
+            var failed = await fault;
+            Assert.Fail($"Expected {expected}; observed {failed.State}: {failed.Diagnostics?.LastFault?.Detail ?? failed.Message}");
+        }
+        await phase;
+    }
+
     [Theory] [InlineData("[]")] [InlineData("null")] [InlineData("42")] [InlineData("\"text\"")] [InlineData("{")]
     public async Task MalformedOutputIsAControlledFinalIpcFailure(string raw)
     {
         var connection = new Connection(); var factory = new Factory(connection);
-        await using var controller = new SessionController(factory, new Audio(false), timing: Timing);
+        await using var controller = TestSessionController.Create(factory, new Audio(false), timing: Timing);
         var fault = Signal(); controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Error) fault.TrySetResult(); };
-        await controller.StartAsync(Receiver(), Settings()); await connection.Started.Task.WaitAsync(Limit); connection.Raw(raw);
+        await controller.StartAsync(Receiver(), Settings()); await connection.Starting.Task.WaitAsync(Limit); connection.Raw(raw);
         await fault.Task.WaitAsync(Limit);
         var notice = controller.Snapshot.Diagnostics!.LastFault!;
         Assert.Equal("protocol_error", notice.Code); Assert.Equal("ipc", notice.Channel); Assert.Equal(false, notice.Retryable);
@@ -95,10 +187,10 @@ public sealed class IpcFailureTests
     public async Task CurrentStructuredPairingFailureKeepsClassificationWithoutPlayback()
     {
         var connection = new Connection(); var factory = new Factory(connection);
-        await using var controller = new SessionController(factory, new Audio(false), timing: Timing);
+        await using var controller = TestSessionController.Create(factory, new Audio(false), timing: Timing);
         var fault = Signal(); controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Error) fault.TrySetResult(); };
         await controller.PairAsync(Receiver(), Settings(), (_, _) => throw new InvalidOperationException("No PIN requested"));
-        await connection.Started.Task.WaitAsync(Limit);
+        await connection.Starting.Task.WaitAsync(Limit);
         connection.Current("error", new { code = "authentication_failed", channel = "authentication", host = "192.0.2.10", retryable = false, message = "synthetic verify rejected" });
         await fault.Task.WaitAsync(Limit);
         Assert.Equal("authentication_failed", controller.Snapshot.Diagnostics?.LastFault?.Code);
@@ -110,7 +202,7 @@ public sealed class IpcFailureTests
     public async Task APreemptedStreamGetsItsOwnStateAndNeverAutoReconnects()
     {
         var connection = new Connection(); var factory = new Factory(connection); var audio = new Audio(false);
-        await using var controller = new SessionController(factory, audio, timing: Timing);
+        await using var controller = TestSessionController.Create(factory, audio, timing: Timing);
         var streaming = Signal(); var preempted = Signal();
         controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Streaming) streaming.TrySetResult(); if (snapshot.State == PlaybackState.Preempted) preempted.TrySetResult(); };
         await controller.StartAsync(Receiver(), Settings());
@@ -132,7 +224,7 @@ public sealed class IpcFailureTests
     public async Task PreemptedAtTheTakeoverLimitUsesTheYieldMessage()
     {
         var connection = new Connection(); var factory = new Factory(connection); var audio = new Audio(false);
-        await using var controller = new SessionController(factory, audio, timing: Timing);
+        await using var controller = TestSessionController.Create(factory, audio, timing: Timing);
         var preempted = Signal();
         controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Preempted) preempted.TrySetResult(); };
         await controller.StartAsync(Receiver(), Settings());
@@ -151,7 +243,7 @@ public sealed class IpcFailureTests
     public async Task ClassicOnlySetupFailurePublishesTheCapabilityGateMessage()
     {
         var connection = new Connection(); var factory = new Factory(connection);
-        await using var controller = new SessionController(factory, new Audio(false), timing: Timing);
+        await using var controller = TestSessionController.Create(factory, new Audio(false), timing: Timing);
         var fault = Signal(); controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Error) fault.TrySetResult(); };
         var receiver = Receiver() with { Model = "AirPort Express", Features = 0UL, SourceVersion = "220.68" };
         await controller.StartAsync(receiver, Settings());
@@ -168,7 +260,7 @@ public sealed class IpcFailureTests
     public async Task AuthenticationFailurePublishesThePairingGateMessage()
     {
         var connection = new Connection(); var factory = new Factory(connection);
-        await using var controller = new SessionController(factory, new Audio(false), timing: Timing);
+        await using var controller = TestSessionController.Create(factory, new Audio(false), timing: Timing);
         var fault = Signal(); controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Error) fault.TrySetResult(); };
         await controller.StartAsync(Receiver(), Settings());
         await connection.Starting.Task.WaitAsync(Limit);
@@ -185,7 +277,7 @@ public sealed class IpcFailureTests
     public async Task TlvTwoAuthenticationFailurePublishesAnImmediateHomeAccessHint(bool pairing)
     {
         var connection = new Connection(); var next = new Connection(); var factory = new Factory(connection, next);
-        await using var controller = new SessionController(factory, new Audio(false), timing: Timing);
+        await using var controller = TestSessionController.Create(factory, new Audio(false), timing: Timing);
         var fault = Signal(); controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Error) fault.TrySetResult(); };
         if (pairing) await controller.PairAsync(Receiver(), Settings(), (_, _) => throw new InvalidOperationException("No PIN requested"));
         else await controller.StartAsync(Receiver(), Settings());
@@ -220,7 +312,7 @@ public sealed class IpcFailureTests
     public async Task TlvThreeAuthenticationFailureDoesNotPublishTheHomeAccessHint()
     {
         var connection = new Connection(); var factory = new Factory(connection);
-        await using var controller = new SessionController(factory, new Audio(false), timing: Timing);
+        await using var controller = TestSessionController.Create(factory, new Audio(false), timing: Timing);
         var fault = Signal(); controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Error) fault.TrySetResult(); };
         await controller.StartAsync(Receiver(), Settings());
         await connection.Starting.Task.WaitAsync(Limit);
@@ -235,7 +327,7 @@ public sealed class IpcFailureTests
     public async Task SocketFailureBeforeAConnectionExistsPublishesTheNetworkGateMessage()
     {
         var factory = new UnreachableFactory();
-        await using var controller = new SessionController(factory, new Audio(false), timing: Timing);
+        await using var controller = TestSessionController.Create(factory, new Audio(false), timing: Timing);
         var fault = Signal(); controller.Changed += snapshot => { if (snapshot.State == PlaybackState.Error) fault.TrySetResult(); };
         await controller.StartAsync(Receiver(), new AppSettings { ForceReconnect = false, MaxReconnectAttempts = 1 });
         await fault.Task.WaitAsync(Limit);
@@ -255,7 +347,7 @@ public sealed class IpcFailureTests
     public async Task LifetimeCancellationRemainsIdleAndDisposesItsConnection()
     {
         var connection = new Connection(); var factory = new Factory(connection);
-        await using var controller = new SessionController(factory, new Audio(true), timing: Timing);
+        await using var controller = TestSessionController.Create(factory, new Audio(true), timing: Timing);
         await controller.StartAsync(Receiver(), Settings()); await connection.Started.Task.WaitAsync(Limit);
         await connection.Reading.Task.WaitAsync(Limit);
         await controller.StopAsync().WaitAsync(Limit);
@@ -280,26 +372,29 @@ public sealed class IpcFailureTests
         public int OpenCount;
         public IEngineConnection Open() { Interlocked.Increment(ref OpenCount); return _connections.TryDequeue(out var connection) ? connection : throw new IOException("unexpected retry"); }
     }
-    private sealed class Connection : IEngineConnection
+    private sealed class Connection(bool autoHello = true) : IEngineConnection
     {
         private readonly Channel<string> _events = Channel.CreateUnbounded<string>();
         public readonly ConcurrentQueue<string> Commands = new();
         public readonly TaskCompletionSource Started = Signal(), Starting = Signal(), Reading = Signal();
         public bool Disposed;
         private string _session = "";
+        private int _reads;
+        public Action<int>? ReadStarted { get; set; }
         public Task SendAsync(string session, string command, object? parameters, CancellationToken cancellation)
         {
             cancellation.ThrowIfCancellationRequested(); Commands.Enqueue(command);
             if (command == "hello")
             {
                 _session = session;
-                Current("hello", new { capabilities = new[] { "receiver_profiles", "software_stereo", "multi_room", "continuity", "buffered_audio", "standby_release", "receiver_ownership_guard", "member_volume", "receiver_password", "application_capture" } });
+                if (autoHello) PublishHello();
                 Started.TrySetResult();
             }
             if (command is "start" or "pair") { _session = session; Starting.TrySetResult(); }
             if (command == "stop") _events.Writer.TryComplete();
             return Task.CompletedTask;
         }
+        public void PublishHello() => Current("hello", new { capabilities = new[] { "receiver_profiles", "software_stereo", "multi_room", "continuity", "buffered_audio", "standby_release", "receiver_ownership_guard", "member_volume", "receiver_password", "application_capture" } });
         public void Raw(string raw) => _events.Writer.TryWrite(raw);
         public void Current(string name, object? fields = null)
         {
@@ -309,6 +404,7 @@ public sealed class IpcFailureTests
         public async ValueTask<JsonElement?> ReadAsync(CancellationToken cancellation)
         {
             Reading.TrySetResult();
+            ReadStarted?.Invoke(Interlocked.Increment(ref _reads));
             try { using var json = JsonDocument.Parse(await _events.Reader.ReadAsync(cancellation)); return json.RootElement.Clone(); }
             catch (ChannelClosedException) { return null; }
         }

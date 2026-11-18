@@ -14,8 +14,59 @@ public sealed class NowPlayingTests
         Assert.Null(await pump.PollAsync(default));
         clock = 2000; source.Value = Track(position: 2000);
         Assert.Equal(2000, (await pump.PollAsync(default))!.PositionMs);
+        // Steady playback is where the receiver's interpolation already has it.
         clock = 4000; source.Value = Track(position: 4000);
-        Assert.Equal(4000, (await pump.PollAsync(default))!.PositionMs);
+        Assert.Null(await pump.PollAsync(default));
+        // A seek is not.
+        clock = 6000; source.Value = Track(position: 30_000);
+        Assert.Equal(30_000, (await pump.PollAsync(default))!.PositionMs);
+    }
+
+    [Fact]
+    public async Task Steady_extrapolated_playback_is_not_republished_every_poll()
+    {
+        var source = new Source();
+        long clock = 0;
+        var pump = new NowPlayingPump(source, () => clock);
+        var published = 0;
+        for (var poll = 0; poll <= 30; poll++)
+        {
+            clock = poll * 2_000L;
+            source.Value = Track(position: 10_000 + clock);
+            if (await pump.PollAsync(default) is not null) published++;
+        }
+        Assert.Equal(1, published);
+        // A paused track is expected to stay put.
+        clock += 2_000; source.Value = Track(position: 10_000 + clock - 2_000, playing: false);
+        await pump.PollAsync(default);
+        clock += 400;
+        Assert.NotNull(await pump.PollAsync(default));
+        clock += 2_000;
+        Assert.Null(await pump.PollAsync(default));
+    }
+
+    [Theory]
+    [InlineData(10_000, 240_000, true, 5_000, 15_000)]   // carried forward while playing
+    [InlineData(10_000, 240_000, false, 5_000, 10_000)]  // paused: as reported
+    [InlineData(238_000, 240_000, true, 5_000, 240_000)] // clamped to the duration
+    [InlineData(10_000, 0, true, 5_000, 15_000)]         // unknown duration: no ceiling
+    [InlineData(-50, 240_000, false, 0, 0)]              // never negative
+    [InlineData(10_000, 240_000, true, -5_000, 10_000)]  // a future update time adds nothing
+    public void Smtc_positions_are_carried_to_now(long position, long duration, bool playing, long ageMs, long expected)
+    {
+        var now = new DateTimeOffset(2026, 11, 6, 12, 0, 0, TimeSpan.Zero);
+        Assert.Equal(expected, NowPlaying.CurrentPositionMs(position, duration, playing, now.AddMilliseconds(-ageMs), now));
+    }
+
+    [Fact]
+    public void An_unset_smtc_update_time_is_not_extrapolated()
+        => Assert.Equal(10_000, NowPlaying.CurrentPositionMs(10_000, 0, true, default, DateTimeOffset.UtcNow));
+
+    [Fact]
+    public void Smtc_projection_uses_the_reported_playback_rate()
+    {
+        var now = DateTimeOffset.UnixEpoch.AddMinutes(1);
+        Assert.Equal(17_500, NowPlaying.CurrentPositionMs(10_000, 240_000, true, now.AddSeconds(-5), now, 1.5));
     }
     private sealed class Source : INowPlayingSource
     {
@@ -141,17 +192,45 @@ public sealed class NowPlayingTests
         var source = new Source();
         long now = 0;
         var pump = new NowPlayingPump(source, () => now) { Settle = TimeSpan.FromMilliseconds(300) };
+        var cleared = 0;
+        pump.SourceCleared += () => cleared++;
         source.Value = Track();
         await pump.PollAsync(CancellationToken.None);
         now = 400;
         await pump.PollAsync(CancellationToken.None);
+        Assert.Equal(0, cleared);
+        // Nothing is sent for a missing or empty source, so the receiver keeps
+        // its display; the pump only forgets what it published, once.
         source.Value = null;
         now = 1_000;
         Assert.Null(await pump.PollAsync(CancellationToken.None));
         source.Value = new NowPlaying("", "", "", "", true, 0, 0);
         now = 1_400;
         Assert.Null(await pump.PollAsync(CancellationToken.None));
-        Assert.NotNull(pump.LastPublished);
+        Assert.Null(pump.LastPublished);
+        Assert.Equal(1, cleared);
+    }
+
+    [Fact]
+    public async Task A_player_that_comes_back_on_the_same_track_and_position_is_sent_again()
+    {
+        var source = new Source();
+        long now = 0;
+        var pump = new NowPlayingPump(source, () => now) { Settle = TimeSpan.FromMilliseconds(300) };
+        source.Value = Track(position: 30_000, playing: false);
+        await pump.PollAsync(CancellationToken.None);
+        now = 400;
+        Assert.NotNull(await pump.PollAsync(CancellationToken.None));
+        source.Value = null;
+        now = 1_000;
+        Assert.Null(await pump.PollAsync(CancellationToken.None));
+        // Identical to the last published value: still a new value after the
+        // player went away, so it settles and is published.
+        source.Value = Track(position: 30_000, playing: false);
+        now = 2_000;
+        Assert.Null(await pump.PollAsync(CancellationToken.None));
+        now = 2_400;
+        Assert.Equal(30_000, (await pump.PollAsync(CancellationToken.None))?.PositionMs);
     }
 
     [Fact]

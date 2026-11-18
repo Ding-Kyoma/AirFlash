@@ -27,7 +27,7 @@ public sealed class SessionHealthTests
     [Fact]
     public void Describe_carries_every_counter_that_can_explain_a_crackle()
     {
-        var sample = HealthSample.From(Metrics(Healthy), new StreamMetrics(13.7, 48.7, 0, 40630, 48000, 2, 1, 0), 200);
+        var sample = HealthSample.From(Metrics(Healthy), new StreamMetrics(13.7, 48.7, 0, 40630, 48000, Rebinds: 2, SilentProbes: 1), 200);
         Assert.Equal(
             "uptime_s=120; target_ms=200; p99_ms=0.515; max_send_us=1301; rtx_req=3; capture_underruns=0; "
             + "capture_rebinds=2; silent_probes=1; feedback_rtt_ms=5.2; clock_offset_us=123.5; clock_jitter_us=40.0",
@@ -58,7 +58,7 @@ public sealed class SessionHealthTests
     [Fact]
     public void A_healthy_minute_never_warns_about_a_tight_target()
     {
-        var now = HealthSample.From(Metrics(Healthy), new StreamMetrics(13.7, 48.7, 0, 40630, 48000, 0, 0, 0), 200);
+        var now = HealthSample.From(Metrics(Healthy), new StreamMetrics(13.7, 48.7, 0, 40630, 48000, Rebinds: 0, SilentProbes: 0), 200);
         Assert.False(SessionHealth.LooksTight(now, now));
     }
 

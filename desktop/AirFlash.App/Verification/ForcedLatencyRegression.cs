@@ -29,7 +29,7 @@ internal static class ForcedLatencyRegression
     {
         var store = new MemoryStore(); var engine = new MockFactory();
         var receiver = new Receiver("forced", "Latency test", "127.0.0.1");
-        await using var app = new AppViewModel(store, new MockDiscovery { Items = [receiver] }, new MockAutostart(), new MockAudio(), engine, Application.Current.Dispatcher);
+        await using var app = new AppViewModel(store, new MockDiscovery { Items = [receiver] }, new MockAutostart(), new MockAudio(), engine, Application.Current.Dispatcher, isolatedVerification: true);
         app.SetPanelVisible(true); app.Start(); await app.Startup; await Pump();
         var window = new SettingsWindow(app);
         window.ViewModel.SelectedPage = SettingsViewModel.StreamingPage;

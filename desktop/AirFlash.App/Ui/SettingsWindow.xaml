@@ -307,6 +307,9 @@
           <StackPanel>
             <TextBlock Text="{Binding App.StatusTitle}" FontSize="20" FontWeight="SemiBold"/>
             <TextBlock Text="{Binding App.StatusDetail}" Style="{StaticResource Hint}" Margin="0,8,0,0"/>
+            <Button x:Name="CopyDiagnosticsButton" Content="{loc:Text 'Copy diagnostics'}"
+                    AutomationProperties.Name="{loc:Text 'Copy diagnostics'}" Command="{Binding CopyDiagnosticsCommand}"
+                    HorizontalAlignment="Left" Margin="0,12,0,0"/>
           </StackPanel>
         </Border>
         <UniformGrid Columns="2">
@@ -332,6 +335,18 @@
             <StackPanel>
               <TextBlock Text="{loc:Text 'Local dropped frames'}" Style="{StaticResource Hint}"/>
               <TextBlock Text="{Binding App.MonitorDrops}" FontSize="25" FontWeight="SemiBold" Margin="0,10,0,0"/>
+            </StackPanel>
+          </Border>
+          <Border Style="{StaticResource Card}" Margin="0,0,10,12">
+            <StackPanel>
+              <TextBlock Text="{loc:Text 'Local padded output frames'}" Style="{StaticResource Hint}"/>
+              <TextBlock x:Name="MonitorPaddedFramesValue" Text="{Binding App.MonitorPaddedFrames}" TextWrapping="Wrap" FontSize="25" FontWeight="SemiBold" Margin="0,10,0,0"/>
+            </StackPanel>
+          </Border>
+          <Border Style="{StaticResource Card}" Margin="0,0,10,12">
+            <StackPanel>
+              <TextBlock Text="{loc:Text 'Wholly padded capture pulls'}" Style="{StaticResource Hint}"/>
+              <TextBlock x:Name="MonitorFullyPaddedPacketsValue" Text="{Binding App.MonitorFullyPaddedPackets}" TextWrapping="Wrap" FontSize="25" FontWeight="SemiBold" Margin="0,10,0,0"/>
             </StackPanel>
           </Border>
           <Border Style="{StaticResource Card}" Margin="0,0,10,12">
@@ -390,11 +405,12 @@
             <TextBlock Text="{loc:Text 'Last connection failure'}" FontWeight="SemiBold"/>
             <TextBlock Text="{Binding App.MonitorLastFault}" TextWrapping="Wrap" Margin="0,8,0,12"/>
             <Expander Header="{loc:Text 'Statistics before the last failure'}">
-              <TextBlock Text="{Binding App.MonitorBeforeFault}" TextWrapping="Wrap" Margin="0,8,0,0" LineHeight="23"/>
+              <TextBlock x:Name="MonitorBeforeFaultValue" Text="{Binding App.MonitorBeforeFault}" TextWrapping="Wrap" Margin="0,8,0,0" LineHeight="23"/>
             </Expander>
           </StackPanel>
         </Border>
         <TextBlock Text="{loc:Text 'Local queue and transport statistics update about once per second. Resent packets are sent, not confirmed received. Delay parameters are not acoustic measurements. The last failure snapshot survives reconnection.'}" Style="{StaticResource Hint}"/>
+        <TextBlock Text="{loc:Text 'Padding counts missing output-rate frames before equalization. A wholly padded pull replaces all 352 frames. Captured silence and scheduled fade or recovery silence are not missing capture. These are local capture counts; unavailable counters show —.'}" Style="{StaticResource Hint}" Margin="0,8,0,0"/>
         <Border Style="{StaticResource Card}" Margin="0,14,0,14">
           <Expander Header="{loc:Text 'Negotiated stream and clock status (experimental)'}" IsExpanded="False" Foreground="{DynamicResource TextBrush}">
             <Expander.HeaderTemplate>
@@ -488,7 +504,15 @@
           <TextBlock Text="AirFlash" FontSize="22" FontWeight="SemiBold"/>
           <TextBlock Text="{loc:Text 'Settings and devices'}" Style="{StaticResource Hint}" Margin="0,4,0,0"/>
         </StackPanel>
-        <ListBox x:Name="Navigation" ItemsSource="{Binding Pages}" SelectedIndex="{Binding SelectedPage}" BorderThickness="0" Background="Transparent" VerticalAlignment="Top" AutomationProperties.Name="{loc:Text 'Settings navigation'}"/>
+        <ListBox x:Name="Navigation" ItemsSource="{Binding Pages}" SelectedIndex="{Binding SelectedPage}" BorderThickness="0" Background="Transparent" VerticalAlignment="Top" AutomationProperties.Name="{loc:Text 'Settings navigation'}">
+          <ListBox.Template>
+            <ControlTemplate TargetType="ListBox">
+              <ScrollViewer Style="{StaticResource InsetListScrollViewer}" CanContentScroll="{TemplateBinding ScrollViewer.CanContentScroll}">
+                <ItemsPresenter/>
+              </ScrollViewer>
+            </ControlTemplate>
+          </ListBox.Template>
+        </ListBox>
       </DockPanel>
     </Border>
     <Grid Grid.Column="1" Margin="26,23,20,0">
@@ -499,6 +523,12 @@
       <StackPanel Margin="0,0,0,20">
         <TextBlock Text="{Binding PageTitle}" FontSize="24" FontWeight="SemiBold"/>
         <TextBlock Text="{Binding PageDescription}" Style="{StaticResource Hint}" Margin="0,5,0,0"/>
+        <Border Padding="10" CornerRadius="6" Background="{DynamicResource TintBrush}" Margin="0,12,0,0" Visibility="{Binding App.HasMuteRecovery, Converter={StaticResource BoolVisibility}}">
+          <StackPanel>
+            <TextBlock Text="{Binding App.MuteRecoveryMessage}" Style="{StaticResource Hint}"/>
+            <Button x:Name="SettingsReviewMuteRecoveryButton" Content="{loc:Text 'Review local audio'}" Command="{Binding App.ReviewMuteRecoveryCommand}" HorizontalAlignment="Left" Margin="0,8,0,0"/>
+          </StackPanel>
+        </Border>
       </StackPanel>
       <ScrollViewer x:Name="PageScroll" Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="0,0,24,10">
         <Grid x:Name="PageContainer"/>

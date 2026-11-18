@@ -127,7 +127,7 @@ public sealed class SoftwareStereoTests
         Assert.True(resolved.Online);
         Assert.Equal("multi_room", resolved.GroupMode);
         Assert.Equal(4, resolved.Members.Length);
-        Assert.Equal("Multi-room · 4 speakers", resolved.Detail);
+        Assert.Equal(L.Format("Multi-room · {0} speakers", 4), resolved.Detail);
         Assert.All(resolved.Members, m => Assert.Equal("stereo", m.Channel));
         Assert.Equal(-25, resolved.Members[1].SyncOffsetMs);
         Assert.Equal(50, resolved.Members[2].SyncOffsetMs);

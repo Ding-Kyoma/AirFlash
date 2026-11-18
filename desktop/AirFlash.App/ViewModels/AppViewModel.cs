@@ -10,6 +10,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private readonly IDiscoveryService _discovery;
     private readonly IAutostart _autostart;
     private readonly IAudioService _audio;
+    private readonly IMuteRecoveryService? _recovery;
+    private string? _recoveryError;
     private readonly Dispatcher _dispatcher;
     private readonly EngineInitialization? _engine;
     private readonly IRestartService _restart;
@@ -32,7 +34,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private AppSettings _settings;
     private SessionSnapshot _snapshot = new(PlaybackState.Idle);
     private string _notice = "";
-    private bool _volumeDirty, _autoSuppressed, _closing;
+    private bool _noticeDismissed;
+    private bool _volumeDirty, _volumeApplyPending, _autoSuppressed, _closing;
     private string? _defaultEndpoint;
     private long _editRevision;
     private Task _startup = Task.CompletedTask;
@@ -52,9 +55,39 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public AppSettings Settings => _settings;
     public SessionSnapshot Snapshot => _snapshot;
     private Task? _stopTask;
-    private long _playIntent;
+    private long _automaticEligibilityRevision;
+    private int _pendingEligibilityChanges;
+    private bool _controlledScheduling;
     public bool IsStopping { get; private set; }
-    public string Notice { get => _notice; private set { Set(ref _notice, value); Notify(nameof(ErrorDetails)); } }
+    private DiscoveryFailure? _discoveryNotice;
+    public string Notice
+    {
+        get => _notice;
+        private set => SetNotice(value);
+    }
+    private void SetNotice(string value, DiscoveryFailure? discoveryFailure = null)
+    {
+        _discoveryNotice = discoveryFailure;
+        if (_notice == value) return;
+        _notice = value;
+        _noticeDismissed = false;
+        Notify(nameof(Notice));
+        RefreshNoticeBanner();
+        Notify(nameof(ErrorDetails));
+    }
+    public bool HasNotice => !_noticeDismissed && !string.IsNullOrWhiteSpace(Notice);
+    public RelayCommand DismissNoticeCommand { get; }
+    private void DismissNotice()
+    {
+        if (!HasNotice) return;
+        _noticeDismissed = true;
+        RefreshNoticeBanner();
+    }
+    private void RefreshNoticeBanner()
+    {
+        Notify(nameof(HasNotice));
+        DismissNoticeCommand.Refresh();
+    }
     public int MasterVolume { get => _settings.MasterVolume; set { if (_closing || _resetting) return; value = Math.Clamp(value, 0, 100); if (value == _settings.MasterVolume) return; _settings.MasterVolume = value; VolumeChanged(); Notify(); } }
     public bool Muted => Session.Muted;
     public string MuteLabel => Muted ? L.Get("Unmute") : L.Get("Mute");
@@ -91,6 +124,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public string MonitorQueue => _snapshot.Metrics?.MaxQueueAge is { } ms ? $"{ms:F1} ms" : "—";
     public string MonitorUnderruns => _snapshot.Metrics?.Underruns?.ToString() ?? "—";
     public string MonitorDrops => _snapshot.Metrics?.DroppedFrames?.ToString() ?? "—";
+    public string MonitorPaddedFrames => _snapshot.Metrics?.PaddedFrames?.ToString() ?? "—";
+    public string MonitorFullyPaddedPackets => _snapshot.Metrics?.FullyPaddedPackets?.ToString() ?? "—";
     public string MonitorRate => _snapshot.Metrics is { InputRate: > 0 } m ? $"{m.InputRate:N0} Hz" : "—";
     public string MonitorStreamRate => _snapshot.StreamRate is { } rate and > 0 ? $"{rate:N0} Hz · 16-bit" : "—";
     public string MonitorRecoveries => _snapshot.Diagnostics?.Transport?.SenderLateRecoveries?.ToString() ?? "—";
@@ -109,6 +144,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             if (_snapshot.Diagnostics is not { LastFault: not null } diagnostics) return "—";
             var capture = diagnostics.CaptureBeforeFault;
             var summary = L.Format("Local underruns: {0}; local drops: {1}; local p95: {2}", capture?.Underruns?.ToString() ?? "—", capture?.DroppedFrames?.ToString() ?? "—", capture?.CaptureToSendP95 is { } ms ? $"{ms:F1} ms" : "—");
+            summary += "\n" + L.Format("Local padded output frames: {0}; wholly padded capture pulls: {1}",
+                capture?.PaddedFrames?.ToString() ?? "—", capture?.FullyPaddedPackets?.ToString() ?? "—");
             if (diagnostics.TransportBeforeFault is { } transport)
             {
                 summary += "\n" + L.Format("Sender recoveries: {0}; skipped packets: {1}", transport.SenderLateRecoveries?.ToString() ?? "—", transport.SkippedPackets?.ToString() ?? "—");
@@ -118,20 +155,31 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         }
     }
     public string ActionHint => _snapshot.State == PlaybackState.Error ? _snapshot.ActionHint : "";
-    public string ErrorDetails => _snapshot.State is PlaybackState.Error or PlaybackState.Preempted
-        ? _snapshot.Diagnostics?.LastFault?.Detail is { Length: > 0 } detail ? detail : _snapshot.Message
-        : Notice;
+    public string ErrorDetails => ErrorDetailsText.For(_snapshot, Notice);
     /// <summary>The receiver now belongs to another controller. Reconnecting is a
     /// deliberate user action, never the automatic transport retry.</summary>
-    public bool CanReconnect => !_closing && !IsStopping && !Session.NeedsCleanup && Session.RequiresManualReconnect && _snapshot.Receiver is not null;
+    public bool CanReconnect => FindReconnectReceiver() is not null;
     public string EngineVersion { get; set; } = L.Get("Unknown");
     public bool EngineReady => _engine is null || _engine.State == EngineAvailability.Ready;
     public bool EngineFailed => _engine?.State == EngineAvailability.Failed;
+    public bool MuteReady => !_settings.ShouldMuteEndpoint || _recovery is null || _recovery.Recovery.CanMute;
+    public bool HasMuteRecovery => _recovery is not null && !_recovery.Recovery.CanMute;
+    public MuteRecoverySnapshot MuteRecovery => _recovery?.Recovery ?? new(0, MuteRecoveryStatus.Ready, []);
+    public string MuteRecoveryMessage => !HasMuteRecovery ? "" : _recoveryError ?? (_recovery!.Recovery.Status switch
+    {
+        MuteRecoveryStatus.NotInitialized => L.Get("Checking local audio recovery…"),
+        MuteRecoveryStatus.Busy => L.Get("Another AirFlash instance owns local audio recovery. Muting playback is paused."),
+        MuteRecoveryStatus.Unreadable => L.Get("Local audio recovery could not be read. Muting playback is paused."),
+        MuteRecoveryStatus.Unrecognized => L.Get("The saved local audio recovery record is not supported. Review it before muting playback."),
+        _ => L.Get("Review the previous local audio mute state before starting playback that mutes this PC.")
+    });
+    public AsyncCommand ReviewMuteRecoveryCommand { get; }
+    public event Action? MuteRecoveryRequested;
     public string EngineMessage => EngineReady ? "" : EngineFailed
         ? L.Format("The audio engine could not start: {0}", _engine!.Error)
         : L.Get("Initializing audio engine…");
     public AsyncCommand RetryEngineCommand { get; }
-    public bool CanEditGlobalLatency => !_closing && !_resetting && !IsStopping && !(_snapshot.State is PlaybackState.Connecting or PlaybackState.Streaming or PlaybackState.Standby && _snapshot.Receiver is { } receiver && _settings.UsesDeviceLatency(receiver));
+    public bool CanEditGlobalLatency => !_closing && !_resetting && !IsStopping && !(_snapshot.State is PlaybackState.Connecting or PlaybackState.Streaming or PlaybackState.Standby && Session.UsesDeviceLatency(_settings.LatencyMode));
     public string GlobalLatencyHint => IsStopping ? L.Get("Disconnecting…") : CanEditGlobalLatency ? "" : L.Get("This device uses its receiver latency mode. Adjust it in Settings → Receivers.");
     public ObservableCollection<StreamChoice> LatencyChoices { get; } = [];
     public string LatencyMode { get => _settings.LatencyMode; set { if (!CanEditGlobalLatency || value == _settings.LatencyMode || value is null) return; _settings.LatencyMode = value; VolumeChanged(); Notify(); RefreshGlobalLatency(); } }
@@ -142,8 +190,14 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public AsyncCommand MuteCommand { get; }
     public event Action? SettingsChanged;
     public event Action? CatalogChanged;
-    public AppViewModel(ISettingsStore store, IDiscoveryService discovery, IAutostart autostart, IAudioService audio, IEngineFactory factory, Dispatcher dispatcher, EngineInitialization? engine = null, IApplicationCatalog? applications = null, IReceiverCapabilityCatalog? receiverCapabilities = null, IRestartService? restart = null, UpdateCheckState? updates = null)
+    private sealed class EmptyNowPlayingSource : INowPlayingSource
     {
+        public Task<NowPlaying?> ReadAsync(CancellationToken cancellation) => Task.FromResult<NowPlaying?>(null);
+    }
+
+    public AppViewModel(ISettingsStore store, IDiscoveryService discovery, IAutostart autostart, IAudioService audio, IEngineFactory factory, Dispatcher dispatcher, EngineInitialization? engine = null, IApplicationCatalog? applications = null, IReceiverCapabilityCatalog? receiverCapabilities = null, IRestartService? restart = null, bool isolatedVerification = false, UpdateCheckState? updates = null)
+    {
+        DismissNoticeCommand = new(DismissNotice, () => HasNotice);
         _engine = engine;
         _restart = restart ?? new RestartService();
         Updates = updates ?? new UpdateCheckState(new UpdateService(UpdateClient), Version.TryParse(AppPaths.Version, out var version) ? version : new Version(0, 0, 0));
@@ -152,33 +206,78 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         if (_engine is not null) _engine.Changed += EngineChanged;
         _store = store; _discovery = discovery; _autostart = autostart; _audio = audio; _dispatcher = dispatcher;
         Applications = applications ?? new ApplicationCatalog(factory);
+        _recovery = audio as IMuteRecoveryService;
+        if (_recovery is not null) _recovery.RecoveryChanged += RecoveryChanged;
+        ReviewMuteRecoveryCommand = new(async () =>
+        {
+            await RefreshMuteRecoveryAsync();
+            if (!_closing && HasMuteRecovery) MuteRecoveryRequested?.Invoke();
+        }, RecoveryFailed, () => !_closing && HasMuteRecovery);
         Endpoints = new(audio, dispatcher);
         Endpoints.DevicesChanged += OnEndpointsChangedAsync;
         Endpoints.Failed += ShowError;
         _settings = store.Load();
         _discovery.SetInterface(_settings.DiscoveryInterfaceId);
-        Session = new(factory, audio, AppPaths.Log);
+        Session = new(factory, audio, AppPaths.Log, sessionRecords: isolatedVerification ? _ => { } : null);
         Session.Changed += SessionChanged;
-        // A receiver's own buttons arrive as transport commands; forward them to the
-        // media keys so the app that is playing reacts, without touching the stream.
+        Session.EndpointRecoveryFailed += error => _dispatcher.BeginInvoke(() => ShowError(error));
+        // A receiver's own buttons (or a remote pointed at it) arrive as commands for
+        // the sender: transport commands go to SMTC or the media keys so the app that
+        // is playing reacts, and mute/volume steps go to AirFlash's own controls on
+        // the dispatcher. See RemoteCommand for what is deliberately ignored.
         _nowPlayingStop = new();
-        var nowPlayingSource = new AirFlash.App.Metadata.SmtcNowPlayingSource(AppPaths.Log);
-        Session.RemoteCommandReceived += command =>
+        if (isolatedVerification)
         {
-            if (command.Name is "play" or "pause")
+            NowPlaying = new NowPlayingPump(new EmptyNowPlayingSource());
+            _nowPlayingWork = Task.CompletedTask;
+        }
+        else
+        {
+            var nowPlayingSource = new AirFlash.App.Metadata.SmtcNowPlayingSource(AppPaths.Log);
+            Session.OwnedRemoteCommandReceived += (command, authority) =>
             {
-                _ = nowPlayingSource.ExecuteAsync(command, _nowPlayingStop.Token);
-                return;
-            }
-            if (command.VirtualKey is not { } key) return;
-            _dispatcher.BeginInvoke(() => AirFlash.App.Input.MediaKeys.Press(key, AppPaths.Log));
+                switch (command.Target)
+                {
+                    case RemoteCommandTarget.MediaSession:
+                        _ = nowPlayingSource.ExecuteAsync(command, () => CanApplyRemoteCommand(authority), _nowPlayingStop.Token);
+                        break;
+                    case RemoteCommandTarget.MediaKey when command.VirtualKey is { } key:
+                        _dispatcher.BeginInvoke(() =>
+                        {
+                            if (CanApplyRemoteCommand(authority))
+                                AirFlash.App.Input.MediaKeys.Press(key, AppPaths.Log);
+                        });
+                        break;
+                    case RemoteCommandTarget.Mute:
+                    case RemoteCommandTarget.MasterVolume:
+                        _ = QueueRemoteAudioCommandAsync(command, authority);
+                        break;
+                }
+            };
+            // Now Playing is polled from SMTC and pushed only when it actually changed;
+            // the engine turns it into the receiver's SET_PARAMETER payloads.
+            NowPlaying = new NowPlayingPump(nowPlayingSource, log: AppPaths.Log);
+            NowPlaying.SourceCleared += () => _ = Session.ClearNowPlayingAsync(_nowPlayingStop.Token);
+            _nowPlayingWork = Task.Run(() => NowPlaying.RunAsync(now => _ = Session.PublishNowPlayingAsync(now, _nowPlayingStop.Token), _nowPlayingStop.Token));
+        }
+        _discovery.Changed += list =>
+        {
+            BeginEligibilityChange();
+            _dispatcher.BeginInvoke(async () =>
+            {
+                try { await ApplyDiscoveryCoreAsync(list); }
+                catch (Exception error) { ShowError(error); }
+                finally { EndEligibilityChange(); }
+            });
         };
-        // Now Playing is polled from SMTC and pushed only when it actually changed;
-        // the engine turns it into the receiver's SET_PARAMETER payloads.
-        NowPlaying = new NowPlayingPump(nowPlayingSource, log: AppPaths.Log);
-        _nowPlayingWork = Task.Run(() => NowPlaying.RunAsync(now => _ = Session.PublishNowPlayingAsync(now, _nowPlayingStop.Token), _nowPlayingStop.Token));
-        _discovery.Changed += list => _dispatcher.BeginInvoke(() => OnDiscovered(list));
-        _discovery.Failed += message => _dispatcher.BeginInvoke(() => ShowError(new IOException(message)));
+        // WindowsDiscovery logs failures before publishing them. Present the
+        // notice without repeating the synchronous file append on the dispatcher.
+        _discovery.Failed += DiscoveryFailed;
+        _discovery.ResolveSucceeded += resolution => _dispatcher.BeginInvoke(() =>
+        {
+            if (!_closing && _discoveryNotice is { Attempt: { } failure } && failure.Epoch <= resolution.Epoch
+                && failure.Sequence < resolution.Sequence && failure.SameService(resolution)) Notice = "";
+        });
         _discovery.RunningChanged += running => _dispatcher.BeginInvoke(() =>
         {
             if (_closing) return;
@@ -199,8 +298,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         }, dispatcher);
         _discoverySearchTimer.Stop();
         StopCommand = new(() => StopAsync(), ShowError, () => !IsStopping && (_snapshot.IsActive || Session.NeedsCleanup));
-        ReconnectCommand = new(() => _snapshot.Receiver is { } receiver ? ToggleAsync(receiver) : Task.CompletedTask, ShowError, () => CanReconnect);
-        MuteCommand = new(async () => { await Session.SetMutedAsync(!Session.Muted); Notify(nameof(Muted)); Notify(nameof(MuteLabel)); }, ShowError);
+        ReconnectCommand = new(() => FindReconnectReceiver() is { } receiver ? ToggleAsync(receiver) : Task.CompletedTask, ShowError, () => CanReconnect);
+        MuteCommand = new(ToggleMuteAsync, ShowError);
         MergeManualReceivers();
         RefreshLatencyChoices();
     }
@@ -208,6 +307,34 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     {
         _startup = StartAsync();
     }
+    private bool CanApplyRemoteCommand(RemoteCommandAuthority authority)
+        => !_closing && !_resetting && Session.IsRemoteCommandCurrent(authority);
+
+    internal Task QueueRemoteAudioCommandAsync(RemoteCommand command, RemoteCommandAuthority authority)
+    {
+        return _dispatcher.InvokeAsync(ApplyAsync).Task.Unwrap();
+
+        async Task ApplyAsync()
+        {
+            if (!CanApplyRemoteCommand(authority)) return;
+            try
+            {
+                if (command.Target == RemoteCommandTarget.MasterVolume)
+                    MasterVolume += command.VolumeDelta;
+                else if (command.Target == RemoteCommandTarget.Mute && await Session.TryToggleRemoteMuteAsync(authority))
+                    NotifyMuteChanged();
+            }
+            catch (Exception error) { ShowError(error); }
+        }
+    }
+
+    private async Task ToggleMuteAsync()
+    {
+        await Session.SetMutedAsync(!Session.Muted);
+        NotifyMuteChanged();
+    }
+
+    private void NotifyMuteChanged() { Notify(nameof(Muted)); Notify(nameof(MuteLabel)); }
     public Task Startup => _startup;
     internal async Task CheckUpdatesAtStartupAsync()
     {
@@ -217,6 +344,14 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     }
     private async Task StartAsync()
     {
+        // Recovery does not display UI and runs before settings/lifecycle locks.
+        if (_recovery is not null)
+        {
+            try { await _recovery.InitializeRecoveryAsync(); }
+            catch (Exception error) { RecoveryFailed(error); }
+            RefreshRecoveryDisplay();
+        }
+        if (_closing) return;
         await _settingsGate.WaitAsync();
         try
         {
@@ -239,10 +374,32 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     }
     public void SetPanelVisible(bool visible) { _panelVisible = visible; UpdateDiscoveryDemand(); }
     public void SetReceiversPageVisible(bool visible) { _receiversPageVisible = visible; UpdateDiscoveryDemand(); }
+    private void DiscoveryFailed(DiscoveryFailure failure)
+    {
+        var context = failure.Reason is DiscoveryFailureReason.ResolveTimeout or DiscoveryFailureReason.ResolveFailed ? failure.Resolve : null;
+        var attempt = context is not null ? Session.CaptureStreamingAttempt()?.Attempt : null;
+        _dispatcher.BeginInvoke(() =>
+        {
+            if (_closing) return;
+            if (context is not null && attempt is { } original && Session.CaptureStreamingAttempt() is { } current
+                && current.Attempt == original && DiscoveryFailureAttribution.IsOtherReceiver(context, current.Receiver, _known.Values, _settings.ReceiverAliases)) return;
+            SetNotice(failure.Message, failure.Reason is DiscoveryFailureReason.ResolveTimeout or DiscoveryFailureReason.ResolveFailed ? failure : null);
+        });
+    }
+    private void RefreshDiscoveryNotice()
+    {
+        if (_discoveryNotice?.Resolve is { } context && Session.CaptureStreamingAttempt() is { } current
+            && DiscoveryFailureAttribution.IsOtherReceiver(context, current.Receiver, _known.Values, _settings.ReceiverAliases)) Notice = "";
+    }
     private void UpdateDiscoveryDemand()
     {
         if (!_started || _closing || _resetting) return;
-        var requested = _panelVisible || _receiversPageVisible || _startupDiscovery || _snapshot.IsActive && _snapshot.Receiver?.IsSoftwareGroup == true;
+        var demand = (_panelVisible ? DiscoveryDemand.Panel : DiscoveryDemand.None)
+            | (_receiversPageVisible ? DiscoveryDemand.Receivers : DiscoveryDemand.None)
+            | (_startupDiscovery ? DiscoveryDemand.Startup : DiscoveryDemand.None)
+            | (_snapshot.IsActive && _snapshot.Receiver?.IsSoftwareGroup == true ? DiscoveryDemand.SoftwareStereo : DiscoveryDemand.None);
+        if (_discovery is IDiscoveryDiagnostics diagnostics) diagnostics.RecordDemand(demand);
+        var requested = demand != DiscoveryDemand.None;
         if (requested == _discoveryRequested) return;
         _discoveryRequested = requested;
         if (requested)
@@ -258,10 +415,41 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         if (EngineReady) EngineVersion = _engine!.Version;
         Notify(nameof(EngineReady)); Notify(nameof(EngineFailed)); Notify(nameof(EngineMessage));
         RetryEngineCommand.Refresh();
+        RefreshReconnect();
         foreach (var row in Receivers) row.Refresh();
         CatalogChanged?.Invoke();
         if (EngineReady) ScheduleAutoConnect();
     });
+    private void RecoveryChanged() => _dispatcher.BeginInvoke(() => { if (!_closing) RefreshRecoveryDisplay(); });
+    private void RefreshRecoveryDisplay()
+    {
+        Notify(nameof(MuteReady)); Notify(nameof(HasMuteRecovery)); Notify(nameof(MuteRecovery)); Notify(nameof(MuteRecoveryMessage));
+        ReviewMuteRecoveryCommand.Refresh();
+        RefreshReconnect();
+        foreach (var row in Receivers) row.Refresh();
+        CatalogChanged?.Invoke();
+        if (MuteReady && !_closing) ScheduleAutoConnect();
+    }
+    private void RecoveryFailed(Exception error)
+    {
+        AppPaths.Log(error.ToString()); _recoveryError = error.Message; RefreshRecoveryDisplay();
+    }
+    public async Task RefreshMuteRecoveryAsync()
+    {
+        if (_closing || _recovery is null) return;
+        await _recovery.RefreshRecoveryAsync(); _recoveryError = null; RefreshRecoveryDisplay();
+    }
+    public async Task ResolveMuteRecoveryAsync(long revision, MuteRecoveryEntry entry, MuteRecoveryChoice choice)
+    {
+        if (_closing || _recovery is null) return;
+        await _recovery.ResolveRecoveryAsync(revision, entry.Owner, entry.Generation, entry.EndpointId, choice);
+        _recoveryError = null; RefreshRecoveryDisplay();
+    }
+    public async Task ArchiveMuteRecoveryAsync(long revision)
+    {
+        if (_closing || _recovery is null) return;
+        await _recovery.ArchiveUnrecognizedRecoveryAsync(revision); _recoveryError = null; RefreshRecoveryDisplay();
+    }
     private async Task MigrateEndpointNameAsync()
     {
         if (_settings.CaptureMode != "endpoint" || string.IsNullOrWhiteSpace(_settings.CaptureEndpoint)) return;
@@ -277,37 +465,59 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         }
         catch (Exception error) { ShowError(error); }
     }
-    private async Task OnEndpointsChangedAsync()
+    internal async Task OnEndpointsChangedAsync()
     {
         if (_closing || _resetting) return;
-        var intent = _playIntent;
+        var authority = Session.Capture();
         await _settingsGate.WaitAsync();
         try
         {
             if (_closing || _resetting) return;
             var next = await _audio.GetDefaultEndpointIdAsync();
             if (_closing || _resetting) return;
-            if (!IsStopping && intent == _playIntent && _settings.CaptureMode == "loopback" && next != _defaultEndpoint && _snapshot.IsActive && _snapshot.State != PlaybackState.Pairing && _snapshot.Receiver is { } receiver) await Session.StartAsync(receiver, _settings.Clone());
-            _defaultEndpoint = next;
-            if (!_snapshot.IsActive) await _audio.RestoreAsync();
+            var restarted = false;
+            if (!IsStopping && _settings.CaptureMode == "loopback" && next != _defaultEndpoint && authority.Snapshot.IsActive)
+                restarted = await Session.TryRestartForEndpointAsync(_settings.Clone(), authority.Owner, authority.AutomaticIntent, CaptureSessionSettingsContext());
+            else if (!IsStopping && !authority.Snapshot.IsActive)
+                await Session.TryRestoreAudioIfInactiveAsync(authority.Owner, authority.AutomaticIntent);
+            var current = Session.Capture();
+            // Pairing has not opened loopback capture yet. Once another owner is
+            // playing, its next observation must still see an unhandled change.
+            if (restarted || !current.Snapshot.IsActive || current.Snapshot.State == PlaybackState.Pairing
+                || (current.Owner == authority.Owner && current.AutomaticIntent == authority.AutomaticIntent))
+                _defaultEndpoint = next;
         }
         catch (Exception error) { ShowError(error); }
         finally { _settingsGate.Release(); }
+        try { await RefreshMuteRecoveryAsync(); } catch (Exception error) { RecoveryFailed(error); }
     }
-    private async void OnDiscovered(IReadOnlyList<Receiver> list)
+    private void BeginEligibilityChange()
+    {
+        Interlocked.Increment(ref _pendingEligibilityChanges);
+        Interlocked.Increment(ref _automaticEligibilityRevision);
+    }
+
+    private void EndEligibilityChange()
+    {
+        if (Interlocked.Decrement(ref _pendingEligibilityChanges) == 0) ScheduleAutoConnect();
+    }
+
+    internal async Task ApplyDiscoveryAsync(IReadOnlyList<Receiver> list)
+    {
+        BeginEligibilityChange();
+        try { await ApplyDiscoveryCoreAsync(list); }
+        finally { EndEligibilityChange(); }
+    }
+
+    private async Task ApplyDiscoveryCoreAsync(IReadOnlyList<Receiver> list)
     {
         if (_closing || _resetting) return;
+        await _settingsGate.WaitAsync();
         try
         {
-            await _settingsGate.WaitAsync();
-            try
-            {
-                if (_closing || _resetting) return;
-                await ReconcileDiscoveryAsync(list);
-            }
-            finally { _settingsGate.Release(); if (_volumeDirty && !_closing) { _volumeTimer.Stop(); _volumeTimer.Start(); } }
+            if (!_closing && !_resetting) await ReconcileDiscoveryAsync(list);
         }
-        catch (Exception error) { ShowError(error); }
+        finally { _settingsGate.Release(); if ((_volumeDirty || _volumeApplyPending) && !_closing && !_controlledScheduling) { _volumeTimer.Stop(); _volumeTimer.Start(); } }
     }
     private async Task ReconcileDiscoveryAsync(IReadOnlyList<Receiver> list)
     {
@@ -319,7 +529,9 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         if (!SettingsMerge.Equal(_settings, reconciliation.Settings))
         {
             var revision = _editRevision;
+            var volumeWasDirty = _volumeDirty;
             await SaveSettingsAsync(reconciliation.Settings, reconciliation.NeedsBackup);
+            _volumeApplyPending |= volumeWasDirty;
             var live = _settings.Clone(); var baseline = originalSettings.Clone();
             ReceiverCatalog.ApplyMigrations(live, reconciliation.Migrations, currentSnapshot.Receiver?.Id);
             ReceiverCatalog.ApplyMigrations(baseline, reconciliation.Migrations, currentSnapshot.Receiver?.Id);
@@ -412,10 +624,12 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     private void RefreshReceivers()
     {
         var active = Session.Snapshot;
+        var retainOwnedRow = active.IsActive || Session.NeedsCleanup;
         IEnumerable<Receiver> catalog = AllReceivers;
-        if (active.IsActive && active.Receiver is { } current && catalog.All(r => r.Id != current.Id))
+        if (retainOwnedRow && active.Receiver is { } current && catalog.All(r => r.Id != current.Id))
             catalog = catalog.Append(current with { Online = false });
-        var visible = catalog.Where(r => (r.Online || active.IsActive && r.Id == active.Receiver?.Id) && !_settings.ReadOptions(r.Id).Hidden).ToList();
+        var visible = catalog.Where(r => retainOwnedRow && r.Id == active.Receiver?.Id
+            || r.Online && !_settings.ReadOptions(r.Id).Hidden).ToList();
         foreach (var row in Receivers.Where(row => visible.All(r => r.Id != row.Receiver.Id)).ToArray()) Receivers.Remove(row);
         for (var i = 0; i < visible.Count; i++)
         {
@@ -425,11 +639,13 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             row.Refresh();
         }
         Notify(nameof(AllReceivers));
+        RefreshReconnect();
     }
     private void SessionChanged(SessionSnapshot snapshot) => _dispatcher.BeginInvoke(() => ApplySessionSnapshot(snapshot));
     private void ApplySessionSnapshot(SessionSnapshot snapshot)
     {
-        if (_closing || !ReferenceEquals(snapshot, Session.Snapshot)) return;
+        // The panel stays open while Quit waits for an Apply or engine cleanup.
+        if (!ReferenceEquals(snapshot, Session.Snapshot)) return;
         var title = StatusTitle; var detail = StatusDetail; var errors = ErrorDetails; var hint = ActionHint;
         var previous = _snapshot;
         _snapshot = snapshot;
@@ -437,16 +653,17 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         if (Session.RequiresManualReconnect) _autoSuppressed = true;
         RefreshGlobalLatency();
         Notify(nameof(Snapshot)); Notify(nameof(LatencyDetail)); Notify(nameof(PanelStatusDetail));
-        if (title != StatusTitle) Notify(nameof(StatusTitle));
-        if (detail != StatusDetail) Notify(nameof(StatusDetail));
+        // Cleanup ownership may already have changed when the worker queued this snapshot.
+        var needsCleanup = Session.NeedsCleanup;
+        if (title != StatusTitle || needsCleanup) Notify(nameof(StatusTitle));
+        if (detail != StatusDetail || needsCleanup) Notify(nameof(StatusDetail));
         if (errors != ErrorDetails) Notify(nameof(ErrorDetails));
         if (hint != ActionHint) Notify(nameof(ActionHint));
-        if (previous.State != snapshot.State || previous.Receiver?.Id != snapshot.Receiver?.Id)
+        if (previous.State != snapshot.State || previous.Receiver?.Id != snapshot.Receiver?.Id || needsCleanup)
         {
+            RefreshDiscoveryNotice();
             RefreshReceivers();
             StopCommand.Refresh();
-            Notify(nameof(CanReconnect));
-            ReconnectCommand.Refresh();
             UpdateDiscoveryDemand();
         }
         foreach (var row in Receivers) row.Refresh();
@@ -463,6 +680,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         {
             [nameof(MonitorLatency)] = MonitorLatency, [nameof(MonitorQueue)] = MonitorQueue,
             [nameof(MonitorUnderruns)] = MonitorUnderruns, [nameof(MonitorDrops)] = MonitorDrops,
+            [nameof(MonitorPaddedFrames)] = MonitorPaddedFrames, [nameof(MonitorFullyPaddedPackets)] = MonitorFullyPaddedPackets,
             [nameof(MonitorRate)] = MonitorRate, [nameof(MonitorStreamRate)] = MonitorStreamRate,
             [nameof(MonitorRecoveries)] = MonitorRecoveries,
             [nameof(MonitorSkipped)] = MonitorSkipped, [nameof(MonitorReconnects)] = MonitorReconnects,
@@ -480,38 +698,75 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             if (row is null) MonitorMembers.Add(new(member)); else row.Update(member);
         }
     }
-    public Task ToggleAsync(Receiver receiver) => ToggleAsync(receiver, SessionStartIntent.Manual);
-    private async Task ToggleAsync(Receiver receiver, SessionStartIntent startIntent)
+    public async Task ToggleAsync(Receiver receiver)
     {
+        var intent = Session.BeginExplicitIntent();
+        var current = Session.Capture().Snapshot;
         if (_closing || IsStopping) return;
-        if (_snapshot.IsActive && _snapshot.Receiver?.Id == receiver.Id) { await StopAsync(); return; }
-        if (_closing || _resetting || !EngineReady || Session.NeedsCleanup) return;
-        var group = AllReceivers.FirstOrDefault(r => r.IsGroup && !r.IsSoftwareGroup && r.Members.Any(m => m.Address == receiver.Address));
-        if (group is not null) receiver = group;
-        var intent = ++_playIntent;
+        if (current.IsActive && current.Receiver?.Id == receiver.Id) { await StopAsync(); return; }
+        if (!CanStartPlayback) return;
+        receiver = ResolvePlayback(receiver);
+        _autoSuppressed = false;
         await FlushVolumeAsync();
         await _settingsGate.WaitAsync();
         try
         {
-            if (_closing || _resetting || IsStopping || intent != _playIntent || !EngineReady || Session.NeedsCleanup) return;
+            if (!CanStartExplicit(intent)) return;
             if (_settings.CaptureMode == "loopback") _defaultEndpoint = await _audio.GetDefaultEndpointIdAsync();
-            if (_closing || _resetting || IsStopping || intent != _playIntent) return;
-            if (startIntent == SessionStartIntent.Manual) _autoSuppressed = false;
-            Notice = "";
-            _autoAttempted.Add(receiver.Id);
-            await Session.StartAsync(receiver, _settings.Clone(), startIntent);
-            if (intent != _playIntent) return;
-            _settings.LastReceiverId = receiver.Id;
-            VolumeChanged();
+            if (!CanStartExplicit(intent)) return;
+            receiver = FindCurrentPlaybackReceiver(receiver, AllReceivers)
+                ?? throw new InvalidOperationException(L.Get("The receiver is unavailable."));
+            if (_settings.ReadOptions(receiver.Id).Hidden) throw new InvalidOperationException(L.Get("The receiver is unavailable."));
+            if (!await Session.TryStartExplicitAsync(receiver, _settings.Clone(), intent)) return;
+            RecordAdmittedStart(receiver, intent);
         }
         finally { _settingsGate.Release(); }
         await FlushVolumeAsync();
     }
+    private bool CanStartPlayback => !_closing && !_resetting && !IsStopping && EngineReady && MuteReady && !Session.NeedsCleanup;
+    private bool CanStartExplicit(long intent) => CanStartPlayback && Session.IsIntentCurrent(intent);
+
+    private Receiver? FindCurrentPlaybackReceiver(Receiver selected, IReadOnlyList<Receiver> catalog)
+    {
+        if (selected.IsManual)
+        {
+            // A queued Apply can remove or edit the selected manual endpoint.
+            return _known.TryGetValue(selected.Id, out var manual) && manual.IsManual
+                && StringComparer.OrdinalIgnoreCase.Equals(manual.Address, selected.Address) && manual.Port == selected.Port
+                ? manual : null;
+        }
+        var id = ReceiverIdentity.Resolve(ReceiverMigrations.GetValueOrDefault(selected.Id, selected.Id), _settings.ReceiverAliases);
+        return catalog.FirstOrDefault(item => item.Id == id);
+    }
+
+    private Receiver? FindReconnectReceiver()
+    {
+        if (!CanStartPlayback || _snapshot.IsActive || !Session.RequiresManualReconnect || _snapshot.Receiver is not { } receiver) return null;
+        var catalog = AllReceivers;
+        var selected = ReceiverSelection.ResolvePlayback(receiver, catalog);
+        return selected is not null && FindCurrentPlaybackReceiver(selected, catalog) is { Online: true, Complete: true } current
+            && !_settings.ReadOptions(current.Id).Hidden ? current : null;
+    }
+
+    private void RefreshReconnect()
+    {
+        Notify(nameof(CanReconnect));
+        ReconnectCommand.Refresh();
+    }
+
+    private void RecordAdmittedStart(Receiver receiver, long intent)
+    {
+        if (Session.IsIntentCurrent(intent)) Notice = "";
+        _autoAttempted.Add(receiver.Id);
+        _settings.LastReceiverId = receiver.Id;
+        VolumeChanged();
+    }
+
     public Task StopAsync(bool userInitiated = true)
     {
+        Session.InvalidateAutomaticIntent();
         if (userInitiated) _autoSuppressed = true;
         if (_stopTask is not null) return _stopTask;
-        ++_playIntent;
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         _stopTask = completion.Task;
         IsStopping = true; RefreshStopUi();
@@ -532,11 +787,26 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     }
     private void RefreshStopUi()
     {
-        Notify(nameof(IsStopping)); Notify(nameof(StatusTitle)); Notify(nameof(StatusDetail)); Notify(nameof(PanelStatusDetail)); Notify(nameof(CanReconnect));
-        RefreshGlobalLatency(); StopCommand.Refresh(); ReconnectCommand.Refresh();
+        Notify(nameof(IsStopping)); Notify(nameof(StatusTitle)); Notify(nameof(StatusDetail)); Notify(nameof(PanelStatusDetail));
+        RefreshGlobalLatency(); StopCommand.Refresh(); RefreshReconnect();
         foreach (var row in Receivers) row.Refresh();
     }
-    private void ScheduleAutoConnect() { _autoTimer.Stop(); if (!_closing && !_resetting) _autoTimer.Start(); }
+    public async Task PairAsync(Receiver receiver, Func<Receiver, CancellationToken, Task<string?>> requestPin)
+    {
+        var intent = Session.BeginExplicitIntent();
+        if (!CanStartExplicit(intent)) return;
+        await Session.TryPairExplicitAsync(ResolvePlayback(receiver), _settings.Clone(), requestPin, intent);
+    }
+    private Receiver ResolvePlayback(Receiver receiver) => ReceiverSelection.ResolvePlayback(receiver, AllReceivers)
+        ?? throw new InvalidOperationException(L.Get("The receiver selection is ambiguous."));
+
+    internal void UseControlledScheduling()
+    {
+        _controlledScheduling = true;
+        _volumeTimer.Stop();
+        _autoTimer.Stop();
+    }
+    private void ScheduleAutoConnect() { _autoTimer.Stop(); if (!_closing && !_resetting && !_controlledScheduling) _autoTimer.Start(); }
     private async Task SaveSettingsAsync(AppSettings settings, bool? identityBackup = null)
     {
         var warning = (_store as SettingsStore)?.LoadWarning;
@@ -545,12 +815,34 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         if (warning is not null && Notice == warning && _store is SettingsStore store && store.LoadWarning != warning)
             Notice = store.LoadWarning ?? "";
     }
+    private bool CanAutoConnect => !_closing && !_resetting && !IsStopping && !Session.NeedsCleanup
+        && !Session.RequiresManualReconnect && EngineReady && MuteReady && !_autoSuppressed && Volatile.Read(ref _pendingEligibilityChanges) == 0;
+
     internal async Task TryAutoConnectAsync()
     {
-        if (_closing || _resetting || IsStopping || Session.NeedsCleanup || Session.RequiresManualReconnect || !EngineReady || _autoSuppressed || Session.Snapshot.IsActive) return;
-        var eligible = AllReceivers.Where(r => r.Online && r.Complete && !_settings.ReadOptions(r.Id).Hidden && (_settings.ReadOptions(r.Id).AutoConnect ?? _settings.AutoConnectOnDiscover));
-        var receiver = eligible.OrderByDescending(r => r.Id == _settings.LastReceiverId).FirstOrDefault();
-        if (receiver is not null && !_autoAttempted.Contains(receiver.Id)) await ToggleAsync(receiver, SessionStartIntent.Automatic);
+        var captured = Session.Capture();
+        if (!CanAutoConnect || captured.Snapshot.IsActive) return;
+        var selected = ReceiverSelection.SelectAutoConnect(AllReceivers, _settings, _autoAttempted);
+        if (selected is null) return;
+        await FlushVolumeAsync();
+        await _settingsGate.WaitAsync();
+        try
+        {
+            if (!CanAutoConnect || !Session.IsIntentCurrent(captured.AutomaticIntent)) return;
+            var revision = Volatile.Read(ref _automaticEligibilityRevision);
+            var id = ReceiverIdentity.Resolve(ReceiverMigrations.GetValueOrDefault(selected.Id, selected.Id), _settings.ReceiverAliases);
+            var receiver = AllReceivers.FirstOrDefault(item => item.Id == id);
+            if (receiver is null || !ReceiverSelection.IsAutoConnectEligible(receiver, _settings, _autoAttempted)) return;
+            if (_settings.CaptureMode == "loopback") _defaultEndpoint = await _audio.GetDefaultEndpointIdAsync();
+            if (!CanAutoConnect || !Session.IsIntentCurrent(captured.AutomaticIntent) || revision != Volatile.Read(ref _automaticEligibilityRevision))
+            { ScheduleAutoConnect(); return; }
+            if (!await Session.TryStartAutomaticAsync(receiver, _settings.Clone(), captured.Owner, captured.AutomaticIntent,
+                () => revision == Volatile.Read(ref _automaticEligibilityRevision) && Volatile.Read(ref _pendingEligibilityChanges) == 0 && MuteReady))
+            { ScheduleAutoConnect(); return; }
+            RecordAdmittedStart(receiver, captured.AutomaticIntent);
+        }
+        finally { _settingsGate.Release(); }
+        await FlushVolumeAsync();
     }
     public DeviceVolumeState ReceiverVolume(string id) => _snapshot.State is PlaybackState.Streaming or PlaybackState.Standby
         ? _snapshot.Receiver?.IsSoftwareGroup == true ? _snapshot.MemberVolumes?.GetValueOrDefault(id) ?? new() : _snapshot.Receiver?.Id == id ? _snapshot.DeviceVolume ?? new() : new() : new();
@@ -597,30 +889,43 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         _settings.Options(id).LastVolume = value;
         VolumeChanged();
     }
-    private void VolumeChanged() { _editRevision++; _volumeDirty = true; _volumeTimer.Stop(); if (!_closing) _volumeTimer.Start(); }
+    private void VolumeChanged() { Interlocked.Increment(ref _automaticEligibilityRevision); _editRevision++; _volumeDirty = true; _volumeTimer.Stop(); if (!_closing && !_controlledScheduling) _volumeTimer.Start(); }
+    private SessionSettingsContext CaptureSessionSettingsContext(IEnumerable<string>? clearedOptions = null, IEnumerable<string>? changedMemberships = null)
+        => new(AllReceivers, ReceiverMigrations, clearedOptions, changedMemberships);
+
     public async Task FlushVolumeAsync()
     {
         _volumeTimer.Stop();
-        if (_resetting || _resetCompleted || !_volumeDirty) return;
+        if (_resetting || _resetCompleted || (!_volumeDirty && !_volumeApplyPending)) return;
         await _settingsGate.WaitAsync();
-        var saved = false;
+        var completed = false;
         try
         {
-            if (_resetting || _resetCompleted || !_volumeDirty) return;
+            if (_resetting || _resetCompleted || (!_volumeDirty && !_volumeApplyPending)) return;
             var current = _settings.Clone();
+            var owner = Session.Capture();
+            var context = CaptureSessionSettingsContext();
             var revision = _editRevision;
-            using (UiPerformance.Measure("settings.persist")) await SaveSettingsAsync(current);
-            saved = true;
-            if (revision == _editRevision) _volumeDirty = false;
-            await Session.UpdateSettingsAsync(current);
+            if (_volumeDirty)
+            {
+                using (UiPerformance.Measure("settings.persist")) await SaveSettingsAsync(current);
+                if (revision == _editRevision) _volumeDirty = false;
+                _volumeApplyPending = true;
+            }
+            // Persistence and live application have different authorities. A newer
+            // intent may reject this saved snapshot without admitting a new worker.
+            // Retry from current settings and authority without repeating the save.
+            if (!_closing) _volumeApplyPending = !await Session.TryUpdateSettingsAsync(current, owner, context);
+            completed = true;
         }
-        finally { _settingsGate.Release(); if (saved && _volumeDirty && !_closing) { _volumeTimer.Stop(); _volumeTimer.Start(); } }
+        finally { _settingsGate.Release(); if (completed && (_volumeDirty || _volumeApplyPending) && !_closing && !_controlledScheduling) { _volumeTimer.Stop(); _volumeTimer.Start(); } }
     }
     public async Task<SettingsApplyResult> ApplyAsync(AppSettings baseline, AppSettings draft, Action<string>? progress = null)
     {
         if (_closing || _resetting) throw new InvalidOperationException(L.Get("The application is closing."));
         baseline = baseline.Clone(); draft = draft.Clone();
         _volumeTimer.Stop();
+        BeginEligibilityChange();
         using (UiPerformance.Measure("apply.queue")) await _settingsGate.WaitAsync();
         try
         {
@@ -629,7 +934,9 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             ReceiverCatalog.ApplyMigrations(baseline, ReceiverMigrations, Session.Snapshot.Receiver?.Id);
             ReceiverCatalog.ApplyMigrations(draft, ReceiverMigrations, Session.Snapshot.Receiver?.Id);
             var before = _settings.Clone();
+            var owner = Session.Capture();
             var revision = _editRevision;
+            var volumeWasDirty = _volumeDirty;
             AppSettings merged;
             using (UiPerformance.Measure("apply.merge")) merged = SettingsMerge.Merge(baseline, draft, before);
             if (merged.Validate() is { } validation) throw new InvalidOperationException(validation);
@@ -656,10 +963,15 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             }
             using (UiPerformance.Measure("apply.ui"))
             {
-                if (!before.AutoConnectOnDiscover && merged.AutoConnectOnDiscover) { _autoSuppressed = false; _autoAttempted.Clear(); }
+                if (!before.AutoConnectOnDiscover && merged.AutoConnectOnDiscover)
+                {
+                    if (Session.IsIntentCurrent(owner.AutomaticIntent)) _autoSuppressed = false;
+                    _autoAttempted.Clear();
+                }
                 // Preserve edits made in the panel while this snapshot was being saved.
                 _settings = revision == _editRevision ? merged.Clone() : SettingsMerge.Merge(before, _settings, merged);
                 foreach (var removed in baseline.Receivers.Keys.Except(draft.Receivers.Keys)) _settings.Receivers.Remove(removed);
+                _volumeApplyPending |= volumeWasDirty;
                 _volumeDirty = revision != _editRevision;
                 if (before.DiscoveryInterfaceId != _settings.DiscoveryInterfaceId) _discovery.SetInterface(_settings.DiscoveryInterfaceId);
                 var oldCatalog = AllReceivers;
@@ -667,6 +979,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
                 RefreshLatencyChoices();
                 Notify(nameof(Settings)); Notify(nameof(MasterVolume)); Notify(nameof(LatencyMode));
                 RefreshGlobalLatency();
+                RefreshRecoveryDisplay();
                 SettingsChanged?.Invoke();
                 if (!CatalogEqual(oldCatalog, AllReceivers)) CatalogChanged?.Invoke();
             }
@@ -676,33 +989,38 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             {
                 using (UiPerformance.Measure("apply.session"))
                 {
-                    if (Session.Snapshot.Receiver is { IsSoftwareGroup: true } active)
+                    if (!_closing && Session.IsIntentCurrent(owner.AutomaticIntent))
                     {
-                        var previousGroup = before.SoftwareGroups.FirstOrDefault(g => g.Id == active.Id);
-                        var nextGroup = merged.SoftwareGroups.FirstOrDefault(g => g.Id == active.Id);
-                        // Only an explicit membership edit adopts the current catalog here.
-                        // Hot settings must retain working addresses through discovery loss.
-                        if (previousGroup is not null && nextGroup is not null && (previousGroup.LeftId != nextGroup.LeftId || previousGroup.RightId != nextGroup.RightId))
+                        var changedMemberships = draft.SoftwareGroups.Where(group => baseline.SoftwareGroups.FirstOrDefault(previous => previous.Id == group.Id) is { } previous
+                            && (previous.IsMultiRoom != group.IsMultiRoom || !previous.MemberIds.SequenceEqual(group.MemberIds)))
+                        .Select(group => group.Id).ToArray();
+                        var context = CaptureSessionSettingsContext(baseline.Receivers.Keys.Except(draft.Receivers.Keys), changedMemberships);
+                        var expected = owner;
+                        if (owner.Snapshot.Receiver is { IsSoftwareGroup: true } active && changedMemberships.Contains(active.Id)
+                            && AllReceivers.FirstOrDefault(receiver => receiver.Id == active.Id) is { Online: true, Complete: true } next)
                         {
-                            var next = AllReceivers.FirstOrDefault(r => r.Id == active.Id);
-                            if (next is { Online: true, Complete: true }) await Session.UpdateReceiverAsync(next, merged);
-                            else await Session.StopAsync();
+                            if (await Session.TryUpdateReceiverAsync(next, merged, owner))
+                                expected = Session.Capture();
                         }
+                        if (expected.AutomaticIntent == owner.AutomaticIntent)
+                            if (await Session.TryUpdateSettingsAsync(merged, expected, context)) _volumeApplyPending = false;
                     }
-                    await Session.UpdateSettingsAsync(merged);
                 }
             }
             catch (Exception error) { audioError = L.Format("Settings saved, but audio could not be updated: {0}", error.Message); ShowError(new IOException(audioError, error)); }
             ScheduleAutoConnect();
             return new(merged, audioError);
         }
-        finally { _settingsGate.Release(); if (_volumeDirty && !_closing) { _volumeTimer.Stop(); _volumeTimer.Start(); } }
+        finally { _settingsGate.Release(); EndEligibilityChange(); if ((_volumeDirty || _volumeApplyPending) && !_closing && !_controlledScheduling) { _volumeTimer.Stop(); _volumeTimer.Start(); } }
     }
     public void ShowError(Exception error) { AppPaths.Log(error.ToString()); Notice = error.Message; }
     public async Task ResetAsync()
     {
         if (_closing || _resetting) return;
+        Session.InvalidateAutomaticIntent();
+        Interlocked.Increment(ref _automaticEligibilityRevision);
         _resetting = true;
+        RefreshReconnect();
         var acquired = false; var cleared = false; var oldStartup = _settings.StartAtLogin;
         try
         {
@@ -714,7 +1032,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             await _audio.RestoreAsync();
             await _autostart.SetAsync(false);
             await _store.ResetAsync(); cleared = true;
-            _settings = new(); _volumeDirty = false; _editRevision++;
+            _settings = new(); _volumeDirty = false; _volumeApplyPending = false; _editRevision++;
             ReceiverMigrations = new Dictionary<string, string>(); _autoAttempted.Clear();
             _discovery.SetInterface(_settings.DiscoveryInterfaceId);
             _known.Clear(); MergeManualReceivers(); RefreshReceivers();
@@ -734,25 +1052,39 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         }
         finally
         {
-            if (acquired) _settingsGate.Release(); _resetting = false; RefreshGlobalLatency();
+            if (acquired) _settingsGate.Release(); _resetting = false; RefreshGlobalLatency(); RefreshReconnect();
             if (!_closing) UpdateDiscoveryDemand();
         }
         ResetCompleted?.Invoke();
     }
-    public string Diagnostics() => $"AirFlash {AppPaths.DisplayVersion} / WPF\n" + L.Format("Engine: {0}\nStatus: {1}\n{2}\nLocal p95: {3}\nQueue age: {4}\nUnderruns: {5}; drops: {6}\nEnd-to-end latency: not measured", EngineVersion, StatusTitle, StatusDetail, MonitorLatency, MonitorQueue, MonitorUnderruns, MonitorDrops) + (ActionHint.Length > 0 ? "\n" + ActionHint : "") + "\n" + System.Text.Json.JsonSerializer.Serialize(_snapshot.Diagnostics, AppSettings.JsonOptions);
+    public string Diagnostics() => $"AirFlash {AppPaths.DisplayVersion} / WPF\n" + L.Format("Engine: {0}\nStatus: {1}\n{2}\nLocal p95: {3}\nQueue age: {4}\nUnderruns: {5}; drops: {6}\nEnd-to-end latency: not measured", EngineVersion, StatusTitle, StatusDetail, MonitorLatency, MonitorQueue, MonitorUnderruns, MonitorDrops)
+        + "\n" + L.Format("Local padded output frames: {0}; wholly padded capture pulls: {1}", MonitorPaddedFrames, MonitorFullyPaddedPackets)
+        + (ActionHint.Length > 0 ? "\n" + ActionHint : "") + "\n" + System.Text.Json.JsonSerializer.Serialize(_snapshot.Diagnostics, AppSettings.JsonOptions);
     /// <summary>Write the current engine's redacted diagnostic bundle into the log folder.</summary>
     public async Task<string> ExportDiagnosticsAsync()
     {
-        var snapshot = await DiagnosticExport.SnapshotAsync(Session).ConfigureAwait(false);
-        var bundle = DiagnosticExport.Compose(AppPaths.DisplayVersion, EngineVersion, snapshot);
+        var capture = await DiagnosticExport.CaptureAsync(Session).ConfigureAwait(false);
+        var discovery = (_discovery as IDiscoveryDiagnostics)?.SnapshotDiagnostics();
+        var bundle = DiagnosticExport.Compose(AppPaths.DisplayVersion, EngineVersion, capture.Summary, capture.CounterHistory, discovery);
         var path = DiagnosticExport.Write(AppPaths.LogDirectory, bundle);
         AppPaths.Log($"Diagnostics exported to {path}");
         return path;
     }
     public ValueTask DisposeAsync() => new(_disposeTask ??= DisposeCoreAsync());
+    internal void BeginShutdown()
+    {
+        if (_closing) return;
+        _closing = true;
+        Session.InvalidateAutomaticIntent();
+        Interlocked.Increment(ref _automaticEligibilityRevision);
+        _volumeTimer.Stop(); _autoTimer.Stop(); _startupDiscoveryTimer.Stop(); _discoverySearchTimer.Stop();
+        RefreshReconnect();
+        foreach (var row in Receivers) row.Refresh();
+    }
     private async Task DisposeCoreAsync()
     {
-        _closing = true; Updates.Dispose(); _volumeTimer.Stop(); _autoTimer.Stop(); _startupDiscoveryTimer.Stop(); _discoverySearchTimer.Stop(); _discovery.Dispose();
+        BeginShutdown(); Updates.Dispose(); _discovery.Dispose();
+        if (_recovery is not null) _recovery.RecoveryChanged -= RecoveryChanged;
         _nowPlayingStop.Cancel();
         await _nowPlayingWork;
         _nowPlayingStop.Dispose();
@@ -762,8 +1094,13 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         try { await Endpoints.DrainAsync(); } catch (Exception error) { AppPaths.Log(error.ToString()); }
         await _settingsGate.WaitAsync(); _settingsGate.Release();
         try { await FlushVolumeAsync(); } catch (Exception error) { AppPaths.Log(error.ToString()); }
-        await Session.DisposeAsync();
-        if (_audio is IAsyncDisposable disposable) await disposable.DisposeAsync();
+        try { await Session.DisposeAsync(); }
+        finally
+        {
+            if (_audio is IAsyncDisposable disposable)
+                try { await disposable.DisposeAsync(); }
+                catch (Exception error) { AppPaths.Log("Local audio cleanup failed: " + error); }
+        }
     }
 }
 public sealed record SettingsApplyResult(AppSettings Saved, string? AudioError)
@@ -810,9 +1147,10 @@ public sealed class ReceiverViewModel : ObservableObject
     public bool IsStopping => _app.IsStopping && _app.Snapshot.Receiver?.Id == Receiver.Id;
     public bool NeedsDisconnect => Active || _app.Session.NeedsCleanup && _app.Snapshot.Receiver?.Id == Receiver.Id;
     public System.Windows.Input.ICommand PlaybackCommand => NeedsDisconnect ? _app.StopCommand : ToggleCommand;
-    public bool CanPlay => !_app.IsStopping && !_app.Session.NeedsCleanup && (Active || _app.EngineReady && Receiver.Online && Receiver.Complete);
+    public bool CanPlay => !_app.IsStopping && !_app.Session.NeedsCleanup
+        && (Active || !_app.IsClosing && _app.EngineReady && _app.MuteReady && Receiver.Online && Receiver.Complete);
     public string PlayHint => IsStopping ? L.Get("Disconnecting…") : NeedsDisconnect ? L.Get("Stop playback / disconnect") : L.Get("Play on this device");
-    public string StateText => (NeedsDisconnect ? _app.StatusTitle : !Receiver.Online ? L.Get("Offline") : !Receiver.Complete ? (Receiver.GroupMode == "multi_room" ? L.Get("Waiting for other members") : L.Get("Waiting for the other member")) : L.Get("Disconnected")) + (Receiver.IsGroup ? $" · {Receiver.Members.Length}/{(Receiver.IsSoftwareGroup && Receiver.GroupMode == "multi_room" ? Receiver.Members.Length : 2)}" : "");
+    public string StateText => (NeedsDisconnect ? _app.StatusTitle : !Receiver.Online ? L.Get("Offline") : !Receiver.Complete ? L.Get(Receiver.IsMultiRoom ? "Waiting for other members" : "Waiting for the other member") : L.Get("Disconnected")) + (Receiver.IsGroup ? $" · {Receiver.GroupDisplayMemberCount}/{(Receiver.IsMultiRoom ? Receiver.Members.Length : 2)}" : "");
     public AsyncCommand ToggleCommand { get; }
     public AsyncCommand MuteCommand { get; }
     public void Refresh()

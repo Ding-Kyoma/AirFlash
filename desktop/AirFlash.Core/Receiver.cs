@@ -19,11 +19,25 @@ public sealed record Receiver(string Id, string Name, string Address, int Port =
     public bool FollowReceiverClock { get; init; }
     public bool IsSoftwareGroup { get; init; }
     public string GroupMode { get; init; } = "";
+    [JsonIgnore] public bool IsMultiRoom => IsSoftwareGroup && GroupMode == "multi_room";
+    [JsonIgnore] internal string PlaybackGroupMode => IsMultiRoom ? "multi_room" : IsSoftwareGroup
+        ? "software_stereo" : IsGroup ? "native_stereo" : "single";
     public string Channel { get; init; } = "stereo";
     public int SyncOffsetMs { get; init; }
     public string[] Aliases { get; init; } = [];
     public bool IsGroup => IsSoftwareGroup || Members.Length > 0 || Id.StartsWith("stereo:", StringComparison.Ordinal);
-    public bool Complete => !IsGroup || (IsSoftwareGroup ? Members.Length >= 2 : Members.Length == 2) && Members.All(m => m.Online && !m.IsGroup && (!IsSoftwareGroup || m.StereoId.Length == 0));
+    // The engine requires distinct peer hosts even when two services advertise different ports.
+    private int NativeMemberEndpointCount => Members.Where(m => m.Online && !m.IsGroup && m.Address.Length > 0)
+        .Select(m => m.Address).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+    // Keep excess announcements visible even when they share an address.
+    [JsonIgnore] public int GroupDisplayMemberCount => IsSoftwareGroup || Members.Length > 2 ? Members.Length : NativeMemberEndpointCount;
+    public bool Complete => !IsGroup || (IsSoftwareGroup
+        ? (IsMultiRoom ? Members.Length >= 2 : Members.Length == 2)
+            && Members.All(m => m.Online && !m.IsGroup && m.StereoId.Length == 0)
+        : Members.Length == 2 && NativeMemberEndpointCount == 2);
+    internal bool HasDistinctSoftwareMembers => Members.All(m => !string.IsNullOrWhiteSpace(m.Address))
+        && Members.Select(m => PhysicalKey(m.DeviceId, m.Address)).Distinct().Count() == Members.Length
+        && Members.Select(m => m.Address).Distinct(StringComparer.OrdinalIgnoreCase).Count() == Members.Length;
     /// <summary>TXT-only four-state label; missing features never become classic.</summary>
     public AirPlayCapability Support => AirPlayCapabilityClassifier.Classify(Features, SourceVersion);
     /// <summary>WAC's routing predicate: TXT bit 40 and <c>srcvers &gt;= 354.54.6</c>.</summary>
@@ -36,7 +50,9 @@ public sealed record Receiver(string Id, string Name, string Address, int Port =
         _ => L.Get("AirPlay 2 support unknown")
     };
     private string BaseDetail => Model.Length > 0 ? Model : L.Get("AirFlash receiver");
-    public string Detail => IsSoftwareGroup ? (GroupMode == "multi_room" ? (Members.Length > 0 ? L.Format("Multi-room · {0} speakers", Members.Length) : L.Get("Multi-room")) : L.Get("Software stereo · experimental")) : IsGroup ? L.Format("HomePod stereo · {0}/2", Members.Length) : $"{BaseDetail} · {CapabilityDetail}";
+    public string Detail => IsMultiRoom ? Members.Length > 0 ? L.Format("Multi-room · {0} speakers", Members.Length) : L.Get("Multi-room")
+        : IsSoftwareGroup ? L.Get("Software stereo · experimental")
+        : IsGroup ? L.Format("HomePod stereo · {0}/2", GroupDisplayMemberCount) : $"{BaseDetail} · {CapabilityDetail}";
     [JsonIgnore] public IEnumerable<Receiver> Peers => IsGroup ? Members : [this];
     public string TransportKey => string.Join(";", Peers.OrderBy(p => p.Address, StringComparer.Ordinal).ThenBy(p => p.Port).Select(p => $"{p.Address}:{p.Port}:{(IsGroup && p.IsLeader)}:{p.Channel}:{p.SyncOffsetMs}"));
     public static string PhysicalKey(string identity, string address) => string.IsNullOrWhiteSpace(identity) ? address : ReceiverIdentity.Normalize(identity);
@@ -74,6 +90,7 @@ public static class ReceiverAggregator
             var name = service.Instance.Split("._", StringSplitOptions.None)[0];
             if (name.Contains('@')) name = name[(name.IndexOf('@') + 1)..];
             var identity = group.Select(Identity).FirstOrDefault(id => id.Length > 0) ?? "";
+            var model = group.Select(Model).FirstOrDefault(value => value.Length > 0) ?? "";
             var codecText = Field(group.Where(s => s.ServiceType.StartsWith("_raop", StringComparison.Ordinal)), "cn");
             var aliases = group.SelectMany(s => new[] { Identity(s), ReceiverIdentity.Normalize(Identity(s)), Endpoint(s) }).Where(id => id.Length > 0).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
             if (group.Length > 1) diagnostic?.Invoke("Discovery merged: " + string.Join(" | ", group.Select(Describe))
@@ -81,7 +98,7 @@ public static class ReceiverAggregator
             return new Receiver(identity.Length > 0 ? ReceiverIdentity.Normalize(identity) : Endpoint(service), name, service.Address, service.Port)
             {
                 DeviceId = identity,
-                Model = group.Select(Model).FirstOrDefault(v => v.Length > 0) ?? "",
+                Model = model,
                 StereoId = Field(group, "tsid"),
                 GroupName = Field(group, "gpn"),
                 IsLeader = Field(group, "igl") == "1",
@@ -90,7 +107,7 @@ public static class ReceiverAggregator
                 Features = ParseFeatures(Field(group, "features") is { Length: > 0 } features ? features : Field(group, "ft")),
                 SourceVersion = Field(group, "srcvers"),
                 RequiresPassword = Field(group, "pw").Equals("true", StringComparison.OrdinalIgnoreCase),
-                FollowReceiverClock = Model(service).StartsWith("AudioAccessory", StringComparison.Ordinal) && Field(group, "igl") == "1" && Field(group, "tsid").Length == 0 && Field(group, "pgid").Length == 0 && int.TryParse(Field(group, "osvers").Split('.')[0], out var os) && os >= 27
+                FollowReceiverClock = model.StartsWith("AudioAccessory", StringComparison.Ordinal) && Field(group, "igl") == "1" && Field(group, "tsid").Length == 0 && Field(group, "pgid").Length == 0 && int.TryParse(Field(group, "osvers").Split('.')[0], out var os) && os >= 27
             };
         }).ToArray();
         // Conflicting unidentified services at one endpoint still need independent catalog keys.
@@ -109,7 +126,7 @@ public static class ReceiverAggregator
             return leader with { Id = $"stereo:{group.Key}", Name = leader.GroupName.Length > 0 ? leader.GroupName : leader.Name, Members = members, Aliases = [] };
         })).OrderBy(r => r.Name, StringComparer.CurrentCultureIgnoreCase).ToArray();
     }
-    private static string Identity(ServiceRecord service)
+    internal static string Identity(ServiceRecord service)
     {
         if (service.Txt.TryGetValue("deviceid", out var id) && !string.IsNullOrWhiteSpace(id)) return id.Trim();
         var at = service.Instance.IndexOf('@');
@@ -164,10 +181,24 @@ public static class DiscoveryInterface
         return adapter is { Available: true } ? adapter.InterfaceIndex : null;
     }
 }
+public enum DiscoveryFailureReason { Other, ResolveTimeout, ResolveFailed }
+public sealed record DiscoveryResolveContext(string DeviceId, string Address, int Port, string StereoId);
+public sealed record DiscoveryResolveAttempt(string Instance, string ServiceType, long Epoch, long Sequence)
+{
+    public bool SameService(DiscoveryResolveAttempt other) =>
+        Instance.TrimEnd('.').Equals(other.Instance.TrimEnd('.'), StringComparison.OrdinalIgnoreCase)
+        && ServiceType.TrimEnd('.').Equals(other.ServiceType.TrimEnd('.'), StringComparison.OrdinalIgnoreCase);
+}
+public sealed record DiscoveryFailure(string Message, DiscoveryFailureReason Reason = DiscoveryFailureReason.Other, DiscoveryResolveContext? Resolve = null)
+{
+    public DiscoveryResolveAttempt? Attempt { get; init; }
+}
+
 public interface IDiscoveryService : IDisposable
 {
     event Action<IReadOnlyList<Receiver>>? Changed;
-    event Action<string>? Failed;
+    event Action<DiscoveryFailure>? Failed;
+    event Action<DiscoveryResolveAttempt>? ResolveSucceeded;
     event Action<bool>? RunningChanged;
     void Start();
     void Stop();

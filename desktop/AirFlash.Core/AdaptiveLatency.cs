@@ -24,7 +24,12 @@ internal sealed record AdaptiveAction(bool Rebuild, int Target, string Reason, l
 internal sealed record PendingLead(AdaptiveAction Action, long SentAt);
 
 /// <summary>One playback run's confirmation, health windows and bounded recovery budget.</summary>
-/// <remarks>Only the session reader calls this state machine. It owns no I/O or timers.</remarks>
+/// <remarks>
+/// Only the session reader calls this state machine. It owns no I/O or timers.
+/// It only raises the lead under the internal <see cref="LatencyPolicy.Mode"/>
+/// policy, which users cannot select (see <see cref="LatencyPolicy"/>); for the
+/// fixed presets it just reports the negotiated and confirmed engine values.
+/// </remarks>
 internal sealed class AdaptiveLatency(TimeProvider clock)
 {
     public static readonly TimeSpan ConfirmationTimeout = TimeSpan.FromSeconds(5);

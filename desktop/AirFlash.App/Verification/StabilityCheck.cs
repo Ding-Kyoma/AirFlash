@@ -48,7 +48,7 @@ internal static class StabilityCheck
         store.Save(settings);
         var discovery = new UiSmoke.MockDiscovery { Items = [receiver] };
         var engine = new UiSmoke.MockFactory();
-        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher, isolatedVerification: true);
         app.Start(); await app.Startup;
         await Until(() => app.Snapshot.State == PlaybackState.Streaming);
         var starts = engine.CreatedCount;
@@ -100,7 +100,7 @@ internal static class StabilityCheck
         store.Save(settings);
         var discovery = new UiSmoke.MockDiscovery { Items = [original] };
         var engine = new UiSmoke.MockFactory();
-        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher, isolatedVerification: true);
         app.SetPanelVisible(true); app.Start(); await app.Startup;
         await Until(() => app.AllReceivers.Count == 1);
         await app.ToggleAsync(app.AllReceivers[0]);
@@ -145,7 +145,7 @@ internal static class StabilityCheck
         settings.DiscoveryInterfaceId = selectedAdapter ? "01db7c77-1016-49cb-8f5c-f5c194425d15" : "";
         store.Save(settings);
         var discovery = new UiSmoke.MockDiscovery { Items = [pair] }; var engine = new UiSmoke.MockFactory();
-        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher, isolatedVerification: true);
         var panel = new AirFlash.App.Ui.ControlPanel(app);
         try
         {
@@ -174,7 +174,7 @@ internal static class StabilityCheck
         var discovery = new UiSmoke.MockDiscovery { Items = [receiver] };
         var engine = new UiSmoke.MockFactory();
         engine.DeviceVolumes[receiver.Address] = 28;
-        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher, isolatedVerification: true);
         app.SetPanelVisible(true);
         app.Start(); await app.Startup;
         await Until(() => app.AllReceivers.Count == 1);

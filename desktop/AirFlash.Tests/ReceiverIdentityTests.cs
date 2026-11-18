@@ -231,6 +231,46 @@ public sealed class ReceiverIdentityTests
         Assert.Equal(2, split.Receivers.Select(r => r.Id).Distinct(StringComparer.Ordinal).Count());
         Assert.Equal("other", split.Settings.ReceiverAliases["other"]);
     }
+    [Theory]
+    [InlineData("192.0.2.11", true, 2)]
+    [InlineData("192.0.2.10", false, 1)]
+    [InlineData(null, false, 1)]
+    public void NativeStereoRequiresTwoDistinctHostsWithoutDiscardingReportedEndpoints(string? rightHost, bool complete, int usable)
+    {
+        var left = Service(id: "synthetic-left", stereo: "synthetic-pair") with { Instance = "Left._airplay._tcp.local" };
+        var right = rightHost is null ? null : Service(id: "synthetic-right", host: rightHost, port: 7001, stereo: "synthetic-pair")
+            with { Instance = "Right._airplay._tcp.local" };
+        var settings = new AppSettings { AutoConnectOnDiscover = true };
+        var aggregate = ReceiverAggregator.Build(right is null ? [left] : [left, right]);
+        var pair = Assert.Single(ReceiverCatalog.Reconcile(aggregate, settings).Receivers);
+
+        Assert.Equal("stereo:synthetic-pair", pair.Id);
+        Assert.Equal(right is null ? 1 : 2, pair.Members.Length);
+        Assert.Contains(pair.Members, member => member.Id == "synthetic-left" && member.Address == left.Address && member.Port == left.Port);
+        if (right is not null)
+            Assert.Contains(pair.Members, member => member.Id == "synthetic-right" && member.Address == right.Address && member.Port == right.Port);
+        Assert.Equal(complete, pair.Complete);
+        Assert.Equal(complete, ReceiverSelection.IsAutoConnectEligible(pair, settings, new HashSet<string>()));
+        Assert.EndsWith($"{usable}/2", pair.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void OverfullNativeStereoShowsAllReportedMembersEvenWithOnlyTwoDistinctHosts()
+    {
+        const string pairId = "synthetic-overfull";
+        var first = Service(id: "synthetic-first", stereo: pairId) with { Instance = "First._airplay._tcp.local" };
+        var second = Service(id: "synthetic-second", port: 7001, stereo: pairId) with { Instance = "Second._airplay._tcp.local" };
+        var third = Service(id: "synthetic-third", host: "192.0.2.11", stereo: pairId) with { Instance = "Third._airplay._tcp.local" };
+        var settings = new AppSettings { AutoConnectOnDiscover = true };
+        var pair = Assert.Single(ReceiverCatalog.Reconcile(ReceiverAggregator.Build([first, second, third]), settings).Receivers);
+
+        Assert.Equal(3, pair.Members.Length);
+        Assert.Equal(2, pair.Members.Select(member => member.Address).Distinct(StringComparer.Ordinal).Count());
+        Assert.False(pair.Complete);
+        Assert.False(ReceiverSelection.IsAutoConnectEligible(pair, settings, new HashSet<string>()));
+        Assert.EndsWith("3/2", pair.Detail, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void AddressReuseDoesNotInheritAnotherDevicesPreferences()
     {

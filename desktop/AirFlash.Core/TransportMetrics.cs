@@ -55,4 +55,12 @@ public sealed record EngineNotice(string Code, string Host, string Channel, stri
 }
 public sealed record PlaybackDiagnostics(long ReconnectCount = 0, EngineNotice? LastFault = null, StreamMetrics? CaptureBeforeFault = null,
     TransportMetrics? TransportBeforeFault = null, TransportMetrics? Transport = null, IReadOnlyList<EngineNotice>? Warnings = null,
-    IReadOnlyList<JsonElement>? Negotiated = null, JsonElement? ClockStatus = null, JsonElement? SchedulerStatus = null);
+    IReadOnlyList<JsonElement>? Negotiated = null, JsonElement? ClockStatus = null, JsonElement? SchedulerStatus = null)
+{
+    public IReadOnlyList<PlaybackCounterDelta>? CounterDeltaHistory { get; init; }
+}
+
+public sealed record PlaybackCounterDelta(DateTimeOffset ReceivedAt, int Attempt, long? SessionEpoch,
+    string Source, IReadOnlyDictionary<string, ulong>? Counters, IReadOnlyList<MemberCounterDelta>? Members = null);
+
+public sealed record MemberCounterDelta(int Member, IReadOnlyDictionary<string, ulong> Counters);

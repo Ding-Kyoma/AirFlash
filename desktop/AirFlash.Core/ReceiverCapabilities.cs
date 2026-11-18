@@ -1,5 +1,3 @@
-using System.Net;
-using System.Net.Sockets;
 using System.Text.Json;
 namespace AirFlash.Core;
 
@@ -46,25 +44,29 @@ public sealed class ReceiverCapabilityCatalog(IEngineFactory factory) : IReceive
             await using var connection = factory.Open();
             const string session = "receiver-capabilities";
             await connection.SendAsync(session, "hello", null, timeout.Token).ConfigureAwait(false);
-            var hello = await connection.ReadAsync(timeout.Token).ConfigureAwait(false) ?? throw new IOException(L.Get("The engine did not return hello."));
+            var hello = await EngineResponses.ReadAsync(connection, timeout.Token).ConfigureAwait(false) ?? throw new IOException(L.Get("The engine did not return hello."));
             return await QueryConnectionAsync(connection, session, hello, receiver, timeout.Token).ConfigureAwait(false);
         }
         finally { _queries.Release(); }
     }
-    public static async Task<ReceiverCapabilitySet> QueryConnectionAsync(IEngineConnection connection, string session, JsonElement hello, Receiver receiver, CancellationToken cancellation)
+    /// <summary>Ask an open engine connection for <paramref name="receiver"/>'s
+    /// supported stream profiles. <paramref name="resolved"/> maps member ids to the
+    /// IPv4 addresses a caller already resolved, so a session start probes the same
+    /// addresses it streams to; other members are resolved with the session's rule
+    /// (<see cref="ReceiverAddress.ResolveIPv4Async"/>).</summary>
+    public static async Task<ReceiverCapabilitySet> QueryConnectionAsync(IEngineConnection connection, string session, JsonElement hello, Receiver receiver, CancellationToken cancellation, IReadOnlyDictionary<string, string>? resolved = null)
     {
-        // Older verification engines can still run fixed-rate profiles, but expose no selectable capabilities.
+        EngineHandshake.RequireCapabilities(hello);
+        // A valid legacy hello may expose no selectable capabilities.
         if (!EngineHandshake.HasCapability(hello, "receiver_capabilities")) return ReceiverCapabilitySet.Unknown;
-        EngineHandshake.RequireCapabilities(hello, "receiver_capabilities");
         var peers = new List<object>();
         foreach (var member in receiver.Peers)
         {
-            var addresses = await Dns.GetHostAddressesAsync(member.Address, cancellation).ConfigureAwait(false);
-            var host = addresses.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork)?.ToString() ?? throw new IOException(L.Format("Cannot resolve IPv4 address: {0}", member.Address));
+            var host = resolved?.GetValueOrDefault(member.Id) ?? await ReceiverAddress.ResolveIPv4Async(member.Address, cancellation).ConfigureAwait(false);
             peers.Add(new { receiver_id = member.Id, host, port = member.Port, codecs = member.Codecs.Select(c => (int)c).ToArray(), profile = new { features = member.Features, follow_receiver_clock = member.FollowReceiverClock } });
         }
         await connection.SendAsync(session, "get_receiver_capabilities", new { peers }, cancellation).ConfigureAwait(false);
-        var response = await connection.ReadAsync(cancellation).ConfigureAwait(false) ?? throw new IOException(L.Get("Could not query receiver capabilities."));
+        var response = await EngineResponses.ReadAsync(connection, cancellation).ConfigureAwait(false) ?? throw new IOException(L.Get("Could not query receiver capabilities."));
         if (response.Number("version") == 1 && response.Text("session_id") == session && response.Text("event") == "error")
             throw new EngineFailure(EngineNotice.Parse(response));
         if (response.Number("version") != 1 || response.Text("session_id") != session || response.Text("event") != "receiver_capabilities")

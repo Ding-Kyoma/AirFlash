@@ -16,6 +16,7 @@ public partial class ControlPanel : Window
 {
     public const double CompactWidth = 400;
     private readonly AppViewModel _viewModel;
+    private readonly Func<MonitorArea>? _workArea;
     private bool _allowClose;
     private bool _placing;
     private DispatcherOperation? _placement;
@@ -26,9 +27,10 @@ public partial class ControlPanel : Window
     public event Action<int>? LatencySettingsRequested;
     public event Action? UpdateRequested;
     public event Action? QuitRequested;
-    public ControlPanel(AppViewModel viewModel)
+    public ControlPanel(AppViewModel viewModel) : this(viewModel, null) { }
+    internal ControlPanel(AppViewModel viewModel, Func<MonitorArea>? workArea)
     {
-        InitializeComponent(); _viewModel = viewModel; DataContext = viewModel; WindowThemeService.Track(this); AppIconService.Track(this);
+        InitializeComponent(); _viewModel = viewModel; _workArea = workArea; DataContext = viewModel; WindowThemeService.Track(this); AppIconService.Track(this);
         viewModel.Receivers.CollectionChanged += OnReceiversChanged;
         IsVisibleChanged += (_, _) => viewModel.SetPanelVisible(IsVisible);
         SizeChanged += (_, _) => { if (!_placing) RequestPlacement(); };
@@ -56,7 +58,7 @@ public partial class ControlPanel : Window
         try
         {
             UiPerformance.Count("panel.place");
-            var area = Tray?.WorkArea() ?? NativeWindowPlacement.CursorWorkArea();
+            var area = _workArea?.Invoke() ?? Tray?.WorkArea() ?? NativeWindowPlacement.CursorWorkArea();
             var maxDip = area.Rect.Height * .7 / area.Scale;
             var constraintsChanged = MaxHeight != maxDip || Width != CompactWidth;
             Width = CompactWidth;

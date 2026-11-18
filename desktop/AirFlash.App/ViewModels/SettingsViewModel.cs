@@ -95,7 +95,9 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     public event Action<Receiver>? PairRequested;
     public RelayCommand AddReceiverCommand { get; }
     public RelayCommand LicensesCommand { get; }
-    public SettingsViewModel(AppViewModel app)
+    public SettingsViewModel(AppViewModel app) : this(app, null) { }
+
+    internal SettingsViewModel(AppViewModel app, Action<string>? diagnosticsWriter)
     {
         App = app; Draft = app.Settings.Clone(); _baseline = Draft.Clone();
         CheckUpdatesCommand = new(Updates.CheckAsync, _ => { });
@@ -124,7 +126,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         });
         RefreshAdaptersCommand = new(RefreshAdapters);
         OpenLogsCommand = new(() => { try { AppPaths.OpenLogs(); } catch (Exception error) { ShowError(error); } });
-        CopyDiagnosticsCommand = new(() => { try { Clipboard.SetText(App.Diagnostics()); } catch (Exception error) { ShowError(error); } });
+        CopyDiagnosticsCommand = new(() => { try { (diagnosticsWriter ?? Clipboard.SetText)(App.Diagnostics()); } catch (Exception error) { ShowError(error); } });
         ExportDiagnosticsCommand = new(async () =>
         {
             try
@@ -375,7 +377,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
             var row = Receivers.FirstOrDefault(r => r.Receiver.Id == receiver.Id);
             if (row is null)
             {
-                row = new(receiver, options, current => PairRequested?.Invoke(current), () => RemoveManual(receiver.Id), () => CanEdit, () => App.EngineReady && !App.IsClosing, App);
+                row = new(receiver, options, current => PairRequested?.Invoke(current), () => RemoveManual(receiver.Id), () => CanEdit, () => App.EngineReady && App.MuteReady && !App.IsClosing, App);
                 row.GroupRate = () => Draft.SoftwareGroups.FirstOrDefault(g => g.MemberIds.Contains(row.Receiver.Id))?.SampleRate;
                 row.GlobalLatencyMode = () => Draft.LatencyMode;
                 Receivers.Insert(index, row);

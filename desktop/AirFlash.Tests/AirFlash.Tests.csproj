@@ -16,10 +16,14 @@
     <Compile Include="../AirFlash.App/Ui/VolumeSliderMath.cs" Link="VolumeSliderMath.cs"/>
     <Compile Include="../AirFlash.App/Input/MediaKeys.cs" Link="MediaKeys.cs"/>
     <Compile Include="../AirFlash.App/Services/TrayRegistration.cs" Link="TrayRegistration.cs"/>
+    <Compile Include="../AirFlash.App/Services/DnsServiceApi.cs" Link="DnsServiceApi.cs"/>
     <Compile Include="../AirFlash.App/Services/WindowsDiscovery.cs" Link="WindowsDiscovery.cs"/>
-    <Compile Include="../AirFlash.App/Services/WindowsDnsSdApi.cs" Link="WindowsDnsSdApi.cs"/>
+    <Compile Include="../AirFlash.App/Services/NativeDnsServiceApi.cs" Link="NativeDnsServiceApi.cs"/>
+    <Compile Include="../AirFlash.App/Services/ResolveProcessDnsServiceApi.cs" Link="ResolveProcessDnsServiceApi.cs"/>
     <Compile Include="../AirFlash.App/Services/WindowsCapabilities.cs" Link="WindowsCapabilities.cs"/>
     <Compile Include="../AirFlash.App/Services/NetworkAdapterCatalog.cs" Link="NetworkAdapterCatalog.cs"/>
     <Compile Include="../AirFlash.App/Services/ApplicationCatalog.cs" Link="ApplicationCatalog.cs"/>
+    <Compile Include="../AirFlash.App/ViewModels/ErrorDetailsText.cs" Link="ErrorDetailsText.cs"/>
+    <Compile Include="../AirFlash.App/Services/ShellShutdown.cs" Link="ShellShutdown.cs"/>
   </ItemGroup>
 </Project>

@@ -36,7 +36,7 @@ internal static class LatencyEntryRegression
             var loaded = persisted.Load();
             Check(loaded.LatencyMode == "normal" && loaded.ReadOptions("legacy").LatencyMode == "normal",
                 "legacy adaptive settings load as normal", checks);
-            await using var app = new AppViewModel(persisted, new MockDiscovery { Items = [receiver] }, new MockAutostart(), new MockAudio(), new MockFactory(), Application.Current.Dispatcher);
+            await using var app = new AppViewModel(persisted, new MockDiscovery { Items = [receiver] }, new MockAutostart(), new MockAudio(), new MockFactory(), Application.Current.Dispatcher, isolatedVerification: true);
             app.SetPanelVisible(true); app.Start(); await app.Startup; await Pump();
             var settingsWindow = new SettingsWindow(app);
             settingsWindow.ViewModel.SelectedPage = SettingsViewModel.StreamingPage;

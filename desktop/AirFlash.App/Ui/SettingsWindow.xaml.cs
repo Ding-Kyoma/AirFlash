@@ -12,9 +12,11 @@ public partial class SettingsWindow : Window
     public SettingsViewModel ViewModel { get; }
     private readonly HashSet<ValidationError> _errors = [];
     private readonly Dictionary<int, FrameworkElement> _pages = [];
-    public SettingsWindow(AppViewModel app)
+    public SettingsWindow(AppViewModel app) : this(app, null) { }
+
+    internal SettingsWindow(AppViewModel app, Action<string>? diagnosticsWriter)
     {
-        InitializeComponent(); ViewModel = new(app); DataContext = ViewModel;
+        InitializeComponent(); ViewModel = new(app, diagnosticsWriter); DataContext = ViewModel;
         ViewModel.ConfirmReset = () => MessageBox.Show(this, L.Get("All settings and receiver pairing will be deleted, and AirFlash will restart. Continue?"), L.Get("Reset and restart"), MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) == MessageBoxResult.Yes;
         WindowThemeService.Track(this);
         AppIconService.Track(this);
@@ -22,7 +24,7 @@ public partial class SettingsWindow : Window
         ViewModel.AddReceiverRequested += () => { var dialog = new ManualReceiverDialog { Owner = this }; if (dialog.ShowDialog() == true) ViewModel.AddManual(dialog.DeviceName, dialog.Host, dialog.Port); };
         ViewModel.PairRequested += async receiver =>
         {
-            try { if (app.EngineReady && !app.IsClosing) await app.Session.PairAsync(receiver, app.Settings.Clone(), (member, token) => PinDialog.RequestAsync(this, member, token)); }
+            try { await app.PairAsync(receiver, (member, token) => PinDialog.RequestAsync(this, member, token)); }
             catch (Exception error) { app.ShowError(error); }
         };
         ViewModel.PropertyChanged += (_, args) => { if (args.PropertyName == nameof(SettingsViewModel.SelectedPage)) ShowPage(); };

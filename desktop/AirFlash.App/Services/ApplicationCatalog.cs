@@ -13,12 +13,12 @@ public sealed class ApplicationCatalog(IEngineFactory factory) : IApplicationCat
         timeout.CancelAfter(TimeSpan.FromSeconds(8));
         await using var connection = factory.Open();
         await connection.SendAsync("catalog", "hello", null, timeout.Token).ConfigureAwait(false);
-        var hello = await connection.ReadAsync(timeout.Token).ConfigureAwait(false) ?? throw new IOException(L.Get("The engine did not return hello."));
-        if (hello.Text("event") != "hello" || hello.Number("version") != 1) throw new IOException(L.Get("Incompatible engine protocol version."));
+        var hello = await EngineResponses.ReadAsync(connection, timeout.Token).ConfigureAwait(false) ?? throw new IOException(L.Get("The engine did not return hello."));
+        EngineHandshake.RequireCapabilities(hello);
         Supported = EngineHandshake.HasCapability(hello, "application_capture");
         if (!Supported) return [];
         await connection.SendAsync("catalog", "list_applications", null, timeout.Token).ConfigureAwait(false);
-        var response = await connection.ReadAsync(timeout.Token).ConfigureAwait(false) ?? throw new IOException(L.Get("Could not list applications."));
+        var response = await EngineResponses.ReadAsync(connection, timeout.Token).ConfigureAwait(false) ?? throw new IOException(L.Get("Could not list applications."));
         if (response.Text("event") != "applications") throw new IOException(response.Text("message", L.Get("Could not list applications.")));
         return response.GetProperty("items").Deserialize<CaptureApplication[]>() ?? [];
     }

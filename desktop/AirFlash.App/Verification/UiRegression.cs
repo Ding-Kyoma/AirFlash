@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Automation.Peers;
@@ -26,7 +27,7 @@ internal static class UiRegression
         var autostart = new UiSmoke.MockAutostart(); var discovery = new UiSmoke.MockDiscovery();
         var engine = new UiSmoke.MockFactory();
         var applications = new MockApplications();
-        await using var app = new AppViewModel(store, discovery, autostart, audio, engine, Application.Current.Dispatcher, applications: applications);
+        await using var app = new AppViewModel(store, discovery, autostart, audio, engine, Application.Current.Dispatcher, applications: applications, isolatedVerification: true);
         app.SetPanelVisible(true); app.Start(); await app.Startup; await Pump();
         var window = new SettingsWindow(app); window.Show(); await Pump();
         var vm = window.ViewModel;
@@ -224,7 +225,8 @@ internal static class UiRegression
     }
     private static async Task RunPaymentQrRegressionAsync(List<string> checks, string directory)
     {
-        var originallyChinese = L.IsChinese;
+        var originalLanguage = CultureInfo.CurrentUICulture.Name;
+        var originalCatalogMarker = L.Get("Settings and devices");
         try
         {
             foreach (var (language, asset, descriptionKey) in new[]
@@ -250,7 +252,9 @@ internal static class UiRegression
                 coffee.Close(); await Pump();
             }
         }
-        finally { L.Initialize([originallyChinese ? "zh-CN" : "en-US"]); }
+        finally { L.Initialize([originalLanguage]); }
+        Check(CultureInfo.CurrentUICulture.Name == originalLanguage && L.Get("Settings and devices") == originalCatalogMarker,
+            "donation QR verification restores the original UI catalog", checks);
     }
     private static async Task RunSoftwareStereoRegressionAsync(List<string> checks, string directory)
     {
@@ -260,7 +264,7 @@ internal static class UiRegression
         var native = new Receiver("stereo:native", "Native pair", "") { StereoId = "native", Members = [new("n1", "Native left", "127.0.0.4"), new("n2", "Native right", "127.0.0.5")] };
         var discovery = new UiSmoke.MockDiscovery { Items = [a, b, c, native] };
         var store = new UiSmoke.MemoryStore(); var engine = new UiSmoke.MockFactory();
-        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher, isolatedVerification: true);
         app.SetPanelVisible(true); app.Start(); await app.Startup; await Pump();
         var window = new SettingsWindow(app); window.Show(); var vm = window.ViewModel;
         var panel = new ControlPanel(app); panel.ShowPanel();
@@ -359,7 +363,7 @@ internal static class UiRegression
         store.Save(original);
         var discovery = new UiSmoke.MockDiscovery { Items = [new("127.0.0.1:7000", "Office", "127.0.0.1")] };
         var engine = new UiSmoke.MockFactory();
-        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher, isolatedVerification: true);
         app.SetPanelVisible(true); app.Start(); await app.Startup; await Until(() => app.AllReceivers.Count == 1);
         var window = new SettingsWindow(app); window.Show(); await Pump(); var vm = window.ViewModel;
         try
@@ -375,12 +379,22 @@ internal static class UiRegression
             store.Fail = false; discovery.Publish();
             await Until(() => app.Snapshot.Receiver?.Id == "aabbccddee01" && vm.Receivers.Count == 2);
             Check(engine.CreatedCount == starts && app.Snapshot.IsActive, "identity promotion updates an active stream without reconnecting", checks);
-            Check(app.Settings.ReadOptions("aabbccddee01").Hidden && !app.Settings.Receivers.ContainsKey("127.0.0.1:7000") && app.Receivers.Count == 0, "duplicate settings merge with hidden taking precedence", checks);
+            Check(app.Settings.ReadOptions("aabbccddee01").Hidden && store.Saved.ReadOptions("aabbccddee01").Hidden
+                && !app.Settings.Receivers.ContainsKey("127.0.0.1:7000") && !store.Saved.Receivers.ContainsKey("127.0.0.1:7000"),
+                "duplicate settings persist with hidden taking precedence", checks);
+            var activeHidden = app.Receivers.Single();
+            Check(activeHidden.Receiver.Id == "aabbccddee01" && activeHidden.Active
+                && ReferenceEquals(activeHidden.PlaybackCommand, app.StopCommand) && activeHidden.PlaybackCommand.CanExecute(null),
+                "the hidden receiver remains visible only as the active Stop control", checks);
             Check(vm.Draft.ForceReconnect && vm.Draft.ReadOptions("aabbccddee01").StandbySeconds == 17 && vm.HasChanges, "open settings keeps unapplied changes through identity migration", checks);
             Check(vm.Receivers.Any(r => r.Receiver.Id == "history" && !r.Receiver.Online) && !vm.Receivers.Any(r => r.Receiver.Id == "AA:BB:CC:DD:EE:01"), "confirmed aliases disappear while unrelated offline history remains", checks);
             Check(await vm.ApplyAsync() && app.Settings.ReadOptions("aabbccddee01").StandbySeconds == 17 && engine.CreatedCount == starts, "applying migrated drafts does not resurrect aliases or restart playback", checks);
+            await app.StopAsync();
+            Check(app.Snapshot.State == PlaybackState.Idle && app.Receivers.Count == 0,
+                "the merged hidden receiver disappears after Stop", checks);
             vm.Draft.Options("aabbccddee01").Hidden = false;
-            Check(await vm.ApplyAsync() && app.Receivers.Count == 1, "merged hidden state remains editable", checks);
+            Check(await vm.ApplyAsync() && app.Receivers.Single().Receiver.Id == "aabbccddee01"
+                && !app.Settings.ReadOptions("aabbccddee01").Hidden, "merged hidden state remains editable", checks);
             var catalogChanges = 0; app.CatalogChanged += () => catalogChanges++;
             discovery.Items = discovery.Items.Select(r => r with { Aliases = r.Aliases.ToArray() }).ToArray();
             discovery.Publish(); await Pump();
@@ -397,7 +411,7 @@ internal static class UiRegression
         var settings = store.Load(); settings.AutoConnectOnDiscover = true; store.Save(settings);
         var discovery = new UiSmoke.MockDiscovery { Items = [new("127.0.0.1:7000", "Office", "127.0.0.1")] };
         var engine = new UiSmoke.MockFactory { FailOpen = true };
-        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher, isolatedVerification: true);
         app.Start(); await app.Startup; await Until(() => app.Snapshot.State == PlaybackState.Error);
         Check(engine.CreatedCount == 1, "automatic connection failure makes one attempt", checks);
         discovery.Items = ReceiverAggregator.Build([new ServiceRecord("Office._airplay._tcp.local", "_airplay._tcp.local", "127.0.0.1", 7000,
@@ -418,7 +432,7 @@ internal static class UiRegression
         var services = new[] { StereoService("_airplay", "AA:BB:CC:DD:EE:01", "127.0.0.1"), StereoService("_raop", "other-id", "127.0.0.1"), StereoService("_airplay", "AA-BB-CC-DD-EE-02", "127.0.0.2") };
         var discovery = new UiSmoke.MockDiscovery { Items = ReceiverAggregator.Build(services) };
         var engine = new UiSmoke.MockFactory();
-        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+        await using var app = new AppViewModel(store, discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher, isolatedVerification: true);
         app.SetPanelVisible(true); app.Start(); await app.Startup; await Until(() => app.AllReceivers.Count == 1);
         var window = new SettingsWindow(app); window.Show(); await Pump(); var vm = window.ViewModel;
         try
@@ -443,7 +457,7 @@ internal static class UiRegression
     private static async Task RunDiscoveryDemandRegressionAsync(List<string> checks)
     {
         var discovery = new UiSmoke.MockDiscovery(); var engine = new UiSmoke.MockFactory();
-        await using var app = new AppViewModel(new UiSmoke.MemoryStore(), discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+        await using var app = new AppViewModel(new UiSmoke.MemoryStore(), discovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher, isolatedVerification: true);
         app.Start(); await app.Startup; await Pump();
         Check(!discovery.Running && discovery.Starts == 0, "tray startup without automatic connection never starts discovery", checks);
         var panel = new ControlPanel(app); var settings = new SettingsWindow(app);
@@ -471,14 +485,14 @@ internal static class UiRegression
         var startupStore = new UiSmoke.MemoryStore(); var startupSettings = startupStore.Load();
         startupSettings.Options("a").AutoConnect = true; startupStore.Save(startupSettings);
         var startupDiscovery = new UiSmoke.MockDiscovery();
-        await using var startupApp = new AppViewModel(startupStore, startupDiscovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), new UiSmoke.MockFactory(), Application.Current.Dispatcher);
+        await using var startupApp = new AppViewModel(startupStore, startupDiscovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), new UiSmoke.MockFactory(), Application.Current.Dispatcher, isolatedVerification: true);
         startupApp.Start(); await startupApp.Startup; await Pump();
         Check(startupDiscovery.Running && startupDiscovery.Starts == 1, "per-device automatic connection starts bounded startup discovery", checks);
 
         var visibleStore = new UiSmoke.MemoryStore(); var visibleSettings = visibleStore.Load();
         visibleSettings.AutoConnectOnDiscover = true; visibleStore.Save(visibleSettings);
         var visibleDiscovery = new UiSmoke.MockDiscovery { Items = [] };
-        await using var visibleApp = new AppViewModel(visibleStore, visibleDiscovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), new UiSmoke.MockFactory(), Application.Current.Dispatcher);
+        await using var visibleApp = new AppViewModel(visibleStore, visibleDiscovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), new UiSmoke.MockFactory(), Application.Current.Dispatcher, isolatedVerification: true);
         visibleApp.SetPanelVisible(true); visibleApp.Start(); await visibleApp.Startup; await Pump();
         await Task.Delay(TimeSpan.FromMilliseconds(10500)); await Pump();
         Check(!startupDiscovery.Running && startupDiscovery.Stops == 1, "startup discovery stops after ten seconds without visible receiver lists", checks);
@@ -489,7 +503,7 @@ internal static class UiRegression
         var hiddenStore = new UiSmoke.MemoryStore(); var hiddenSettings = hiddenStore.Load();
         hiddenSettings.Options("a").AutoConnect = true; hiddenSettings.Options("a").Hidden = true; hiddenStore.Save(hiddenSettings);
         var hiddenDiscovery = new UiSmoke.MockDiscovery();
-        await using var hiddenApp = new AppViewModel(hiddenStore, hiddenDiscovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), new UiSmoke.MockFactory(), Application.Current.Dispatcher);
+        await using var hiddenApp = new AppViewModel(hiddenStore, hiddenDiscovery, new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), new UiSmoke.MockFactory(), Application.Current.Dispatcher, isolatedVerification: true);
         hiddenApp.Start(); await hiddenApp.Startup; await Pump();
         Check(hiddenDiscovery.Starts == 0, "hidden per-device automatic connection does not request startup discovery", checks);
     }
@@ -505,7 +519,7 @@ internal static class UiRegression
             saved.LatencyMode = "realtime"; store.Save(saved);
             var engine = new UiSmoke.MockFactory();
             await using var app = new AppViewModel(store, new UiSmoke.MockDiscovery { Items = [receiver] },
-                new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher);
+                new UiSmoke.MockAutostart(), new UiSmoke.MockAudio(), engine, Application.Current.Dispatcher, isolatedVerification: true);
             app.SetPanelVisible(true); app.Start(); await app.Startup; await Pump();
             var panel = new ControlPanel(app);
             try
@@ -669,7 +683,8 @@ internal static class UiRegression
                 await Until(() => slider == master ? app.MasterVolume == value : row.Volume == value && row.VolumeStatus.Length == 0);
                 await Pump();
                 var grid = (Grid)slider.Parent;
-                var percent = grid.Children.OfType<TextBlock>().Single(text => Grid.GetRow(text) == 0 && Grid.GetColumn(text) == 2);
+                var percentColumn = Grid.GetColumn(slider) + 1;
+                var percent = grid.Children.OfType<TextBlock>().Single(text => Grid.GetRow(text) == 0 && Grid.GetColumn(text) == percentColumn);
                 var button = grid.Children.OfType<Button>().Single();
                 Check(slider.IsVisible && slider.Value == value && percent.Text == $"{value}%"
                     && slider.TranslatePoint(new(slider.ActualWidth, 0), grid).X <= percent.TranslatePoint(new(), grid).X + 1
@@ -701,7 +716,7 @@ internal static class UiRegression
 
         void CheckMuteButton(Slider slider, Button button)
         {
-            CheckAlignedSliders();
+            CheckVolumeTracks();
             var text = UiSmoke.Descendants(button).OfType<TextBlock>().Single();
             var bounds = text.TransformToAncestor(button).TransformBounds(new Rect(text.RenderSize));
             Check(slider.ActualWidth >= 60 && bounds.Left >= 0 && bounds.Right <= button.ActualWidth + 1
@@ -712,7 +727,7 @@ internal static class UiRegression
 
         void CheckIndicator(bool syncing, bool warningVisible, string state)
         {
-            CheckAlignedSliders();
+            CheckVolumeTracks();
             var alert = syncing || warningVisible;
             Check(Math.Abs(device.ActualWidth - deviceWidth) <= 1
                 && Math.Abs(deviceRow.ActualHeight - rowHeight) <= 1
@@ -745,12 +760,20 @@ internal static class UiRegression
                 $"{label}: {name} uses its built-in vector, renders nontransparent pixels and follows the current theme", checks);
         }
 
-        void CheckAlignedSliders()
+        void CheckVolumeTracks()
         {
-            var masterStart = master.TranslatePoint(new(), panel).X;
-            var deviceStart = device.TranslatePoint(new(), panel).X;
-            Check(Math.Abs(masterStart - deviceStart) <= 1 && Math.Abs(master.ActualWidth - device.ActualWidth) <= 1,
-                $"{label}: device and master volume tracks share the same start and width", checks);
+            Check(FillsColumn(master, masterRow) && FillsColumn(device, deviceRow)
+                && Math.Abs(device.TranslatePoint(new(), panel).X - master.TranslatePoint(new(), panel).X) <= 1
+                && Math.Abs(device.ActualWidth - master.ActualWidth) <= 1,
+                $"{label}: volume tracks fill their columns and align across the active receiver and master rows", checks);
+        }
+
+        static bool FillsColumn(Slider slider, Grid row)
+        {
+            var column = Grid.GetColumn(slider);
+            var start = row.ColumnDefinitions.Take(column).Sum(definition => definition.ActualWidth);
+            return Math.Abs(slider.TranslatePoint(new(), row).X - start) <= 1
+                && Math.Abs(slider.ActualWidth - row.ColumnDefinitions[column].ActualWidth) <= 1;
         }
     }
     private static async Task Pump() { await Application.Current.Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle); await Task.Delay(20); }

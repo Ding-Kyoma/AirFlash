@@ -18,7 +18,7 @@ internal static class UiPerf
         var audio = new UiSmoke.MockAudio { DelayMs = 300 };
         var store = new UiSmoke.MemoryStore { DelayMs = 500 };
         var engine = new UiSmoke.MockFactory { StopDelayMs = 300 };
-        await using var app = new AppViewModel(store, new UiSmoke.MockDiscovery(), new UiSmoke.MockAutostart(), audio, engine, dispatcher);
+        await using var app = new AppViewModel(store, new UiSmoke.MockDiscovery(), new UiSmoke.MockAutostart(), audio, engine, dispatcher, isolatedVerification: true);
         var panel = new ControlPanel(app);
         SettingsWindow? settings = null;
         var phase = "cold";

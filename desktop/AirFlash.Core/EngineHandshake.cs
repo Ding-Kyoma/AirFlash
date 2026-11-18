@@ -19,7 +19,8 @@ public static class EngineHandshake
     }
     public static void RequireCapabilities(JsonElement hello, params string[] required)
     {
-        if (hello.Text("event") != "hello" || hello.Number("version") != 1)
+        EngineResponses.ThrowIfRejected(hello);
+        if (hello.ValueKind != JsonValueKind.Object || hello.Text("event") != "hello" || hello.Number("version") != 1)
             throw new IOException(L.Get("Incompatible engine protocol version."));
         if (required.Any(c => !HasCapability(hello, c))) throw new IOException(L.Get("Incompatible engine protocol version."));
     }
@@ -31,11 +32,9 @@ public static class EngineHandshake
         try
         {
             await connection.SendAsync("check", "hello", null, timeout.Token).ConfigureAwait(false);
-            var hello = await EngineEvents.ReadAsync(connection, timeout.Token).ConfigureAwait(false)
+            var hello = await EngineResponses.ReadAsync(connection, timeout.Token).ConfigureAwait(false)
                 ?? throw new IOException(connection is ProcessEngineConnection process ? process.FailureDescription : L.Get("The engine did not return hello."));
-            if (EngineEvents.IsProcessRejection(hello)) throw new EngineFailure(EngineNotice.Parse(hello));
-            if (hello.Text("event") != "hello" || hello.Number("version") != 1)
-                throw new IOException(L.Get("Incompatible engine protocol version."));
+            RequireCapabilities(hello);
             return hello;
         }
         catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)

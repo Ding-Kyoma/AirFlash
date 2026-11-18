@@ -34,7 +34,7 @@ internal static class StopRegression
             var audio = new MockAudio();
             var receiver = new Receiver("stop-test", "Stop test", "127.0.0.1");
             var other = new Receiver("other", "Other", "127.0.0.2");
-            await using var app = new AppViewModel(store, new MockDiscovery { Items = [receiver, other] }, new MockAutostart(), audio, engine, Application.Current.Dispatcher);
+            await using var app = new AppViewModel(store, new MockDiscovery { Items = [receiver, other] }, new MockAutostart(), audio, engine, Application.Current.Dispatcher, isolatedVerification: true);
             app.Start(); await app.Startup;
             var panel = new ControlPanel(app) { MenuOpen = true }; panel.Show(); await Pump();
             try

@@ -78,6 +78,7 @@ public sealed class SoftwareStereoGroup : ObservableObject
     };
     public void CopyFrom(SoftwareStereoGroup source)
     {
+        if (ReferenceEquals(this, source)) return;
         Name = source.Name; GroupMode = source.GroupMode; LeftId = source.LeftId; RightId = source.RightId; SampleRate = source.SampleRate;
         LeftOffsetMs = source.LeftOffsetMs; RightOffsetMs = source.RightOffsetMs; MixedInvariantVersion = source.MixedInvariantVersion;
         Members.Clear();
@@ -169,10 +170,10 @@ public sealed class AppSettings : ObservableObject
     }
     public double Gain(string id) => Math.Clamp(MasterVolume, 0, 100) / 100d;
     public string? SampleRate(Receiver receiver) => receiver.IsSoftwareGroup ? SoftwareGroups.Single(g => g.Id == receiver.Id).SampleRate : ReadOptions(receiver.Id).SampleRate;
-    public bool UsesDeviceLatency(Receiver receiver) => (receiver.IsSoftwareGroup ? receiver.Peers : [receiver]).Any(r =>
+    public bool UsesDeviceLatency(Receiver receiver, string? globalMode = null) => (receiver.IsSoftwareGroup ? receiver.Peers : [receiver]).Any(r =>
     {
         var options = ReadOptions(r.Id);
-        return options.LatencyMode is not null || options.ForceLatency is not null || LatencyMode == "custom" && options.CustomBufferMs is not null;
+        return options.LatencyMode is not null || options.ForceLatency is not null || (globalMode ?? LatencyMode) == "custom" && options.CustomBufferMs is not null;
     });
     public string? EffectiveEndpoint => CaptureMode == "endpoint" ? CaptureEndpoint : null;
     public string? Validate()
@@ -208,7 +209,11 @@ public sealed class AppSettings : ObservableObject
         var members = new HashSet<string>(StringComparer.Ordinal);
         foreach (var group in SoftwareGroups)
         {
-            if (!group.Id.StartsWith("software:", StringComparison.Ordinal) || !groupIds.Add(group.Id) || string.IsNullOrWhiteSpace(group.Name) || !SampleRates.Contains(group.SampleRate)) return L.Get("Invalid software stereo group.");
+            if (string.IsNullOrWhiteSpace(group.Id) || !group.Id.StartsWith("software:", StringComparison.Ordinal)
+                || !groupIds.Add(group.Id) || string.IsNullOrWhiteSpace(group.Name) || !SampleRates.Contains(group.SampleRate)
+                || group.GroupMode is not ("software_stereo" or "multi_room")
+                || group.Members is null || group.Members.Any(member => member is null))
+                return L.Get("Invalid software stereo group.");
             if (group.IsMultiRoom)
             {
                 if (group.Members.Count < 2) return L.Get("Multi-room groups require at least two distinct independent receivers.");

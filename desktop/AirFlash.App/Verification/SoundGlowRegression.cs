@@ -13,6 +13,8 @@ internal static class SoundGlowRegression
 {
     public static async Task RunAsync(List<string> checks, string directory)
     {
+        var initialCulture = System.Globalization.CultureInfo.CurrentUICulture.Name;
+        var initialTheme = ThemeService.CurrentPalette.IsDark;
         try
         {
             foreach (var language in new[] { "en-US", "zh-CN", "zh-TW", "de-DE", "es-ES" })
@@ -20,7 +22,7 @@ internal static class SoundGlowRegression
                 L.Initialize([language]);
                 var engine = new MockFactory();
                 var receiver = new Receiver("glow-test", "Sound Glow test", "127.0.0.1");
-                await using var app = new AppViewModel(new MemoryStore(), new MockDiscovery { Items = [receiver] }, new MockAutostart(), new MockAudio(), engine, Application.Current.Dispatcher);
+                await using var app = new AppViewModel(new MemoryStore(), new MockDiscovery { Items = [receiver] }, new MockAutostart(), new MockAudio(), engine, Application.Current.Dispatcher, isolatedVerification: true);
                 app.Start(); await app.Startup;
                 var settings = new SettingsWindow(app); settings.Show(); await Pump();
                 try
@@ -86,7 +88,7 @@ internal static class SoundGlowRegression
             L.Initialize(["en-US"]);
             var unsupported = new MockFactory { SupportsSoundGlow = false };
             var pod = new Receiver("old-engine", "Old engine", "127.0.0.1");
-            await using var oldApp = new AppViewModel(new MemoryStore(), new MockDiscovery { Items = [pod] }, new MockAutostart(), new MockAudio(), unsupported, Application.Current.Dispatcher);
+            await using var oldApp = new AppViewModel(new MemoryStore(), new MockDiscovery { Items = [pod] }, new MockAutostart(), new MockAudio(), unsupported, Application.Current.Dispatcher, isolatedVerification: true);
             oldApp.Start(); await oldApp.Startup;
             await oldApp.Session.StartAsync(pod, oldApp.Settings.Clone());
             await Until(() => oldApp.Session.Snapshot.State == PlaybackState.Streaming);
@@ -100,7 +102,7 @@ internal static class SoundGlowRegression
             }
             finally { oldSettings.Close(); }
         }
-        finally { L.Initialize(["en-US"]); ThemeService.SetForVerification(false); }
+        finally { L.Initialize([initialCulture]); ThemeService.SetForVerification(initialTheme); }
     }
     private static void Check(bool value, string name, List<string> checks) { if (!value) throw new InvalidOperationException(name); checks.Add(name); }
     private static async Task Pump() { await Application.Current.Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle); await Task.Delay(40); }

@@ -48,8 +48,9 @@ internal static class UiSettingsRecovery
         Check(initial.Validate() is null && !initial.StartAtLogin && !initial.AutoConnectOnDiscover, name + ": first shell load returns valid safe defaults", checks);
         Check(!string.IsNullOrEmpty(store.LoadWarning), name + ": first load reports recovery", checks);
         var discovery = new FixtureDiscovery(); var autostart = new FixtureAutostart(); var audio = new FixtureAudio(); var engine = new UiSmoke.MockFactory();
-        await using var app = new AppViewModel(store, discovery, autostart, audio, engine, Application.Current.Dispatcher);
-        var panel = new ControlPanel(app);
+        await using var app = new AppViewModel(store, discovery, autostart, audio, engine, Application.Current.Dispatcher, isolatedVerification: true);
+        // Keep the fixture visible when the interactive desktop transfers focus.
+        var panel = new ControlPanel(app) { MenuOpen = true };
         try
         {
             Check(app.Settings.Validate() is null && app.Settings.ManualReceivers.Count == 0 && app.Settings.Receivers.Count == 0, name + ": second constructor load cannot expose invalid manual entries or rates", checks);
@@ -59,7 +60,8 @@ internal static class UiSettingsRecovery
             await Until(() => app.AllReceivers.Any(r => r.Id == FixtureDiscovery.ReceiverId));
             await Pump();
             Check(!string.IsNullOrEmpty(app.Notice) && app.Notice == store.LoadWarning, name + ": startup retains the recovery notice across both loads", checks);
-            Check(UiSmoke.Descendants(panel).OfType<TextBlock>().Any(t => t.IsVisible && t.Text == app.Notice), name + ": recovery notice reaches the panel text binding", checks);
+            Check(UiSmoke.Descendants(panel.NoticeBanner).OfType<TextBlock>().Any(t => t.IsVisible && t.Text == app.Notice),
+                name + ": recovery notice reaches the panel text binding", checks);
             await app.TryAutoConnectAsync(); await Pump();
             Check(autostart.Values.SequenceEqual(new[] { false }), name + ": rejected startup flags cannot enable autostart", checks);
             Check(discovery.StartCount == 1 && discovery.Publications == 1 && app.Snapshot.State == PlaybackState.Idle, name + ": mock discovery completes without automatic playback", checks);
@@ -85,7 +87,7 @@ internal static class UiSettingsRecovery
             {
                 var initial = store.Load();
                 Check(initial.Validate() is null && !initial.AutoConnectOnDiscover && !initial.StartAtLogin && !string.IsNullOrEmpty(store.LoadWarning), "locked settings: shell load recovers without an escaping reread", checks);
-                app = new(store, discovery, autostart, audio, engine, Application.Current.Dispatcher);
+                app = new(store, discovery, autostart, audio, engine, Application.Current.Dispatcher, isolatedVerification: true);
                 app.Start(); await app.Startup.WaitAsync(TimeSpan.FromSeconds(5));
                 Check(discovery.StartCount == 0, "locked settings: recovered defaults do not request a background startup browse", checks);
                 app.SetPanelVisible(true);
@@ -126,7 +128,7 @@ internal static class UiSettingsRecovery
         File.WriteAllBytes(path, original); var store = new SettingsStore(path); var initial = store.Load();
         Check(initial.Validate() is null && initial.SchemaVersion == 5 && initial.CustomBufferMs == 2000 && initial.Extra?.ContainsKey("stream_sample_rate") != true, "valid settings: legacy migration validates, retires the global rate, and clamps the buffer", checks);
         var discovery = new FixtureDiscovery(); var audio = new FixtureAudio(); var engine = new UiSmoke.MockFactory();
-        await using var app = new AppViewModel(store, discovery, new FixtureAutostart(), audio, engine, Application.Current.Dispatcher);
+        await using var app = new AppViewModel(store, discovery, new FixtureAutostart(), audio, engine, Application.Current.Dispatcher, isolatedVerification: true);
         app.Start(); await app.Startup.WaitAsync(TimeSpan.FromSeconds(5)); await Pump();
         Check(discovery.StartCount == 0, "valid settings: an inactive hidden panel does not browse without automatic demand", checks);
         app.SetPanelVisible(true); await Pump();
@@ -183,7 +185,8 @@ internal static class UiSettingsRecovery
         private bool _requested;
         public string SelectedInterface { get; private set; } = "";
         public event Action<IReadOnlyList<Receiver>>? Changed;
-        public event Action<string>? Failed { add { } remove { } }
+        public event Action<DiscoveryFailure>? Failed { add { } remove { } }
+        public event Action<DiscoveryResolveAttempt>? ResolveSucceeded { add { } remove { } }
         public event Action<bool>? RunningChanged;
         public void SetInterface(string id) => SelectedInterface = id;
         public void Start()

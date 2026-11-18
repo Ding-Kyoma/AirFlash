@@ -28,7 +28,7 @@ internal static class ReceiverSettingsRegression
     {
         await using var engine = new EngineInitialization(_ => Task.FromResult("mock"));
         await using var app = new AppViewModel(new MemoryStore(), Discovery(), new MockAutostart(), new MockAudio(), new MockFactory(), Application.Current.Dispatcher,
-            engine, receiverCapabilities: new CapabilityCatalog { Known = true });
+            engine, receiverCapabilities: new CapabilityCatalog { Known = true }, isolatedVerification: true);
         app.SetPanelVisible(true); app.Start(); await app.Startup; await Pump();
         var window = new SettingsWindow(app); window.ViewModel.SelectedPage = SettingsViewModel.ReceiversPage; window.Show(); await Pump();
         try
@@ -44,7 +44,7 @@ internal static class ReceiverSettingsRegression
     {
         var store = new MemoryStore(); var saved = store.Load(); saved.Options("a").Codec = "pcm"; saved.Options("a").SampleRate = "48000"; store.Save(saved);
         var discovery = Discovery(); var catalog = new CapabilityCatalog(); var engine = new MockFactory { AutoReady = false };
-        await using var app = new AppViewModel(store, discovery, new MockAutostart(), new MockAudio(), engine, Application.Current.Dispatcher, receiverCapabilities: catalog);
+        await using var app = new AppViewModel(store, discovery, new MockAutostart(), new MockAudio(), engine, Application.Current.Dispatcher, receiverCapabilities: catalog, isolatedVerification: true);
         app.SetPanelVisible(true); app.Start(); await app.Startup; await Pump();
         var window = new SettingsWindow(app); var panel = new ControlPanel(app); window.Show();
         var vm = window.ViewModel;
@@ -147,7 +147,7 @@ internal static class ReceiverSettingsRegression
     private static async Task ResetAsync(List<string> checks)
     {
         var store = new MemoryStore(); var discovery = Discovery(); var audio = new MockAudio(); var startup = new MockAutostart(); var restart = new RestartProbe();
-        await using var app = new AppViewModel(store, discovery, startup, audio, new MockFactory(), Application.Current.Dispatcher, restart: restart);
+        await using var app = new AppViewModel(store, discovery, startup, audio, new MockFactory(), Application.Current.Dispatcher, restart: restart, isolatedVerification: true);
         app.SetPanelVisible(true); app.Start(); await app.Startup; await Pump(); await app.ToggleAsync(app.AllReceivers.Single(r => r.Id == "a")); await Until(() => app.Snapshot.State == PlaybackState.Streaming);
         var window = new SettingsWindow(app); window.Show(); var vm = window.ViewModel;
         try
@@ -170,7 +170,7 @@ internal static class ReceiverSettingsRegression
     {
         var store = new MemoryStore { FailReset = true }; var saved = store.Load(); saved.StartAtLogin = true; store.Save(saved);
         var startup = new MockAutostart(); var restart = new RestartProbe();
-        await using var app = new AppViewModel(store, Discovery(), startup, new MockAudio(), new MockFactory(), Application.Current.Dispatcher, restart: restart);
+        await using var app = new AppViewModel(store, Discovery(), startup, new MockAudio(), new MockFactory(), Application.Current.Dispatcher, restart: restart, isolatedVerification: true);
         app.SetPanelVisible(true); app.Start(); await app.Startup; await Pump();
         using var vm = new SettingsViewModel(app) { ConfirmReset = () => true };
         await vm.ResetAsync();
