@@ -281,6 +281,12 @@ impl Health {
     pub fn ownership_uncertain(&self) -> bool {
         self.0.lock().unwrap().ownership_uncertain
     }
+    /// Clear the ownership guard after a confirmed probe if no newer signal
+    /// is pending.
+    pub fn clear_ownership_uncertain(&self) {
+        self.clear_ownership_uncertain_if_current();
+    }
+
     /// The ownership probe settled on `ours_active`: the receiver is still
     /// serving this session, so a timing or feedback symptom was not a
     /// takeover. Clear the cleanup guard so an ordinary stop tears the session

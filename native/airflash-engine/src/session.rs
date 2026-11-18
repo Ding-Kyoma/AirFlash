@@ -1738,7 +1738,7 @@ fn run_live(
                 }
                 if Instant::now() >= next_metrics {
                     emit(
-                        json!({"event":"capture_metrics","metrics":crate::live::Metrics::unavailable_snapshot()}),
+                        json!({"event":"capture_metrics","metrics":crate::live::Metrics::default()}),
                     );
                     next_metrics = Instant::now() + Duration::from_secs(1);
                 }
@@ -1757,7 +1757,9 @@ fn run_live(
             if !standby.should_resume(live.last_audio(), at) {
                 live.discard_stale();
                 if Instant::now() >= next_metrics {
-                    emit(json!({"event":"capture_metrics","metrics":live.metrics()}));
+                    emit(
+                        json!({"event":"capture_metrics","metrics":live.capture_metrics_report()}),
+                    );
                     next_metrics = Instant::now() + Duration::from_secs(1);
                 }
                 thread::sleep(Duration::from_millis(20));
@@ -2559,7 +2561,7 @@ fn send_packets(
             schedule.max_lateness_us = schedule.max_lateness_us.max(late.as_micros());
             telemetry.observe_lateness(late.as_secs_f64() * 1000.0);
             if let Some(source) = &live {
-                if let Some(age) = source.sample_age_ms() {
+                if let Some(age) = source.queued_capture_age_ms() {
                     telemetry.capture_age.observe(age);
                 }
                 // Slow outer loop: sustained lateness trims the capture resampler.
@@ -3343,8 +3345,9 @@ fn sample_capture(
     source: &crate::live::Loopback,
     baseline: &mut Option<crate::live::Metrics>,
     telemetry: &mut crate::telemetry::SessionTelemetry,
-) -> crate::live::Metrics {
-    let metrics = source.metrics();
+) -> crate::live::CaptureMetricsReport {
+    let report = source.capture_metrics_report();
+    let metrics = &report.metrics;
     if let Some(previous) = baseline {
         telemetry.input_drops += metrics
             .dropped_frames
@@ -3378,7 +3381,7 @@ fn sample_capture(
         }
     }
     *baseline = Some(metrics.clone());
-    metrics
+    report
 }
 
 /// Copy per-member counters into the session block before a snapshot. The
@@ -4655,6 +4658,20 @@ mod tests {
         drop(receiver);
         server.join().unwrap();
     }
+    #[test]
+    fn public_ownership_clear_preserves_queued_loss() {
+        let health = Health::default();
+        health.preemption_signal(preemption::Signal::UnexpectedTeardown);
+        health.clear_ownership_uncertain();
+        assert!(health.ownership_uncertain());
+        assert_eq!(
+            health.take_preemption_signals(),
+            vec![preemption::Signal::UnexpectedTeardown]
+        );
+        health.clear_ownership_uncertain();
+        assert!(!health.ownership_uncertain());
+    }
+
     #[test]
     fn a_finished_ownership_probe_does_not_clear_a_newer_teardown() {
         let (mut member, _, worker) = local_member();

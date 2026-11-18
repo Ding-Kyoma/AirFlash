@@ -110,6 +110,13 @@ pub fn dmap_tags(now: &NowPlaying) -> Vec<u8> {
     out
 }
 
+/// An issued metadata command and the instant it was sent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Command {
+    pub sequence: u64,
+    pub sent_at: Instant,
+}
+
 #[derive(Clone, Default)]
 pub struct Control(Arc<Mutex<Option<(u64, NowPlaying, Instant)>>>);
 impl Control {

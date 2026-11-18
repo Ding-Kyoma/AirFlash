@@ -83,12 +83,6 @@ pub struct Metrics {
     pub mmcss_priority_set: bool,
     pub dropped_frames: u64,
     pub underrun_packets: u64,
-    /// Missing capture frame slots at the output rate, before equalization.
-    #[serde(default)]
-    pub padded_frames: u64,
-    /// Shared pulls missing every capture slot, excluding scheduled silence.
-    #[serde(default)]
-    pub fully_padded_packets: u64,
     pub capture_frames: u64,
     pub max_queue_age_ms: f64,
     pub capture_to_send_p95_ms: Option<f64>,
@@ -118,16 +112,21 @@ pub struct Metrics {
     #[serde(default)]
     pub last_rebind_reason: Option<String>,
 }
-impl Metrics {
-    /// Keep the legacy waiting-event shape when no capture worker exists.
-    pub fn unavailable_snapshot() -> serde_json::Value {
-        let mut metrics = serde_json::json!(Self::default());
-        if let Some(fields) = metrics.as_object_mut() {
-            fields.remove("padded_frames");
-            fields.remove("fully_padded_packets");
-        }
-        metrics
-    }
+#[derive(Clone, Copy, Default, Serialize)]
+struct CapturePadding {
+    /// Missing capture frame slots at the output rate, before equalization.
+    padded_frames: u64,
+    /// Shared pulls missing every capture slot, excluding scheduled silence.
+    fully_padded_packets: u64,
+}
+
+/// JSONL snapshot from an active capture worker.
+#[derive(Serialize)]
+pub(crate) struct CaptureMetricsReport {
+    #[serde(flatten)]
+    pub(crate) metrics: Metrics,
+    #[serde(flatten)]
+    padding: CapturePadding,
 }
 /// A `{"event":"warning"}`-shaped state change raised by the capture thread.
 /// The session owns the JSON framing because the capture thread has no emitter.
@@ -150,6 +149,7 @@ struct State {
     error: Option<String>,
     ended: bool,
     metrics: Metrics,
+    padding: CapturePadding,
     ages: VecDeque<f64>,
     warnings: VecDeque<CaptureWarning>,
 }
@@ -254,6 +254,7 @@ impl Loopback {
             error: None,
             ended: false,
             metrics: Metrics::default(),
+            padding: CapturePadding::default(),
             ages: VecDeque::with_capacity(4000),
             warnings: VecDeque::new(),
         }));
@@ -399,9 +400,9 @@ impl Loopback {
         s.last_pull_ended_missing = force_silence || padded != 0;
         if padded != 0 {
             s.metrics.underrun_packets += 1;
-            s.metrics.padded_frames = s.metrics.padded_frames.saturating_add(padded);
+            s.padding.padded_frames = s.padding.padded_frames.saturating_add(padded);
             if padded == FRAMES as u64 {
-                s.metrics.fully_padded_packets = s.metrics.fully_padded_packets.saturating_add(1);
+                s.padding.fully_padded_packets = s.padding.fully_padded_packets.saturating_add(1);
             }
         }
         s.metrics.transition_count = s.splice.transitions;
@@ -423,9 +424,14 @@ impl Loopback {
         s.boundary_pending = true;
         s.metrics.last_discontinuity = Some("scheduler_recovery".into());
     }
-    /// Age of the oldest capture frame queued at a sender deadline. An empty
-    /// queue has no observation for the `capture_age` histogram.
-    pub fn sample_age_ms(&self) -> Option<f64> {
+    /// Age of the oldest queued capture frame in milliseconds, or zero for an
+    /// empty queue.
+    pub fn sample_age_ms(&self) -> f64 {
+        self.queued_capture_age_ms().unwrap_or(0.0)
+    }
+
+    /// An empty queue has no observation for the sender's capture age histogram.
+    pub(crate) fn queued_capture_age_ms(&self) -> Option<f64> {
         let s = self.state.lock().unwrap();
         let queued = s.frames.front()?;
         Some(qpc_ns().saturating_sub(queued.frame.qpc) as f64 / 1e6)
@@ -436,16 +442,23 @@ impl Loopback {
         (s.frames.len(), s.capacity)
     }
     pub fn metrics(&self) -> Metrics {
-        let (mut metrics, mut ages) = {
+        self.capture_metrics_report().metrics
+    }
+
+    pub(crate) fn capture_metrics_report(&self) -> CaptureMetricsReport {
+        let (mut report, mut ages) = {
             let s = self.state.lock().unwrap();
             (
-                s.metrics.clone(),
+                CaptureMetricsReport {
+                    metrics: s.metrics.clone(),
+                    padding: s.padding,
+                },
                 s.ages.iter().copied().collect::<Vec<_>>(),
             )
         };
         ages.sort_by(f64::total_cmp);
-        metrics.capture_to_send_p95_ms = ages.get(ages.len() * 95 / 100).copied();
-        metrics
+        report.metrics.capture_to_send_p95_ms = ages.get(ages.len() * 95 / 100).copied();
+        report
     }
 }
 impl Drop for Loopback {
@@ -1583,7 +1596,10 @@ pub(crate) mod tests {
             assert_eq!(pending_frames, 0);
             let (_, marker) = source.packet(1.0).unwrap();
             assert_eq!(marker.is_some(), amplitude > 0.0);
-            assert_eq!(source.metrics().padded_frames, (FRAMES - frames) as u64);
+            assert_eq!(
+                source.capture_metrics_report().padding.padded_frames,
+                (FRAMES - frames) as u64
+            );
         }
     }
 
@@ -1932,6 +1948,7 @@ pub(crate) mod tests {
                 error: None,
                 ended: false,
                 metrics: Metrics::default(),
+                padding: CapturePadding::default(),
                 ages: VecDeque::new(),
                 warnings: VecDeque::new(),
             })),
@@ -2005,10 +2022,10 @@ pub(crate) mod tests {
 
             source.packet(0.1).unwrap();
             assert_eq!(source.state.lock().unwrap().ages.len(), 3);
-            let captured = source.metrics();
-            assert!(captured.capture_to_send_p95_ms.is_some());
-            assert_eq!(captured.padded_frames, (2 * FRAMES - 3) as u64);
-            assert_eq!(captured.fully_padded_packets, 1);
+            let captured = source.capture_metrics_report();
+            assert!(captured.metrics.capture_to_send_p95_ms.is_some());
+            assert_eq!(captured.padding.padded_frames, (2 * FRAMES - 3) as u64);
+            assert_eq!(captured.padding.fully_padded_packets, 1);
 
             // Synthetic silence must not evict previous capture observations.
             for _ in 0..12 {
@@ -2017,14 +2034,15 @@ pub(crate) mod tests {
             assert_eq!(source.state.lock().unwrap().ages.len(), 3);
             assert_eq!(
                 source.metrics().capture_to_send_p95_ms,
-                captured.capture_to_send_p95_ms
+                captured.metrics.capture_to_send_p95_ms
             );
         }
     }
     #[test]
     fn sender_deadline_sample_distinguishes_an_empty_queue_from_zero_age() {
         let source = source();
-        assert_eq!(source.sample_age_ms(), None);
+        assert_eq!(source.queued_capture_age_ms(), None);
+        assert_eq!(source.sample_age_ms(), 0.0);
         {
             let mut state = source.state.lock().unwrap();
             // A future timestamp gives an exact zero after saturating subtraction.
@@ -2036,9 +2054,11 @@ pub(crate) mod tests {
                 });
             }
         }
-        assert_eq!(source.sample_age_ms(), Some(0.0));
+        assert_eq!(source.queued_capture_age_ms(), Some(0.0));
+        assert_eq!(source.sample_age_ms(), 0.0);
         source.packet(0.1).unwrap();
-        assert_eq!(source.sample_age_ms(), None);
+        assert_eq!(source.queued_capture_age_ms(), None);
+        assert_eq!(source.sample_age_ms(), 0.0);
     }
     #[test]
     fn padding_counts_missing_output_frames_at_both_rates() {
@@ -2049,10 +2069,16 @@ pub(crate) mod tests {
                 let (packet, marker) = source.packet(0.1).unwrap();
                 assert_eq!(packet.len(), FRAMES * 4);
                 assert_eq!(marker.is_some(), count > 0);
-                let metrics = source.metrics();
-                assert_eq!(metrics.padded_frames, (FRAMES - count) as u64);
-                assert_eq!(metrics.fully_padded_packets, if count == 0 { 1 } else { 0 });
-                assert_eq!(metrics.underrun_packets, if count < FRAMES { 1 } else { 0 });
+                let report = source.capture_metrics_report();
+                assert_eq!(report.padding.padded_frames, (FRAMES - count) as u64);
+                assert_eq!(
+                    report.padding.fully_padded_packets,
+                    if count == 0 { 1 } else { 0 }
+                );
+                assert_eq!(
+                    report.metrics.underrun_packets,
+                    if count < FRAMES { 1 } else { 0 }
+                );
                 assert!(source.state.lock().unwrap().frames.is_empty());
             }
         }
@@ -2068,22 +2094,25 @@ pub(crate) mod tests {
             }
             enqueue(&source, FRAMES - 1, 0.01);
             assert!(source.packet(0.1).unwrap().0.iter().any(|byte| *byte != 0));
-            assert_eq!(source.metrics().padded_frames, 1);
+            assert_eq!(source.capture_metrics_report().padding.padded_frames, 1);
             source.packet(0.1).unwrap();
-            let before_resume = source.metrics();
+            let before_resume = source.capture_metrics_report();
             enqueue(&source, FRAMES, 0.01);
             assert!(source.packet(0.1).unwrap().0.iter().any(|byte| *byte != 0));
-            let after_resume = source.metrics();
-            assert_eq!(after_resume.padded_frames, FRAMES as u64 + 1);
-            assert_eq!(after_resume.fully_padded_packets, 1);
-            assert_eq!(after_resume.underrun_packets, 2);
-            assert_eq!(after_resume.padded_frames, before_resume.padded_frames);
+            let after_resume = source.capture_metrics_report();
+            assert_eq!(after_resume.padding.padded_frames, FRAMES as u64 + 1);
+            assert_eq!(after_resume.padding.fully_padded_packets, 1);
+            assert_eq!(after_resume.metrics.underrun_packets, 2);
             assert_eq!(
-                after_resume.fully_padded_packets,
-                before_resume.fully_padded_packets
+                after_resume.padding.padded_frames,
+                before_resume.padding.padded_frames
             );
-            assert_eq!(after_resume.input_rate, 96000);
-            assert_eq!(after_resume.capture_frames, 100_000);
+            assert_eq!(
+                after_resume.padding.fully_padded_packets,
+                before_resume.padding.fully_padded_packets
+            );
+            assert_eq!(after_resume.metrics.input_rate, 96000);
+            assert_eq!(after_resume.metrics.capture_frames, 100_000);
         }
     }
     #[test]
@@ -2095,10 +2124,10 @@ pub(crate) mod tests {
                 let (packet, marker) = source.packet(gain).unwrap();
                 assert!(packet.iter().all(|byte| *byte == 0));
                 assert_eq!(marker.is_some(), sample > 0.004);
-                let metrics = source.metrics();
-                assert_eq!(metrics.padded_frames, 0);
-                assert_eq!(metrics.fully_padded_packets, 0);
-                assert_eq!(metrics.underrun_packets, 0);
+                let report = source.capture_metrics_report();
+                assert_eq!(report.padding.padded_frames, 0);
+                assert_eq!(report.padding.fully_padded_packets, 0);
+                assert_eq!(report.metrics.underrun_packets, 0);
             }
         }
     }
@@ -2117,11 +2146,11 @@ pub(crate) mod tests {
             let (tail, marker) = source.packet(1.0).unwrap();
             assert!(tail.iter().any(|byte| *byte != 0));
             assert!(marker.is_none());
-            let metrics = source.metrics();
-            assert_eq!(metrics.padded_frames, FRAMES as u64 * 2 - 1);
-            assert_eq!(metrics.fully_padded_packets, 1);
-            assert_eq!(metrics.underrun_packets, 2);
-            assert_eq!(metrics.last_audio_qpc_ns, last_audio);
+            let report = source.capture_metrics_report();
+            assert_eq!(report.padding.padded_frames, FRAMES as u64 * 2 - 1);
+            assert_eq!(report.padding.fully_padded_packets, 1);
+            assert_eq!(report.metrics.underrun_packets, 2);
+            assert_eq!(report.metrics.last_audio_qpc_ns, last_audio);
         }
     }
     #[test]
@@ -2130,17 +2159,17 @@ pub(crate) mod tests {
             let source = source_with(rate, crate::equalizer::Settings::default());
             {
                 let mut state = source.state.lock().unwrap();
-                state.metrics.padded_frames = u64::MAX - 100;
-                state.metrics.fully_padded_packets = u64::MAX - 1;
+                state.padding.padded_frames = u64::MAX - 100;
+                state.padding.fully_padded_packets = u64::MAX - 1;
             }
             source.packet(0.1).unwrap();
             source.packet(0.1).unwrap();
             for _ in 0..2 {
-                let metrics = source.metrics();
-                assert_eq!(metrics.padded_frames, u64::MAX);
-                assert_eq!(metrics.fully_padded_packets, u64::MAX);
-                assert_eq!(metrics.underrun_packets, 2);
-                let event = serde_json::json!({ "event": "capture_metrics", "metrics": metrics });
+                let report = source.capture_metrics_report();
+                assert_eq!(report.padding.padded_frames, u64::MAX);
+                assert_eq!(report.padding.fully_padded_packets, u64::MAX);
+                assert_eq!(report.metrics.underrun_packets, 2);
+                let event = serde_json::json!({ "event": "capture_metrics", "metrics": report });
                 let wire = serde_json::to_vec(&event).unwrap();
                 let received: serde_json::Value = serde_json::from_slice(&wire).unwrap();
                 assert_eq!(
@@ -2160,24 +2189,33 @@ pub(crate) mod tests {
         for rate in [44100, 48000] {
             let source = source_with(rate, crate::equalizer::Settings::default());
             source.packet(0.1).unwrap();
-            let before_fault = source.metrics();
+            let before_fault = source.capture_metrics_report();
             enqueue(&source, 1, 0.01);
             source.state.lock().unwrap().error = Some("synthetic capture failure".into());
             assert!(source.packet(0.1).is_err());
-            let after_fault = source.metrics();
-            assert_eq!(after_fault.padded_frames, before_fault.padded_frames);
+            let after_fault = source.capture_metrics_report();
             assert_eq!(
-                after_fault.fully_padded_packets,
-                before_fault.fully_padded_packets
+                after_fault.padding.padded_frames,
+                before_fault.padding.padded_frames
             );
-            assert_eq!(after_fault.underrun_packets, before_fault.underrun_packets);
+            assert_eq!(
+                after_fault.padding.fully_padded_packets,
+                before_fault.padding.fully_padded_packets
+            );
+            assert_eq!(
+                after_fault.metrics.underrun_packets,
+                before_fault.metrics.underrun_packets
+            );
             assert_eq!(source.state.lock().unwrap().frames.len(), 1);
             let fresh = source_with(rate, crate::equalizer::Settings::default());
-            assert_eq!(fresh.metrics().padded_frames, 0);
-            assert_eq!(fresh.metrics().fully_padded_packets, 0);
+            assert_eq!(fresh.capture_metrics_report().padding.padded_frames, 0);
+            assert_eq!(
+                fresh.capture_metrics_report().padding.fully_padded_packets,
+                0
+            );
             assert_eq!(fresh.metrics().underrun_packets, 0);
-            assert_eq!(before_fault.padded_frames, FRAMES as u64);
-            assert_eq!(before_fault.fully_padded_packets, 1);
+            assert_eq!(before_fault.padding.padded_frames, FRAMES as u64);
+            assert_eq!(before_fault.padding.fully_padded_packets, 1);
         }
     }
     #[test]
@@ -2188,10 +2226,10 @@ pub(crate) mod tests {
                 enqueue(&source, count, 0.01);
                 for gain in [0.1, 0.0] {
                     source.silence_packet(gain).unwrap();
-                    let metrics = source.metrics();
-                    assert_eq!(metrics.padded_frames, 0);
-                    assert_eq!(metrics.fully_padded_packets, 0);
-                    assert_eq!(metrics.underrun_packets, 0);
+                    let report = source.capture_metrics_report();
+                    assert_eq!(report.padding.padded_frames, 0);
+                    assert_eq!(report.padding.fully_padded_packets, 0);
+                    assert_eq!(report.metrics.underrun_packets, 0);
                     assert_eq!(source.state.lock().unwrap().frames.len(), count);
                 }
                 assert_eq!(
@@ -2200,9 +2238,12 @@ pub(crate) mod tests {
                 );
                 assert_eq!(source.metrics().silence_pad_frames, (FRAMES * 2) as u64);
                 source.packet(0.1).unwrap();
-                assert_eq!(source.metrics().padded_frames, (FRAMES - count) as u64);
                 assert_eq!(
-                    source.metrics().fully_padded_packets,
+                    source.capture_metrics_report().padding.padded_frames,
+                    (FRAMES - count) as u64
+                );
+                assert_eq!(
+                    source.capture_metrics_report().padding.fully_padded_packets,
                     if count == 0 { 1 } else { 0 }
                 );
                 assert_eq!(
@@ -2223,17 +2264,23 @@ pub(crate) mod tests {
             ] {
                 assert_eq!(channel.map(&pcm).len(), FRAMES * 4);
             }
-            let metrics = source.metrics();
-            assert_eq!(metrics.padded_frames, FRAMES as u64);
-            assert_eq!(metrics.fully_padded_packets, 1);
-            assert_eq!(metrics.underrun_packets, 1);
+            let report = source.capture_metrics_report();
+            assert_eq!(report.padding.padded_frames, FRAMES as u64);
+            assert_eq!(report.padding.fully_padded_packets, 1);
+            assert_eq!(report.metrics.underrun_packets, 1);
             // Paused standby/discard operations retain this capture worker. A new
             // application capture creates another Loopback with fresh counters.
             source.discard_stale();
-            assert_eq!(source.metrics().padded_frames, FRAMES as u64);
+            assert_eq!(
+                source.capture_metrics_report().padding.padded_frames,
+                FRAMES as u64
+            );
             let fresh = source_with(rate, crate::equalizer::Settings::default());
-            assert_eq!(fresh.metrics().padded_frames, 0);
-            assert_eq!(fresh.metrics().fully_padded_packets, 0);
+            assert_eq!(fresh.capture_metrics_report().padding.padded_frames, 0);
+            assert_eq!(
+                fresh.capture_metrics_report().padding.fully_padded_packets,
+                0
+            );
         }
     }
     #[test]
@@ -2334,7 +2381,7 @@ pub(crate) mod tests {
             assert!(left(join - 1) > 8000 && left(FRAMES - 1) < -8000);
             assert_eq!(before_join, before);
             assert_eq!(source.metrics().transition_count, before + 1);
-            assert_eq!(source.metrics().padded_frames, 0);
+            assert_eq!(source.capture_metrics_report().padding.padded_frames, 0);
         }
     }
     #[test]
@@ -2405,19 +2452,21 @@ pub(crate) mod tests {
             );
         }
         assert!(source.packet(0.1).unwrap().0.iter().any(|b| *b != 0));
-        let metrics = source.metrics();
-        assert_eq!(metrics.transition_count, before + 1);
-        assert_eq!(metrics.padded_frames, FRAMES as u64);
-        assert_eq!(metrics.fully_padded_packets, 1);
-        assert_eq!(metrics.underrun_packets, 1);
+        let report = source.capture_metrics_report();
+        assert_eq!(report.metrics.transition_count, before + 1);
+        assert_eq!(report.padding.padded_frames, FRAMES as u64);
+        assert_eq!(report.padding.fully_padded_packets, 1);
+        assert_eq!(report.metrics.underrun_packets, 1);
     }
     #[test]
     fn waiting_without_a_worker_does_not_report_measured_zero_padding() {
-        let waiting = Metrics::unavailable_snapshot();
+        let waiting = serde_json::json!(Metrics::default());
         assert!(waiting.get("padded_frames").is_none());
         assert!(waiting.get("fully_padded_packets").is_none());
         assert_eq!(waiting["underrun_packets"].as_u64(), Some(0));
-        let active = serde_json::json!(source().metrics());
+        let source = source();
+        assert_eq!(serde_json::json!(source.metrics()), waiting);
+        let active = serde_json::json!(source.capture_metrics_report());
         assert_eq!(active["padded_frames"].as_u64(), Some(0));
         assert_eq!(active["fully_padded_packets"].as_u64(), Some(0));
     }
