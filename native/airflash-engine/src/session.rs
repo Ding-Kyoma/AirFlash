@@ -5060,6 +5060,50 @@ mod tests {
     }
 
     #[test]
+    fn group_close_sends_teardown_after_an_advisory_close_header() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = receiver.local_addr().unwrap();
+        let (left, left_server, left_methods) = local_member_with(addr, None);
+        let (right, right_server, right_methods) = local_member_with_feedback_drop(
+            addr,
+            None,
+            Health::default(),
+            false,
+            Some(preemption::Signal::ConnectionClose),
+        );
+        let mut members = [left, right];
+        // No feedback worker is active. The close header is the sole evidence.
+        members[1]
+            .conn
+            .lock()
+            .unwrap()
+            .request("SET_PARAMETER", &members[1].uri, &[], b"volume: -15\r\n")
+            .unwrap();
+
+        close_group(&mut members);
+
+        assert!(members.iter().all(|member| member.closed));
+        assert_eq!(
+            members[1].health.take_preemption_signals(),
+            vec![preemption::Signal::ConnectionClose]
+        );
+        assert!(!members[1].health.ownership_uncertain());
+        drop(members);
+        for (server, methods) in [(left_server, left_methods), (right_server, right_methods)] {
+            server.join().unwrap();
+            assert_eq!(
+                methods
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|method| *method == "TEARDOWN")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn group_stop_checks_ownership_signals_already_read_by_other_control_workers() {
         let timeout = Duration::from_secs(5);
         for (signal, resolved) in [
@@ -5082,6 +5126,10 @@ mod tests {
                     signal,
                 );
                 member.media.connect_audio(address).unwrap();
+                // Allow runner scheduling headroom for the real final send.
+                member
+                    .media
+                    .configure_latency(Duration::from_millis(500), true);
                 (member, (receiver, server, methods))
             };
             let (left, left_receiver) = setup(None);
@@ -5090,11 +5138,9 @@ mod tests {
             let connection = members[1].conn.clone();
             let uri = members[1].uri.clone();
             let health = members[1].health.clone();
-            let (streaming, start_control) = std::sync::mpsc::channel();
             let (parsed, wait_parsed) = std::sync::mpsc::channel();
             let (capture_sampled, release_control) = std::sync::mpsc::channel();
             let control = thread::spawn(move || {
-                start_control.recv_timeout(timeout).unwrap();
                 let mut connection = connection.lock().unwrap();
                 connection
                     .request("SET_PARAMETER", &uri, &[], b"volume: -15\r\n")
@@ -5118,9 +5164,12 @@ mod tests {
                 // path waiting on this lock cannot reach its capture snapshot.
                 release_control.recv_timeout(timeout).unwrap();
             });
+            // Complete the control request before the production media
+            // schedule starts. The worker keeps its lock until final sampling.
+            wait_parsed.recv_timeout(timeout).unwrap();
             let cancel = Cancellation::default();
             let source = crate::live::tests::source();
-            let saw_drain = std::sync::atomic::AtomicBool::new(false);
+            let drained = std::sync::Mutex::new(None);
 
             let ended = send_packets(
                 &summary_options("", "native_stereo", 0),
@@ -5136,12 +5185,11 @@ mod tests {
                 &[],
                 None,
                 &|event| match event["event"].as_str() {
-                    Some("streaming") => {
-                        streaming.send(()).unwrap();
-                        wait_parsed.recv_timeout(timeout).unwrap();
-                        cancel.cancel();
+                    Some("streaming") => cancel.cancel(),
+                    Some("timeline_drained") => {
+                        let faded = event["faded"].as_bool().unwrap();
+                        assert!(drained.lock().unwrap().replace(faded).is_none());
                     }
-                    Some("timeline_drained") => saw_drain.store(true, Ordering::Relaxed),
                     Some("capture_metrics") => capture_sampled.send(()).unwrap(),
                     _ => {}
                 },
@@ -5149,23 +5197,46 @@ mod tests {
             .unwrap();
 
             control.join().unwrap();
-            let uncertain = signal == Some(preemption::Signal::UnexpectedTeardown) && !resolved;
             assert!(matches!(ended, StreamEnd::Finished));
             assert!(members.iter().all(|member| member.closed));
-            assert_eq!(
-                members[1].health.take_preemption_signals(),
-                signal.filter(|_| !resolved).into_iter().collect::<Vec<_>>()
-            );
+            let expected_signal = signal.filter(|_| !resolved);
+            let observed = members[1].health.take_preemption_signals();
+            // Once the control lock is released, feedback can observe the
+            // queued signal and exit before the shutdown joins it. Such an
+            // exit also records FeedbackLost unless shutdown canceled it first.
+            let feedback_lost = match (expected_signal, observed.as_slice()) {
+                (None, []) => false,
+                (Some(expected), [actual]) if expected == *actual => false,
+                (Some(expected), [actual, preemption::Signal::FeedbackLost])
+                    if expected == *actual =>
+                {
+                    true
+                }
+                _ => panic!("unexpected signals {observed:?} for {signal:?}, resolved {resolved}"),
+            };
+            let explicit_loss = expected_signal == Some(preemption::Signal::UnexpectedTeardown);
+            let uncertain = explicit_loss || feedback_lost;
             assert_eq!(members[1].health.ownership_uncertain(), uncertain);
-            assert_eq!(saw_drain.load(Ordering::Relaxed), !uncertain);
+            assert_eq!(
+                drained.into_inner().unwrap(),
+                (!explicit_loss).then_some(true)
+            );
             drop(members);
             for (receiver, server, methods) in [left_receiver, right_receiver] {
                 server.join().unwrap();
                 assert_eq!(
                     receiver.recv(&mut [0; 2048]).is_ok(),
-                    !uncertain,
+                    !explicit_loss,
                     "final RTP for queued signal {signal:?}, resolved {resolved}"
                 );
+                if !explicit_loss {
+                    receiver.set_nonblocking(true).unwrap();
+                    assert_eq!(
+                        receiver.recv(&mut [0; 2048]).unwrap_err().kind(),
+                        std::io::ErrorKind::WouldBlock,
+                        "only one faded packet per member"
+                    );
+                }
                 assert_eq!(
                     methods
                         .lock()
