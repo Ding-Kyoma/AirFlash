@@ -1957,18 +1957,51 @@ public sealed class SessionTests
     [Fact]
     public async Task SoftwareGroupMemberVolumeTargetsOnlyItsHostAndGroupRemovalStopsPlayback()
     {
-        var connection = new FakeConnection(); var (receiver, settings) = SoftwareGroup(); await using var controller = TestSessionController.Create(new FakeFactory(connection), new FakeAudio(), timing: Fast);
-        await controller.StartAsync(receiver, settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
-        connection.EmitData(new { @event = "device_volume", host = "127.0.0.1", volume = 28, sequence = 0, status = "confirmed", available = true });
-        connection.EmitData(new { @event = "device_volume", host = "127.0.0.2", volume = 42, sequence = 0, status = "confirmed", available = true });
-        await Until(() => controller.Snapshot.MemberVolumes?.Count == 2); Assert.False(controller.Snapshot.DeviceVolume!.Available);
-        var update = controller.SetDeviceVolumeAsync("b", 55); await Until(() => connection.Commands.Any(c => c.Command == "set_device_volume"));
-        var command = connection.Commands.Single(c => c.Command == "set_device_volume"); Assert.Equal("127.0.0.2", command.Parameters.Text("host")); Assert.Equal(55, command.Parameters.Number("volume"));
-        connection.EmitData(new { @event = "device_volume", host = "127.0.0.2", volume = 55, sequence = command.Parameters.Integer("sequence"), status = "confirmed", available = true });
-        await update;
-        Assert.Equal("confirmed", controller.Snapshot.MemberVolumes!["b"].Status);
-        Assert.Equal(28, controller.Snapshot.MemberVolumes!["a"].Actual);
-        settings.SoftwareGroups.Clear(); await controller.UpdateSettingsAsync(settings); Assert.Equal(PlaybackState.Idle, controller.Snapshot.State); Assert.True(connection.Disposed);
+        var connection = new FakeConnection();
+        var factory = new FakeFactory(connection);
+        var (receiver, settings) = SoftwareGroup();
+        // This quiet fake stays connected until the group is removed.
+        await using var controller = TestSessionController.Create(factory, new FakeAudio(), clock: new ManualDeadlineClock());
+        var volumeSent = new TaskCompletionSource<EngineCommand>(TaskCreationOptions.RunContinuationsAsynchronously);
+        connection.CommandSent = command => { if (command.Command == "set_device_volume") volumeSent.TrySetResult(command); };
+        var edit = Task.CompletedTask;
+        try
+        {
+            await controller.StartAsync(receiver, settings);
+            await SnapshotAsync(controller, snapshot => snapshot.State == PlaybackState.Streaming);
+            connection.EmitData(new { @event = "device_volume", host = "127.0.0.1", volume = 28, sequence = 0, status = "confirmed", available = true });
+            connection.EmitData(new { @event = "device_volume", host = "127.0.0.2", volume = 42, sequence = 0, status = "confirmed", available = true });
+            var initial = await SnapshotAsync(controller, snapshot =>
+                snapshot.MemberVolumes?.GetValueOrDefault("a") is { Actual: 28, Available: true } &&
+                snapshot.MemberVolumes.GetValueOrDefault("b") is { Actual: 42, Available: true });
+            Assert.False(initial.DeviceVolume!.Available);
+
+            edit = controller.SetDeviceVolumeAsync("b", 55);
+            var command = await volumeSent.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal("127.0.0.2", command.Parameters.Text("host"));
+            Assert.Equal(55, command.Parameters.Number("volume"));
+            var sequence = command.Parameters.Integer("sequence");
+            Assert.True(sequence > 0);
+            connection.EmitData(new { @event = "device_volume", host = "127.0.0.2", volume = 55, sequence, status = "confirmed", available = true });
+            var confirmed = await SnapshotAsync(controller, snapshot =>
+                snapshot.State == PlaybackState.Streaming &&
+                snapshot.MemberVolumes?.GetValueOrDefault("b") is { Actual: 55, Target: null, Status: "confirmed" } member && member.Sequence == sequence);
+            Assert.Equal(28, confirmed.MemberVolumes!["a"].Actual);
+            Assert.False(connection.Disposed);
+
+            settings.SoftwareGroups.Clear();
+            await controller.UpdateSettingsAsync(settings).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(PlaybackState.Idle, controller.Snapshot.State);
+            Assert.True(connection.Disposed);
+            Assert.Equal(1, factory.OpenCount);
+            Assert.Single(connection.Commands, outbound => outbound.Command == "set_device_volume");
+        }
+        finally
+        {
+            connection.CommandSent = null;
+            await controller.StopAsync();
+            await edit.WaitAsync(TimeSpan.FromSeconds(5));
+        }
     }
     [Fact]
     public async Task SoftwareGroupSwapRebuildsBothMembersAndKeepsCommonRate()
