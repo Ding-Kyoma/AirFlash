@@ -21,18 +21,6 @@ pub const RATE: u32 = 44100;
 pub const FRAMES: usize = 352;
 pub const PCM_BYTES: usize = FRAMES * 2 * 2;
 pub const SUPPORTED_RATES: [u32; 2] = [44100, 48000];
-pub fn pcm_bytes(bit_depth: u8) -> usize {
-    FRAMES * 2 * usize::from(bit_depth / 8)
-}
-
-pub fn buffered_alac_24_format(rate: u32) -> u64 {
-    match rate {
-        44_100 => 1 << 19,
-        48_000 => 1 << 21,
-        _ => 0,
-    }
-}
-
 pub fn audio_format(alac: bool, rate: u32) -> u64 {
     match (alac, rate) {
         (true, 48000) => 1 << 20,
@@ -41,26 +29,6 @@ pub fn audio_format(alac: bool, rate: u32) -> u64 {
         (false, _) => 1 << 11,
     }
 }
-enum AudioEncoding {
-    Pcm16,
-    Alac16(Box<alac_encoder::AlacEncoder>),
-    Alac24,
-}
-
-/// ALAC's stereo escape frame carries full-width samples without compression.
-/// The 23-bit header leaves one bit of the last byte for the first PCM sample.
-fn alac_24_escape(pcm: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(pcm.len() + 4);
-    out.extend([0x20, 0x00]); // Channel-pair element, instance 0.
-    let mut pending = 0x02; // Full frame, no shifted bytes, escape flag set.
-    for &byte in pcm {
-        out.push(pending | (byte >> 7));
-        pending = byte << 1;
-    }
-    out.extend([pending | 1, 0xc0]); // Three-bit end element and zero padding.
-    out
-}
-
 pub struct Packetizer {
     pub seq: u16,
     pub timestamp: u32,
@@ -71,7 +39,7 @@ pub struct Packetizer {
     history: VecDeque<CachedPacket>,
     retention: Duration,
     latency: Duration,
-    encoding: AudioEncoding,
+    alac: Option<Box<alac_encoder::AlacEncoder>>,
 }
 impl Packetizer {
     pub fn new(key: [u8; 32], seq: u16, timestamp: u32, ssrc: u32) -> Self {
@@ -88,17 +56,13 @@ impl Packetizer {
             history: VecDeque::with_capacity(MAX_HISTORY),
             retention: Duration::from_secs(1),
             latency: Duration::from_millis(150),
-            encoding: AudioEncoding::Pcm16,
+            alac: None,
         }
     }
     pub fn enable_alac(&mut self) {
-        self.encoding = AudioEncoding::Alac16(Box::new(alac_encoder::AlacEncoder::new(
+        self.alac = Some(Box::new(alac_encoder::AlacEncoder::new(
             &alac_encoder::FormatDescription::alac(self.rate as f64, FRAMES as u32, 2),
         )));
-    }
-    pub fn enable_buffered_alac_24(&mut self) {
-        self.encoding = AudioEncoding::Alac24;
-        self.enable_buffered();
     }
     pub fn enable_buffered(&mut self) {
         self.payload_type = 103;
@@ -139,31 +103,24 @@ impl Packetizer {
         now: Instant,
         deadline: Instant,
     ) -> Result<Vec<u8>> {
-        let bit_depth = if matches!(self.encoding, AudioEncoding::Alac24) {
-            24
-        } else {
-            16
-        };
-        ensure!(pcm.len() == pcm_bytes(bit_depth), "wrong PCM packet length");
+        ensure!(pcm.len() == PCM_BYTES, "wrong PCM packet length");
         let mut out = vec![0x80, self.payload_type | if first { 0x80 } else { 0 }];
         out.extend(self.seq.to_be_bytes());
         out.extend(self.timestamp.to_be_bytes());
         out.extend(self.ssrc.to_be_bytes());
         let nonce = self.cipher.counter();
-        let audio = match &mut self.encoding {
-            AudioEncoding::Pcm16 => self.cipher.encrypt(pcm, &out[4..12])?,
-            AudioEncoding::Alac24 => self.cipher.encrypt(&alac_24_escape(pcm), &out[4..12])?,
-            AudioEncoding::Alac16(encoder) => {
-                let little: Vec<u8> = pcm
-                    .chunks_exact(2)
-                    .flat_map(|bytes| [bytes[1], bytes[0]])
-                    .collect();
-                let format = alac_encoder::FormatDescription::pcm::<i16>(self.rate as f64, 2);
-                let mut encoded = vec![0; PCM_BYTES + 64];
-                let length = encoder.encode(&format, &little, &mut encoded);
-                encoded.truncate(length);
-                self.cipher.encrypt(&encoded, &out[4..12])?
-            }
+        let audio = if let Some(encoder) = &mut self.alac {
+            let little: Vec<u8> = pcm
+                .chunks_exact(2)
+                .flat_map(|bytes| [bytes[1], bytes[0]])
+                .collect();
+            let format = alac_encoder::FormatDescription::pcm::<i16>(self.rate as f64, 2);
+            let mut encoded = vec![0; PCM_BYTES + 64];
+            let length = encoder.encode(&format, &little, &mut encoded);
+            encoded.truncate(length);
+            self.cipher.encrypt(&encoded, &out[4..12])?
+        } else {
+            self.cipher.encrypt(pcm, &out[4..12])?
         };
         out.extend(audio);
         out.extend(nonce.to_le_bytes());
@@ -350,10 +307,7 @@ mod codec_tests {
             let key = [17; 32];
             let mut sender = Packetizer::with_rate(key, 9, 11, 13, rate);
             sender.enable_alac();
-            let AudioEncoding::Alac16(encoder) = &sender.encoding else {
-                panic!("expected the 16-bit ALAC encoder");
-            };
-            let cookie = encoder.magic_cookie();
+            let cookie = sender.alac.as_ref().unwrap().magic_cookie();
             let info = alac::StreamInfo::from_cookie(&cookie).unwrap();
             assert_eq!(info.sample_rate(), rate);
             let mut decoder = alac::Decoder::new(info);
@@ -371,41 +325,6 @@ mod codec_tests {
                 let result = decoder.decode_packet(&payload, &mut decoded).unwrap();
                 assert_eq!(result, samples);
                 assert!(packet.len() <= 1472);
-            }
-        }
-    }
-
-    #[test]
-    fn buffered_alac_24_preserves_low_bits_and_channel_order() {
-        for rate in SUPPORTED_RATES {
-            let key = [41; 32];
-            let mut sender = Packetizer::with_rate(key, 9, 11, 13, rate);
-            sender.enable_buffered_alac_24();
-            let mut receiver = Cipher::new(key);
-            let mut cookie = Vec::from((FRAMES as u32).to_be_bytes());
-            cookie.extend([0, 24, 40, 10, 14, 2, 0, 255]);
-            cookie.extend([0; 8]);
-            cookie.extend(rate.to_be_bytes());
-            let mut decoder = alac::Decoder::new(alac::StreamInfo::from_cookie(&cookie).unwrap());
-
-            for mut codes in [
-                vec![0; FRAMES * 2],
-                (0..FRAMES * 2)
-                    .map(|i| ((i as i32 * 779_971) & 0xff_ffff) - 0x80_0000)
-                    .collect(),
-            ] {
-                if codes[2] != 0 {
-                    codes[..6].copy_from_slice(&[-8_388_608, 8_388_607, -1, 1, 257, -259]);
-                }
-                let pcm: Vec<_> = codes.iter().flat_map(|&s| i32::to_be_bytes(s)[1..].to_vec()).collect();
-                let packet = sender.packet(&pcm, false).unwrap();
-                assert_eq!(packet[1] & 127, 103);
-                let payload = receiver
-                    .decrypt(&packet[12..packet.len() - 8], &packet[4..12])
-                    .unwrap();
-                let mut decoded = vec![0i32; FRAMES * 2];
-                let result = decoder.decode_packet(&payload, &mut decoded).unwrap();
-                assert!(result.iter().zip(&codes).all(|(&actual, &code)| actual == code << 8));
             }
         }
     }

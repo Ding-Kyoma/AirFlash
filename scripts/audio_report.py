@@ -25,19 +25,8 @@ import numpy as np
 BAND_CENTERS = (125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0)
 
 
-def decode_pcm(raw: bytes, width: int) -> np.ndarray:
-    if width == 3:
-        packed = np.frombuffer(raw, dtype="u1").reshape(-1, 3).astype(np.int32)
-        codes = packed[:, 0] | (packed[:, 1] << 8) | (packed[:, 2] << 16)
-        signed = (codes ^ 0x800000) - 0x800000
-    elif width in (2, 4):
-        signed = np.frombuffer(raw, dtype=f"<i{width}")
-    else:
-        raise ValueError(f"unsupported sample width {width} bytes")
-    return signed.astype(np.float64) / (1 << (width * 8 - 1))
-
-
-def wav_format(path: Path) -> tuple[np.ndarray, int, int]:
+def read_wav(path: Path) -> tuple[np.ndarray, int]:
+    """Stereo frames as int16 or float32 plus the sample rate."""
     with wave.open(str(path), "rb") as handle:
         channels, width, rate, frames = (
             handle.getnchannels(),
@@ -46,41 +35,37 @@ def wav_format(path: Path) -> tuple[np.ndarray, int, int]:
             handle.getnframes(),
         )
         raw = handle.readframes(frames)
-    return decode_pcm(raw, width).reshape(-1, channels), rate, width
-
-
-def read_wav(path: Path) -> tuple[np.ndarray, int]:
-    """Normalized PCM samples and sample rate."""
-    data, rate, _ = wav_format(path)
-    return data, rate
-
-
-def raw_tap(path: Path, sidecar: Path) -> tuple[bytes, int, int, int]:
-    spec = json.loads(sidecar.read_text(encoding="utf-8"))
-    channels, bits = int(spec["channels"]), int(spec["bits"])
-    if bits not in (16, 24):
-        raise ValueError(f"unsupported tap bit depth {bits}")
-    width = bits // 8
-    raw = path.read_bytes()
-    return raw[: len(raw) - len(raw) % (channels * width)], int(spec["rate"]), channels, width
+    if width == 2:
+        data = np.frombuffer(raw, dtype="<i2").astype(np.float64) / 32768.0
+    elif width == 4:
+        data = np.frombuffer(raw, dtype="<i4").astype(np.float64) / 2147483648.0
+    else:
+        raise ValueError(f"unsupported sample width {width} bytes")
+    return data.reshape(-1, channels), rate
 
 
 def read_raw(path: Path, sidecar: Path) -> tuple[np.ndarray, int]:
     """Read an ``AIRFLASH_PCM_DUMP`` tap and the format its sidecar recorded."""
-    raw, rate, channels, width = raw_tap(path, sidecar)
-    return decode_pcm(raw, width).reshape(-1, channels), rate
+    spec = json.loads(sidecar.read_text(encoding="utf-8"))
+    channels, bits = int(spec["channels"]), int(spec["bits"])
+    if bits != 16:
+        raise ValueError(f"only 16-bit taps are supported, got {bits}")
+    data = np.frombuffer(path.read_bytes(), dtype="<i2").astype(np.float64) / 32768.0
+    usable = len(data) - len(data) % channels
+    return data[:usable].reshape(-1, channels), int(spec["rate"])
 
 
 def wrap(raw: Path, out: Path) -> dict:
     """Write the tap as a WAV next to its sidecar and return a short summary."""
     sidecar = raw.with_suffix(".json")
-    pcm, rate, channels, width = raw_tap(raw, sidecar)
+    data, rate = read_raw(raw, sidecar)
+    codes = np.clip(np.round(data * 32768.0), -32768, 32767).astype("<i2")
     with wave.open(str(out), "wb") as handle:
-        handle.setnchannels(channels)
-        handle.setsampwidth(width)
+        handle.setnchannels(data.shape[1])
+        handle.setsampwidth(2)
         handle.setframerate(rate)
-        handle.writeframes(pcm)
-    return {"wav": str(out), "rate": rate, "frames": len(pcm) // (channels * width)}
+        handle.writeframes(codes.tobytes())
+    return {"wav": str(out), "rate": rate, "frames": int(data.shape[0])}
 
 
 def band_levels(data: np.ndarray, rate: int) -> dict[str, float]:
@@ -103,15 +88,12 @@ def band_levels(data: np.ndarray, rate: int) -> dict[str, float]:
 
 def compare(first: Path, second: Path) -> dict:
     """Level, band and null-residual differences between two captures."""
-    a, rate_a, width_a = wav_format(first)
-    b, rate_b, width_b = wav_format(second)
+    a, rate_a = read_wav(first)
+    b, rate_b = read_wav(second)
     if rate_a != rate_b:
         raise ValueError(f"sample rates differ: {rate_a} vs {rate_b}")
-    if a.shape[1] != b.shape[1]:
-        raise ValueError(f"channel counts differ: {a.shape[1]} vs {b.shape[1]}")
-    scale = 1 << (8 * max(width_a, width_b) - 1)
-    codes_a = a * scale
-    codes_b = b * scale
+    codes_a = np.round(a * 32768.0)
+    codes_b = np.round(b * 32768.0)
     frames = min(codes_a.shape[0], codes_b.shape[0])
     identical = codes_a.shape == codes_b.shape and bool(np.array_equal(codes_a, codes_b))
     overlap_a, overlap_b = a[:frames], b[:frames]

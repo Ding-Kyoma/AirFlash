@@ -69,7 +69,8 @@ struct Frame {
     left: f32,
     right: f32,
     qpc: u64,
-    /// True when the frame is still on the output's integer PCM grid.
+    /// True when the sample is still the untouched 16-bit capture value, so the
+    /// packetiser may skip the TPDF dither and stay bit-exact.
     clean: bool,
 }
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -154,11 +155,11 @@ struct DumpWriter {
     capped: bool,
 }
 impl DumpWriter {
-    fn from_env(rate: u32, bit_depth: u8) -> Option<Self> {
+    fn from_env(rate: u32) -> Option<Self> {
         let path = std::env::var_os("AIRFLASH_PCM_DUMP")?;
-        Self::open(Path::new(&path), rate, bit_depth)
+        Self::open(Path::new(&path), rate)
     }
-    fn open(base: &Path, rate: u32, bit_depth: u8) -> Option<Self> {
+    fn open(base: &Path, rate: u32) -> Option<Self> {
         let name = base.file_name()?.to_string_lossy().into_owned();
         let file = File::create(base.with_file_name(format!("{name}.raw"))).ok()?;
         let writer = Self {
@@ -166,7 +167,7 @@ impl DumpWriter {
             sidecar: base.with_file_name(format!("{name}.json")),
             rate,
             channels: 2,
-            bits: u32::from(bit_depth),
+            bits: 16,
             frames: 0,
             capped: false,
         };
@@ -188,8 +189,8 @@ impl DumpWriter {
             return;
         }
         let mut bytes = Vec::with_capacity(pcm.len());
-        for sample in pcm.chunks_exact((self.bits / 8) as usize) {
-            bytes.extend(sample.iter().rev());
+        for pair in pcm.chunks_exact(2) {
+            bytes.extend_from_slice(&[pair[1], pair[0]]);
         }
         if self.file.write_all(&bytes).is_err() {
             self.capped = true;
@@ -211,7 +212,6 @@ impl Drop for DumpWriter {
     }
 }
 struct State {
-    bit_depth: u8,
     splice: crate::continuity::Splice,
     quantizer: crate::continuity::Quantizer,
     boundary_pending: bool,
@@ -285,17 +285,10 @@ impl Loopback {
     pub fn start(
         endpoint: Option<String>,
         rate: u32,
-        bit_depth: u8,
         equalizer: crate::equalizer::Control,
         bit_exact: bool,
     ) -> Result<Self> {
-        Self::start_target(
-            Target::Endpoint(endpoint),
-            rate,
-            bit_depth,
-            equalizer,
-            bit_exact,
-        )
+        Self::start_target(Target::Endpoint(endpoint), rate, equalizer, bit_exact)
     }
     /// Capture one application target. `pinned` is true when the IPC request
     /// named a pid + creation time: while that instance lives, it is the only
@@ -304,7 +297,6 @@ impl Loopback {
         application: crate::applications::Application,
         pinned: bool,
         rate: u32,
-        bit_depth: u8,
         equalizer: crate::equalizer::Control,
         bit_exact: bool,
     ) -> Result<Self> {
@@ -314,7 +306,6 @@ impl Loopback {
                 pinned: pinned.then_some((application.process_id, application.started_at)),
             },
             rate,
-            bit_depth,
             equalizer,
             bit_exact,
         )
@@ -322,14 +313,12 @@ impl Loopback {
     fn start_target(
         target: Target,
         rate: u32,
-        bit_depth: u8,
         equalizer: crate::equalizer::Control,
         bit_exact: bool,
     ) -> Result<Self> {
         let capacity = rate as usize * 60 / 1000;
         let queue_target = rate as usize * 20 / 1000;
         let state = Arc::new(Mutex::new(State {
-            bit_depth,
             splice: crate::continuity::Splice::new(rate),
             quantizer: crate::continuity::Quantizer::new(),
             boundary_pending: false,
@@ -342,7 +331,7 @@ impl Loopback {
             metrics: Metrics::default(),
             ages: VecDeque::with_capacity(4000),
             warnings: VecDeque::new(),
-            dump: DumpWriter::from_env(rate, bit_depth),
+            dump: DumpWriter::from_env(rate),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let child_stop = stop.clone();
@@ -361,7 +350,6 @@ impl Loopback {
                 if let Err(e) = capture(
                     target,
                     rate,
-                    bit_depth,
                     bit_exact,
                     child_stop,
                     &child_state,
@@ -436,8 +424,7 @@ impl Loopback {
         if let Some(e) = &s.error {
             anyhow::bail!("capture stopped: {e}");
         }
-        let bit_depth = s.bit_depth;
-        let mut out = Vec::with_capacity(crate::rtp::pcm_bytes(bit_depth));
+        let mut out = Vec::with_capacity(FRAMES * 4);
         let mut marker = None;
         let now = qpc_ns();
         let mut underrun = false;
@@ -475,7 +462,9 @@ impl Loopback {
                 s.ages.pop_front();
             }
             s.ages.push_back(age);
-            // Untouched integer samples on the output grid need no dither.
+            // A 16-bit capture that was neither resampled, re-gained nor
+            // equalised is already on the 16-bit grid: dithering it again only
+            // adds noise, so the codes go through untouched.
             let exact = !missing
                 && frame.clean
                 && gain == 1.0
@@ -483,16 +472,12 @@ impl Loopback {
                 && s.splice.transparent();
             let processed = s.equalizer.frame([frame.left, frame.right]);
             for value in s.splice.frame(processed, gain, missing) {
-                if bit_depth == 24 {
-                    out.extend(s.quantizer.pcm24(value, exact));
+                let code = if exact {
+                    crate::continuity::Quantizer::exact(value)
                 } else {
-                    let code = if exact {
-                        crate::continuity::Quantizer::exact(value)
-                    } else {
-                        s.quantizer.quantize(value)
-                    };
-                    out.extend(code.to_be_bytes());
-                }
+                    s.quantizer.quantize(value)
+                };
+                out.extend(code.to_be_bytes());
             }
         }
         if let Some(dump) = &mut s.dump {
@@ -641,12 +626,11 @@ fn find_device(enumerator: &IMMDeviceEnumerator, name: Option<&str>) -> Result<I
     Ok(unsafe { devices.Item(endpoint_index(name, &endpoints)? as u32) }?)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 struct Format {
     tag: u16,
     channels: usize,
     bits: usize,
-    valid_bits: usize,
     rate: u32,
 }
 impl Format {
@@ -654,7 +638,6 @@ impl Format {
     fn label(&self) -> String {
         let kind = match (self.tag, self.bits) {
             (3, bits) => format!("f{bits}"),
-            (1, bits) if bits != self.valid_bits => format!("pcm{}in{bits}", self.valid_bits),
             (1, bits) => format!("pcm{bits}"),
             (tag, bits) => format!("tag{tag}/{bits}"),
         };
@@ -703,7 +686,6 @@ struct Binding {
     tag: u16,
     channels: usize,
     bits: usize,
-    valid_bits: usize,
     rate: u32,
     /// Device position where this client's previous packet ended; used to tell
     /// a benign loopback wrap from a real capture gap.
@@ -714,7 +696,6 @@ impl Binding {
         client: IAudioClient,
         spec: WAVEFORMATEX,
         tag: u16,
-        valid_bits: usize,
         process: Option<crate::applications::Process>,
     ) -> Result<Self> {
         let channels = spec.nChannels as usize;
@@ -741,11 +722,6 @@ impl Binding {
             tag,
             channels,
             bits,
-            valid_bits: if (1..=bits).contains(&valid_bits) {
-                valid_bits
-            } else {
-                bits
-            },
             rate,
             last_end: None,
         })
@@ -758,54 +734,43 @@ impl Binding {
         let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }?;
         let pointer = MixFormat(unsafe { client.GetMixFormat() }?);
         let spec = unsafe { pointer.0.read_unaligned() };
-        let (tag, valid_bits) = if spec.wFormatTag == 0xfffe {
-            let spec = unsafe { (pointer.0 as *const WAVEFORMATEXTENSIBLE).read_unaligned() };
-            (
-                spec.SubFormat.data1 as u16,
-                usize::from(unsafe { spec.Samples.wValidBitsPerSample }),
-            )
+        let tag = if spec.wFormatTag == 0xfffe {
+            unsafe { (pointer.0 as *const WAVEFORMATEXTENSIBLE).read_unaligned() }
+                .SubFormat
+                .data1 as u16
         } else {
-            (spec.wFormatTag, usize::from(spec.wBitsPerSample))
+            spec.wFormatTag
         };
         initialize_client(&client, capture_flags(flow)?, pointer.0, true)?;
-        Self::finish(client, spec, tag, valid_bits, None)
+        Self::finish(client, spec, tag, None)
     }
     fn open_application(
         application: &crate::applications::Application,
         stream_rate: u32,
-        bit_depth: u8,
         stop: &AtomicBool,
     ) -> Result<Self> {
         let process = crate::applications::Process::verify(application)?;
         let client = crate::applications::activate(application.process_id, stop)?;
-        let block_align = u16::from(bit_depth / 8) * 2;
         let spec = WAVEFORMATEX {
             wFormatTag: 1,
             nChannels: 2,
             nSamplesPerSec: stream_rate,
-            nAvgBytesPerSec: stream_rate * u32::from(block_align),
-            nBlockAlign: block_align,
-            wBitsPerSample: u16::from(bit_depth),
+            nAvgBytesPerSec: stream_rate * 4,
+            nBlockAlign: 4,
+            wBitsPerSample: 16,
             cbSize: 0,
         };
         let flags = AUDCLNT_STREAMFLAGS_LOOPBACK
             | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
             | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM;
         initialize_client(&client, flags, &spec, false)?;
-        Self::finish(
-            client,
-            spec,
-            spec.wFormatTag,
-            usize::from(bit_depth),
-            Some(process),
-        )
+        Self::finish(client, spec, spec.wFormatTag, Some(process))
     }
     fn format(&self) -> Format {
         Format {
             tag: self.tag,
             channels: self.channels,
             bits: self.bits,
-            valid_bits: self.valid_bits,
             rate: self.rate,
         }
     }
@@ -826,39 +791,7 @@ impl Binding {
     }
 }
 
-fn unsupported_capture_format(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<windows::core::Error>()
-        .is_some_and(|error| {
-            matches!(
-                error.code(),
-                AUDCLNT_E_UNSUPPORTED_FORMAT | windows::Win32::Foundation::E_INVALIDARG
-            )
-        })
-}
-
-fn bind_target(
-    target: &Target,
-    stream_rate: u32,
-    bit_depth: u8,
-    stop: &AtomicBool,
-) -> Result<Vec<Binding>> {
-    let result = bind_at_depth(target, stream_rate, bit_depth, stop);
-    if matches!(target, Target::Application { .. })
-        && bit_depth == 24
-        && result.as_ref().is_err_and(unsupported_capture_format)
-    {
-        return bind_at_depth(target, stream_rate, 16, stop);
-    }
-    result
-}
-
-fn bind_at_depth(
-    target: &Target,
-    stream_rate: u32,
-    bit_depth: u8,
-    stop: &AtomicBool,
-) -> Result<Vec<Binding>> {
+fn bind_target(target: &Target, stream_rate: u32, stop: &AtomicBool) -> Result<Vec<Binding>> {
     match target {
         Target::Endpoint(name) => Ok(vec![Binding::open_endpoint(name.as_deref())?]),
         Target::Application { path, pinned } => {
@@ -881,30 +814,29 @@ fn bind_at_depth(
                     return Ok(vec![Binding::open_application(
                         &identity,
                         stream_rate,
-                        bit_depth,
                         stop,
                     )?]);
                 }
             }
             let candidates = crate::applications::matching(path)?;
-            let plan =
-                crate::applications::bind_plan(path, &candidates, *pinned, MAX_CAPTURE_INSTANCES);
+            let plan = crate::applications::bind_plan(
+                path,
+                &candidates,
+                *pinned,
+                MAX_CAPTURE_INSTANCES,
+            );
             ensure!(!plan.is_empty(), "no running instance of {path}");
             let mut bindings = Vec::with_capacity(plan.len());
             let mut last_error = None;
             for application in &plan {
-                match Binding::open_application(application, stream_rate, bit_depth, stop) {
+                match Binding::open_application(application, stream_rate, stop) {
                     Ok(binding) => bindings.push(binding),
-                    Err(error) if bit_depth == 24 && unsupported_capture_format(&error) => {
-                        return Err(error);
-                    }
                     Err(error) => last_error = Some(error),
                 }
             }
             if bindings.is_empty() {
-                return Err(
-                    last_error.unwrap_or_else(|| anyhow::anyhow!("no running instance of {path}"))
-                );
+                return Err(last_error
+                    .unwrap_or_else(|| anyhow::anyhow!("no running instance of {path}")));
             }
             Ok(bindings)
         }
@@ -1148,8 +1080,8 @@ struct Pipeline {
     chunk: usize,
     stream_rate: u32,
     input_rate: u32,
-    /// The capture delivers integers that fit on the output PCM grid.
-    integer_passthrough: bool,
+    /// The capture delivers 16-bit integers, so untouched samples stay on the grid.
+    source_is_pcm16: bool,
     /// Frame debt: |debt| >= 1 means one slip is due. Fed by the same PI and
     /// servo demand the resampler ratio used to consume.
     debt: f64,
@@ -1158,7 +1090,7 @@ struct Pipeline {
     slow_chunks: u32,
 }
 impl Pipeline {
-    fn new(stream_rate: u32, format: Format, bit_depth: u8, bit_exact: bool) -> Result<Self> {
+    fn new(stream_rate: u32, format: Format, bit_exact: bool) -> Result<Self> {
         let chunk = (format.rate / 100) as usize;
         let direct = bit_exact && format.rate == stream_rate;
         Ok(Self {
@@ -1172,7 +1104,7 @@ impl Pipeline {
             chunk,
             stream_rate,
             input_rate: format.rate,
-            integer_passthrough: format.tag == 1 && format.valid_bits <= usize::from(bit_depth),
+            source_is_pcm16: format.tag == 1 && format.bits == 16,
             debt: 0.0,
             slips: 0,
             started: Instant::now(),
@@ -1234,7 +1166,7 @@ impl Pipeline {
             Some(slip) => apply_slip(input, frames, slip, &mut out),
             None => out.extend((0..frames).map(|i| [input[0][i], input[1][i]])),
         }
-        (out, self.integer_passthrough && slip.is_none())
+        (out, self.source_is_pcm16 && slip.is_none())
     }
     /// Give up bit-exactness when the clocks differ too much to absorb with a
     /// slip every second: hand the stream to the resampler for the rest of the
@@ -1594,7 +1526,6 @@ fn drain_multi(
 fn capture(
     target: Target,
     stream_rate: u32,
-    bit_depth: u8,
     bit_exact: bool,
     stop: Arc<AtomicBool>,
     state: &Arc<Mutex<State>>,
@@ -1612,22 +1543,27 @@ fn capture(
         s.metrics.mmcss_registered = _priority.registered();
         s.metrics.mmcss_priority_set = _priority.priority_set();
     }
-    let mut bindings = bind_target(&target, stream_rate, bit_depth, &stop)?;
+    let mut bindings = bind_target(&target, stream_rate, &stop)?;
     let mut format = bindings
         .first()
         .context("capture produced no stream")?
         .format();
     ensure!(
-        bindings.iter().all(|b| b.format() == format),
+        bindings.iter().all(|b| {
+            let other = b.format();
+            other.rate == format.rate
+                && other.channels == format.channels
+                && other.bits == format.bits
+                && other.tag == format.tag
+        }),
         "capture stream formats differ"
     );
-    let mut pipeline = Pipeline::new(stream_rate, format, bit_depth, bit_exact)?;
+    let mut pipeline = Pipeline::new(stream_rate, format, bit_exact)?;
     let mut mixer = Mixer::new(format.rate);
     {
         let mut s = state.lock().unwrap();
         s.metrics.input_rate = format.rate;
         s.metrics.input_format = Some(format.label());
-        s.metrics.bit_exact = pipeline.resampler.is_none();
         s.metrics.capture_instances = bindings.len() as u32;
     }
     let _ = ready.send(Ok(()));
@@ -1747,21 +1683,24 @@ fn capture(
             if stop.load(Ordering::Acquire) {
                 return Ok(());
             }
-            match bind_target(&target, stream_rate, bit_depth, &stop) {
+            match bind_target(&target, stream_rate, &stop) {
                 Ok(new_bindings) => {
                     let new_format = new_bindings
                         .first()
                         .context("capture produced no stream")?
                         .format();
                     ensure!(
-                        new_bindings.iter().all(|b| b.format() == new_format),
+                        new_bindings.iter().all(|b| {
+                            b.rate == new_format.rate
+                                && b.channels == new_format.channels
+                                && b.bits == new_format.bits
+                                && b.tag == new_format.tag
+                        }),
                         "capture stream formats differ"
                     );
-                    if new_format != format {
-                        pipeline = Pipeline::new(stream_rate, new_format, bit_depth, bit_exact)?;
-                        format = new_format;
-                    }
+                    format = new_format;
                     if new_format.rate != mixer.rate {
+                        pipeline = Pipeline::new(stream_rate, new_format, bit_exact)?;
                         mixer = Mixer::new(new_format.rate);
                     }
                     bindings = new_bindings;
@@ -1772,7 +1711,6 @@ fn capture(
                         let mut s = state.lock().unwrap();
                         s.metrics.input_rate = format.rate;
                         s.metrics.input_format = Some(format.label());
-                        s.metrics.bit_exact = pipeline.resampler.is_none();
                         s.metrics.capture_instances = count;
                         s.metrics.rebinds = rebinds;
                         s.metrics.rebind_failures = failures;
@@ -1783,9 +1721,12 @@ fn capture(
                     // the log names the storm instead of repeating the same line.
                     let stamp = Instant::now();
                     rebind_times.push_back(stamp);
-                    while rebind_times.front().is_some_and(|oldest| {
-                        stamp.saturating_duration_since(*oldest) > REBIND_STORM_WINDOW
-                    }) {
+                    while rebind_times
+                        .front()
+                        .is_some_and(|oldest| {
+                            stamp.saturating_duration_since(*oldest) > REBIND_STORM_WINDOW
+                        })
+                    {
                         rebind_times.pop_front();
                     }
                     let window = rebind_times.len() as u32;
@@ -1999,7 +1940,10 @@ pub(crate) mod tests {
         // quiet again. That burst used to clear `last_probe` and restart the
         // two-second window, which is exactly the 2.36 s storm cadence.
         assert!(!probe.observe(start + Duration::from_secs(41), ProbeInput::Audible));
-        assert!(!probe.observe(start + Duration::from_millis(41_050), ProbeInput::Muted));
+        assert!(!probe.observe(
+            start + Duration::from_millis(41_050),
+            ProbeInput::Muted
+        ));
         assert!(!probe.observe(start + Duration::from_secs(50), ProbeInput::Muted));
         assert!(!probe.observe(start + Duration::from_secs(99), ProbeInput::Muted));
         assert!(probe.observe(start + Duration::from_secs(100), ProbeInput::Muted));
@@ -2073,10 +2017,8 @@ pub(crate) mod tests {
                 tag: 1,
                 channels: 2,
                 bits: 16,
-                valid_bits: 16,
                 rate: 1000,
             },
-            16,
             false,
         )
         .unwrap();
@@ -2123,7 +2065,7 @@ pub(crate) mod tests {
         );
         let equalizer =
             crate::equalizer::Control::new(crate::equalizer::Settings::default(), 44100).unwrap();
-        let source = Loopback::start(Some(endpoint), 44100, 16, equalizer, false).unwrap();
+        let source = Loopback::start(Some(endpoint), 44100, equalizer, false).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut nonzero = false;
         while Instant::now() < deadline {
@@ -2149,7 +2091,6 @@ pub(crate) mod tests {
                 .unwrap();
         Loopback {
             state: Arc::new(Mutex::new(State {
-                bit_depth: 16,
                 splice: crate::continuity::Splice::new(crate::rtp::RATE),
                 quantizer: crate::continuity::Quantizer::new(),
                 boundary_pending: false,
@@ -2352,10 +2293,8 @@ pub(crate) mod tests {
                 tag: 1,
                 channels: 2,
                 bits: 16,
-                valid_bits: 16,
                 rate: 44_100,
             },
-            16,
             true,
         )
         .unwrap();
@@ -2403,48 +2342,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn integer_capture_preserves_all_twenty_four_bits() {
-        let source = source();
-        let pipeline = Pipeline::new(
-            crate::rtp::RATE,
-            Format {
-                tag: 1,
-                channels: 2,
-                bits: 32,
-                valid_bits: 24,
-                rate: crate::rtp::RATE,
-            },
-            24,
-            true,
-        )
-        .unwrap();
-        assert!(pipeline.integer_passthrough);
-        let codes = [-8_388_608i32, 8_388_607, 1, -1, 65_537, -65_537];
-        let mut expected = Vec::new();
-        {
-            let mut state = source.state.lock().unwrap();
-            state.bit_depth = 24;
-            for _ in 0..crate::rtp::RATE / 200 + 2 {
-                state.splice.frame([0.0; 2], 1.0, false);
-            }
-            for i in 0..FRAMES {
-                let left = codes[i % codes.len()];
-                let right = codes[(i + 1) % codes.len()];
-                expected.extend_from_slice(&left.to_be_bytes()[1..]);
-                expected.extend_from_slice(&right.to_be_bytes()[1..]);
-                state.push_frame(Frame {
-                    left: left as f32 / 8_388_608.0,
-                    right: right as f32 / 8_388_608.0,
-                    qpc: qpc_ns(),
-                    clean: pipeline.integer_passthrough,
-                });
-            }
-        }
-        let (pcm, _) = source.packet(1.0).unwrap();
-        assert_eq!(pcm, expected);
-    }
-
-    #[test]
     fn a_slip_moves_exactly_one_frame_and_leaves_the_rest_untouched() {
         let frames = 441;
         let sine: Vec<f32> = (0..frames)
@@ -2489,10 +2386,8 @@ pub(crate) mod tests {
                 tag: 1,
                 channels: 2,
                 bits: 16,
-                valid_bits: 16,
                 rate: 44_100,
             },
-            16,
             true,
         )
         .unwrap();
@@ -2573,10 +2468,8 @@ pub(crate) mod tests {
                 tag: 1,
                 channels: 2,
                 bits: 16,
-                valid_bits: 16,
                 rate: 48_000,
             },
-            16,
             true,
         )
         .unwrap();
@@ -2587,15 +2480,13 @@ pub(crate) mod tests {
                 tag: 3,
                 channels: 2,
                 bits: 32,
-                valid_bits: 32,
                 rate: 44_100,
             },
-            16,
             true,
         )
         .unwrap();
         assert!(
-            float.resampler.is_none() && !float.integer_passthrough,
+            float.resampler.is_none() && !float.source_is_pcm16,
             "a float capture is copied but cannot be bit-exact"
         );
     }

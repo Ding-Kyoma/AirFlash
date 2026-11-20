@@ -13,7 +13,6 @@ pub struct ProfileChoice {
     pub transport: &'static str,
     pub timing: &'static str,
     pub sample_rate: u32,
-    pub bit_depth: u8,
     pub selected_codec: &'static str,
     pub selected_transport: &'static str,
     pub selected_timing: &'static str,
@@ -33,21 +32,15 @@ pub struct Capabilities {
 /// runtime uses. Solo choices use the full model/firmware evidence; group queries
 /// enumerate every member under the shared group timing plan.
 pub fn choices(fingerprint: &CompatFingerprint, evidence: &Profile) -> Vec<ProfileChoice> {
-    choices_planned(fingerprint, evidence, None, false)
+    choices_planned(fingerprint, evidence, None)
 }
 fn choices_planned(
     fingerprint: &CompatFingerprint,
     evidence: &Profile,
     group: Option<TimingPlan>,
-    include_24_bit: bool,
 ) -> Vec<ProfileChoice> {
     let mut result = Vec::new();
-    let depths: &[u8] = if include_24_bit { &[16, 24] } else { &[16] };
-    for (bit_depth, rate) in depths
-        .iter()
-        .copied()
-        .flat_map(|depth| [44100, 48000].map(|rate| (depth, rate)))
-    {
+    for rate in [44100, 48000] {
         for (codec_name, codec) in [
             ("auto", Codec::Auto),
             ("pcm", Codec::Pcm),
@@ -78,15 +71,12 @@ fn choices_planned(
                             || timing_name == "auto" && evidence.follow_receiver_clock,
                         ..evidence.clone()
                     };
-                    if let Ok(compat) =
-                        fingerprint.negotiate_stream(plan, &profile, rate, bit_depth, false)
-                    {
+                    if let Ok(compat) = fingerprint.negotiate_planned(plan, &profile, rate, false) {
                         result.push(ProfileChoice {
                             codec: codec_name,
                             transport: transport_name,
                             timing: timing_name,
                             sample_rate: rate,
-                            bit_depth,
                             selected_codec: compat.codec_name(),
                             selected_transport: if compat.uses_buffered_stream() {
                                 "buffered"
@@ -106,14 +96,6 @@ pub fn query(peer: &Peer, cancellation: Cancellation) -> Result<Capabilities> {
     Ok(query_group(std::slice::from_ref(peer), cancellation)?.remove(0))
 }
 pub fn query_group(peers: &[Peer], cancellation: Cancellation) -> Result<Vec<Capabilities>> {
-    query_stream_profiles(peers, cancellation, false)
-}
-
-pub fn query_stream_profiles(
-    peers: &[Peer],
-    cancellation: Cancellation,
-    include_24_bit: bool,
-) -> Result<Vec<Capabilities>> {
     let mut fingerprints = Vec::new();
     for peer in peers {
         let mut connection = Connection::connect(
@@ -148,7 +130,7 @@ pub fn query_stream_profiles(
             host: peer.host,
             port: peer.port,
             known: fingerprint.advertises_audio(),
-            profiles: choices_planned(fingerprint, &peer.profile, Some(plan), include_24_bit),
+            profiles: choices_planned(fingerprint, &peer.profile, Some(plan)),
         })
         .collect())
 }
@@ -157,35 +139,6 @@ pub fn query_stream_profiles(
 mod tests {
     use super::*;
     use crate::profile::Formats;
-
-    #[test]
-    fn first_generation_homepod_advertises_24_bit_only_on_buffered_streams() {
-        let info = plist::from_bytes(br#"<?xml version="1.0" encoding="UTF-8"?>
-            <plist version="1.0"><dict>
-            <key>model</key><string>AudioAccessory1,1</string>
-            <key>sourceVersion</key><string>1005.13.2</string>
-            <key>supportedFormats</key><dict>
-                <key>audioStream</key><integer>21235712</integer>
-                <key>bufferStream</key><integer>-577021992844656640</integer>
-            </dict>
-            <key>supportedAudioFormatsExtended</key><dict>
-                <key>bufferStream</key><array>
-                    <integer>71</integer><integer>19</integer><integer>21</integer><integer>22</integer>
-                </array>
-            </dict></dict></plist>"#).unwrap();
-        let profile = Profile::default();
-        let fingerprint = CompatFingerprint::from_info(&info, &profile, &[]);
-        let plan = TimingPlan::select(&[fingerprint.timing_evidence(), fingerprint.timing_evidence()], Codec::Auto).unwrap();
-        let profiles = choices_planned(&fingerprint, &profile, Some(plan), true);
-        for (rate, depth, transport) in [(44100, 16, "realtime"), (44100, 24, "buffered"), (48000, 24, "buffered")] {
-            assert!(profiles.iter().any(|p| p.codec == "auto" && p.sample_rate == rate
-                && p.bit_depth == depth && p.transport == transport && p.timing == "auto"
-                && p.selected_codec == "alac" && p.selected_transport == transport));
-        }
-        assert!(!profiles.iter().any(|p| p.bit_depth == 24 && p.selected_transport == "realtime"));
-        assert!(!profiles.iter().any(|p| p.bit_depth == 16 && (p.transport == "buffered" || p.sample_rate == 48000)));
-        assert!(choices_planned(&fingerprint, &profile, Some(plan), false).iter().all(|p| p.bit_depth == 16));
-    }
 
     fn info_peer(model: &str, version: Option<&str>) -> (Peer, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};

@@ -30,25 +30,6 @@ public sealed class ReceiverCapabilityTests
         Assert.Empty(set.Select(new ReceiverOptions(), "48000"));
     }
     [Fact]
-    public void NativeHomePodPairSelectsCommonRateAndDepthWithoutChangingAutomaticPlayback()
-    {
-        ReceiverProfile[] profiles = [
-            Profile(44100),
-            new("auto", "auto", "auto", 44100, "alac", "buffered", "ptp", 24),
-            new("auto", "auto", "auto", 48000, "alac", "buffered", "ptp", 24),
-            new("auto", "buffered", "auto", 44100, "alac", "buffered", "ptp", 24),
-            new("auto", "buffered", "auto", 48000, "alac", "buffered", "ptp", 24),
-        ];
-        var left = new ReceiverCapabilities("a", "127.0.0.1", 7000, true, profiles);
-        var right = left with { ReceiverId = "b", Host = "127.0.0.2" };
-        var pair = new ReceiverCapabilitySet([left, right]);
-        Assert.All(pair.Select(new ReceiverOptions()), s => Assert.Equal((44100, 16, "realtime"), (s.Profile.SampleRate, s.Profile.BitDepth, s.Profile.SelectedTransport)));
-        Assert.All(pair.Select(new ReceiverOptions(), "48000"), s => Assert.Equal((24, "buffered"), (s.Profile.BitDepth, s.Profile.SelectedTransport)));
-        Assert.All(pair.Select(new ReceiverOptions { Transport = "buffered" }), s => Assert.Equal((44100, 24), (s.Profile.SampleRate, s.Profile.BitDepth)));
-        Assert.Empty(pair.Select(new ReceiverOptions { Transport = "buffered", BitDepth = 16 }));
-        Assert.Empty(new ReceiverCapabilitySet([left, right with { Profiles = [Profile(44100)] }]).Select(new ReceiverOptions { BitDepth = 24 }));
-    }
-    [Fact]
     public void UnknownAndInvalidProfilesRemainDistinct()
     {
         Assert.False(ReceiverCapabilitySet.Unknown.Known); Assert.Empty(ReceiverCapabilitySet.Unknown.Select(new ReceiverOptions()));

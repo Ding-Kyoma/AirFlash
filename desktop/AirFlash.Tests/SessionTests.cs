@@ -884,7 +884,6 @@ public sealed class SessionTests
     [InlineData("capture")]
     [InlineData("latency")]
     [InlineData("sample_rate")]
-    [InlineData("bit_depth")]
     [InlineData("codec")]
     [InlineData("transport")]
     [InlineData("timing")]
@@ -899,7 +898,6 @@ public sealed class SessionTests
             case "capture": settings.CaptureMode = "endpoint"; settings.CaptureEndpoint = "endpoint"; break;
             case "latency": settings.LatencyMode = "buffered"; break;
             case "sample_rate": settings.Options("a").SampleRate = "48000"; break;
-            case "bit_depth": settings.Options("a").BitDepth = 16; break;
             case "codec": settings.Options("a").Codec = "pcm"; break;
             case "transport": settings.Options("a").Transport = "realtime"; break;
             case "timing": settings.Options("a").Timing = "ntp"; break;
@@ -949,7 +947,7 @@ public sealed class SessionTests
         await Until(() => controller.Snapshot.Metrics?.InputFormat == "pcm16/44100/2ch");
         var metrics = controller.Snapshot.Metrics!;
         Assert.True(metrics.BitExact); Assert.Equal(2, metrics.Slips);
-        Assert.Contains(logs, line => line.StartsWith("Audio chain:") && line.Contains("pcm16/44100/2ch") && line.Contains("rate passthrough"));
+        Assert.Contains(logs, line => line.StartsWith("Audio chain:") && line.Contains("pcm16/44100/2ch") && line.Contains("bit-exact"));
         process.EmitData(new { @event = "capture_metrics", metrics = new { input_rate = 44100, input_format = "pcm16/44100/2ch", bit_exact = true, slips = 3 } });
         await Until(() => controller.Snapshot.Metrics?.Slips == 3);
         Assert.Single(logs, line => line.StartsWith("Audio chain:"));
@@ -1026,44 +1024,6 @@ public sealed class SessionTests
         Assert.True(Array.FindIndex(commands, c => c.Command == "get_receiver_capabilities") < Array.FindIndex(commands, c => c.Command == "start"));
         Assert.Equal(48000, commands.Single(c => c.Command == "start").Parameters.Number("sample_rate")); Assert.Equal(48000, controller.Snapshot.StreamRate);
         Assert.Equal("a", commands.Single(c => c.Command == "start").Parameters.GetProperty("peers")[0].Text("receiver_id"));
-    }
-    [Fact]
-    public async Task StartUsesAdvertisedBufferedBitDepth()
-    {
-        var process = new FakeConnection
-        {
-            SupportsBufferedAlac24 = true,
-            ReceiverCapabilityResponse = new
-            {
-                @event = "receiver_capabilities",
-                members = new[] { new
-                {
-                    receiver_id = "a", host = "127.0.0.1", port = 7000, known = true,
-                    profiles = new[] { new
-                    {
-                        codec = "auto", transport = "buffered", timing = "auto", sample_rate = 48000, bit_depth = 24,
-                        selected_codec = "alac", selected_transport = "buffered", selected_timing = "ptp"
-                    } }
-                } }
-            }
-        };
-        await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast);
-        var settings = Settings();
-        settings.Options("a").Transport = "buffered";
-        settings.Options("a").BitDepth = 24;
-        settings.Options("a").SampleRate = "48000";
-        await controller.StartAsync(Pod(), settings);
-        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
-        Assert.True(process.Commands.Single(c => c.Command == "get_receiver_capabilities").Parameters.Boolean("include_24_bit"));
-        var start = process.Commands.Single(c => c.Command == "start").Parameters;
-        Assert.Equal(48000, start.Number("sample_rate"));
-        Assert.Equal(24, start.Number("bit_depth"));
-        var profile = start.GetProperty("peers")[0].GetProperty("profile");
-        Assert.Equal("buffered", profile.Text("transport"));
-        Assert.Equal("auto", profile.Text("codec"));
-        process.EmitData(new { @event = "negotiated", receiver_id = "a", codec = "alac", transport = "buffered", timing = "ptp", sample_rate = 48000, bit_depth = 24 });
-        await Until(() => controller.Snapshot.Diagnostics?.Negotiated?.Any(n => n.Text("codec") == "alac") == true);
-        Assert.Equal(24, controller.Snapshot.StreamBitDepth);
     }
     [Fact]
     public async Task SwitchingWaitsForPreviousCleanupAndRejectsStaleEvents()
@@ -1808,7 +1768,6 @@ public sealed class SessionTests
         public bool SupportsAdaptiveLead { get; init; } = true;
         public bool SupportsInitialVolume { get; init; } = true;
         public bool SupportsOwnershipGuard { get; init; } = true;
-        public bool SupportsBufferedAlac24 { get; init; }
         private int _latencyBase;
         private long _streamEpoch = 1;
         public object? ReceiverCapabilityResponse { get; init; }
@@ -1830,7 +1789,7 @@ public sealed class SessionTests
                 case "set_gain": GainEntered?.TrySetResult(); if (GainGate is not null) await GainGate.Task.WaitAsync(cancellation); break;
             }
         }
-        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "multi_room", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture" }.Where(c => SupportsOwnershipGuard || c != "receiver_ownership_guard").Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).Concat(SupportsSoundGlow ? ["sound_glow_test"] : Array.Empty<string>()).Concat(SupportsForcedLatency ? ["forced_latency"] : Array.Empty<string>()).Concat(SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).Concat(SupportsInitialVolume ? ["initial_volume"] : Array.Empty<string>()).Concat(SupportsBufferedAlac24 ? ["buffered_alac_24"] : Array.Empty<string>()).ToArray() });
+        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "multi_room", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture" }.Where(c => SupportsOwnershipGuard || c != "receiver_ownership_guard").Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).Concat(SupportsSoundGlow ? ["sound_glow_test"] : Array.Empty<string>()).Concat(SupportsForcedLatency ? ["forced_latency"] : Array.Empty<string>()).Concat(SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).Concat(SupportsInitialVolume ? ["initial_volume"] : Array.Empty<string>()).ToArray() });
         public void ConfirmLead(int extra)
         {
             var command = Commands.Last(c => c.Command == "set_lead");

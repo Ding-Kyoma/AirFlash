@@ -18,8 +18,8 @@ filtered every sample for no reason. Bit-exact passthrough (§3) removes that.
 | 4 | Servo | `servo.rs` | PI on queue depth + lateness servo, ±400/±50 ppm | By design, inaudible |
 | 5 | Equalizer | `equalizer.rs` | 10 peaking bands; a disabled or flat curve is a bypass | Only when enabled |
 | 6 | Splice + gain | `continuity.rs` | 5 ms crossfade on boundary/gain change/resume, 10 ms concealment | Only at boundaries |
-| 7 | Quantizer | `continuity.rs` | Outputs 16-bit or 24-bit PCM, with TPDF dither when converting processed or higher-resolution samples | See §3.4 |
-| 8 | ALAC encode | `rtp.rs` | 16-bit ALAC, or 24-bit ALAC over buffered TCP | No (lossless, checked by independent decoding in tests) |
+| 7 | Quantizer | `continuity.rs` | TPDF dither, or an exact pass when the stream is already 16-bit | See §3.4 |
+| 8 | ALAC encode | `rtp.rs` | 16-bit ALAC | No (lossless, proven by `session_simulation`) |
 | 9 | Transport | `transport.rs` | RTP over UDP (realtime) or type-103 (buffered) | No |
 
 Nothing in stages 8–9 can alter a sample: `session_simulation.rs` encodes,
@@ -53,10 +53,11 @@ On by default (`Settings › Audio source › Bit-exact passthrough`,
 
 ### 3.1 When it applies
 
-`bit_exact && capture_rate == stream_rate`. The pipeline then skips the
-resampler. The Monitor row calls this **Sample rate passthrough**.
+`bit_exact && capture_rate == stream_rate`. The pipeline then holds no
+resampler at all and copies the 16-bit samples through.
 
-When the rates differ, the resampler runs with 256 taps and a 0.947
+When the rates differ — a 48 kHz endpoint with a 44.1 kHz stream, the only
+case the receiver may force — the resampler runs with 256 taps and a 0.947
 cutoff instead of 64 taps and 0.9, which is flat through 20 kHz.
 
 ### 3.2 Clock drift
@@ -84,17 +85,18 @@ inside one machine are usually much closer than that.
 
 ### 3.3 What "bit-exact" guarantees
 
-When capture is integer PCM, the encoder can preserve the samples WASAPI
-delivered at matching rates if the output bit depth can represent them and
-the samples pass through without processing.
+The 16-bit samples that reach the encoder are the samples WASAPI delivered.
+Exactly three situations are excluded:
 
 1. **Start and resume.** The first 5 ms after playback starts, after a rebind,
    or after at least one second of digital silence is faded in. This is the
    click guard and it is deliberate.
 2. **Clock slips.** One frame out of 64 is interpolated, about once a second
    at 20 ppm and never when the clocks agree.
-3. **Processing and conversion.** Equalization, master gain, and conversion
-   from floating-point or higher-resolution input can change output samples.
+3. **Processing you asked for.** An equalizer curve, a master gain below 100 %,
+   or a capture device that is not 16-bit puts the path back on the dithered
+   route. Dither is correct there: the input carried more resolution than the
+   16-bit output.
 
 ### 3.4 Why the dither is skipped
 
@@ -104,16 +106,10 @@ capture that was never touched is already on the grid, so it is scaled by
 TPDF noise to a signal that has already been quantised would only raise the
 noise floor.
 
-In Receivers → Advanced settings, **Buffered TCP** exposes 24-bit ALAC at
-44.1 or 48 kHz when the receiver advertises the corresponding format and can
-use PTP. A group uses one common rate and bit depth. Automatic prefers an
-available 16-bit stream for compatibility. Monitor shows the WASAPI input
-format separately from the negotiated output rate and depth.
-
 ## 4. Proving it
 
 Set `AIRFLASH_PCM_DUMP` to a path before starting a stream; the engine writes
-`<path>.raw` (little-endian interleaved PCM, capped at two minutes) and
+`<path>.raw` (little-endian interleaved 16-bit, capped at two minutes) and
 `<path>.json` with the format and frame count. The tap is taken after the
 splice and quantizer, so it is exactly what the encoder sees.
 
@@ -130,10 +126,9 @@ something the telemetry is not.
 
 ## 5. When iPhone → HomePod still sounds better
 
-The two paths can sound different even at the same negotiated rate and bit
-depth. Match playback level and compare the source mix, capture format and
-processing along each path. Comparing how the HomePod renders each stream
-requires listening or acoustic measurement.
+Bit-exact passthrough fixes the only stage AirFlash was changing. If the two
+paths still differ audibly, the difference is upstream of AirFlash or in how
+the comparison was made. Check these in order:
 
 1. **Volume.** AirPlay volume is on a 0–100 scale mapped to dB; `43` is about
    -17 dB. A 1–3 dB mismatch reads as "fuller" or "brighter". Match the two
@@ -151,6 +146,7 @@ requires listening or acoustic measurement.
 5. **What the equalizer and master gain say.** Anything below a flat curve or
    100 % master gain is processing by definition.
 
-The `Audio chain:` line in the desktop log records
-`<capture format> → rate passthrough|resample → <codec>/<transport> <rate>/<depth> → gain →
+Telemetry shows which of these is in play: the `Audio chain:` line in the
+desktop log and the `Audio chain` row under Monitor read
+`<capture format> → bit-exact|resample → <codec>/<transport> <rate> → gain →
 eq → slips`.

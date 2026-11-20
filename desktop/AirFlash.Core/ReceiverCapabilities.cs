@@ -4,11 +4,9 @@ using System.Text.Json;
 namespace AirFlash.Core;
 
 public sealed record ReceiverProfile(string Codec, string Transport, string Timing, int SampleRate,
-    string SelectedCodec, string SelectedTransport, string SelectedTiming, int BitDepth = 16)
+    string SelectedCodec, string SelectedTransport, string SelectedTiming)
 {
-    internal bool Matches(ReceiverOptions options, int rate, int depth) =>
-        Codec == options.Codec && Transport == options.Transport && Timing == options.Timing &&
-        SampleRate == rate && BitDepth == depth && (options.BitDepth is null || options.BitDepth == depth);
+    public bool Matches(ReceiverOptions options, int rate) => Codec == options.Codec && Transport == options.Transport && Timing == options.Timing && SampleRate == rate;
 }
 public sealed record ReceiverCapabilities(string ReceiverId, string Host, int Port, bool Known, ReceiverProfile[] Profiles);
 public sealed record ReceiverProfileSelection(string ReceiverId, ReceiverProfile Profile);
@@ -22,14 +20,10 @@ public sealed class ReceiverCapabilitySet(IReadOnlyList<ReceiverCapabilities> me
     public IReadOnlyList<ReceiverProfileSelection> Select(Func<string, ReceiverOptions> options, string? sampleRate = null)
     {
         if (Members.Count == 0) return [];
-        var rates = sampleRate is null ? new[] { 44100, 48000 } : int.TryParse(sampleRate, out var requestedRate) ? [requestedRate] : Array.Empty<int>();
-        var members = Members.Select(m => (Member: m, Options: options(m.ReceiverId))).ToArray();
-        // The first common 16-bit profile preserves the automatic choice of
-        // older versions, including devices that only offered 48 kHz.
-        foreach (var depth in new[] { 16, 24 })
-        foreach (var rate in rates)
+        var rates = sampleRate is null ? new[] { 44100, 48000 } : int.TryParse(sampleRate, out var rate) ? [rate] : Array.Empty<int>();
+        foreach (var candidate in rates)
         {
-            var selected = members.Select(m => new { m.Member, Profile = m.Member.Profiles.FirstOrDefault(p => p.Matches(m.Options, rate, depth)) }).ToArray();
+            var selected = Members.Select(m => new { Member = m, Profile = m.Profiles.FirstOrDefault(p => p.Matches(options(m.ReceiverId), candidate)) }).ToArray();
             if (selected.All(m => m.Profile is not null)) return selected.Select(m => new ReceiverProfileSelection(m.Member.ReceiverId, m.Profile!)).ToArray();
         }
         return [];
@@ -69,10 +63,7 @@ public sealed class ReceiverCapabilityCatalog(IEngineFactory factory) : IReceive
             var host = addresses.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork)?.ToString() ?? throw new IOException(L.Format("Cannot resolve IPv4 address: {0}", member.Address));
             peers.Add(new { receiver_id = member.Id, host, port = member.Port, codecs = member.Codecs.Select(c => (int)c).ToArray(), profile = new { features = member.Features, follow_receiver_clock = member.FollowReceiverClock } });
         }
-        object parameters = EngineHandshake.HasCapability(hello, "buffered_alac_24")
-            ? new { peers, include_24_bit = true }
-            : new { peers };
-        await connection.SendAsync(session, "get_receiver_capabilities", parameters, cancellation).ConfigureAwait(false);
+        await connection.SendAsync(session, "get_receiver_capabilities", new { peers }, cancellation).ConfigureAwait(false);
         var response = await connection.ReadAsync(cancellation).ConfigureAwait(false) ?? throw new IOException(L.Get("Could not query receiver capabilities."));
         if (response.Number("version") == 1 && response.Text("session_id") == session && response.Text("event") == "error")
             throw new EngineFailure(EngineNotice.Parse(response));

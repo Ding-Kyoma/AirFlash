@@ -4,15 +4,13 @@ use crate::{
     clock::{Clock, PtpMaster},
     crypto::derive,
     preemption,
-    rtp::{self, FRAMES, Packetizer},
+    rtp::{self, FRAMES, PCM_BYTES, Packetizer},
     rtsp::{Cancellation, Connection},
     telemetry::TimelineResetReason,
     transport::{
         EventWorker, Fault, FeedbackTiming, FeedbackWorker, Health, MediaSchedule, MediaTransport,
     },
 };
-#[cfg(test)]
-use crate::rtp::PCM_BYTES;
 use anyhow::{Context, Result, ensure};
 use plist::{Dictionary, Value};
 use serde::Deserialize;
@@ -49,9 +47,6 @@ fn default_port() -> u16 {
 }
 fn default_sample_rate() -> u32 {
     44100
-}
-fn default_bit_depth() -> u8 {
-    16
 }
 /// Bit-exact passthrough is the default: a 1:1 capture must not be filtered.
 fn default_bit_exact() -> bool {
@@ -96,8 +91,6 @@ pub struct ProbeOptions {
     pub bit_exact: bool,
     #[serde(default = "default_sample_rate")]
     pub sample_rate: u32,
-    #[serde(default = "default_bit_depth")]
-    pub bit_depth: u8,
     #[serde(default = "default_timing")]
     pub timing: String,
     #[serde(default)]
@@ -293,10 +286,6 @@ impl ProbeOptions {
         ensure!(
             crate::rtp::SUPPORTED_RATES.contains(&self.sample_rate),
             "sample rate must be 44100 or 48000"
-        );
-        ensure!(
-            matches!(self.bit_depth, 16 | 24),
-            "bit depth must be 16 or 24"
         );
         Ok(())
     }
@@ -663,11 +652,10 @@ impl Member {
         let ssrc = rand::random::<u32>();
         let uri = format!("rtsp://{local}/{ssrc}");
         let capabilities = info.as_dictionary().context("info is not a dictionary")?;
-        let compat = fingerprint.negotiate_stream(
+        let compat = fingerprint.negotiate_planned(
             plan,
             &peer.profile,
             options.sample_rate,
-            options.bit_depth,
             options.timing == "ptp",
         )?;
         if compat.uses_ptp() && ptp.is_none() {
@@ -719,9 +707,7 @@ impl Member {
         let mut packetizer =
             Packetizer::with_rate(audio_key, rand::random(), initial_rtp, ssrc, rate);
         let use_alac = compat.prefers_alac();
-        if options.bit_depth == 24 {
-            packetizer.enable_buffered_alac_24();
-        } else if use_alac {
+        if use_alac {
             packetizer.enable_alac();
         }
         let mut member = Self {
@@ -842,11 +828,7 @@ impl Member {
         let mut stream_fields = vec![
             (
                 "audioFormat",
-                number(if options.bit_depth == 24 {
-                    rtp::buffered_alac_24_format(rate)
-                } else {
-                    rtp::audio_format(use_alac, rate)
-                }),
+                number(crate::rtp::audio_format(use_alac, rate)),
             ),
             ("audioMode", string("default")),
             ("controlPort", number(member.media.control_port()? as u64)),
@@ -933,7 +915,7 @@ impl Member {
             receiver_min.is_none() || options.force_latency,
         );
         emit(
-            json!({"event":"negotiated","receiver_id":peer.receiver_id,"host":peer.host,"port":peer.port,"clock_role":member.compat.clock_role(),"data_port":data_port,"codec":member.compat.codec_name(),"transport":member.compat.transport(),"timing":member.compat.timing_name(),"channel":peer.profile.channel,"sync_offset_ms":peer.profile.sync_offset_ms,"qualification":"experimental","sample_rate":rate,"bit_depth":options.bit_depth,"control_port":member.remote_control,"requested_latency_ms":requested_latency,"effective_latency_ms":effective_latency.as_secs_f64()*1000.0,"force_latency":options.force_latency,"receiver_latency_min_ms":receiver_min.map(|v|v.as_secs_f64()*1000.0),"receiver_latency_min_samples":receiver_latency,"measured_latency_ms":null}),
+            json!({"event":"negotiated","receiver_id":peer.receiver_id,"host":peer.host,"port":peer.port,"clock_role":member.compat.clock_role(),"data_port":data_port,"codec":member.compat.codec_name(),"transport":member.compat.transport(),"timing":member.compat.timing_name(),"channel":peer.profile.channel,"sync_offset_ms":peer.profile.sync_offset_ms,"qualification":"experimental","sample_rate":rate,"control_port":member.remote_control,"requested_latency_ms":requested_latency,"effective_latency_ms":effective_latency.as_secs_f64()*1000.0,"force_latency":options.force_latency,"receiver_latency_min_ms":receiver_min.map(|v|v.as_secs_f64()*1000.0),"receiver_latency_min_samples":receiver_latency,"measured_latency_ms":null}),
         );
         if options.force_latency && receiver_min.is_some_and(|min| effective_latency < min) {
             emit(
@@ -1510,31 +1492,32 @@ fn group_timing_diagnostic(
     ))
 }
 
-fn load_quiet_wav(options: &ProbeOptions) -> Result<Vec<i32>> {
+fn load_quiet_wav(options: &ProbeOptions) -> Result<Vec<i16>> {
     let rate = options.sample_rate;
     let mut reader = hound::WavReader::open(&options.wav_path).context("open probe WAV")?;
     let spec = reader.spec();
     ensure!(
         spec.channels == 2
             && spec.sample_rate == rate
-            && (spec.bits_per_sample == 16 || spec.bits_per_sample == u16::from(options.bit_depth))
+            && spec.bits_per_sample == 16
             && spec.sample_format == hound::SampleFormat::Int,
-        "probe WAV must be stereo {rate} Hz, 16-bit or matching the stream bit depth"
+        "probe WAV must be S16 stereo {rate} Hz"
     );
     ensure!(
         u64::from(reader.len()) <= rate as u64 * 2 * 5,
         "probe WAV exceeds five seconds"
     );
     let samples = reader
-        .samples::<i32>()
+        .samples::<i16>()
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let peak_limit = ((1i32 << (spec.bits_per_sample - 1)) as f64 * 0.05).round() as u32;
     ensure!(
-        !samples.is_empty() && samples.iter().all(|s| s.unsigned_abs() <= peak_limit),
+        !samples.is_empty() && samples.iter().all(|s| (*s as i32).abs() <= 1639),
         "probe WAV must have peak amplitude <= 0.05"
     );
-    let shift = u16::from(options.bit_depth) - spec.bits_per_sample;
-    Ok(samples.into_iter().map(|s| ((s << shift) as f32 * options.gain).round() as i32).collect())
+    Ok(samples
+        .into_iter()
+        .map(|s| (s as f32 * options.gain).round() as i16)
+        .collect())
 }
 
 pub fn probe(
@@ -1675,7 +1658,6 @@ fn run_live(
         Some(crate::live::Loopback::start(
             options.capture_endpoint.clone(),
             options.sample_rate,
-            options.bit_depth,
             equalizer.clone(),
             options.bit_exact,
         )?)
@@ -1718,7 +1700,6 @@ fn run_live(
             source = Some(crate::live::Loopback::start(
                 options.capture_endpoint.clone(),
                 options.sample_rate,
-                options.bit_depth,
                 equalizer.clone(),
                 options.bit_exact,
             )?);
@@ -1745,7 +1726,6 @@ fn run_live(
                     application.clone(),
                     pinned,
                     options.sample_rate,
-                    options.bit_depth,
                     equalizer.clone(),
                     options.bit_exact,
                 ) {
@@ -2149,7 +2129,6 @@ fn run_stream(
         Some(crate::live::Loopback::start(
             options.capture_endpoint.clone(),
             rate,
-            options.bit_depth,
             equalizer,
             options.bit_exact,
         )?)
@@ -2235,7 +2214,7 @@ fn send_packets(
     members: &mut [Member],
     ptp: Option<&PtpMaster>,
     takeovers: &mut preemption::TakeoverCounters,
-    samples: &[i32],
+    samples: &[i16],
     reset_before: Option<TimelineResetReason>,
     emit: &impl Fn(Json),
 ) -> Result<StreamEnd> {
@@ -2266,8 +2245,6 @@ fn send_packets(
                 &dictionary(vec![
                     ("rate", number(1)),
                     ("rtpTime", number(member.media.packetizer.timestamp as u64)),
-                    // AirTunes 1005.x requires this field even when no flags are set.
-                    ("networkTimeFlags", number(0)),
                     ("networkTimeSecs", number(network / 1_000_000_000)),
                     (
                         "networkTimeFrac",
@@ -2381,14 +2358,13 @@ fn send_packets(
     let mut silence_packets = 0u64;
     let mut recovery_left = 0u64;
     emit(with_lead(
-        json!({"event":"streaming","members":members.len(),"clock_id":clock_id,"first_send_unix_ns":clock.now_ns(),"first_send_qpc_ns":crate::wasapi::qpc_ns(),"requested_latency_ms":options.latency_ms,"sample_rate":rate,"bit_depth":options.bit_depth,"measured_latency_ms":null,"qualified":false}),
+        json!({"event":"streaming","members":members.len(),"clock_id":clock_id,"first_send_unix_ns":clock.now_ns(),"first_send_qpc_ns":crate::wasapi::qpc_ns(),"requested_latency_ms":options.latency_ms,"sample_rate":rate,"measured_latency_ms":null,"qualified":false}),
         &lead,
         &schedule,
         negotiated_baseline,
         telemetry.session_epoch,
     ));
-    let bit_depth = options.bit_depth;
-    let mut pcm = vec![0; rtp::pcm_bytes(bit_depth)];
+    let mut pcm = vec![0; PCM_BYTES];
     let started_ns = crate::wasapi::qpc_ns();
     let mut pending_clock_fault: Option<(String, Instant)> = None;
     // Q46's all-failed rule state. The gateway address is discovered once per
@@ -2780,10 +2756,10 @@ fn send_packets(
                     last_marker = qpc;
                 }
             } else {
-                for (j, bytes) in pcm.chunks_exact_mut(usize::from(bit_depth / 8)).enumerate() {
+                for (j, bytes) in pcm.chunks_exact_mut(2).enumerate() {
                     let index = schedule.frames as usize * 2 + j;
                     let sample = samples.get(index).copied().unwrap_or(0);
-                    bytes.copy_from_slice(&sample.to_be_bytes()[4 - bytes.len()..]);
+                    bytes.copy_from_slice(&sample.to_be_bytes());
                 }
             }
             if now >= next_metrics {
@@ -2830,7 +2806,7 @@ fn send_packets(
             // Every member gets new media before any member services retransmissions.
             for member in members.iter_mut() {
                 member.media.send(
-                    &member.peer.profile.channel.map(&pcm, bit_depth),
+                    &member.peer.profile.channel.map(&pcm),
                     packets == 0,
                     Instant::now(),
                     offset_deadline(
@@ -2899,7 +2875,7 @@ fn send_packets(
                     sent &= member
                         .media
                         .send(
-                            &member.peer.profile.channel.map(&fade, bit_depth),
+                            &member.peer.profile.channel.map(&fade),
                             false,
                             Instant::now(),
                             offset_deadline(
@@ -6696,7 +6672,6 @@ mod tests {
             equalizer: crate::equalizer::Settings::default(),
             bit_exact: true,
             sample_rate: 44100,
-            bit_depth: 16,
             timing: "ptp".into(),
             group_id: None,
             group_mode: String::new(),

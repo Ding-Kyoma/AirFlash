@@ -271,7 +271,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         if (_updating || _disposed) return;
         _validation = Draft.Validate();
         _validation ??= Receivers.FirstOrDefault(r => r.HasInvalidProfile && ProfileEdited(r.Receiver.Id)) is { } invalid ? L.Format("Unsupported stream profile for {0}. Choose Automatic or a supported option.", invalid.Name) : null;
-        _validation ??= Groups.FirstOrDefault(g => g.HasInvalidRate && (g.Group.SampleRate != _baseline.SoftwareGroups.FirstOrDefault(b => b.Id == g.Group.Id)?.SampleRate || !g.Group.MemberIds.SequenceEqual(_baseline.SoftwareGroups.FirstOrDefault(b => b.Id == g.Group.Id)?.MemberIds ?? []) || g.Group.MemberIds.Any(ProfileEdited))) is { } group ? L.Format("Unsupported stream profile for {0}. Choose Automatic or a supported option.", group.Group.Name) : null;
+        _validation ??= Groups.FirstOrDefault(g => g.HasInvalidRate && (g.Group.SampleRate != _baseline.SoftwareGroups.FirstOrDefault(b => b.Id == g.Group.Id)?.SampleRate || !g.Group.MemberIds.SequenceEqual(_baseline.SoftwareGroups.FirstOrDefault(b => b.Id == g.Group.Id)?.MemberIds ?? []))) is { } group ? L.Format("Unsupported stream profile for {0}. Choose Automatic or a supported option.", group.Group.Name) : null;
         _hasChanges = !SettingsMerge.Equal(_baseline, Draft);
         if (clearError) Error = _validationErrors > 0 ? L.Get("Correct the highlighted fields before applying.") : _validation ?? "";
         Notify(nameof(HasChanges)); ApplyCommand.Refresh(); OkCommand.Refresh();
@@ -281,7 +281,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private bool ProfileEdited(string id)
     {
         var before = _baseline.ReadOptions(id); var after = Draft.ReadOptions(id);
-        return before.Codec != after.Codec || before.Transport != after.Transport || before.Timing != after.Timing || before.SampleRate != after.SampleRate || before.BitDepth != after.BitDepth;
+        return before.Codec != after.Codec || before.Transport != after.Transport || before.Timing != after.Timing || before.SampleRate != after.SampleRate;
     }
     private void RefreshBusy()
     {
@@ -377,7 +377,6 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
             {
                 row = new(receiver, options, current => PairRequested?.Invoke(current), () => RemoveManual(receiver.Id), () => CanEdit, () => App.EngineReady && !App.IsClosing, App);
                 row.GroupRate = () => Draft.SoftwareGroups.FirstOrDefault(g => g.MemberIds.Contains(row.Receiver.Id))?.SampleRate;
-                row.GroupOptions = Draft.ReadOptions;
                 row.GlobalLatencyMode = () => Draft.LatencyMode;
                 Receivers.Insert(index, row);
             }
@@ -406,7 +405,6 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
             if (_profileCache.TryGetValue(key, out var cached)) { row.SetCapabilities(cached); continue; }
             if (_profileQueries.Add(key)) _ = LoadReceiverProfileAsync(row, key, _profileStop.Token);
         }
-        RefreshGroupProfiles();
     }
     private async Task LoadReceiverProfileAsync(ReceiverEditor row, string key, CancellationToken cancellation)
     {
@@ -422,44 +420,16 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     }
     private void RefreshGroupProfiles()
     {
-        foreach (var row in Receivers) row.GroupCapabilities = null;
-        var resolved = SoftwareStereo.Resolve(Receivers.Select(row => row.Receiver), Draft).ToDictionary(r => r.Id);
+        foreach (var row in Receivers) row.RefreshProfiles();
         foreach (var group in Groups)
         {
-            var capabilities = ReceiverCapabilitySet.Unknown;
-            if (resolved.TryGetValue(group.Group.Id, out var receiver) && receiver.Online && receiver.Complete)
-            {
-                var key = ProfileKey(receiver);
-                if (_profileCache.TryGetValue(key, out var cached)) capabilities = cached;
-                else if (SelectedPage == ReceiversPage && !_disposed && !_profileStop.IsCancellationRequested
-                    && App.EngineReady && !App.IsClosing && _profileQueries.Add(key))
-                    _ = LoadGroupProfilesAsync(receiver, key, _profileStop.Token);
-            }
-            foreach (var row in Receivers.Where(r => group.Group.MemberIds.Contains(r.Receiver.Id)))
-                row.GroupCapabilities = capabilities;
-            group.RefreshRates(capabilities, Draft);
+            var memberIds = group.Group.MemberIds.ToArray();
+            var memberRows = memberIds.Select(id => Receivers.FirstOrDefault(r => r.Receiver.Id == id)).ToArray();
+            var members = memberRows.Where(r => r is not null).SelectMany(r => r!.Capabilities.Members).ToArray();
+            var expectedCount = memberIds.Length;
+            group.RefreshRates(memberRows.All(r => r is not null) && members.Length == expectedCount ? new(members) : ReceiverCapabilitySet.Unknown, Draft);
             group.RefreshMembership();
         }
-        foreach (var row in Receivers) row.RefreshProfiles();
-    }
-    private async Task LoadGroupProfilesAsync(Receiver receiver, string key, CancellationToken cancellation)
-    {
-        // Queue completion after the current refresh, even for synchronous catalogs.
-        await Task.Yield();
-        try
-        {
-            _profileCache[key] = await App.ReceiverCapabilities.QueryAsync(receiver, cancellation);
-        }
-        catch (OperationCanceledException) { return; }
-        catch (Exception error)
-        {
-            _profileCache[key] = ReceiverCapabilitySet.Unknown;
-            AppPaths.Log(error.ToString());
-        }
-        finally { _profileQueries.Remove(key); }
-        if (_disposed || cancellation.IsCancellationRequested) return;
-        RefreshGroupProfiles();
-        RefreshValidation(false);
     }
     public void AddManual(string name, string host, int port)
     {
@@ -625,51 +595,29 @@ public sealed class ReceiverEditor : ObservableObject, IDisposable
     public ReceiverOptions Options { get; private set; }
     public ReceiverCapabilitySet Capabilities { get; private set; } = ReceiverCapabilitySet.Unknown;
     public Func<string?>? GroupRate { get; set; }
-    public Func<string, ReceiverOptions>? GroupOptions { get; set; }
-    public ReceiverCapabilitySet? GroupCapabilities { get; set; }
-    private ReceiverCapabilitySet ProfileCapabilities => GroupCapabilities ?? Capabilities;
     public Func<string>? GlobalLatencyMode { get; set; }
     public bool CanForceLatency => (Options.LatencyMode ?? GlobalLatencyMode?.Invoke() ?? _app?.Settings.LatencyMode ?? LatencyPolicy.Mode) != LatencyPolicy.Mode;
     public bool CanSetSampleRate => GroupRate?.Invoke() is null;
     public string GroupRateHint => CanSetSampleRate ? "" : L.Get("The software stereo group controls this receiver's sample rate.");
     private string _capabilityError = "";
-    private string _transportAdjustment = "";
     public string CapabilityError { get => _capabilityError; set { if (Set(ref _capabilityError, value)) Notify(nameof(ProfileStatus)); } }
-    private readonly ObservableCollection<StreamChoice> _codecs = [], _transports = [], _timings = [], _rates = [], _depths = [];
+    private readonly ObservableCollection<StreamChoice> _codecs = [], _transports = [], _timings = [], _rates = [];
     public ObservableCollection<StreamChoice> CodecChoices => _codecs;
     public ObservableCollection<StreamChoice> TransportChoices => _transports;
     public ObservableCollection<StreamChoice> TimingChoices => _timings;
     public ObservableCollection<StreamChoice> RateChoices => _rates;
-    public ObservableCollection<StreamChoice> BitDepthChoices => _depths;
     public StreamChoice? CodecChoice { get => _codecs.FirstOrDefault(c => Equals(c.Value, Options.Codec)); set { if (value is not null && _canEdit()) Options.Codec = (string)value.Value!; } }
-    public StreamChoice? TransportChoice
-    {
-        get => _transports.FirstOrDefault(c => Equals(c.Value, Options.Transport));
-        set
-        {
-            if (value?.Value is not string transport || !_canEdit() || transport == Options.Transport ||
-                TransportProfile(transport) is not { } profile) return;
-            var adjusted = new List<string>();
-            if (Options.Timing != profile.Timing) adjusted.Add(L.Get("Clock policy"));
-            if (Options.Codec != profile.Codec) adjusted.Add(L.Get("Audio encoding"));
-            if (Options.BitDepth != profile.BitDepth) adjusted.Add(L.Get("Stream bit depth"));
-            if (Options.SampleRate != profile.SampleRate) adjusted.Add(L.Get("Stream sample rate"));
-            _transportAdjustment = adjusted.Count == 0 ? "" : L.Format("Set to Automatic for this transport: {0}", string.Join(" · ", adjusted));
-            Options.ApplyStreamProfile(profile);
-        }
-    }
+    public StreamChoice? TransportChoice { get => _transports.FirstOrDefault(c => Equals(c.Value, Options.Transport)); set { if (value is not null && _canEdit()) Options.Transport = (string)value.Value!; } }
     public StreamChoice? TimingChoice { get => _timings.FirstOrDefault(c => Equals(c.Value, Options.Timing)); set { if (value is not null && _canEdit()) Options.Timing = (string)value.Value!; } }
     public StreamChoice? RateChoice { get => _rates.FirstOrDefault(c => Equals(c.Value, EffectiveRate)); set { if (value is not null && _canEdit() && CanSetSampleRate) Options.SampleRate = (string?)value.Value; } }
-    public StreamChoice? BitDepthChoice { get => _depths.FirstOrDefault(c => Equals(c.Value, Options.BitDepth)); set { if (value is not null && _canEdit()) Options.BitDepth = (int?)value.Value; } }
     private string? EffectiveRate => GroupRate?.Invoke() ?? Options.SampleRate;
-    public bool HasInvalidProfile => ProfileCapabilities.Known && SelectProfile(Options).Count == 0;
+    public bool HasInvalidProfile => Capabilities.Known && Capabilities.Select(Options, EffectiveRate).Count == 0;
     public string ProfileStatus => string.Join("\n", new[] {
-        CapabilityError, _transportAdjustment,
-        !ProfileCapabilities.Known ? L.Get("Receiver capabilities are not verified. Only Automatic is available.") : HasInvalidProfile ? L.Get("The saved profile is unsupported. Choose Automatic or a supported option.") : "",
-        (!ProfileCapabilities.Known || HasInvalidProfile) && (Options.Codec != "auto" || Options.Transport != "auto" || Options.Timing != "auto" || Options.SampleRate is not null || Options.BitDepth is not null)
-            ? L.Format("Saved profile: {0}", $"{Label(Options.Codec)} · {Label(Options.Transport)} · {Label(Options.Timing)} · {Label(EffectiveRate ?? "auto")} · {Label(Options.BitDepth?.ToString() ?? "auto")}") : ""
+        CapabilityError,
+        !Capabilities.Known ? L.Get("Receiver capabilities are not verified. Only Automatic is available.") : HasInvalidProfile ? L.Get("The saved profile is unsupported. Choose Automatic or a supported option.") : "",
+        (!Capabilities.Known || HasInvalidProfile) && (Options.Codec != "auto" || Options.Transport != "auto" || Options.Timing != "auto" || Options.SampleRate is not null) ? L.Format("Saved profile: {0}", $"{Label(Options.Codec)} · {Label(Options.Transport)} · {Label(Options.Timing)} · {Label(EffectiveRate ?? "auto")}") : ""
     }.Where(s => s.Length > 0));
-    public void SetOptions(ReceiverOptions options) { if (ReferenceEquals(Options, options)) return; Options.PropertyChanged -= Changed; Options = options; _transportAdjustment = ""; Options.PropertyChanged += Changed; Notify(nameof(Options)); RefreshProfiles(); }
+    public void SetOptions(ReceiverOptions options) { if (ReferenceEquals(Options, options)) return; Options.PropertyChanged -= Changed; Options = options; Options.PropertyChanged += Changed; Notify(nameof(Options)); RefreshProfiles(); }
     public void SetCapabilities(ReceiverCapabilitySet capabilities) { Capabilities = capabilities; CapabilityError = ""; RefreshProfiles(); }
     public ReceiverEditor(Receiver receiver, ReceiverOptions options, Action<Receiver> pair, Action remove, Func<bool> canEdit, Func<bool>? canPair = null, AppViewModel? app = null)
     {
@@ -680,89 +628,57 @@ public sealed class ReceiverEditor : ObservableObject, IDisposable
         RemoveCommand = new(() => { if (canEdit()) remove(); }, canEdit);
         RefreshProfiles();
     }
-    private void Changed(object? sender, PropertyChangedEventArgs args)
-    {
-        if (!string.IsNullOrEmpty(args.PropertyName)) _transportAdjustment = "";
-        RefreshProfiles();
-    }
-    private static string Label(string value) => value switch { "auto" => L.Get("Automatic"), "pcm" => "PCM", "alac" => "ALAC", "realtime" => L.Get("Real-time UDP"), "buffered" => L.Get("Buffered TCP"), "ptp" => L.Get("Sender PTP clock"), "ntp" => "NTP", "follow" => L.Get("Follow receiver PTP clock"), "44100" => "44.1 kHz", "48000" => "48 kHz", "16" or "24" => L.Format("{0}-bit", value), _ => value };
-    private IReadOnlyList<ReceiverProfileSelection> SelectProfile(ReceiverOptions candidate) =>
-        GroupCapabilities is { } group && GroupOptions is { } options
-            ? group.Select(id => id == Receiver.Id ? candidate : options(id), GroupRate?.Invoke())
-            : Capabilities.Select(candidate, candidate.SampleRate);
-
-    private ReceiverOptions? TransportProfile(string transport)
-    {
-        var candidate = new ReceiverOptions();
-        candidate.CopyFrom(Options);
-        candidate.Transport = transport;
-        if (!ProfileCapabilities.Known) return transport == "auto" ? candidate : null;
-        if (SelectProfile(candidate).Count > 0) return candidate;
-
-        candidate = new ReceiverOptions { Transport = transport };
-        if (SelectProfile(candidate).Count == 0) return transport == "auto" ? candidate : null;
-        candidate.Timing = Options.Timing;
-        if (SelectProfile(candidate).Count == 0) candidate.Timing = "auto";
-        candidate.Codec = Options.Codec;
-        if (SelectProfile(candidate).Count == 0) candidate.Codec = "auto";
-        candidate.BitDepth = Options.BitDepth;
-        if (SelectProfile(candidate).Count == 0) candidate.BitDepth = null;
-        candidate.SampleRate = Options.SampleRate;
-        if (SelectProfile(candidate).Count == 0) candidate.SampleRate = null;
-        return candidate;
-    }
+    private void Changed(object? sender, PropertyChangedEventArgs args) => RefreshProfiles();
+    private static string Label(string value) => value switch { "auto" => L.Get("Automatic"), "pcm" => "PCM", "alac" => "ALAC", "realtime" => L.Get("Real-time UDP"), "buffered" => L.Get("Buffered TCP"), "ptp" => L.Get("Sender PTP clock"), "ntp" => "NTP", "follow" => L.Get("Follow receiver PTP clock"), "44100" => "44.1 kHz", "48000" => "48 kHz", _ => value };
     public void RefreshProfiles()
     {
         Notify(nameof(CanForceLatency));
-        Choice[] ChoicesFor<T>(string field, IEnumerable<T> values, Action<ReceiverOptions, T> set)
+        Choice[] ChoicesFor(string field, IEnumerable<string> values)
         {
-            var result = new List<Choice> { new(field is "rate" or "depth" ? null : "auto", AutoLabel(field)) };
+            var result = new List<Choice> { new("auto", AutoLabel(field)) };
             foreach (var value in values)
             {
                 var candidate = new ReceiverOptions(); candidate.CopyFrom(Options);
-                set(candidate, value);
-                if (ProfileCapabilities.Known && SelectProfile(candidate).Count > 0) result.Add(new(value, Label(value!.ToString()!)));
+                if (field == "codec") candidate.Codec = value;
+                if (field == "transport") candidate.Transport = value;
+                if (field == "timing") candidate.Timing = value;
+                if (Capabilities.Known && Capabilities.Select(candidate, EffectiveRate).Count > 0) result.Add(new(value, Label(value)));
             }
             return result.ToArray();
         }
-        StreamChoice.Update(_codecs, ChoicesFor<string>("codec", ["pcm", "alac"], (p, c) => p.Codec = c));
-        StreamChoice.Update(_transports, [new("auto", AutoLabel("transport")),
-            .. new[] { "realtime", "buffered" }.Where(t => TransportProfile(t) is not null).Select(t => new Choice(t, Label(t)))]);
-        StreamChoice.Update(_timings, ChoicesFor<string>("timing", ["ptp", "ntp", "follow"], (p, t) => p.Timing = t));
-        StreamChoice.Update(_rates, CanSetSampleRate ? ChoicesFor("rate", AppSettings.SampleRates, (p, r) => p.SampleRate = r) : [new(EffectiveRate, Label(EffectiveRate!))]);
-        StreamChoice.Update(_depths, ChoicesFor<int>("depth", [16, 24], (p, d) => p.BitDepth = d));
-        foreach (var property in new[] { nameof(CodecChoice), nameof(TransportChoice), nameof(TimingChoice), nameof(RateChoice), nameof(BitDepthChoice), nameof(CanSetSampleRate), nameof(GroupRateHint), nameof(ProfileStatus), nameof(HasInvalidProfile) }) Notify(property);
+        StreamChoice.Update(_codecs, ChoicesFor("codec", ["pcm", "alac"]));
+        StreamChoice.Update(_transports, ChoicesFor("transport", ["realtime", "buffered"]));
+        StreamChoice.Update(_timings, ChoicesFor("timing", ["ptp", "ntp", "follow"]));
+        StreamChoice.Update(_rates, CanSetSampleRate ? [new(null, AutoLabel("rate")), .. AppSettings.SampleRates.Where(r => Capabilities.Known && Capabilities.Select(Options, r).Count > 0).Select(r => new Choice(r, Label(r)))] : [new(EffectiveRate, Label(EffectiveRate!))]);
+        foreach (var property in new[] { nameof(CodecChoice), nameof(TransportChoice), nameof(TimingChoice), nameof(RateChoice), nameof(CanSetSampleRate), nameof(GroupRateHint), nameof(ProfileStatus), nameof(HasInvalidProfile) }) Notify(property);
 
     }
     private string AutoLabel(string field)
     {
         var candidate = new ReceiverOptions(); candidate.CopyFrom(Options);
         if (field == "codec") candidate.Codec = "auto";
-        if (field == "transport") candidate = TransportProfile("auto")!;
+        if (field == "transport") candidate.Transport = "auto";
         if (field == "timing") candidate.Timing = "auto";
-        if (field == "rate") candidate.SampleRate = null;
-        if (field == "depth") candidate.BitDepth = null;
-        var ids = Receiver.Peers.Select(p => p.Id).ToArray();
-        var selections = SelectProfile(candidate).Where(s => ids.Contains(s.ReceiverId)).ToArray();
+        var selections = Capabilities.Select(candidate, field == "rate" && CanSetSampleRate ? null : EffectiveRate);
         var active = _app?.Session.Snapshot;
         var applied = _app?.Settings.ReadOptions(Receiver.Id);
         var appliedGroup = _app?.Settings.SoftwareGroups.FirstOrDefault(g => g.MemberIds.Contains(Receiver.Id))?.SampleRate;
-        var isAutomatic = field switch { "codec" => Options.Codec == "auto", "transport" => Options.Transport == "auto", "timing" => Options.Timing == "auto", "depth" => Options.BitDepth is null, _ => EffectiveRate is null };
-        var same = isAutomatic && applied is not null && applied.Codec == Options.Codec && applied.Transport == Options.Transport && applied.Timing == Options.Timing && applied.BitDepth == Options.BitDepth && (appliedGroup ?? applied.SampleRate) == EffectiveRate;
+        var isAutomatic = field switch { "codec" => Options.Codec == "auto", "transport" => Options.Transport == "auto", "timing" => Options.Timing == "auto", _ => EffectiveRate is null };
+        var same = isAutomatic && applied is not null && applied.Codec == Options.Codec && applied.Transport == Options.Transport && applied.Timing == Options.Timing && (appliedGroup ?? applied.SampleRate) == EffectiveRate;
+        var ids = Receiver.Peers.Select(p => p.Id).ToArray();
         var actual = same && active?.State == PlaybackState.Streaming && active.Receiver?.Peers.Any(p => ids.Contains(p.Id)) == true
             ? (active.Diagnostics?.Negotiated ?? []).Where(n => ids.Contains(n.Text("receiver_id"))).ToArray() : [];
         string summary;
-        if (actual.Length > 0 && actual.Length == ids.Length)
+        if (actual.Length == ids.Length)
         {
             summary = Join(actual.Select(n => (n.Text("receiver_id"), field switch {
                 "codec" => Label(n.Text("codec")), "transport" => Label(n.Text("transport")), "rate" => Label(n.Integer("sample_rate")?.ToString() ?? ""),
-                "depth" => Label((n.Integer("bit_depth") ?? 16).ToString()),
                 _ => ClockLabel(n, active!)
             })));
             return L.Format("Automatic ({0})", summary);
         }
-        if (!ProfileCapabilities.Known || selections.Length == 0) return L.Get("Automatic (pending detection)");
-        summary = Join(selections.Select(s => (s.ReceiverId, Label(field switch { "codec" => s.Profile.SelectedCodec, "transport" => s.Profile.SelectedTransport, "timing" => s.Profile.SelectedTiming, "depth" => s.Profile.BitDepth.ToString(), _ => s.Profile.SampleRate.ToString() }))));
+        if (!Capabilities.Known || selections.Count == 0) return L.Get("Automatic (pending detection)");
+        summary = Join(selections.Select(s => (s.ReceiverId, Label(field switch { "codec" => s.Profile.SelectedCodec, "transport" => s.Profile.SelectedTransport, "timing" => s.Profile.SelectedTiming, _ => s.Profile.SampleRate.ToString() }))));
         return L.Format("Automatic (expected: {0})", summary);
     }
     private static string ClockLabel(System.Text.Json.JsonElement negotiated, SessionSnapshot active)
