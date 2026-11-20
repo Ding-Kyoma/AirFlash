@@ -93,6 +93,18 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public string MonitorDrops => _snapshot.Metrics?.DroppedFrames?.ToString() ?? "—";
     public string MonitorRate => _snapshot.Metrics is { InputRate: > 0 } m ? $"{m.InputRate:N0} Hz" : "—";
     public string MonitorStreamRate => _snapshot.StreamRate is { } rate and > 0 ? $"{rate:N0} Hz · 16-bit" : "—";
+    /// <summary>Capture format -> whether it was copied or resampled -> stream rate.</summary>
+    public string MonitorChain
+    {
+        get
+        {
+            if (_snapshot.Metrics is not { InputFormat: { Length: > 0 } input } metrics) return "—";
+            var path = metrics.BitExact == true ? L.Get("bit-exact") : L.Get("resampled");
+            var rate = _snapshot.StreamRate is { } stream and > 0 ? $" → {stream:N0} Hz · 16-bit" : "";
+            var slips = metrics.Slips is { } count and > 0 ? " · " + L.Format("{0} one-frame corrections", count) : "";
+            return $"{input} → {path}{rate}{slips}";
+        }
+    }
     public string MonitorRecoveries => _snapshot.Diagnostics?.Transport?.SenderLateRecoveries?.ToString() ?? "—";
     public string MonitorSkipped => _snapshot.Diagnostics?.Transport?.SkippedPackets?.ToString() ?? "—";
     public string MonitorReconnects => _snapshot.Diagnostics?.ReconnectCount.ToString() ?? "—";
