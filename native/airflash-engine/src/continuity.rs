@@ -64,6 +64,25 @@ impl Quantizer {
             .round()
             .clamp(-32768.0, 32767.0) as i16
     }
+    /// Packed, big-endian signed PCM for the 24-bit ALAC path. Accumulate
+    /// dither in f64 so it is not rounded away at high levels.
+    pub fn pcm24(&mut self, value: f32, exact: bool) -> [u8; 3] {
+        let code = if !value.is_finite() || value == 0.0 {
+            0
+        } else {
+            let dither = if exact {
+                0.0
+            } else {
+                self.dither_frames += 1;
+                f64::from(self.tpdf())
+            };
+            (f64::from(value.clamp(-1.0, 1.0)) * 8_388_608.0 + dither)
+                .round()
+                .clamp(-8_388_608.0, 8_388_607.0) as i32
+        };
+        let [_, high, middle, low] = code.to_be_bytes();
+        [high, middle, low]
+    }
     /// Frames that received dither (diagnostics only).
     pub fn dither_frames(&self) -> u64 {
         self.dither_frames

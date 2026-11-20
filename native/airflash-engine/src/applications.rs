@@ -526,7 +526,7 @@ mod tests {
         let control =
             crate::equalizer::Control::new(crate::equalizer::Settings::default(), 44100).unwrap();
         let capture =
-            crate::live::Loopback::start_application(identity, true, 44100, control, false)
+            crate::live::Loopback::start_application(identity, true, 44100, 16, control, false)
                 .unwrap();
         std::thread::sleep(Duration::from_millis(40));
         assert_eq!(capture.last_audio(), 0);

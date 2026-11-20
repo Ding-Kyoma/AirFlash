@@ -178,7 +178,9 @@ fn mock_with_model(
     ap2: bool,
     model: Option<&'static str>,
 ) -> Mock {
-    mock_with_cancel_and_model(ip, buffered, alac, channel, offset, ap2, model, None, true)
+    mock_with_cancel_and_model(
+        ip, buffered, alac, channel, offset, ap2, model, None, true, None,
+    )
 }
 fn mock_with_cancel(
     ip: &str,
@@ -199,6 +201,7 @@ fn mock_with_cancel(
         Some("AudioAccessory5,1"),
         cancel_on_stream,
         true,
+        None,
     )
 }
 /// A receiver that is only probed with `/info`: the test expects the group to
@@ -214,6 +217,7 @@ fn mock_probe_only(ip: &str, alac: bool, channel: Channel, offset: i32, ap2: boo
         Some("AudioAccessory5,1"),
         None,
         false,
+        None,
     )
 }
 /// `pair` = false models a receiver that is only probed: the session must be
@@ -230,6 +234,7 @@ fn mock_with_cancel_and_model(
     model: Option<&'static str>,
     cancel_on_stream: Option<Cancellation>,
     pair: bool,
+    buffered_24_rate: Option<u32>,
 ) -> Mock {
     let control = TcpListener::bind((ip, 0)).unwrap();
     let event = TcpListener::bind((ip, 0)).unwrap();
@@ -285,6 +290,10 @@ fn mock_with_cancel_and_model(
         let (socket, _) = control.accept().unwrap();
         let mut c = Connection::from_stream(socket, Cancellation::default()).unwrap();
         let mut formats = plist::Dictionary::new();
+        let stream_format = buffered_24_rate.map_or_else(
+            || crate::rtp::audio_format(alac, 44100),
+            crate::rtp::buffered_alac_24_format,
+        );
         formats.insert(
             if buffered {
                 "bufferStream"
@@ -292,7 +301,7 @@ fn mock_with_cancel_and_model(
                 "audioStream"
             }
             .into(),
-            plist::Value::Integer(crate::rtp::audio_format(alac, 44100).into()),
+            plist::Value::Integer(stream_format.into()),
         );
         let mut info = plist::Dictionary::new();
         info.insert("supportedFormats".into(), plist::Value::Dictionary(formats));
@@ -377,7 +386,11 @@ fn mock_with_cancel_and_model(
                     );
                     assert_eq!(
                         stream["audioFormat"].as_unsigned_integer(),
-                        Some(crate::rtp::audio_format(alac, 44100))
+                        Some(stream_format)
+                    );
+                    assert_eq!(
+                        stream["sr"].as_unsigned_integer(),
+                        Some(u64::from(buffered_24_rate.unwrap_or(44100)))
                     );
                     assert_eq!(stream.contains_key("latencyMin"), !buffered);
                     *key_out.lock().unwrap() =
@@ -611,6 +624,124 @@ fn ptp_receiver(
         }
     })
 }
+#[test]
+fn native_stereo_sends_48_khz_24_bit_alac_over_buffered_tcp() {
+    const RATE: u32 = 48_000;
+    let (left_ip, left_event, left_general) = crate::test_net::ptp_receiver_sockets();
+    let (right_ip, right_event, right_general) = crate::test_net::ptp_receiver_sockets();
+    let [left, right] = [left_ip, right_ip].map(|ip| {
+        mock_with_cancel_and_model(
+            &ip.to_string(),
+            true,
+            true,
+            Channel::Stereo,
+            0,
+            true,
+            Some("AudioAccessory1,1"),
+            None,
+            true,
+            Some(RATE),
+        )
+    });
+    let event = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let general = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let event_addr = event.local_addr().unwrap();
+    let left_ptp = ptp_receiver(left_event, left_general, event_addr, left.stop.clone());
+    let right_ptp = ptp_receiver(right_event, right_general, event_addr, right.stop.clone());
+    let clock = crate::clock::Clock::new();
+    let timer = crate::clock::PtpMaster::from_sockets(
+        vec![left_ip, right_ip],
+        vec![],
+        clock.clone(),
+        event,
+        general,
+    )
+    .unwrap();
+    let path = std::env::temp_dir().join(format!("airflash-24-{}.wav", uuid::Uuid::new_v4()));
+    let mut wav = hound::WavWriter::create(
+        &path,
+        hound::WavSpec {
+            channels: 2,
+            sample_rate: RATE,
+            bits_per_sample: 24,
+            sample_format: hound::SampleFormat::Int,
+        },
+    )
+    .unwrap();
+    for _ in 0..RATE {
+        wav.write_sample(82_310i32).unwrap();
+        wav.write_sample(-85_550i32).unwrap();
+    }
+    wav.finalize().unwrap();
+    let mut options: ProbeOptions = serde_json::from_value(serde_json::json!({
+        "peers": [], "source": "wav", "duration_ms": 200, "gain": 0.1, "latency_ms": 200,
+        "wav_path": path, "group_mode": "native_stereo", "sample_rate": RATE, "bit_depth": 24
+    }))
+    .unwrap();
+    options.peers = vec![left.peer.clone(), right.peer.clone()];
+    let eq = crate::equalizer::Control::new(options.equalizer, RATE).unwrap();
+    let events = Mutex::new(Vec::new());
+    let result = run_session(
+        options,
+        Cancellation::default(),
+        Arc::new(AtomicU32::new(0.1f32.to_bits())),
+        crate::volume::Control::default(),
+        eq,
+        |event| events.lock().unwrap().push(event),
+        (clock, Some(timer)),
+    );
+    std::fs::remove_file(path).unwrap();
+    left.stop.store(true, Ordering::Relaxed);
+    right.stop.store(true, Ordering::Relaxed);
+    left_ptp.join().unwrap();
+    right_ptp.join().unwrap();
+    result.unwrap();
+
+    let mut cookie = alac_encoder::AlacEncoder::new(&alac_encoder::FormatDescription::alac(
+        f64::from(RATE),
+        352,
+        2,
+    ))
+    .magic_cookie();
+    cookie[5] = 24;
+    for mock in [left, right] {
+        mock.worker.join().unwrap();
+        assert_eq!(*mock.setups.lock().unwrap(), ["PTP"]);
+        assert_eq!(mock.methods.lock().unwrap().last().unwrap(), "TEARDOWN");
+        assert!(mock.anchor.lock().unwrap().is_some());
+        let packets = mock.packets.lock().unwrap();
+        assert!(packets.len() > 10);
+        let mut cipher = Cipher::new(mock.key.lock().unwrap().unwrap());
+        let mut decoder = alac::Decoder::new(alac::StreamInfo::from_cookie(&cookie).unwrap());
+        for packet in packets.iter() {
+            assert_eq!(packet[1] & 127, 103);
+            let clear = cipher
+                .decrypt(&packet[12..packet.len() - 8], &packet[4..12])
+                .unwrap();
+            let mut decoded = [0i32; 704];
+            decoder.decode_packet(&clear, &mut decoded).unwrap();
+            assert!(
+                decoded
+                    .chunks_exact(2)
+                    .all(|pair| pair == [8231 << 8, -8555 << 8])
+            );
+        }
+    }
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event["event"] == "negotiated"
+                    && event["bit_depth"] == 24
+                    && event["sample_rate"] == RATE
+            })
+            .count(),
+        2
+    );
+}
+
 #[test]
 fn mixed_transports_share_sample_timeline_route_channels_and_close_together() {
     // PTP receiver ports are protocol-fixed, so each mock gets its own

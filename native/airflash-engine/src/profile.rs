@@ -58,16 +58,19 @@ pub enum Channel {
     Right,
 }
 impl Channel {
-    pub fn map(self, pcm: &[u8]) -> Vec<u8> {
+    pub fn map(self, pcm: &[u8], bit_depth: u8) -> std::borrow::Cow<'_, [u8]> {
         if self == Self::Stereo {
-            return pcm.to_vec();
+            return pcm.into();
         }
-        pcm.chunks_exact(4)
-            .flat_map(|f| {
-                let i = if self == Self::Left { 0 } else { 2 };
-                [f[i], f[i + 1], f[i], f[i + 1]]
-            })
-            .collect()
+        let width = usize::from(bit_depth / 8);
+        let offset = if self == Self::Left { 0 } else { width };
+        let mut stereo = Vec::with_capacity(pcm.len());
+        for frame in pcm.chunks_exact(width * 2) {
+            let sample = &frame[offset..offset + width];
+            stereo.extend_from_slice(sample);
+            stereo.extend_from_slice(sample);
+        }
+        stereo.into()
     }
 }
 #[derive(Clone, Copy, Debug, Default)]
@@ -422,29 +425,60 @@ impl CompatFingerprint {
         rate: u32,
         inherited_ptp: bool,
     ) -> Result<CompatProfile> {
+        self.negotiate_stream(plan, profile, rate, 16, inherited_ptp)
+    }
+
+    pub fn negotiate_stream(
+        &self,
+        plan: TimingPlan,
+        profile: &Profile,
+        rate: u32,
+        bit_depth: u8,
+        inherited_ptp: bool,
+    ) -> Result<CompatProfile> {
         ensure!(
             (-500..=500).contains(&profile.sync_offset_ms),
             "sync offset must be -500..500 ms"
         );
         let group_ntp = plan.is_group() && plan.timing() == Timing::Ntp;
-        let transport = match profile.transport {
-            // Buffered audio is PTP-only, so an NTP group cannot select it
-            // automatically; only an explicit Buffered request fails below.
-            Transport::Auto if group_ntp => Transport::Realtime,
-            Transport::Auto
-                if self.formats.realtime.is_some_and(|f| {
-                    f & (crate::rtp::audio_format(true, rate)
-                        | crate::rtp::audio_format(false, rate))
-                        == 0
-                }) && self
-                    .formats
-                    .buffered
-                    .is_some_and(|f| f & crate::rtp::audio_format(true, rate) != 0) =>
-            {
-                Transport::Buffered
+        let transport = if bit_depth == 24 {
+            ensure!(
+                profile.transport != Transport::Realtime
+                    && matches!(profile.codec, Codec::Alac | Codec::Auto),
+                "24-bit audio requires buffered ALAC"
+            );
+            ensure!(
+                self.formats.buffered.is_some_and(|formats| {
+                    formats & crate::rtp::buffered_alac_24_format(rate) != 0
+                }),
+                "receiver does not advertise {rate} Hz 24-bit buffered ALAC"
+            );
+            ensure!(
+                profile.timing != Timing::Ntp,
+                "buffered audio requires PTP timing"
+            );
+            Transport::Buffered
+        } else {
+            ensure!(bit_depth == 16, "stream bit depth must be 16 or 24");
+            match profile.transport {
+                // Buffered audio is PTP-only, so an NTP group cannot select it
+                // automatically; only an explicit Buffered request fails below.
+                Transport::Auto if group_ntp => Transport::Realtime,
+                Transport::Auto
+                    if self.formats.realtime.is_some_and(|f| {
+                        f & (crate::rtp::audio_format(true, rate)
+                            | crate::rtp::audio_format(false, rate))
+                            == 0
+                    }) && self
+                        .formats
+                        .buffered
+                        .is_some_and(|f| f & crate::rtp::audio_format(true, rate) != 0) =>
+                {
+                    Transport::Buffered
+                }
+                Transport::Auto => Transport::Realtime,
+                forced => forced,
             }
-            Transport::Auto => Transport::Realtime,
-            forced => forced,
         };
         let formats = if transport == Transport::Buffered {
             self.formats.buffered
@@ -453,22 +487,25 @@ impl CompatFingerprint {
         };
         let supports =
             |alac| formats.is_some_and(|f| f & crate::rtp::audio_format(alac, rate) != 0);
-        let alac = match profile.codec {
-            Codec::Auto if formats.is_some() => supports(true),
-            Codec::Auto | Codec::Legacy => self.legacy_alac(),
-            Codec::Alac => true,
-            Codec::Pcm => false,
-        };
-        if let Some(f) = formats {
-            ensure!(
-                f & crate::rtp::audio_format(alac, rate) != 0,
-                "requested codec/sample rate is not advertised for this stream"
-            );
-        } else {
-            ensure!(
-                self.legacy_codecs.is_empty() || self.legacy_codecs.contains(&u8::from(alac)),
-                "requested codec is not advertised"
-            );
+        let alac = bit_depth == 24
+            || match profile.codec {
+                Codec::Auto if formats.is_some() => supports(true),
+                Codec::Auto | Codec::Legacy => self.legacy_alac(),
+                Codec::Alac => true,
+                Codec::Pcm => false,
+            };
+        if bit_depth == 16 {
+            if let Some(f) = formats {
+                ensure!(
+                    f & crate::rtp::audio_format(alac, rate) != 0,
+                    "requested codec/sample rate is not advertised for this stream"
+                );
+            } else {
+                ensure!(
+                    self.legacy_codecs.is_empty() || self.legacy_codecs.contains(&u8::from(alac)),
+                    "requested codec is not advertised"
+                );
+            }
         }
         ensure!(
             transport != Transport::Buffered || alac,
@@ -1312,13 +1349,13 @@ mod tests {
     fn mono_routing_duplicates_only_the_assigned_channel() {
         let pcm = [0x12, 0x34, 0xfe, 0xdc, 0, 1, 0, 2];
         assert_eq!(
-            Channel::Left.map(&pcm),
+            Channel::Left.map(&pcm, 16).as_ref(),
             [0x12, 0x34, 0x12, 0x34, 0, 1, 0, 1]
         );
         assert_eq!(
-            Channel::Right.map(&pcm),
+            Channel::Right.map(&pcm, 16).as_ref(),
             [0xfe, 0xdc, 0xfe, 0xdc, 0, 2, 0, 2]
         );
-        assert_eq!(Channel::Stereo.map(&pcm), pcm);
+        assert_eq!(Channel::Stereo.map(&pcm, 16).as_ref(), pcm);
     }
 }

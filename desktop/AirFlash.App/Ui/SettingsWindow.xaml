@@ -272,14 +272,16 @@
                   <CheckBox Content="{loc:Text 'Hide from control panel'}" IsChecked="{Binding Options.Hidden}"/>
                   <Expander Header="{loc:Text 'Advanced settings'}" Foreground="{DynamicResource TextBrush}" Margin="0,0,0,12">
                     <StackPanel Margin="0,14,0,0">
-                      <TextBlock Text="{Binding ProfileStatus}" Style="{StaticResource Hint}" Margin="0,0,0,12"/>
+                      <TextBlock Text="{Binding ProfileStatus}" Style="{StaticResource Hint}" Margin="0,0,0,12" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite"/>
+                      <TextBlock Text="{loc:Text 'Stream transport'}" Style="{StaticResource Hint}"/>
+                      <ComboBox ItemsSource="{Binding TransportChoices}" DisplayMemberPath="Label" SelectedItem="{Binding TransportChoice, Mode=TwoWay}" Margin="0,4,0,12" AutomationProperties.Name="{loc:Text 'Stream transport'}"/>
                       <TextBlock Text="{loc:Text 'Audio encoding'}" Style="{StaticResource Hint}"/>
                       <ComboBox ItemsSource="{Binding CodecChoices}" DisplayMemberPath="Label" SelectedItem="{Binding CodecChoice, Mode=TwoWay}" Margin="0,4,0,12"/>
                       <TextBlock Text="{loc:Text 'Stream sample rate'}" Style="{StaticResource Hint}"/>
                       <ComboBox ItemsSource="{Binding RateChoices}" DisplayMemberPath="Label" SelectedItem="{Binding RateChoice, Mode=TwoWay}" IsEnabled="{Binding CanSetSampleRate}" Margin="0,4,0,12"/>
                       <TextBlock Text="{Binding GroupRateHint}" Style="{StaticResource Hint}" Margin="0,0,0,8"/>
-                      <TextBlock Text="{loc:Text 'Stream transport'}" Style="{StaticResource Hint}"/>
-                      <ComboBox ItemsSource="{Binding TransportChoices}" DisplayMemberPath="Label" SelectedItem="{Binding TransportChoice, Mode=TwoWay}" Margin="0,4,0,12"/>
+                      <TextBlock Text="{loc:Text 'Stream bit depth'}" Style="{StaticResource Hint}"/>
+                      <ComboBox ItemsSource="{Binding BitDepthChoices}" DisplayMemberPath="Label" SelectedItem="{Binding BitDepthChoice, Mode=TwoWay}" Margin="0,4,0,12" AutomationProperties.Name="{loc:Text 'Stream bit depth'}"/>
                       <TextBlock Text="{loc:Text 'Clock policy'}" Style="{StaticResource Hint}"/>
                       <ComboBox ItemsSource="{Binding TimingChoices}" DisplayMemberPath="Label" SelectedItem="{Binding TimingChoice, Mode=TwoWay}" Margin="0,4,0,12"/>
                       <TextBlock Text="{loc:Text 'Latency mode'}" Style="{StaticResource Hint}"/>

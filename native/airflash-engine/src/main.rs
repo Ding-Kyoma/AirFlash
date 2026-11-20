@@ -66,6 +66,7 @@ fn capabilities() -> Vec<&'static str> {
         "multi_room",
         "continuity",
         "buffered_audio",
+        "buffered_alac_24",
         "member_volume",
         "initial_volume",
         "receiver_password",
@@ -269,9 +270,14 @@ fn main() {
                         !peers.is_empty(),
                         "capability query requires at least one receiver"
                     );
-                    airflash_engine::receiver_capabilities::query_group(
+                    airflash_engine::receiver_capabilities::query_stream_profiles(
                         &peers,
                         Cancellation::default(),
+                        request
+                            .params
+                            .get("include_24_bit")
+                            .and_then(Value::as_bool)
+                            == Some(true),
                     )
                 })();
                 match result {

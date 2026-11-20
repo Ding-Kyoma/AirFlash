@@ -42,6 +42,27 @@ def test_wrap_reproduces_the_raw_tap(tmp_path):
         assert handle.readframes(frames) == codes.tobytes()
 
 
+def test_24_bit_tap_preserves_and_compares_the_lowest_bit(tmp_path):
+    raw = tmp_path / "tap.raw"
+    raw.with_suffix(".json").write_text(
+        json.dumps({"rate": 48000, "channels": 2, "bits": 24}), encoding="utf-8"
+    )
+    pcm = bytes.fromhex("000080 ffff7f 0100ff 020001")
+    raw.write_bytes(pcm)
+    reference = tmp_path / "a.wav"
+    assert wrap(raw, reference)["frames"] == 2
+    with wave.open(str(reference), "rb") as handle:
+        assert handle.getsampwidth() == 3
+        assert handle.readframes(2) == pcm
+
+    altered = tmp_path / "b.wav"
+    raw.write_bytes(pcm[:-3] + bytes.fromhex("030001"))
+    wrap(raw, altered)
+    report = compare(reference, altered)
+    assert report["identical"] is False
+    assert report["max_difference_lsb"] == 1
+
+
 def test_identical_files_report_as_identical(tmp_path):
     first = write_wav(tmp_path / "a.wav", tone(1000))
     second = write_wav(tmp_path / "b.wav", tone(1000))

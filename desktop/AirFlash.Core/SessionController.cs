@@ -14,6 +14,7 @@ public sealed record SessionSnapshot(PlaybackState State, Receiver? Receiver = n
     internal long Generation { get; init; }
     public LatencyRuntime? Latency { get; init; }
     public int? PendingLatency { get; init; }
+    public int StreamBitDepth { get; init; }
     public string ActionHint { get; init; } = "";
 }
 public sealed record SessionTiming(TimeSpan Connect, TimeSpan Read, TimeSpan Pin, TimeSpan Retry)
@@ -322,6 +323,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             ["latency"] = settings.Latency(receiver).ToString(),
             ["force_latency"] = JsonSerializer.Serialize(receiver.Peers.OrderBy(m => m.Address, StringComparer.Ordinal).ThenBy(m => m.Port).Select(m => settings.ForcesLatency(receiver.IsSoftwareGroup ? m.Id : receiver.Id))),
             ["sample_rate"] = settings.SampleRate(receiver),
+            ["bit_depth"] = JsonSerializer.Serialize(receiver.Peers.OrderBy(m => m.Id, StringComparer.Ordinal).Select(m => ProfileOptions(receiver, m, settings).BitDepth)),
             ["profiles"] = JsonSerializer.Serialize(receiver.Peers.OrderBy(m => m.Address, StringComparer.Ordinal).ThenBy(m => m.Port).Select(m => PeerProfile(receiver, m, settings)))
         };
     }
@@ -578,16 +580,15 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     /// One line that spells out every stage the audio passes through, so a
     /// quality report can be written from the desktop log alone.
     /// </summary>
-    private string ChainLine(StreamMetrics metrics, int rate)
+    private string ChainLine(StreamMetrics metrics, int rate, int bitDepth)
     {
         var negotiated = _diagnostics.Negotiated is { Count: > 0 } list
             ? $"{list[0].Text("codec", "auto")}/{list[0].Text("transport", "auto")}"
             : "auto";
-        var path = metrics.BitExact == true ? "bit-exact" : "resample";
-        var dither = metrics.BitExact == true ? "no dither" : "tpdf dither";
+        var path = metrics.BitExact == true ? "rate passthrough" : "resample";
         var equalizer = _settings.Equalizer.Enabled ? "eq on" : "eq off";
         var gain = _receiver is null ? "1.00" : $"{Gain(_receiver):0.00}";
-        return $"Audio chain: {metrics.InputFormat ?? "unknown"} -> {path} ({dither}) -> {negotiated} {rate} Hz -> gain {gain} -> {equalizer} -> slips {metrics.Slips ?? 0}";
+        return $"Audio chain: {metrics.InputFormat ?? "unknown"} -> {path} -> {negotiated} {rate} Hz/{bitDepth}-bit -> gain {gain} -> {equalizer} -> slips {metrics.Slips ?? 0}";
     }
     private async Task SendGainAsync()
     {
@@ -758,10 +759,14 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                     if (settings.CaptureMode == "application") EngineHandshake.RequireCapabilities(hello, "application_capture");
                     if (receiver.IsSoftwareGroup) EngineHandshake.RequireCapabilities(hello, "member_volume");
                     if (receiver.IsSoftwareGroup && receiver.GroupMode == "multi_room") EngineHandshake.RequireCapabilities(hello, "multi_room");
+                    var supports24Bit = EngineHandshake.HasCapability(hello, "buffered_alac_24");
+                    if (receiver.Peers.Any(member => ProfileOptions(receiver, member, settings).BitDepth == 24))
+                        EngineHandshake.RequireCapabilities(hello, "buffered_alac_24");
                     var capabilities = await ReceiverCapabilityCatalog.QueryConnectionAsync(connection, session, hello, receiver, cancellation).ConfigureAwait(false);
                     var selected = capabilities.Select(id => ProfileOptions(receiver, receiver.Peers.Single(p => p.Id == id), settings), settings.SampleRate(receiver));
                     if (capabilities.Members.Count > 0 && selected.Count == 0) throw new InvalidOperationException(L.Get("The receiver does not support this stream profile. Choose Automatic or a supported option in Receivers."));
                     var sampleRate = selected.FirstOrDefault()?.Profile.SampleRate ?? (int.TryParse(settings.SampleRate(receiver), out var explicitRate) ? explicitRate : 44100);
+                    var bitDepth = selected.FirstOrDefault()?.Profile.BitDepth ?? 16;
                     peers.Clear();
                     _adaptiveInitial = receiver.Peers.Max(member => InitialLatency(receiver, member, settings, selected.FirstOrDefault(s => s.ReceiverId == member.Id)?.Profile));
                     var adaptiveMode = UsesAdaptive(settings, receiver);
@@ -786,6 +791,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         var groupMode = receiver.IsSoftwareGroup ? (receiver.GroupMode.Length > 0 ? receiver.GroupMode : "software_stereo") : receiver.IsGroup ? "native_stereo" : "single";
                         var startParameters = JsonSerializer.SerializeToNode(new { peers, group_mode = groupMode, group_id = receiver.IsGroup && !receiver.IsSoftwareGroup ? receiver.StereoId : null, source = settings.CaptureMode == "application" ? "application" : "loopback", capture_application_path = settings.CaptureMode == "application" ? settings.CaptureApplicationPath : null, capture_process_id = settings.CaptureMode == "application" ? settings.CaptureApplicationInstance?.ProcessId : null, capture_process_started_at = settings.CaptureMode == "application" ? settings.CaptureApplicationInstance?.StartedAt : null, standby = StandbyParameters(settings, receiver.Id), duration_ms = 0, latency_ms = _adaptiveBase, gain = Gain(receiver), timing = "ptp", capture_endpoint = settings.EffectiveEndpoint, sample_rate = sampleRate, bit_exact = settings.BitExactPassthrough, equalizer = EffectiveEqualizer().WireParameters() })!.AsObject();
                         if (forceLatency) startParameters["force_latency"] = true;
+                        if (supports24Bit) startParameters["bit_depth"] = bitDepth;
                         startParameters["intent"] = attemptIntent == SessionStartIntent.Manual ? "manual" : "automatic";
                         if (adaptiveMode && _confirmedLeadSupported)
                         {
@@ -793,7 +799,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                             startParameters["adaptive_initial_latency_ms"] = _adaptiveInitial;
                         }
                         await connection.SendAsync(session, "start", startParameters, cancellation).ConfigureAwait(false);
-                        lock (_sync) { if (epoch == _generation) _snapshot = _snapshot with { StreamRate = sampleRate }; }
+                        lock (_sync) { if (epoch == _generation) _snapshot = _snapshot with { StreamRate = sampleRate, StreamBitDepth = bitDepth }; }
                         lock (_sync) { if (epoch == _generation && ReferenceEquals(_connection, connection)) _equalizerReady = true; }
                     }
                     finally { _equalizerWriter.Release(); }
@@ -849,7 +855,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                             // The handshake alone does not prove that the receiver can render
                             // the stream; this line records the codec, transport, timing and
                             // clock role needed to diagnose a silent session.
-                            log?.Invoke($"Receiver negotiated: {item.Text("receiver_id", item.Text("host"))}; host {item.Text("host")}; codec {item.Text("codec")}; transport {item.Text("transport")}; timing {item.Text("timing")}; clock_role {item.Text("clock_role")}; {item.Integer("sample_rate")} Hz");
+                            log?.Invoke($"Receiver negotiated: {item.Text("receiver_id", item.Text("host"))}; host {item.Text("host")}; codec {item.Text("codec")}; transport {item.Text("transport")}; timing {item.Text("timing")}; clock_role {item.Text("clock_role")}; {item.Integer("sample_rate")} Hz; {item.Integer("bit_depth") ?? bitDepth}-bit");
                             if (item.Number("effective_latency_ms") is { } baseline) lock (_sync) _adaptive.Negotiated(baseline);
                         }
                         if (kind is "lead_changed" or "lead_error")
@@ -997,8 +1003,8 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                             var current = Snapshot;
                             // Once per capture format: say out loud what the audio actually
                             // goes through, so a quality report needs no engine log.
-                            if (parsed.InputFormat is { } chainInput && chainInput != current.Metrics?.InputFormat)
-                                log?.Invoke(ChainLine(parsed, sampleRate));
+                            if (parsed.InputFormat is { } chainInput && (chainInput != current.Metrics?.InputFormat || parsed.BitExact != current.Metrics?.BitExact))
+                                log?.Invoke(ChainLine(parsed, sampleRate, bitDepth));
                             Publish(epoch, current.State, current.Message, metrics: parsed);
                         }
                         await CheckAdaptiveAsync(connection, session, epoch, cancellation).ConfigureAwait(false);
@@ -1202,7 +1208,11 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             var hint = state != PlaybackState.Error ? "" : failure is not null
                 ? GateFailure.ActionHint(failure) ?? ""
                 : _snapshot.Generation == epoch && _snapshot.State == state && _snapshot.Message == message ? _snapshot.ActionHint : "";
-            snapshot = new(state, _receiver, message, metrics ?? _snapshot.Metrics, _receiver is null ? 0 : _adaptive.Current > 0 ? _adaptive.Current : _settings.Latency(_receiver), _diagnostics, _receiver is null ? 0 : _snapshot.StreamRate, _deviceVolume, new Dictionary<string, DeviceVolumeState>(_memberVolumes)) { Generation = epoch, Latency = _adaptive.Runtime, PendingLatency = _adaptive.Pending?.Action.Target, ActionHint = hint };
+            snapshot = new(state, _receiver, message, metrics ?? _snapshot.Metrics, _receiver is null ? 0 : _adaptive.Current > 0 ? _adaptive.Current : _settings.Latency(_receiver), _diagnostics, _receiver is null ? 0 : _snapshot.StreamRate, _deviceVolume, new Dictionary<string, DeviceVolumeState>(_memberVolumes))
+            {
+                Generation = epoch, Latency = _adaptive.Runtime, PendingLatency = _adaptive.Pending?.Action.Target, ActionHint = hint,
+                StreamBitDepth = _receiver is null ? 0 : _snapshot.StreamBitDepth,
+            };
             _snapshot = snapshot;
         }
         Changed?.Invoke(snapshot);

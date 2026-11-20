@@ -10,7 +10,7 @@ public sealed class ReceiverOptions : ObservableObject
     {
         AutoConnect = source.AutoConnect; Hidden = source.Hidden; Volume = source.Volume; LastVolume = source.LastVolume;
         LatencyMode = source.LatencyMode; CustomBufferMs = source.CustomBufferMs; ForceLatency = source.ForceLatency; StandbySeconds = source.StandbySeconds;
-        Codec = source.Codec; SampleRate = source.SampleRate; Transport = source.Transport; Timing = source.Timing;
+        Codec = source.Codec; SampleRate = source.SampleRate; BitDepth = source.BitDepth; Transport = source.Transport; Timing = source.Timing;
     }
     private bool? _AutoConnect = null;
     public bool? AutoConnect { get => _AutoConnect; set => Set(ref _AutoConnect, value); }
@@ -34,10 +34,20 @@ public sealed class ReceiverOptions : ObservableObject
     public double? StandbySeconds { get => _StandbySeconds; set => Set(ref _StandbySeconds, value); }
     private string _codec = "auto", _transport = "auto", _timing = "auto";
     private string? _sampleRate;
+    private int? _bitDepth;
     public string Codec { get => _codec; set => Set(ref _codec, value); }
     public string? SampleRate { get => _sampleRate; set => Set(ref _sampleRate, value); }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? BitDepth { get => _bitDepth; set => Set(ref _bitDepth, value); }
     public string Transport { get => _transport; set => Set(ref _transport, value); }
     public string Timing { get => _timing; set => Set(ref _timing, value); }
+
+    public void ApplyStreamProfile(ReceiverOptions source)
+    {
+        (_codec, _sampleRate, _bitDepth, _transport, _timing) =
+            (source.Codec, source.SampleRate, source.BitDepth, source.Transport, source.Timing);
+        Notify("");
+    }
 }
 public sealed class GroupMemberConfig : ObservableObject
 {
@@ -203,6 +213,7 @@ public sealed class AppSettings : ObservableObject
         {
             if (options.Codec is not ("auto" or "pcm" or "alac") || options.Transport is not ("auto" or "realtime" or "buffered") || options.Timing is not ("auto" or "ptp" or "ntp" or "follow")) return L.Get("Invalid receiver stream profile.");
             if (options.SampleRate is not null && !SampleRates.Contains(options.SampleRate)) return L.Get("Select a valid stream sample rate.");
+            if (options.BitDepth is not (null or 16 or 24)) return L.Get("Select a valid stream bit depth.");
             if (options.Volume is < 0 or > 100) return L.Get("Device volume must be between 0 and 100.");
             if (options.LastVolume is < 0 or > 100) return L.Get("Device volume must be between 0 and 100.");
             if (options.LatencyMode is not null && !Modes.Contains(options.LatencyMode)) return L.Get("Invalid device latency mode.");

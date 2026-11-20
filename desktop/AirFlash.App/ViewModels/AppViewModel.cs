@@ -92,15 +92,15 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public string MonitorUnderruns => _snapshot.Metrics?.Underruns?.ToString() ?? "—";
     public string MonitorDrops => _snapshot.Metrics?.DroppedFrames?.ToString() ?? "—";
     public string MonitorRate => _snapshot.Metrics is { InputRate: > 0 } m ? $"{m.InputRate:N0} Hz" : "—";
-    public string MonitorStreamRate => _snapshot.StreamRate is { } rate and > 0 ? $"{rate:N0} Hz · 16-bit" : "—";
+    public string MonitorStreamRate => _snapshot.StreamRate is { } rate and > 0 ? $"{rate:N0} Hz · {L.Format("{0}-bit", Math.Max(16, _snapshot.StreamBitDepth))}" : "—";
     /// <summary>Capture format -> whether it was copied or resampled -> stream rate.</summary>
     public string MonitorChain
     {
         get
         {
             if (_snapshot.Metrics is not { InputFormat: { Length: > 0 } input } metrics) return "—";
-            var path = metrics.BitExact == true ? L.Get("bit-exact") : L.Get("resampled");
-            var rate = _snapshot.StreamRate is { } stream and > 0 ? $" → {stream:N0} Hz · 16-bit" : "";
+            var path = metrics.BitExact == true ? L.Get("Sample rate passthrough") : L.Get("resampled");
+            var rate = _snapshot.StreamRate > 0 ? $" → {MonitorStreamRate}" : "";
             var slips = metrics.Slips is { } count and > 0 ? " · " + L.Format("{0} one-frame corrections", count) : "";
             return $"{input} → {path}{rate}{slips}";
         }
@@ -111,7 +111,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public string MonitorSessionUptime => _snapshot.Diagnostics?.Transport?.SessionUptimeMs is { } ms ? TimeSpan.FromMilliseconds(ms).ToString(@"d\.hh\:mm\:ss") : "—";
     public string MonitorWarnings => _snapshot.Diagnostics?.Warnings is { Count: > 0 } warnings ? string.Join("\n", warnings.Select(w => w.Detail)) : "—";
     public string MonitorLastFault => _snapshot.Diagnostics?.LastFault?.Detail ?? "—";
-    public string MonitorNegotiated => string.Join("\n", (_snapshot.Diagnostics?.Negotiated ?? []).Select(n => $"{n.Text("host")} · {n.Text("codec")} · {n.Integer("sample_rate")} Hz · {n.Text("transport")} · {n.Text("timing")} · {n.Text("channel")} · {n.Integer("sync_offset_ms")} ms"))
+    public string MonitorNegotiated => string.Join("\n", (_snapshot.Diagnostics?.Negotiated ?? []).Select(n => $"{n.Text("host")} · {n.Text("codec")} · {n.Integer("sample_rate")} Hz · {L.Format("{0}-bit", n.Integer("bit_depth") ?? 16)} · {n.Text("transport")} · {n.Text("timing")} · {n.Text("channel")} · {n.Integer("sync_offset_ms")} ms"))
         + "\n" + (_snapshot.Diagnostics?.ClockStatus?.ToString() ?? "—") + "\n" + (_snapshot.Diagnostics?.SchedulerStatus?.ToString() ?? "—");
     public ObservableCollection<TransportMemberViewModel> MonitorMembers { get; } = [];
     public string MonitorBeforeFault

@@ -14,6 +14,7 @@ internal static class ReceiverSettingsRegression
     {
         await CapabilitiesAfterEngineStartupAsync(checks);
         await ProfilesAndLatencyAsync(checks, directory);
+        await HomePodBufferedProfileAsync(checks);
         await MultiRoomAsync(checks);
         await ResetAsync(checks);
         await ResetFailuresAsync(checks);
@@ -81,7 +82,7 @@ internal static class ReceiverSettingsRegression
             Check(row.CodecChoices[0].Label == L.Format("Automatic ({0})", "ALAC") && row.TimingChoices[0].Label == L.Format("Automatic ({0})", L.Get("Follow receiver PTP clock")), "automatic labels show negotiated codec and receiver clock role", checks);
             var profileSelectors = Descendants(window).OfType<ComboBox>().Where(c => ReferenceEquals(c.DataContext, row)
                 && System.Windows.Data.BindingOperations.GetBinding(c, System.Windows.Controls.Primitives.Selector.SelectedItemProperty) is not null).ToArray();
-            Check(profileSelectors.Length == 4 && profileSelectors.All(c => c.SelectedItem is StreamChoice), "WPF profile selectors display their current selections after linked options and labels change", checks);
+            Check(profileSelectors.Length == 5 && profileSelectors.All(c => c.SelectedItem is StreamChoice), "WPF profile selectors display their current selections after linked options and labels change", checks);
             Descendants(window).OfType<Expander>().First(e => ReferenceEquals(e.DataContext, row) && (string?)e.Header == L.Get("Advanced settings")).BringIntoView(); await Pump();
             Render(window, Path.Combine(directory, "receiver-stream-profiles.png"), 1); Render(panel, Path.Combine(directory, "receiver-latency-disabled.png"), 1);
             Check(profileSelectors.All(c => c.SelectedItem is StreamChoice selected && Descendants(c).OfType<TextBlock>().Any(t => t.Text == selected.Label)),
@@ -111,6 +112,47 @@ internal static class ReceiverSettingsRegression
         }
         finally { window.Close(); panel.ShutdownPanel(); }
     }
+    private static async Task HomePodBufferedProfileAsync(List<string> checks)
+    {
+        var a = new Receiver("a", "A", "127.0.0.1");
+        var b = new Receiver("b", "B", "127.0.0.2");
+        var stereo = new Receiver("stereo:homepod-test", "HomePods", a.Address) { Members = [a, b] };
+        var discovery = new MockDiscovery { Items = [stereo] };
+        var store = new MemoryStore();
+        var catalog = new CapabilityCatalog { Known = true, HomePod = true };
+        await using var app = new AppViewModel(store, discovery, new MockAutostart(), new MockAudio(), new MockFactory(), Application.Current.Dispatcher, receiverCapabilities: catalog);
+        app.SetPanelVisible(true); app.Start(); await app.Startup; await Pump();
+        var window = new SettingsWindow(app); var vm = window.ViewModel;
+        vm.SelectedPage = SettingsViewModel.ReceiversPage; window.Show();
+        try
+        {
+            await Until(() => vm.Receivers.Any(r => r.Receiver.Id == stereo.Id && r.Capabilities.Known));
+            var row = vm.Receivers.Single(r => r.Receiver.Id == stereo.Id);
+            var advanced = Descendants(window).OfType<Expander>().Single(e => ReferenceEquals(e.DataContext, row));
+            advanced.IsExpanded = true;
+            await Pump();
+            var transport = Descendants(advanced).OfType<ComboBox>().Single(c => System.Windows.Automation.AutomationProperties.GetName(c) == L.Get("Stream transport"));
+            transport.SelectedItem = row.TransportChoices.Single(c => Equals(c.Value, "buffered"));
+            await Pump();
+            Check(row.RateChoices.Select(c => c.Value).SequenceEqual(new object?[] { null, "44100", "48000" })
+                && row.BitDepthChoices.Select(c => c.Value).SequenceEqual(new object?[] { null, 24 }), "HomePod buffered transport exposes both advertised 24-bit rates", checks);
+            row.CodecChoice = row.CodecChoices.Single(c => Equals(c.Value, "alac"));
+            row.RateChoice = row.RateChoices.Single(c => Equals(c.Value, "48000"));
+            row.BitDepthChoice = row.BitDepthChoices.Single(c => Equals(c.Value, 24));
+            Check(await vm.ApplyAsync() && store.Saved.ReadOptions(stereo.Id).BitDepth == 24, "HomePod 48 kHz, 24-bit buffered profile saves", checks);
+            transport.SelectedItem = row.TransportChoices.Single(c => Equals(c.Value, "realtime"));
+            await Pump();
+            Check(row.Options.Codec == "alac" && row.Options.Transport == "realtime" && row.Options.BitDepth is null && row.Options.SampleRate is null
+                && row.RateChoices.Select(c => c.Value).SequenceEqual(new object?[] { null, "44100" })
+                && row.BitDepthChoices.Select(c => c.Value).SequenceEqual(new object?[] { null, 16 })
+                && row.ProfileStatus.Contains(L.Get("Stream bit depth"), StringComparison.Ordinal), "HomePod UDP retains ALAC and clears incompatible rate and depth", checks);
+            row.SetCapabilities(ReceiverCapabilitySet.Unknown);
+            Check(row.TransportChoices.Count == 1 && row.BitDepthChoices.Count == 1 && row.Options.Transport == "realtime",
+                "unverified HomePod capabilities hide explicit choices and retain the draft", checks);
+        }
+        finally { window.Close(); }
+    }
+
     private static async Task MultiRoomAsync(List<string> checks)
     {
         var store = new MemoryStore();
@@ -187,19 +229,21 @@ internal static class ReceiverSettingsRegression
     }
     private sealed class CapabilityCatalog : IReceiverCapabilityCatalog
     {
-        public bool Known;
+        public bool Known, HomePod;
         public Task<ReceiverCapabilitySet> QueryAsync(Receiver receiver, CancellationToken cancellation = default)
         {
             if (!Known) return Task.FromResult(ReceiverCapabilitySet.Unknown);
             var members = receiver.Peers.Select(peer =>
             {
                 var profiles = new List<ReceiverProfile>();
+                foreach (var depth in HomePod ? new[] { 16, 24 } : new[] { 16 })
                 foreach (var rate in new[] { 44100, 48000 })
                     foreach (var codec in new[] { "auto", "pcm", "alac" })
                         foreach (var transport in new[] { "auto", "realtime", "buffered" })
                             foreach (var timing in new[] { "auto", "ptp", "ntp", "follow" })
-                                if (!(transport == "buffered" && (codec == "pcm" || timing == "ntp")) && (timing != "follow" || peer.FollowReceiverClock))
-                                    profiles.Add(new(codec, transport, timing, rate, codec == "pcm" ? "pcm" : "alac", transport == "buffered" ? "buffered" : "realtime", timing == "ntp" ? "ntp" : timing == "follow" || timing == "auto" && peer.FollowReceiverClock ? "follow" : "ptp"));
+                                if (!(transport == "buffered" && (codec == "pcm" || timing == "ntp")) && (timing != "follow" || peer.FollowReceiverClock)
+                                    && (!HomePod || (depth == 24 ? transport != "realtime" && codec != "pcm" && timing != "ntp" : transport != "buffered" && rate == 44100)))
+                                    profiles.Add(new(codec, transport, timing, rate, codec == "pcm" ? "pcm" : "alac", transport == "buffered" || depth == 24 ? "buffered" : "realtime", timing == "ntp" ? "ntp" : timing == "follow" || timing == "auto" && peer.FollowReceiverClock ? "follow" : "ptp", depth));
                 return new ReceiverCapabilities(peer.Id, peer.Address, peer.Port, true, profiles.ToArray());
             }).ToArray();
             return Task.FromResult(new ReceiverCapabilitySet(members));
