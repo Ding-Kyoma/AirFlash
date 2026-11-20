@@ -498,7 +498,21 @@ fn mock_with_cancel_and_model(
                     );
                 }
             } else if method == "SETRATEANCHORTIME" {
-                *anchor_out.lock().unwrap() = Some(request.plist().unwrap());
+                let anchor = request.plist().unwrap();
+                let flags = anchor
+                    .as_dictionary()
+                    .and_then(|fields| fields.get("networkTimeFlags"))
+                    .and_then(plist::Value::as_unsigned_integer);
+                if flags != Some(0) {
+                    let cseq = &request.headers["cseq"];
+                    c.write(
+                        format!("RTSP/1.0 400 Bad Request\r\nCSeq: {cseq}\r\nContent-Length: 0\r\n\r\n")
+                            .as_bytes(),
+                    )
+                    .unwrap();
+                    continue;
+                }
+                *anchor_out.lock().unwrap() = Some(anchor);
             } else if method == "SETPEERSX" {
                 *peers_out.lock().unwrap() = Some(request.plist().unwrap());
             }

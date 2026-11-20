@@ -2266,6 +2266,8 @@ fn send_packets(
                 &dictionary(vec![
                     ("rate", number(1)),
                     ("rtpTime", number(member.media.packetizer.timestamp as u64)),
+                    // AirTunes 1005.x requires this field even when no flags are set.
+                    ("networkTimeFlags", number(0)),
                     ("networkTimeSecs", number(network / 1_000_000_000)),
                     (
                         "networkTimeFrac",
