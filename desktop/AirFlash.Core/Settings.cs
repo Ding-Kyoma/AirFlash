@@ -143,6 +143,13 @@ public sealed class AppSettings : ObservableObject
     public void RefreshCaptureEndpoint() => Notify(nameof(CaptureEndpoint));
     private int _MasterVolume = 100;
     public int MasterVolume { get => _MasterVolume; set => Set(ref _MasterVolume, value); }
+    private bool _BitExactPassthrough = true;
+    /// <summary>
+    /// Copy the capture through untouched when its rate already matches the
+    /// stream rate. On by default: a 1:1 stream has nothing to resample, so
+    /// filtering it only costs high-frequency detail.
+    /// </summary>
+    public bool BitExactPassthrough { get => _BitExactPassthrough; set => Set(ref _BitExactPassthrough, value); }
     public string? LastReceiverId { get; set; }
     public Dictionary<string, ReceiverOptions> Receivers { get; set; } = new(StringComparer.Ordinal);
     public Dictionary<string, string> ReceiverAliases { get; set; } = new(StringComparer.Ordinal);
@@ -241,6 +248,7 @@ public sealed class AppSettings : ObservableObject
         CaptureMode = source.CaptureMode; CaptureEndpoint = source.CaptureEndpoint;
         CaptureApplicationPath = source.CaptureApplicationPath; CaptureApplicationInstance = source.CaptureApplicationInstance;
         MasterVolume = source.MasterVolume; LastReceiverId = source.LastReceiverId;
+        BitExactPassthrough = source.BitExactPassthrough;
         Extra = source.Extra?.ToDictionary(p => p.Key, p => p.Value.Clone());
         ReceiverAliases = new(source.ReceiverAliases, StringComparer.Ordinal);
         foreach (var group in SoftwareGroups.Where(g => source.SoftwareGroups.All(s => s.Id != g.Id)).ToArray()) SoftwareGroups.Remove(group);

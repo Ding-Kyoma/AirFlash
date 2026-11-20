@@ -254,6 +254,11 @@ impl Processor {
         self.next = Some(Chain::new(prepared));
         self.position = 0;
     }
+    /// True when `frame` returns its input untouched: no crossfade in flight and
+    /// the active chain is a bypass. Used to keep 16-bit capture bit-exact.
+    pub fn transparent(&self) -> bool {
+        self.next.is_none() && self.pending.is_none() && self.active.prepared.bypass
+    }
     pub fn frame(&mut self, input: [f32; 2]) -> [f32; 2] {
         let old = self.active.frame(input);
         let Some(next) = &mut self.next else {

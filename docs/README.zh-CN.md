@@ -33,6 +33,9 @@ AirFlash 提供 Windows x64 可执行文件和可独立运行的 MSI 安装包�
 可以下载安装 [Virtual Audio Cable（VAC Lite）](https://software.muzychenko.net/freeware/vac471lite.zip)
 等工具创建虚拟端点，并将需要投放的音频路由到该端点。
 
+音质链路的逐段说明、位精确直通（默认开启）与 PCM 抓取验证方法见
+[音频链路与音质](AUDIO-QUALITY-CHAIN.md)。
+
 ## 主要功能
 
 - 通过 AirPlay 2 将 Windows 系统声音发送到 HomePod。

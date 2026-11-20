@@ -58,6 +58,8 @@ or a similar tool, and route the audio you want to stream to that endpoint.
 See [audio continuity and schema v4](docs/audio-stereo-v3.md) for setup, protocol details,
 simulation results and remaining hardware acceptance. Samsung, Mac and mixed-brand
 playback and acoustic synchronization have not been qualified by this implementation.
+See [audio quality: what the signal passes through](docs/AUDIO-QUALITY-CHAIN.md) for the
+capture-to-HomePod chain, bit-exact passthrough and how to prove it with a PCM dump.
 
 - [ ] Dolby Atmos support.
 
