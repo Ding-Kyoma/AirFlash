@@ -35,6 +35,7 @@ public sealed class SettingsTests
             LatencyMode = "custom", CustomBufferMs = 650, StandbyEnabled = true,
             StandbySilenceSeconds = 22, CaptureMode = "endpoint", CaptureEndpoint = "b",
             MasterVolume = 41, LastReceiverId = "a", DiscoveryInterfaceId = "01db7c77-1016-49cb-8f5c-f5c194425d15",
+            BitExactPassthrough = false,
             Extra = new() { ["future_option"] = JsonSerializer.SerializeToElement(new { enabled = true }) }
         };
         source.Options("a").Volume = 52; source.Options("a").LastVolume = 63; source.Options("a").Hidden = true;
@@ -44,6 +45,7 @@ public sealed class SettingsTests
         target.CopyFrom(source);
         Assert.Same(options, target.Options("a")); Assert.Same(manual, target.ManualReceivers);
         Assert.False(target.CheckUpdatesOnStartup);
+        Assert.False(target.BitExactPassthrough);
         Assert.False(target.Receivers.ContainsKey("removed")); Assert.True(SettingsMerge.Equal(source, target));
         source.Options("a").Volume = 99; source.Extra.Clear();
         Assert.Equal(52, target.Options("a").Volume); Assert.Equal(63, target.Options("a").LastVolume); Assert.True(target.Extra!.ContainsKey("future_option"));
