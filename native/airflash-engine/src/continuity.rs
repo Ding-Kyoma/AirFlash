@@ -49,6 +49,21 @@ impl Quantizer {
             .round()
             .clamp(-32768.0, 32767.0) as i16
     }
+    /// Bit-exact 16-bit conversion for a stream that never left the 16-bit grid.
+    ///
+    /// `i16 / 32768.0` is exact in f32, so scaling by the same 32768 restores the
+    /// original integer for every value, including -32768 (the 32767 scale used
+    /// by the dithered path turns it into -32767). No dither: the sample already
+    /// *is* a 16-bit sample, and decorrelating the quantisation error only makes
+    /// sense when the input carried more resolution than the output.
+    pub fn exact(value: f32) -> i16 {
+        if !value.is_finite() {
+            return 0;
+        }
+        (value.clamp(-1.0, 1.0) * 32768.0)
+            .round()
+            .clamp(-32768.0, 32767.0) as i16
+    }
     /// Frames that received dither (diagnostics only).
     pub fn dither_frames(&self) -> u64 {
         self.dither_frames
@@ -101,6 +116,19 @@ impl Splice {
         self.origin = self.last;
         self.remaining = self.length;
         self.transitions += 1;
+    }
+    /// True when `frame` returns its input untouched for the current chunk: no
+    /// boundary fade in flight, no concealment tail, no gain ramp, and no
+    /// silence-resumption boundary pending. The capture path uses it to keep a
+    /// 16-bit stream bit-exact instead of dithering it a second time.
+    pub fn transparent(&self) -> bool {
+        self.remaining == 0
+            && self.conceal == 0
+            && !self.missing
+            && self.silent_frames < self.rate
+            && self.gain_remaining == 0
+            && self.gain == 1.0
+            && self.gain_target == 1.0
     }
     pub fn frame(&mut self, input: [f32; 2], gain: f32, missing: bool) -> [f32; 2] {
         if !self.gain_initialized {
@@ -195,6 +223,45 @@ mod tests {
         assert_eq!(q.quantize(f32::INFINITY), 0);
         assert!(i32::from(q.quantize(4.0)) <= 32767);
         assert!(i32::from(q.quantize(-4.0)) >= -32768);
+    }
+    #[test]
+    fn exact_conversion_round_trips_every_sixteen_bit_code() {
+        for code in i16::MIN..=i16::MAX {
+            assert_eq!(Quantizer::exact(f32::from(code) / 32768.0), code, "{code}");
+        }
+        assert_eq!(Quantizer::exact(f32::NAN), 0);
+        assert_eq!(Quantizer::exact(f32::INFINITY), 0);
+        assert_eq!(Quantizer::exact(4.0), 32767);
+        assert_eq!(Quantizer::exact(-4.0), -32768);
+    }
+    #[test]
+    fn transparency_tracks_the_fade_gain_and_concealment_state() {
+        let rate = 44100;
+        let settle = |s: &mut Splice| {
+            for _ in 0..rate / 200 + 2 {
+                s.frame([0.5, -0.5], 1.0, false);
+            }
+        };
+        let mut s = Splice::new(rate);
+        assert!(!s.transparent(), "startup fade must not be transparent");
+        settle(&mut s);
+        assert!(s.transparent());
+        assert_eq!(s.frame([0.25, -0.5], 1.0, false), [0.25, -0.5]);
+        s.frame([0.5; 2], 0.5, false);
+        assert!(!s.transparent(), "gain ramp must not be transparent");
+        settle(&mut s);
+        assert!(s.transparent());
+        s.frame([0.5; 2], 1.0, true);
+        assert!(!s.transparent(), "concealment must not be transparent");
+        settle(&mut s);
+        assert!(s.transparent());
+        for _ in 0..rate {
+            s.frame([0.0; 2], 1.0, false);
+        }
+        assert!(
+            !s.transparent(),
+            "a silence boundary is still pending when audio resumes"
+        );
     }
     #[test]
     fn startup_respects_initial_gain_and_silence_resume_has_no_peak() {

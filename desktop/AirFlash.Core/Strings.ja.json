@@ -427,5 +427,12 @@
   "Start streaming before testing Sound Glow.": "Sound Glow を試す前に配信を開始してください。",
   "Sound Glow": "Sound Glow",
   "Test HomePod light effects with synthetic covers and metadata.": "合成ジャケットとメタデータで HomePod のライト効果を試します。",
-  "Log": "ログ"
+  "Log": "ログ",
+  "Bit-exact passthrough": "ビット完全パススルー",
+  "Copy the capture untouched when its sample rate already matches the stream": "サンプルレートがストリームと一致している場合はキャプチャをそのまま通す",
+  "No resampling and no dither: 16-bit samples reach HomePod unchanged. Clock drift is absorbed by one-frame corrections at smooth points in the signal. The first 5 ms after playback starts or resumes from silence is faded in, and an equalizer or master gain below 100% makes the path a processed one.": "リサンプリングもディザも行わず、16 ビットのサンプルをそのまま HomePod へ届けます。クロックのずれは、信号の滑らかな箇所での 1 フレーム補正で吸収します。再生開始時と無音から復帰した最初の 5 ms はフェードインし、イコライザーまたはマスター音量が 100% 未満の場合は処理ありの経路になります。",
+  "Audio chain": "オーディオ経路",
+  "bit-exact": "ビット完全",
+  "resampled": "リサンプリング済み",
+  "{0} one-frame corrections": "{0} 回の 1 フレーム補正"
 }

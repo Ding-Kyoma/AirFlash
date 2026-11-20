@@ -427,5 +427,12 @@
   "Start streaming before testing Sound Glow.": "请先开始播放，再测试 Sound Glow。",
   "Sound Glow": "Sound Glow",
   "Test HomePod light effects with synthetic covers and metadata.": "使用虚构封面和歌曲信息测试 HomePod 灯效。",
-  "Log": "日志"
+  "Log": "日志",
+  "Bit-exact passthrough": "位精确直通",
+  "Copy the capture untouched when its sample rate already matches the stream": "采样率与串流一致时原样复制采集数据",
+  "No resampling and no dither: 16-bit samples reach HomePod unchanged. Clock drift is absorbed by one-frame corrections at smooth points in the signal. The first 5 ms after playback starts or resumes from silence is faded in, and an equalizer or master gain below 100% makes the path a processed one.": "不重采样也不加抖动：16 位样本原样送达 HomePod。时钟漂移通过在信号平缓处插入或删除一帧来吸收。播放开始或从静音恢复后的前 5 ms 会淡入；开启均衡器或主音量低于 100% 时，这条通路就变成有处理的通路。",
+  "Audio chain": "音频链路",
+  "bit-exact": "位精确",
+  "resampled": "已重采样",
+  "{0} one-frame corrections": "{0} 次单帧校正"
 }

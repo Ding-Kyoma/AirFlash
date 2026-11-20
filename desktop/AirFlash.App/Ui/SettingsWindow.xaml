@@ -84,6 +84,13 @@
         </Border>
         <Border Style="{StaticResource Card}">
           <StackPanel>
+            <TextBlock Text="{loc:Text 'Bit-exact passthrough'}" Style="{StaticResource SectionTitle}"/>
+            <CheckBox Content="{loc:Text 'Copy the capture untouched when its sample rate already matches the stream'}" IsChecked="{Binding Draft.BitExactPassthrough}"/>
+            <TextBlock Text="{loc:Text 'No resampling and no dither: 16-bit samples reach HomePod unchanged. Clock drift is absorbed by one-frame corrections at smooth points in the signal. The first 5 ms after playback starts or resumes from silence is faded in, and an equalizer or master gain below 100% makes the path a processed one.'}" Style="{StaticResource Hint}"/>
+          </StackPanel>
+        </Border>
+        <Border Style="{StaticResource Card}">
+          <StackPanel>
             <TextBlock Text="{loc:Text 'Play an application only on HomePod'}" Style="{StaticResource SectionTitle}"/>
             <TextBlock Text="{loc:Text 'Install a virtual audio cable, then set only the target application output to CABLE Input in the Windows volume mixer. Keep games and notifications on your headphones.'}" Style="{StaticResource Hint}"/>
             <Button Content="{loc:Text 'Open Windows volume mixer'}" Command="{Binding OpenVolumeMixerCommand}" HorizontalAlignment="Left" Margin="0,12,0,12"/>
@@ -356,6 +363,10 @@
             <DockPanel Margin="0,0,0,12">
               <TextBlock Text="{loc:Text 'Stream sample rate'}" Style="{StaticResource Hint}"/>
               <TextBlock Text="{Binding App.MonitorStreamRate}" HorizontalAlignment="Right"/>
+            </DockPanel>
+            <DockPanel Margin="0,0,0,12">
+              <TextBlock Text="{loc:Text 'Audio chain'}" Style="{StaticResource Hint}"/>
+              <TextBlock Text="{Binding App.MonitorChain}" HorizontalAlignment="Right"/>
             </DockPanel>
             <DockPanel>
               <TextBlock Text="{loc:Text 'End-to-end acoustic latency'}" Style="{StaticResource Hint}"/>
