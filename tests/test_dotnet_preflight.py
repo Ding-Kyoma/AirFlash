@@ -17,6 +17,7 @@ HARNESS = r"""
 $ErrorActionPreference = 'Stop'
 $global:airflashTestCase = $env:AIRFLASH_PREFLIGHT_CASE | ConvertFrom-Json
 $global:airflashTestEvents = [Collections.Generic.List[object]]::new()
+$global:airflashTestPathMatches = @()
 $global:airflashTestRoot = $env:AIRFLASH_PREFLIGHT_ROOT
 $global:airflashTestIntegration = $env:AIRFLASH_PREFLIGHT_INTEGRATION
 $global:PSNativeCommandUseErrorActionPreference = [bool]$global:airflashTestCase.native_errors
@@ -31,6 +32,14 @@ function global:Get-Command {
     [CmdletBinding()]
     param([string[]]$Name, $CommandType)
     if ($Name.Count -eq 1 -and $Name[0] -eq 'dotnet') {
+        if ($global:airflashTestCase.real_path_lookup) {
+            # Preserve the real cmdlet's ordered ApplicationInfo results. Full-path
+            # functions intercept invocation only, never native PATH discovery.
+            $matches = @(Microsoft.PowerShell.Core\Get-Command @PSBoundParameters)
+            $global:airflashTestPathMatches = @($matches | ForEach-Object Source)
+            $matches
+            return
+        }
         if ($global:airflashTestCase.hosts.path) {
             [pscustomobject]@{ Source = $global:airflashTestCase.hosts.path.path }
         }
@@ -119,6 +128,7 @@ try {
 [pscustomobject]@{
     error = $errorMessage; exit = $capturedExit; output = $capturedOutput; resolved = $resolved
     events = $global:airflashTestEvents.ToArray(); cwd = (Get-Location).Path
+    path_matches = $global:airflashTestPathMatches
     cli_home = $env:DOTNET_CLI_HOME; nuget = $env:NUGET_PACKAGES
     telemetry = $env:DOTNET_CLI_TELEMETRY_OPTOUT
 } | ConvertTo-Json -Depth 10 -Compress | Set-Content -LiteralPath $env:AIRFLASH_PREFLIGHT_REPORT
@@ -321,6 +331,83 @@ def test_preflight_checks_the_selected_host_in_desktop(fixture, available, selec
     assert calls[0]["path"] == str(paths[selected])
     assert calls[0]["cwd"] == str(fixture.root / "desktop")
     assert calls[0]["arguments"] == ["--version"]
+
+
+def ordered_path_environment(*hosts):
+    return {"PATH": os.pathsep.join([*(str(host.parent) for host in hosts), os.environ["PATH"]])}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Requires Windows executable PATH discovery")
+def test_real_ordered_path_lookup_selects_and_invokes_only_first_compatible_host(fixture):
+    first = fixture.host("first PATH installation", version="10.0.402")
+    second = fixture.host("second PATH installation", version="", resolve_exit=42)
+    result = fixture.run(
+        "check-dotnet.ps1",
+        real_path_lookup=True,
+        environment=ordered_path_environment(first, second),
+    )
+    assert result["path_matches"][:2] == [str(first), str(second)]
+    assert result["error"] is None, result
+    assert result["exit"] == 0
+    assert side_effects(result) == []
+    assert [(call["path"], call["arguments"], call["cwd"]) for call in host_calls(result)] == [
+        (str(first), ["--version"], str(fixture.root / "desktop"))
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Requires Windows executable PATH discovery")
+def test_real_ordered_path_lookup_rejects_first_incompatible_host_without_fallback(fixture):
+    first = fixture.host(
+        "first PATH installation",
+        version="",
+        resolve_exit=42,
+        error="Synthetic preferred PATH installation has no compatible SDK.",
+    )
+    second = fixture.host("second PATH installation", version="10.0.402")
+    result = fixture.run(
+        "build-release.ps1",
+        real_path_lookup=True,
+        native_errors=True,
+        environment=ordered_path_environment(first, second),
+    )
+    assert result["path_matches"][:2] == [str(first), str(second)]
+    assert result["error"], result
+    assert side_effects(result) == []
+    assert [(call["path"], call["arguments"], call["cwd"]) for call in host_calls(result)] == [
+        (str(first), ["--version"], str(fixture.root / "desktop"))
+    ]
+    for expected in (str(first), "Synthetic preferred PATH", "10.0.100", "latestFeature"):
+        assert expected in result["error"]
+    assert not (fixture.root / "artifacts/release.lock").exists()
+    for directory in ("build", "dist"):
+        assert (fixture.root / directory / "preserve.txt").read_text() == "keep fixture output"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Requires Windows executable PATH discovery")
+@pytest.mark.parametrize("preferred", ["checkout", "integration", "override"])
+def test_multiple_actual_path_hosts_do_not_override_deliberate_host_precedence(fixture, preferred):
+    first = fixture.host("first PATH installation", version="", resolve_exit=42)
+    second = fixture.host("second PATH installation", version="10.0.402")
+    fixture.host("integration", version="10.0.402")
+    if preferred in ("checkout", "override"):
+        fixture.host("checkout", version="10.0.402")
+    if preferred == "override":
+        fixture.host("override", version="10.0.402")
+    selected = fixture.hosts[preferred]["path"]
+    parameters = {"override": selected} if preferred == "override" else {}
+    result = fixture.run(
+        mode="context",
+        real_path_lookup=True,
+        environment=ordered_path_environment(first, second),
+        **parameters,
+    )
+    assert result["error"] is None, result
+    assert result["resolved"] == "10.0.402"
+    assert result["path_matches"] == []  # Preferred installations avoid PATH lookup entirely.
+    assert side_effects(result) == []
+    assert [(call["path"], call["arguments"]) for call in host_calls(result)] == [
+        (selected, ["--version"])
+    ]
 
 
 @pytest.mark.parametrize("version", ["10.0.100", "10.0.301", "10.0.400"])
