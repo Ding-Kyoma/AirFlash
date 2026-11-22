@@ -16,6 +16,7 @@ use windows::{
 };
 use zeroize::Zeroizing;
 const MAGIC: &[u8] = b"W2AP\x01";
+const PASSWORD_MAGIC: &[u8] = b"W2PW\x01";
 const MAX_FILE_BYTES: usize = 16 * 1024;
 pub fn directory() -> PathBuf {
     std::env::var_os("APPDATA")
@@ -112,18 +113,37 @@ fn load_with<R: Read>(
     target: &Path,
     open: impl FnOnce(&Path) -> io::Result<R>,
 ) -> Result<Option<Credentials>> {
+    read_opened_with(
+        target,
+        "native credentials",
+        "credential file too large",
+        open,
+        decode_credentials,
+    )
+}
+
+fn read_opened_with<R: Read, T>(
+    target: &Path,
+    kind: &str,
+    oversize: &str,
+    open: impl FnOnce(&Path) -> io::Result<R>,
+    decode: impl FnOnce(&[u8]) -> Result<T>,
+) -> Result<Option<T>> {
     let file = match open(target) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("cannot open native credentials"),
+        Err(error) => return Err(error).with_context(|| format!("cannot open {kind}")),
     };
-    // Read the opened object, not the path again. Only the initial open can establish
-    // absence; disappearance or other failures during reading must remain errors.
+    // Only the initial open establishes absence. Read this object once, without
+    // a metadata/path reread, and bound a file that can grow after it is opened.
     let mut data = Vec::new();
     file.take((MAX_FILE_BYTES + 1) as u64)
         .read_to_end(&mut data)
-        .context("cannot read native credentials")?;
-    ensure!(data.len() <= MAX_FILE_BYTES, "credential file too large");
+        .with_context(|| format!("cannot read {kind}"))?;
+    ensure!(data.len() <= MAX_FILE_BYTES, "{oversize}");
+    decode(&data).map(Some)
+}
+fn decode_credentials(data: &[u8]) -> Result<Credentials> {
     ensure!(data.starts_with(MAGIC), "unsupported credential format");
     let clear = protect(&data[MAGIC.len()..], false)
         .context("cannot decrypt native credentials for this Windows user")?;
@@ -132,7 +152,7 @@ fn load_with<R: Read>(
         !credentials.controller_id.is_empty() && !credentials.accessory_id.is_empty(),
         "empty credential identity"
     );
-    Ok(Some(credentials))
+    Ok(credentials)
 }
 pub fn save_password(root: &Path, id: &str, password: &str) -> Result<()> {
     std::fs::create_dir_all(root)?;
@@ -144,7 +164,7 @@ pub fn save_password(root: &Path, id: &str, password: &str) -> Result<()> {
             .write(true)
             .create_new(true)
             .open(&temp)?;
-        file.write_all(b"W2PW\x01")?;
+        file.write_all(PASSWORD_MAGIC)?;
         file.write_all(&encrypted)?;
         file.sync_all()?;
         drop(file);
@@ -164,18 +184,32 @@ pub fn save_password(root: &Path, id: &str, password: &str) -> Result<()> {
 }
 pub fn load_password(root: &Path, id: &str) -> Result<Option<Zeroizing<String>>> {
     let target = path(root, id).with_extension("password.dpapi");
-    if !target.exists() {
-        return Ok(None);
-    }
+    load_password_with(&target, |target| std::fs::File::open(target))
+}
+
+fn load_password_with<R: Read>(
+    target: &Path,
+    open: impl FnOnce(&Path) -> io::Result<R>,
+) -> Result<Option<Zeroizing<String>>> {
+    read_opened_with(
+        target,
+        "stored password",
+        "password file too large",
+        open,
+        decode_password,
+    )
+}
+
+fn decode_password(data: &[u8]) -> Result<Zeroizing<String>> {
     ensure!(
-        std::fs::metadata(&target)?.len() <= 16384,
-        "password file too large"
+        data.starts_with(PASSWORD_MAGIC),
+        "unsupported password format"
     );
-    let data = std::fs::read(target)?;
-    ensure!(data.starts_with(b"W2PW\x01"), "unsupported password format");
-    let mut clear = protect(&data[5..], false)?;
-    let text = String::from_utf8(std::mem::take(&mut *clear)).context("invalid stored password")?;
-    Ok(Some(Zeroizing::new(text)))
+    let clear = protect(&data[PASSWORD_MAGIC.len()..], false)
+        .context("cannot decrypt stored password for this Windows user")?;
+    // Utf8Error reports validation offsets without retaining a plaintext buffer.
+    let text = std::str::from_utf8(&clear).context("invalid stored password")?;
+    Ok(Zeroizing::new(text.to_owned()))
 }
 
 #[cfg(test)]
@@ -217,10 +251,10 @@ mod tests {
             controller_secret: [22; 32],
         }
     }
-    fn expect_error(result: Result<Option<Credentials>>) -> anyhow::Error {
+    fn expect_error<T>(result: Result<T>) -> anyhow::Error {
         match result {
             Err(error) => error,
-            Ok(_) => panic!("credential load unexpectedly succeeded"),
+            Ok(_) => panic!("storage lookup unexpectedly succeeded"),
         }
     }
     fn assert_setup_io_event(
@@ -403,6 +437,104 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn password_lookup_distinguishes_open_absence_from_other_failures() {
+        let target = Path::new("synthetic-password.dpapi");
+        let absent = load_password_with(target, |_| -> io::Result<Cursor<Vec<u8>>> {
+            Err(io::Error::new(io::ErrorKind::NotFound, "synthetic absence"))
+        });
+        assert!(absent.unwrap().is_none());
+
+        struct FailedRead(io::ErrorKind);
+        impl Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(self.0, "synthetic password read"))
+            }
+        }
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+        ] {
+            let error = expect_error(load_password_with(target, |_| Ok(FailedRead(kind))));
+            assert_setup_io_event(
+                &error,
+                kind,
+                "cannot read stored password",
+                "synthetic password read",
+            );
+        }
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Other] {
+            let opens = Cell::new(0);
+            let error = expect_error(load_password_with(
+                target,
+                |opened| -> io::Result<Cursor<Vec<u8>>> {
+                    assert_eq!(opened, target);
+                    opens.set(opens.get() + 1);
+                    Err(io::Error::new(kind, "synthetic password open"))
+                },
+            ));
+            assert_eq!(opens.get(), 1);
+            assert_setup_io_event(
+                &error,
+                kind,
+                "cannot open stored password",
+                "synthetic password open",
+            );
+        }
+    }
+
+    #[test]
+    fn password_lookup_uses_the_opened_handle_and_rejects_an_oversized_file() {
+        let root = TemporaryRoot::new();
+        let id = "synthetic-accessory";
+        let target = path(&root.0, id).with_extension("password.dpapi");
+        let password = "  \t";
+        assert!(load_password(&root.0, id).unwrap().is_none());
+        save_password(&root.0, id, password).unwrap();
+        let loaded = load_password_with(&target, |opened| {
+            let file = std::fs::File::open(opened)?;
+            std::fs::rename(opened, opened.with_extension("original"))?;
+            std::fs::write(opened, vec![0; MAX_FILE_BYTES + 1])?;
+            Ok(file)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(loaded.as_str(), password);
+        assert_eq!(
+            expect_error(load_password(&root.0, id)).to_string(),
+            "password file too large"
+        );
+    }
+
+    #[test]
+    fn invalid_password_format_dpapi_and_utf8_do_not_fall_back_or_expose_plaintext() {
+        let root = TemporaryRoot::new();
+        let id = "synthetic-accessory";
+        let target = path(&root.0, id).with_extension("password.dpapi");
+        std::fs::write(&target, b"W2PW\x02").unwrap();
+        assert_eq!(
+            expect_error(load_password(&root.0, id)).to_string(),
+            "unsupported password format"
+        );
+
+        let encrypted = protect(b"synthetic-secret\xff", true).unwrap();
+        let mut bytes = PASSWORD_MAGIC.to_vec();
+        bytes.extend_from_slice(&encrypted);
+        std::fs::write(&target, &bytes).unwrap();
+        let error = expect_error(load_password(&root.0, id));
+        assert!(error.is::<std::str::Utf8Error>());
+        assert!(!format!("{error:?}").contains("synthetic-secret"));
+
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&target, bytes).unwrap();
+        assert!(
+            expect_error(load_password(&root.0, id))
+                .to_string()
+                .contains("cannot decrypt stored password")
+        );
+    }
+
     #[test]
     fn passwords_are_user_bound_encrypted_and_separate_from_pairing_credentials() {
         let root =
