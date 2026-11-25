@@ -527,6 +527,40 @@ public sealed class SettingsRecoveryTests
         fixture.AssertNoTemps();
     }
 
+    [Fact]
+    public void MalformedGroupAfterAValidGroupRecoversTheWholeConfiguration()
+    {
+        using var fixture = new Fixture();
+        var original = Encode("""
+            {
+                "schema_version": 5,
+                "auto_connect_on_discover": true,
+                "software_groups": [
+                    { "id": "software:first", "left_id": "left", "right_id": "right" },
+                    { "id": "software:second", "left_id": "other-left", "right_id": "other-right", "members": [null] }
+                ]
+            }
+            """, "utf8-bom");
+        File.WriteAllBytes(fixture.Path, original);
+        var store = new SettingsStore(fixture.Path);
+
+        for (var load = 0; load < 2; load++)
+        {
+            var recovered = store.Load();
+            Assert.Empty(recovered.SoftwareGroups);
+            Assert.False(recovered.AutoConnectOnDiscover);
+            Assert.False(string.IsNullOrWhiteSpace(store.LoadWarning));
+        }
+        Assert.Equal(original, File.ReadAllBytes(fixture.Path));
+        Assert.Empty(fixture.Backups());
+
+        store.Save(new() { MasterVolume = 29 });
+        Assert.Equal(original, File.ReadAllBytes(Assert.Single(fixture.Backups())));
+        var reopened = new SettingsStore(fixture.Path);
+        Assert.Equal(29, reopened.Load().MasterVolume);
+        Assert.Null(reopened.LoadWarning);
+    }
+
     public static TheoryData<string> InvalidConfigurations => new()
     {
         "[]", "null", "42",
@@ -544,6 +578,11 @@ public sealed class SettingsRecoveryTests
         """{"schema_version":2,"receivers":{"one":{"sample_rate":"invalid"}}}""",
         """{"schema_version":2,"receivers":{"one":{"sample_rate":"96000"}}}""",
         """{"schema_version":2,"receivers":{"one":{"sample_rate":44100}}}""",
+        """{"schema_version":5,"software_groups":[{"id":null,"left_id":"left","right_id":"right"}]}""",
+        """{"schema_version":5,"software_groups":[{"id":"software:one","group_mode":"multi_room","members":null}]}""",
+        """{"schema_version":5,"software_groups":[{"id":"software:one","group_mode":"multi_room","members":[{"receiver_id":"first"},null]}]}""",
+        """{"schema_version":5,"software_groups":[{"id":"software:one","left_id":"left","right_id":"right","members":null}]}""",
+        """{"schema_version":5,"software_groups":[{"id":"software:one","left_id":"left","right_id":"right","members":[null]}]}""",
         """{"schema_version":2,"software_groups":[{"id":"software:one","name":"Stereo","left_id":"left","right_id":"right","sample_rate":"invalid"}]}""",
         """{"schema_version":2,"software_groups":[{"id":"software:one","name":"Stereo","left_id":"left","right_id":"right","sample_rate":null}]}""",
         """{"schema_version":2,"ui_language":null}""",
