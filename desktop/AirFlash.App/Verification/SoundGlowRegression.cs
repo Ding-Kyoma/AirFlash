@@ -142,7 +142,7 @@ internal static class SoundGlowRegression
         }
         stream.Seek(0);
         var thumbnail = RandomAccessStreamReference.CreateFromStream(stream);
-        var jpeg = await PlayerArtworkReader.ReadAsync(thumbnail, CancellationToken.None)
+        var jpeg = PlayerArtworkReader.Read(thumbnail, CancellationToken.None)
             ?? throw new InvalidOperationException("Missing encoded thumbnail");
         using var output = new MemoryStream(jpeg);
         var decoded = new JpegBitmapDecoder(output, BitmapCreateOptions.None, BitmapCacheOption.OnLoad).Frames[0];

@@ -8,14 +8,20 @@ internal static class PlayerArtworkReader
 {
     private const int MaxSourceBytes = 16 * 1024 * 1024;
 
-    public static async Task<byte[]?> ReadAsync(IRandomAccessStreamReference thumbnail, CancellationToken cancellation)
+    // Deliberately synchronous: awaiting a WinRT stream operation resumes the
+    // continuation on an STA thread, and SMTC session calls made from that thread
+    // fail with RPC_E_WRONG_THREAD (an empty-message COMException). Blocking keeps
+    // the read and the caller's follow-up session query on the same MTA thread.
+    // The streaming caller runs this on a thread-pool thread; never call it on the
+    // UI thread with a real media-session reference.
+    public static byte[]? Read(IRandomAccessStreamReference thumbnail, CancellationToken cancellation)
     {
-        using var source = await thumbnail.OpenReadAsync().AsTask(cancellation).ConfigureAwait(false);
+        using var source = thumbnail.OpenReadAsync().AsTask(cancellation).GetAwaiter().GetResult();
         var length = source.Size;
         if (length is 0 or > MaxSourceBytes) return null;
         using var stream = source.AsStreamForRead();
         var data = new byte[(int)length];
-        await stream.ReadExactlyAsync(data, cancellation).ConfigureAwait(false);
+        stream.ReadExactly(data.AsSpan());
         cancellation.ThrowIfCancellationRequested();
         return Encode(data);
     }
