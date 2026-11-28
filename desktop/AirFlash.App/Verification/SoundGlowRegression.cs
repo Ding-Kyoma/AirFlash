@@ -1,11 +1,14 @@
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using AirFlash.App.Metadata;
 using AirFlash.App.Services;
 using AirFlash.App.Ui;
 using AirFlash.App.ViewModels;
 using AirFlash.Core;
+using Windows.Storage.Streams;
 using static AirFlash.App.Verification.UiSmoke;
 namespace AirFlash.App.Verification;
 
@@ -15,6 +18,7 @@ internal static class SoundGlowRegression
     {
         try
         {
+            var jpeg = await CheckPlayerThumbnail(checks);
             foreach (var language in new[] { "en-US", "zh-CN", "zh-TW", "de-DE", "es-ES" })
             {
                 L.Initialize([language]);
@@ -30,6 +34,8 @@ internal static class SoundGlowRegression
                     Check(settings.OwnedWindows.Count == 0, language + ": experiment is embedded without a child window", checks);
                     var buttons = Descendants(panel).OfType<Button>().Where(b => b.Tag is string).ToArray();
                     var reset = Descendants(panel).OfType<Button>().Single(b => b.Name == "SoundGlowReset");
+                    var follow = Descendants(panel).OfType<CheckBox>().Single(c => c.Name == "FollowArtwork");
+                    Check(!follow.IsEnabled, language + ": artwork waits for a stream", checks);
                     Check(buttons.Length == 4 && buttons.All(b => !b.IsEnabled), language + ": experiment disabled before streaming", checks);
                     await app.Session.StartAsync(receiver, app.Settings.Clone());
                     await Until(() => app.Session.Snapshot.State == PlaybackState.Streaming); await Pump();
@@ -51,7 +57,7 @@ internal static class SoundGlowRegression
                     settings.Width = 880; await Pump();
                     foreach (var button in buttons) { button.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await Pump(); }
                     Check(engine.Commands.Count(c => c.Text("command") == "set_sound_glow") == 4, language + ": all four manual actions send a request", checks);
-                    var cycle = Descendants(panel).OfType<CheckBox>().Single();
+                    var cycle = Descendants(panel).OfType<CheckBox>().Single(c => c.Name == "Cycle");
                     cycle.IsChecked = true;
                     await Until(() => engine.Commands.Count(c => c.Text("command") == "set_sound_glow") == 5);
                     var latest = engine.Commands.Last(c => c.Text("command") == "set_sound_glow").GetProperty("params");
@@ -79,6 +85,20 @@ internal static class SoundGlowRegression
                     Check(log.ExtentHeight > log.ViewportHeight && logScroll.ComputedVerticalScrollBarVisibility == Visibility.Visible,
                         language + ": the fixed log scrolls internally", checks);
                     Check(settings.OwnedWindows.Count == 0, language + ": actions never open a child window", checks);
+                    follow.IsChecked = true;
+                    follow.RaiseEvent(new RoutedEventArgs(CheckBox.ClickEvent));
+                    await Until(() => app.Session.PlayerArtworkGeneration.HasValue);
+                    var current = new NowPlaying("Cover sample", "Artist", "", "", true, 10000, 0)
+                        { ArtworkJpeg = jpeg, ArtworkGeneration = app.Session.PlayerArtworkGeneration };
+                    await app.Session.PublishNowPlayingAsync(current);
+                    var request = engine.Commands.Last(c => c.Text("command") == "set_sound_glow").GetProperty("params");
+                    Check(request.Text("palette") == "player_artwork" && request.GetProperty("track").GetProperty("jpeg")
+                        .GetBytesFromBase64().AsSpan().SequenceEqual(jpeg), language + ": current album JPEG reaches the engine", checks);
+                    engine.EmitEvent!(new { @event = "sound_glow_result", sequence = request.Integer("sequence"), palette = "player_artwork", part = "artwork", accepted = true });
+                    var preview = Descendants(panel).OfType<Image>().Single(i => i.Name == "CoverPreview");
+                    await Until(() => preview.Source is BitmapFrame);
+                    settings.ViewModel.SelectedPage = SettingsViewModel.EqualizerPage; await Pump();
+                    Check(app.Session.FollowPlayerArtwork, language + ": following continues after leaving Sound Glow", checks);
                 }
                 finally { settings.Close(); }
                 await app.Session.StopAsync();
@@ -96,11 +116,39 @@ internal static class SoundGlowRegression
                 oldSettings.ViewModel.SelectedPage = SettingsViewModel.SoundGlowPage; await Pump();
                 var oldPanel = Descendants(oldSettings).OfType<SoundGlowPanel>().Single();
                 Check(Descendants(oldPanel).OfType<Button>().Where(b => b.Tag is string).All(b => !b.IsEnabled), "old engine: actions disabled while normal playback works", checks);
+                Check(!Descendants(oldPanel).OfType<CheckBox>().Single(c => c.Name == "FollowArtwork").IsEnabled, "old engine: current album cover control is disabled", checks);
                 Check(oldSettings.OwnedWindows.Count == 0, "old engine: experiment stays embedded", checks);
             }
             finally { oldSettings.Close(); }
         }
         finally { L.Initialize(["en-US"]); ThemeService.SetForVerification(false); }
+    }
+    private static async Task<byte[]> CheckPlayerThumbnail(List<string> checks)
+    {
+        const int width = 640, height = 320;
+        var pixels = new byte[width * height * 3];
+        new Random(42).NextBytes(pixels);
+        var frame = BitmapSource.Create(width, height, 96, 96, PixelFormats.Rgb24, null, pixels, width * 3);
+        var png = new PngBitmapEncoder();
+        png.Frames.Add(BitmapFrame.Create(frame));
+        using var input = new MemoryStream();
+        png.Save(input);
+        using var stream = new InMemoryRandomAccessStream();
+        using (var writer = new DataWriter(stream.GetOutputStreamAt(0)))
+        {
+            writer.WriteBytes(input.ToArray());
+            await writer.StoreAsync();
+            await writer.FlushAsync();
+        }
+        stream.Seek(0);
+        var thumbnail = RandomAccessStreamReference.CreateFromStream(stream);
+        var jpeg = PlayerArtworkReader.Read(thumbnail, CancellationToken.None)
+            ?? throw new InvalidOperationException("Missing encoded thumbnail");
+        using var output = new MemoryStream(jpeg);
+        var decoded = new JpegBitmapDecoder(output, BitmapCreateOptions.None, BitmapCacheOption.OnLoad).Frames[0];
+        Check(jpeg.Length <= NowPlaying.MaxArtworkBytes && decoded.PixelWidth <= 256 && decoded.PixelWidth == 2 * decoded.PixelHeight,
+            "WinRT thumbnail becomes a bounded JPEG with the original aspect ratio", checks);
+        return jpeg;
     }
     private static void Check(bool value, string name, List<string> checks) { if (!value) throw new InvalidOperationException(name); checks.Add(name); }
     private static async Task Pump() { await Application.Current.Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle); await Task.Delay(40); }

@@ -1,4 +1,9 @@
 {
+  "Follow current album cover": "Suivre la pochette de l’album en cours",
+  "Enable Sound Glow in the Home app. Album covers follow track changes even after closing Settings.": "Activez Sound Glow dans l’app Maison. La pochette change à chaque morceau, même après la fermeture des réglages.",
+  "Waiting for the current album cover.": "En attente de la pochette de l’album en cours.",
+  "No cover available: {0}": "Pochette indisponible : {0}",
+  "Current cover: {0}": "Pochette actuelle : {0}",
   "No receivers found": "Aucun récepteur trouvé",
   "Discovery paused. Showing previous results.": "Recherche suspendue. Affichage des résultats précédents.",
   "Check for updates": "Rechercher des mises à jour",
@@ -426,7 +431,7 @@
   "Playback: {0} · Requested palette: {1}": "Lecture : {0} · Palette demandée : {1}",
   "Start streaming before testing Sound Glow.": "Démarrez la diffusion avant de tester Sound Glow.",
   "Sound Glow": "Sound Glow",
-  "Test HomePod light effects with synthetic covers and metadata.": "Testez les effets lumineux avec pochettes et métadonnées.",
+  "Use player album covers or test colors with HomePod Sound Glow.": "Utilisez les pochettes du lecteur ou les couleurs de test avec Sound Glow sur le HomePod.",
   "Log": "Journal",
   "Bit-exact passthrough": "Transmission exacte au bit près",
   "Copy the capture untouched when its sample rate already matches the stream": "Copier la capture telle quelle lorsque sa fréquence d’échantillonnage correspond déjà au flux",

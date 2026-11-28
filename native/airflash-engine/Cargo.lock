@@ -19,6 +19,7 @@ dependencies = [
  "alac",
  "alac-encoder",
  "anyhow",
+ "base64",
  "chacha20poly1305",
  "ed25519-dalek",
  "hkdf",

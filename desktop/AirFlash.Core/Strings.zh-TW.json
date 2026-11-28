@@ -1,4 +1,9 @@
 {
+  "Follow current album cover": "跟隨目前歌曲封面",
+  "Enable Sound Glow in the Home app. Album covers follow track changes even after closing Settings.": "請先在「家庭」App 開啟聲音光暈。啟用封面跟隨後，關閉設定視窗仍會隨曲目更新。",
+  "Waiting for the current album cover.": "正在等待播放器提供封面。",
+  "No cover available: {0}": "播放器未提供《{0}》的封面",
+  "Current cover: {0}": "目前封面：{0}",
   "No receivers found": "找不到接收器",
   "Discovery paused. Showing previous results.": "已暫停搜尋，顯示上次的結果。",
   "Configuration contains invalid values: {0}": "設定包含無效的值：{0}",
@@ -426,7 +431,7 @@
   "Playback: {0} · Requested palette: {1}": "播放狀態：{0} · 請求的配色：{1}",
   "Start streaming before testing Sound Glow.": "請先開始播放，再測試 Sound Glow。",
   "Sound Glow": "Sound Glow",
-  "Test HomePod light effects with synthetic covers and metadata.": "使用虛構封面和歌曲資訊測試 HomePod 燈效。",
+  "Use player album covers or test colors with HomePod Sound Glow.": "將目前播放的專輯封面或測試色傳送到 HomePod，用於聲音光暈。",
   "Log": "日誌",
   "Bit-exact passthrough": "位元精確直通",
   "Copy the capture untouched when its sample rate already matches the stream": "取樣率與串流一致時原樣複製擷取資料",

@@ -1,4 +1,9 @@
 {
+  "Follow current album cover": "현재 앨범 표지 따라가기",
+  "Enable Sound Glow in the Home app. Album covers follow track changes even after closing Settings.": "홈 앱에서 Sound Glow를 켜세요. 설정을 닫아도 곡이 바뀌면 표지가 바뀝니다.",
+  "Waiting for the current album cover.": "현재 앨범 표지를 기다리는 중입니다.",
+  "No cover available: {0}": "표지가 없습니다: {0}",
+  "Current cover: {0}": "현재 표지: {0}",
   "No receivers found": "수신기를 찾을 수 없습니다",
   "Discovery paused. Showing previous results.": "검색이 일시 중지되었습니다. 이전 결과를 표시합니다.",
   "Check for updates": "업데이트 확인",
@@ -426,7 +431,7 @@
   "Playback: {0} · Requested palette: {1}": "재생: {0} · 요청 팔레트: {1}",
   "Start streaming before testing Sound Glow.": "Sound Glow를 테스트하기 전에 스트리밍을 시작하세요.",
   "Sound Glow": "Sound Glow",
-  "Test HomePod light effects with synthetic covers and metadata.": "합성 표지와 메타데이터로 HomePod 조명 효과를 테스트합니다.",
+  "Use player album covers or test colors with HomePod Sound Glow.": "HomePod Sound Glow에 재생 중인 앨범 표지 또는 테스트 색상을 보냅니다.",
   "Log": "로그",
   "Bit-exact passthrough": "비트 정확 통과",
   "Copy the capture untouched when its sample rate already matches the stream": "샘플 레이트가 스트림과 이미 같으면 캡처를 그대로 통과시킵니다",

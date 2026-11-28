@@ -2,6 +2,7 @@
 //! Uses the existing authenticated RTSP connection, off the audio thread.
 use crate::rtsp::{Cancellation, Connection};
 use anyhow::{Result, ensure};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -46,28 +47,87 @@ pub struct Command {
     pub sequence: u64,
     pub palette: Palette,
 }
+
+pub const MAX_ARTWORK_BYTES: usize = 24 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlayerArtwork {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    #[serde(deserialize_with = "decode_jpeg")]
+    pub jpeg: Vec<u8>,
+}
+
+fn decode_jpeg<'de, D: serde::Deserializer<'de>>(reader: D) -> Result<Vec<u8>, D::Error> {
+    let encoded = String::deserialize(reader)?;
+    if encoded.len() > MAX_ARTWORK_BYTES.div_ceil(3) * 4 {
+        return Err(serde::de::Error::custom("player artwork exceeds 24 KiB"));
+    }
+    let bytes = STANDARD.decode(encoded).map_err(serde::de::Error::custom)?;
+    if !bytes.starts_with(&[0xff, 0xd8, 0xff]) || !bytes.ends_with(&[0xff, 0xd9]) {
+        return Err(serde::de::Error::custom("expected JPEG player artwork"));
+    }
+    Ok(bytes)
+}
+
 #[derive(Debug, Default)]
 struct State {
     command: Option<Command>,
+    sequence: u64,
+    last_test: u64,
+    player: Option<Arc<PlayerArtwork>>,
     unavailable: Option<String>,
 }
 #[derive(Clone, Debug, Default)]
 pub struct Control(Arc<Mutex<State>>);
 impl Control {
+    pub fn set_request(&self, params: Value) -> Result<()> {
+        if params["palette"] != "player_artwork" {
+            return self.set(serde_json::from_value(params)?);
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Update {
+            sequence: u64,
+            #[serde(rename = "palette")]
+            _palette: String,
+            track: Option<PlayerArtwork>,
+        }
+        let update: Update = serde_json::from_value(params)?;
+        if let Some(track) = &update.track {
+            ensure!([&track.title, &track.artist, &track.album].iter().all(|s| s.len() <= 4096),
+                    "player artwork tags too long");
+            ensure!(!(track.title.is_empty() && track.artist.is_empty() && track.album.is_empty()),
+                    "player artwork needs a track");
+        }
+        self.replace(update.sequence, None, update.track.map(Arc::new))
+    }
     pub fn set(&self, command: Command) -> Result<()> {
-        ensure!(command.sequence > 0, "sequence must be positive");
+        self.replace(command.sequence, Some(command), None)
+    }
+    fn replace(&self, sequence: u64, command: Option<Command>, player: Option<Arc<PlayerArtwork>>) -> Result<()> {
         let mut current = self.0.lock().unwrap();
         if let Some(error) = &current.unavailable {
             anyhow::bail!("Sound Glow worker unavailable: {error}");
         }
-        ensure!(
-            current
-                .command
-                .is_none_or(|old| command.sequence > old.sequence),
-            "stale sound glow command"
-        );
-        current.command = Some(command);
+        ensure!(sequence > current.sequence, "stale sound glow command");
+        current.sequence = sequence;
+        if command.is_some() { current.last_test = sequence; }
+        current.command = command;
+        current.player = player;
         Ok(())
+    }
+    pub fn player_snapshot(&self) -> (u64, u64, Option<Arc<PlayerArtwork>>) {
+        let state = self.0.lock().unwrap();
+        (state.last_test, state.sequence, state.player.clone())
+    }
+    pub fn forget_player_artwork(&self) {
+        self.0.lock().unwrap().player = None;
+    }
+    pub fn is_current(&self, sequence: u64) -> bool {
+        self.0.lock().unwrap().sequence == sequence
     }
     fn latest(&self) -> Option<Command> {
         self.0.lock().unwrap().command
@@ -78,6 +138,7 @@ impl Control {
     pub fn disable(&self, error: String) {
         let mut state = self.0.lock().unwrap();
         state.command = None;
+        state.player = None;
         state.unavailable = Some(error);
     }
 }
@@ -101,6 +162,7 @@ fn metadata(palette: Palette) -> Vec<u8> {
     out
 }
 
+#[derive(Clone)]
 pub struct Peer {
     pub host: String,
     pub uri: String,
@@ -112,7 +174,7 @@ pub struct Peer {
 pub fn position(sequence: u16, timestamp: u32) -> u64 {
     ((sequence as u64) << 32) | timestamp as u64
 }
-fn send_part(peer: &Peer, content_type: &str, body: &[u8], stop: &Cancellation) -> Result<()> {
+fn send_part(peer: &Peer, content_type: &str, body: &[u8], stop: &Cancellation, control: &Control, sequence: u64) -> Result<()> {
     let mut connection = loop {
         stop.check()?;
         match peer.connection.try_lock() {
@@ -121,6 +183,11 @@ fn send_part(peer: &Peer, content_type: &str, body: &[u8], stop: &Cancellation) 
             Err(TryLockError::Poisoned(error)) => anyhow::bail!("{error}"),
         }
     };
+    ensure!(control.is_current(sequence), "superseded sound glow request");
+    send_locked(peer, &mut connection, content_type, body, stop)
+}
+
+pub fn send_locked(peer: &Peer, connection: &mut Connection, content_type: &str, body: &[u8], stop: &Cancellation) -> Result<()> {
     let current = peer.position.load(Ordering::Acquire);
     let mut headers = vec![
         ("Content-Type", content_type.to_owned()),
@@ -161,7 +228,7 @@ impl Worker {
                         // Each response is reported separately: 200 is acceptance, not proof of light.
                         for (part, content_type, body) in parts {
                             if done.is_cancelled() { break; }
-                            let result = send_part(peer, content_type, body, &done);
+                            let result = send_part(peer, content_type, body, &done, &control, command.sequence);
                             let event = json!({"event":"sound_glow_result", "sequence":command.sequence,
                                 "host":peer.host,"palette":command.palette.name(),"part":part,
                                 "accepted":result.is_ok(),"bytes":body.len(),
@@ -528,6 +595,25 @@ mod tests {
                 (&b"asar"[..], "AirFlash")
             ]
         );
+    }
+    #[test]
+    fn invalid_player_artwork_cannot_replace_the_last_good_request() {
+        let control = Control::default();
+        let update = |seq, data: String| json!({"palette":"player_artwork","sequence":seq,"track":{
+            "title":"Track","artist":"","album":"","jpeg":data
+        }});
+        let jpeg = Palette::Green.artwork().unwrap();
+        control.set_request(update(1, STANDARD.encode(jpeg))).unwrap();
+        for bad in ["%%%".to_owned(), STANDARD.encode(b"not a JPEG"), "A".repeat(MAX_ARTWORK_BYTES * 2)] {
+            assert!(control.set_request(update(2, bad)).is_err());
+        }
+        let (_, revision, good) = control.player_snapshot();
+        assert_eq!(revision, 1);
+        assert_eq!(good.unwrap().jpeg, jpeg);
+        control.set_request(json!({"sequence":2,"palette":"player_artwork","track":null})).unwrap();
+        assert!(control.player_snapshot().2.is_none());
+        assert!(!control.is_active());
+        assert!(control.set_request(update(1, STANDARD.encode(jpeg))).is_err());
     }
     #[test]
     fn commands_are_explicit_bounded_and_monotonic() {

@@ -7,9 +7,12 @@
     <Border Style="{StaticResource Card}">
       <StackPanel>
         <TextBlock Text="{loc:Text 'Sound Glow experiment'}" Style="{StaticResource SectionTitle}"/>
-        <TextBlock Text="{loc:Text 'Enable Sound Glow in the Home app, then stream audio. This experiment sends synthetic song information and test covers.'}" Style="{StaticResource Hint}"/>
+        <TextBlock Text="{loc:Text 'Enable Sound Glow in the Home app. Album covers follow track changes even after closing Settings.'}" Style="{StaticResource Hint}"/>
+        <CheckBox x:Name="FollowArtwork" Content="{loc:Text 'Follow current album cover'}" Click="OnFollowArtworkClick" Margin="0,10,0,0" IsEnabled="False"/>
         <TextBlock x:Name="StateText" TextWrapping="Wrap" Margin="0,12,0,0" AutomationProperties.LiveSetting="Polite"/>
-        <Border x:Name="Swatch" Height="60" CornerRadius="6" Background="Gray" Margin="0,12,0,12"/>
+        <Border x:Name="Swatch" Height="60" CornerRadius="6" Background="Gray" Margin="0,12,0,12">
+          <Image x:Name="CoverPreview" Stretch="Uniform"/>
+        </Border>
         <WrapPanel x:Name="Actions" IsEnabled="False">
           <Button Content="{loc:Text 'Song information only'}" Tag="metadata_only" Click="OnPaletteClick" Margin="0,0,8,8" Padding="10,6"/>
           <Button Content="{loc:Text 'Red'}" Tag="red" Click="OnPaletteClick" Margin="0,0,8,8" Padding="10,6"/>

@@ -76,6 +76,7 @@ fn capabilities() -> Vec<&'static str> {
         "forced_latency",
         "adaptive_lead_v2",
         "sound_glow_test",
+        "player_artwork",
     ];
     if airflash_engine::applications::supported() {
         values.push("application_capture");
@@ -86,11 +87,10 @@ fn capabilities() -> Vec<&'static str> {
 fn sound_glow_event(running: Option<&Running>, session: &str, params: Value) -> Value {
     let sequence = params.get("sequence").cloned().unwrap_or(Value::Null);
     let result = (|| -> anyhow::Result<()> {
-        let command: airflash_engine::sound_glow::Command = serde_json::from_value(params)?;
         let active = running
             .filter(|r| r.id == session && r.equalizer.is_some() && !r.cancel.is_cancelled())
             .ok_or_else(|| anyhow::anyhow!("sound glow test requires an active live session"))?;
-        active.sound_glow.set(command)
+        active.sound_glow.set_request(params)
     })();
     match result {
         Ok(()) => json!({"event":"sound_glow_queued","sequence":sequence}),

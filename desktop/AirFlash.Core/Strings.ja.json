@@ -1,4 +1,9 @@
 {
+  "Follow current album cover": "再生中のアルバムアートワークに合わせる",
+  "Enable Sound Glow in the Home app. Album covers follow track changes even after closing Settings.": "ホームアプリで Sound Glow をオンにしてください。設定を閉じた後も、曲に合わせてアートワークが更新されます。",
+  "Waiting for the current album cover.": "再生中のアルバムアートワークを待っています。",
+  "No cover available: {0}": "アートワークがありません：{0}",
+  "Current cover: {0}": "現在のアートワーク：{0}",
   "No receivers found": "受信機が見つかりません",
   "Discovery paused. Showing previous results.": "検索を一時停止しています。前回の結果を表示しています。",
   "Check for updates": "更新を確認",
@@ -426,7 +431,7 @@
   "Playback: {0} · Requested palette: {1}": "再生: {0} · 要求したパレット: {1}",
   "Start streaming before testing Sound Glow.": "Sound Glow を試す前に配信を開始してください。",
   "Sound Glow": "Sound Glow",
-  "Test HomePod light effects with synthetic covers and metadata.": "合成ジャケットとメタデータで HomePod のライト効果を試します。",
+  "Use player album covers or test colors with HomePod Sound Glow.": "HomePod の Sound Glow に、再生中のアルバムのジャケットやテストカラーを送信します。",
   "Log": "ログ",
   "Bit-exact passthrough": "ビット完全パススルー",
   "Copy the capture untouched when its sample rate already matches the stream": "サンプルレートがストリームと一致している場合はキャプチャをそのまま通す",

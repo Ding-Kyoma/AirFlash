@@ -1,4 +1,9 @@
 {
+  "Follow current album cover": "Использовать обложку текущего альбома",
+  "Enable Sound Glow in the Home app. Album covers follow track changes even after closing Settings.": "Включите Sound Glow в приложении «Дом». Обложка меняется вместе с композицией даже после закрытия настроек.",
+  "Waiting for the current album cover.": "Ожидание обложки альбома.",
+  "No cover available: {0}": "Обложка недоступна: {0}",
+  "Current cover: {0}": "Текущая обложка: {0}",
   "No receivers found": "Приёмники не найдены",
   "Discovery paused. Showing previous results.": "Поиск приостановлен. Показаны предыдущие результаты.",
   "Check for updates": "Проверить обновления",
@@ -426,7 +431,7 @@
   "Playback: {0} · Requested palette: {1}": "Воспроизведение: {0} · Запрошенная палитра: {1}",
   "Start streaming before testing Sound Glow.": "Начните трансляцию перед проверкой Sound Glow.",
   "Sound Glow": "Sound Glow",
-  "Test HomePod light effects with synthetic covers and metadata.": "Проверьте световые эффекты с обложками и метаданными.",
+  "Use player album covers or test colors with HomePod Sound Glow.": "Отправляйте обложки из проигрывателя или тестовые цвета для Sound Glow на HomePod.",
   "Log": "Журнал",
   "Bit-exact passthrough": "Побитовая передача без обработки",
   "Copy the capture untouched when its sample rate already matches the stream": "Копировать захват без изменений, если его частота дискретизации уже совпадает с потоком",

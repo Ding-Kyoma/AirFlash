@@ -213,7 +213,7 @@ public partial class App : Application
     }
     private static async Task<int> SelfCheckAsync(string[] args)
     {
-        var hello = await QueryHelloAsync(new ProcessEngineFactory(AppPaths.ExtractEngine()));
+        var hello = await QueryHelloAsync(new ProcessEngineFactory(AppPaths.ExtractEngine(AppPaths.DataDirectory)));
         WriteOutput(args, new { ok = true, host = "wpf", version = AppPaths.Version, display_version = AppPaths.DisplayVersion, native = hello });
         return 0;
     }

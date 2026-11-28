@@ -1778,6 +1778,8 @@ fn run_live(
                 continue;
             }
         }
+        // A resumed transport needs a fresh sample from the desktop media session.
+        options.sound_glow.forget_player_artwork();
         emit(json!({"event":"resuming"}));
         live.discard_stale();
         let ended = match run_stream(
@@ -2281,8 +2283,7 @@ fn send_packets(
             ))
         })
         .collect::<Vec<_>>();
-    let glow_worker = crate::sound_glow::Worker::start(
-        members
+    let metadata_peers: Vec<_> = members
             .iter()
             .zip(&positions)
             .map(|(m, position)| crate::sound_glow::Peer {
@@ -2292,7 +2293,9 @@ fn send_packets(
                 connection: m.conn.clone(),
                 position: position.clone(),
             })
-            .collect(),
+            .collect();
+    let glow_worker = crate::sound_glow::Worker::start(
+        metadata_peers.clone(),
         options.sound_glow.clone(),
     );
     let glow_worker = match glow_worker {
@@ -2322,7 +2325,7 @@ fn send_packets(
     let metadata_timeline =
         crate::metadata::Timeline::new(members[0].media.packetizer.timestamp, rate);
     let metadata_worker = crate::metadata::Worker::start(
-        volume_peers,
+        metadata_peers,
         crate::metadata::global().clone(),
         metadata_timeline.clone(),
         options.sound_glow.clone(),

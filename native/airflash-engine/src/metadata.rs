@@ -10,10 +10,12 @@
 //! - `application/x-dmap-tagged` with a `mlit` item holding `minm` (title),
 //!   `asar` (artist), `asal` (album) and `asgn` (genre).
 //!
-//! Player artwork is not sent. The separate opt-in Sound Glow experiment owns
-//! metadata output once enabled, until a fresh session restores normal updates.
+//! Opt-in player JPEGs follow matching track tags. Synthetic Sound Glow tests
+//! take exclusive ownership until normal playback or player artwork is selected.
 
-use crate::rtsp::{Cancellation, Connection};
+use crate::{rtsp::Cancellation, sound_glow::Peer};
+#[cfg(test)]
+use crate::rtsp::Connection;
 use anyhow::{Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -116,6 +118,9 @@ impl Control {
     fn latest(&self) -> Option<(u64, NowPlaying, Instant)> {
         self.0.lock().unwrap().clone()
     }
+    fn is_current(&self, sequence: u64) -> bool {
+        self.0.lock().unwrap().as_ref().is_some_and(|(latest, _, _)| *latest == sequence)
+    }
 }
 
 /// Process-wide control, mirroring the volume and lead controls: the engine runs
@@ -129,8 +134,6 @@ pub fn global() -> &'static Control {
 /// Progress changes faster than the display can use; Apple senders coalesce to
 /// roughly one update every second and a half.
 pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(1500);
-
-pub type Peer = (String, String, Arc<Mutex<Connection>>);
 
 #[derive(Clone)]
 pub struct Timeline {
@@ -176,6 +179,9 @@ impl Worker {
                 let mut tags_sent: Vec<Option<Vec<u8>>> = vec![None; peers.len()];
                 let mut progress_enabled = vec![true; peers.len()];
                 let mut tags_enabled = vec![true; peers.len()];
+                let mut artwork_attempt = vec![0; peers.len()];
+                let mut last_revision = 0;
+                let mut last_test = 0;
                 while !done.is_cancelled() {
                     if glow.is_active() {
                         thread::sleep(Duration::from_millis(50));
@@ -185,7 +191,14 @@ impl Worker {
                         thread::sleep(Duration::from_millis(100));
                         continue;
                     };
-                    let fresh = last.as_ref().is_none_or(|(old, previous, at)| {
+                    let (test, revision, artwork) = glow.player_snapshot();
+                    if test != last_test {
+                        // A colour test can replace the receiver's tags between polls.
+                        tags_sent.fill(None);
+                        last = None;
+                        last_test = test;
+                    }
+                    let fresh = revision != last_revision || last.as_ref().is_none_or(|(old, previous, at)| {
                         *old != sequence && (previous != &now || at.elapsed() >= PROGRESS_INTERVAL)
                     });
                     if !fresh {
@@ -194,11 +207,12 @@ impl Worker {
                     }
                     let mut errors = Vec::new();
                     let mut tags_updated = false;
-                    for (index, (host, uri, connection)) in peers.iter().enumerate() {
+                    for (index, peer) in peers.iter().enumerate() {
                         if done.is_cancelled() {
                             return;
                         }
-                        let mut connection = connection.lock().unwrap();
+                        let (host, uri) = (&peer.host, &peer.uri);
+                        let mut connection = peer.connection.lock().unwrap();
                         // Check again under the transaction lock so an in-flight
                         // normal update cannot overwrite the experiment's tags.
                         if glow.is_active() {
@@ -225,7 +239,37 @@ impl Worker {
                             }
                         }
                         let tags = dmap_tags(&now);
-                        if tags_enabled[index]
+                        let pending_art = artwork.as_ref().filter(|art| {
+                            artwork_attempt[index] != revision
+                                && (art.title.as_str(), art.artist.as_str(), art.album.as_str())
+                                    == (now.title.as_str(), now.artist.as_str(), now.album.as_str())
+                                && glow.is_current(revision)
+                                && control.is_current(sequence)
+                        });
+                        if let Some(art) = pending_art {
+                            // Repeat the real tags with the same session and RTP header format
+                            // as the colour tests, even when the thumbnail arrived a poll late.
+                            let tag_result = crate::sound_glow::send_locked(
+                                peer, &mut connection, "application/x-dmap-tagged", &tags, &done,
+                            );
+                            let (part, bytes, result) = match tag_result {
+                                Ok(()) => {
+                                    tags_sent[index] = Some(tags);
+                                    tags_updated = true;
+                                    if !glow.is_current(revision) || !control.is_current(sequence) { continue; }
+                                    let result = crate::sound_glow::send_locked(
+                                        peer, &mut connection, "image/jpeg", &art.jpeg, &done,
+                                    );
+                                    ("artwork", art.jpeg.len(), result)
+                                }
+                                Err(error) => ("metadata", tags.len(), Err(error)),
+                            };
+                            artwork_attempt[index] = revision;
+                            let _ = tx.try_send(json!({"event":"sound_glow_result","sequence":revision,
+                                "palette":"player_artwork","part":part,"host":host,"bytes":bytes,
+                                "accepted":result.is_ok(),"light_verified":false,
+                                "message":result.err().map(|e| format!("{e:#}"))}));
+                        } else if tags_enabled[index]
                             && !tags.is_empty()
                             && tags_sent[index].as_ref() != Some(&tags)
                         {
@@ -255,6 +299,7 @@ impl Worker {
                         "message": errors.join("; "),
                     }));
                     last = Some((sequence, now, Instant::now()));
+                    last_revision = revision;
                 }
             })?;
         Ok(Self {
@@ -364,10 +409,11 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
             socket
-                .set_read_timeout(Some(Duration::from_millis(500)))
+                .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
             let mut pending = Vec::new();
             let mut buffer = [0; 4096];
+            let mut cover_count = 0;
             loop {
                 let read = socket.read(&mut buffer).unwrap_or(0);
                 if read == 0 {
@@ -398,8 +444,12 @@ mod tests {
                             .map(|v| v.trim().to_string())
                     });
                     if let Some(cseq) = cseq {
+                        let status = if request.to_ascii_lowercase().contains("content-type: image/jpeg") {
+                            cover_count += 1;
+                            if cover_count == 2 { "415 Unsupported Media Type" } else { "200 OK" }
+                        } else { "200 OK" };
                         let _ = socket.write_all(
-                            format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Length: 0\r\n\r\n")
+                            format!("RTSP/1.0 {status}\r\nCSeq: {cseq}\r\nContent-Length: 0\r\n\r\n")
                                 .as_bytes(),
                         );
                     }
@@ -412,11 +462,10 @@ mod tests {
         let control = Control::default();
         control.set(1, sample());
         let connection = Connection::connect(addr, Cancellation::default()).unwrap();
-        let peers = vec![(
-            "127.0.0.1".to_string(),
-            "/stream".to_string(),
-            Arc::new(Mutex::new(connection)),
-        )];
+        let peers = vec![Peer {
+            host: "127.0.0.1".into(), uri: "/stream".into(), session: Some("test-session".into()),
+            connection: Arc::new(Mutex::new(connection)), position: Arc::new(0.into()),
+        }];
         let glow = crate::sound_glow::Control::default();
         let worker = Worker::start(
             peers,
@@ -466,6 +515,50 @@ mod tests {
         moved.title = "Normal metadata must not overwrite the experiment".into();
         control.set(3, moved);
         assert!(received.recv_timeout(Duration::from_millis(250)).is_err());
+        // Artwork arrives before its track. Resume real tags, but do not pair the
+        // pending image with whatever track the previous poll still described.
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let jpeg = include_bytes!("../assets/sound-glow/blue.jpg");
+        let actual = sample();
+        glow.set_request(json!({"sequence":2,"palette":"player_artwork","track":{
+            "title":actual.title,"artist":actual.artist,"album":actual.album,"jpeg":STANDARD.encode(jpeg)
+        }})).unwrap();
+        let next = || received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(next().0.to_ascii_lowercase().contains("text/parameters"));
+        assert!(next().0.to_ascii_lowercase().contains("application/x-dmap-tagged"));
+        control.set(4, actual.clone());
+        assert!(next().0.to_ascii_lowercase().contains("text/parameters"));
+        let (tag_header, tag_body) = next();
+        assert_eq!(tag_body, dmap_tags(&actual));
+        assert!(tag_header.contains("Session: test-session"));
+        assert!(tag_header.contains("RTP-Info: seq=0;rtptime=0"));
+        let (header, body) = next();
+        assert!(header.to_ascii_lowercase().contains("content-type: image/jpeg"));
+        assert!(header.contains("Session: test-session"));
+        assert!(header.contains("RTP-Info: seq=0;rtptime=0"));
+        assert_eq!(body, jpeg);
+        let mut advancing = actual.clone();
+        advancing.position_ms += 2000;
+        control.set(5, advancing);
+        assert!(next().0.to_ascii_lowercase().contains("text/parameters"));
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+        glow.set_request(json!({"sequence":3,"palette":"player_artwork","track":{
+            "title":actual.title,"artist":actual.artist,"album":actual.album,"jpeg":STANDARD.encode(jpeg)
+        }})).unwrap();
+        assert!(next().0.to_ascii_lowercase().contains("text/parameters"));
+        assert_eq!(next().1, dmap_tags(&actual));
+        assert_eq!(next().1, jpeg);
+        let rejection = loop {
+            let event = worker.events.recv_timeout(Duration::from_secs(2)).unwrap();
+            if event["event"] == "sound_glow_result" && event["sequence"] == 3 { break event; }
+        };
+        assert_eq!(rejection["accepted"], false);
+        let mut different = actual;
+        different.title = "Track after rejected cover".into();
+        control.set(6, different.clone());
+        assert!(next().0.to_ascii_lowercase().contains("text/parameters"));
+        assert_eq!(next().1, dmap_tags(&different));
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
         drop(worker);
         drop(received);
         let _ = server.join();
