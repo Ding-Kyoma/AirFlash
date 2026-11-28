@@ -5,6 +5,19 @@ namespace AirFlash.Tests;
 public sealed class NowPlayingTests
 {
     [Fact]
+    public async Task Late_cover_and_new_stream_are_published_even_for_a_paused_song()
+    {
+        var source = new Source { Value = Track(playing: false) with { ArtworkGeneration = 1 } };
+        var pump = new NowPlayingPump(source) { Settle = TimeSpan.Zero };
+        Assert.NotNull(await pump.PollAsync(default));
+        source.Value = source.Value! with { ArtworkJpeg = [1, 2, 3] };
+        Assert.NotNull(await pump.PollAsync(default));
+        Assert.Null(await pump.PollAsync(default));
+        source.Value = source.Value with { ArtworkGeneration = 2 };
+        Assert.NotNull(await pump.PollAsync(default));
+    }
+
+    [Fact]
     public async Task Continuous_progress_does_not_restart_the_tag_settle_window()
     {
         var source = new Source();

@@ -31,11 +31,12 @@ public static class AppPaths
         stream.ReadExactly(bytes);
         return bytes;
     }
-    public static string ExtractEngine()
+    public static string ExtractEngine(string? cacheRoot = null)
     {
         var bytes = ReadEmbeddedEngine();
         var hash = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
-        var directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), Name, "engine", hash);
+        cacheRoot ??= Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), Name);
+        var directory = Path.Combine(cacheRoot, "engine", hash);
         Directory.CreateDirectory(directory);
         var target = Path.Combine(directory, "airflash-engine.exe");
         if (File.Exists(target) && Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(target))).Equals(hash, StringComparison.OrdinalIgnoreCase)) return target;

@@ -25,19 +25,48 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private readonly SemaphoreSlim _serial = new(1, 1);
     private long _soundGlowSequence;
     private bool _soundGlowSupported;
+    private bool _playerArtworkSupported, _followPlayerArtwork;
+    private long _artworkGeneration;
+    private NowPlaying? _lastArtwork;
+    public bool PlayerArtworkSupported { get { lock (_sync) return _playerArtworkSupported; } }
+    public bool FollowPlayerArtwork { get { lock (_sync) return _followPlayerArtwork; } }
+    public byte[]? CurrentArtworkJpeg { get { lock (_sync) return _lastArtwork is { HasSendableArtwork: true } track ? track.ArtworkJpeg : null; } }
+    public long? PlayerArtworkGeneration { get { lock (_sync) return _followPlayerArtwork && _playerArtworkSupported && _snapshot.State == PlaybackState.Streaming ? _artworkGeneration : null; } }
+    public string PlayerArtworkStatus
+    {
+        get
+        {
+            lock (_sync) return _lastArtwork is not { } track ? L.Get("Waiting for the current album cover.")
+                : L.Format(track.HasSendableArtwork ? "Current cover: {0}" : "No cover available: {0}", track.Title);
+        }
+    }
     private readonly SemaphoreSlim _soundGlowWriter = new(1, 1);
     public bool SoundGlowSupported { get { lock (_sync) return _soundGlowSupported; } }
     public event Action<JsonElement>? SoundGlowFeedback;
-    public async Task SendSoundGlowTestAsync(string palette, CancellationToken cancellation = default)
+    public Task SendSoundGlowTestAsync(string palette, CancellationToken cancellation = default)
     {
         if (palette is not ("metadata_only" or "red" or "blue" or "green"))
             throw new ArgumentException("Unknown test palette.", nameof(palette));
+        return WriteSoundGlowAsync(palette, false, null, cancellation);
+    }
+    public Task SetFollowPlayerArtworkAsync(bool enabled, CancellationToken cancellation = default)
+        => WriteSoundGlowAsync("player_artwork", enabled, null, cancellation);
+
+    private async Task WriteSoundGlowAsync(string palette, bool follow, NowPlaying? sample, CancellationToken cancellation)
+    {
         IEngineConnection connection; string session; CancellationToken lifetime; long epoch;
         lock (_sync)
         {
+            if (sample is not null && !IsCurrentArtworkSample(sample)) return;
+            if (palette == "player_artwork" && !follow && sample is null &&
+                (!_playerArtworkSupported || _snapshot.State != PlaybackState.Streaming || _connection is null))
+            {
+                _followPlayerArtwork = false; _lastArtwork = null; ++_artworkGeneration;
+                return;
+            }
             if (_snapshot.State != PlaybackState.Streaming || _connection is null || _sessionId is null || _lifetime is null)
                 throw new InvalidOperationException(L.Get("Start streaming before testing Sound Glow."));
-            if (!_soundGlowSupported)
+            if (!_soundGlowSupported || (palette == "player_artwork" && !_playerArtworkSupported))
                 throw new InvalidOperationException(L.Get("This audio engine does not support the Sound Glow experiment."));
             connection = _connection; session = _sessionId; lifetime = _lifetime.Token; epoch = _generation;
         }
@@ -52,13 +81,32 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                 timeout.Token.ThrowIfCancellationRequested();
                 if (epoch != _generation || !ReferenceEquals(connection, _connection) || _snapshot.State != PlaybackState.Streaming)
                     throw new InvalidOperationException(L.Get("Start streaming before testing Sound Glow."));
+                if (sample is not null && (!IsCurrentArtworkSample(sample) ||
+                    (_lastArtwork is { } last && (last.Title, last.Artist, last.Album, last.ArtworkJpeg) ==
+                    (sample.Title, sample.Artist, sample.Album, sample.ArtworkJpeg)))) return;
                 sequence = ++_soundGlowSequence;
             }
-            await connection.SendAsync(session, "set_sound_glow", new { sequence, palette }, timeout.Token).ConfigureAwait(false);
-            log?.Invoke($"Sound Glow test requested: sequence={sequence}; palette={palette}");
+            object payload = new { sequence, palette };
+            if (palette == "player_artwork")
+            {
+                var track = sample is { HasSendableArtwork: true }
+                    ? new { title = sample.Title, artist = sample.Artist, album = sample.Album, jpeg = sample.ArtworkJpeg } : null;
+                payload = new { sequence, palette, track };
+            }
+            await connection.SendAsync(session, "set_sound_glow", payload, timeout.Token).ConfigureAwait(false);
+            lock (_sync)
+            {
+                if (epoch != _generation || !ReferenceEquals(connection, _connection)) return;
+                if (sample is null) { _followPlayerArtwork = follow; ++_artworkGeneration; }
+                _lastArtwork = sample;
+            }
+            log?.Invoke($"Sound Glow requested: sequence={sequence}; palette={palette}");
         }
         finally { _soundGlowWriter.Release(); }
     }
+    private bool IsCurrentArtworkSample(NowPlaying sample) =>
+        _followPlayerArtwork && _playerArtworkSupported && _snapshot.State == PlaybackState.Streaming
+        && sample.ArtworkGeneration == _artworkGeneration && ReferenceEquals(_nowPlaying, sample);
     private readonly SemaphoreSlim _audioWriter = new(1, 1);
     private readonly SemaphoreSlim _diagnosticWriter = new(1, 1);
     private TaskCompletionSource<JsonElement?>? _diagnosticReply;
@@ -613,12 +661,15 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                 title = now.Title, artist = now.Artist, album = now.Album, genre = now.Genre,
                 duration_ms = now.DurationMs, position_ms = now.PositionMs, playing = now.Playing
             }, cancellation).ConfigureAwait(false);
+            if (now.ArtworkGeneration.HasValue)
+                await WriteSoundGlowAsync("player_artwork", true, now, cancellation).ConfigureAwait(false);
         }
         catch (Exception error) when (error is IOException or ObjectDisposedException or InvalidOperationException)
         {
             log?.Invoke(L.Format("Now Playing deferred to the next session: {0}", error.Message));
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+        catch (OperationCanceledException) { log?.Invoke("Player artwork update deferred."); }
     }
     public async Task<JsonElement?> DiagnosticSnapshotAsync(CancellationToken cancellation = default)
     {
@@ -746,7 +797,14 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                     var deadline = DateTime.UtcNow + _timing.Connect;
                     await connection.SendAsync(session, "hello", null, cancellation).ConfigureAwait(false);
                     var hello = await ReadEventAsync(connection, session, _timing.Connect, cancellation).ConfigureAwait(false);
-                    lock (_sync) { if (epoch == _generation) _soundGlowSupported = EngineHandshake.HasCapability(hello, "sound_glow_test"); }
+                    lock (_sync)
+                    {
+                        if (epoch == _generation)
+                        {
+                            _soundGlowSupported = EngineHandshake.HasCapability(hello, "sound_glow_test");
+                            _playerArtworkSupported = EngineHandshake.HasCapability(hello, "player_artwork");
+                        }
+                    }
                     _confirmedLeadSupported = EngineHandshake.HasCapability(hello, "adaptive_lead_v2");
                     EngineHandshake.RequireStreamingCapabilities(hello);
                     EngineHandshake.RequireCapabilities(hello, "standby_release");
@@ -876,7 +934,13 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                             recovering = false;
                             AcceptLatency(item);
                             startedAt = Stopwatch.GetTimestamp();
-                            lock (_sync) { if (epoch != _generation) continue; _transportStreaming = true; }
+                            lock (_sync)
+                            {
+                                if (epoch != _generation) continue;
+                                _transportStreaming = true;
+                                _lastArtwork = null;
+                                ++_artworkGeneration;
+                            }
                             await ApplyLocalMuteAsync().ConfigureAwait(false);
                             log?.Invoke($"Streaming started: {receiver.Id}; target latency {_adaptiveBase} ms; reconnect attempts {attempts}");
                             Publish(epoch, PlaybackState.Streaming);
@@ -1139,8 +1203,14 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         public NetworkFailure(string message) : base(message) { }
     }
     private static bool IsAuthenticationFailure(string message) => new[] { "pairing", "srp", "verification", "credentials", "signature", "identity", "authentication" }.Any(word => message.Contains(word, StringComparison.OrdinalIgnoreCase));
-    private void SetConnection(IEngineConnection connection, string session) { lock (_sync) { _connection = connection; _sessionId = session; _equalizerReady = false; _sentStandby = null; _soundGlowSupported = false; } }
-    private void ClearConnection(IEngineConnection connection) { lock (_sync) if (ReferenceEquals(_connection, connection)) { _connection = null; _sessionId = null; _equalizerReady = false; _sentStandby = null; _soundGlowSupported = false; } }
+    private void SetConnection(IEngineConnection connection, string session) { lock (_sync) { _connection = connection; _sessionId = session; _equalizerReady = false; _sentStandby = null; ResetSoundGlowConnection(); } }
+    private void ClearConnection(IEngineConnection connection) { lock (_sync) if (ReferenceEquals(_connection, connection)) { _connection = null; _sessionId = null; _equalizerReady = false; _sentStandby = null; ResetSoundGlowConnection(); } }
+    private void ResetSoundGlowConnection()
+    {
+        _soundGlowSupported = _playerArtworkSupported = false;
+        _lastArtwork = null;
+        ++_artworkGeneration;
+    }
     private static async Task RequestStopAsync(IEngineConnection connection, string session)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));

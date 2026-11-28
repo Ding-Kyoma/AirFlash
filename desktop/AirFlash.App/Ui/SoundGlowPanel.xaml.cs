@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using AirFlash.App.Services;
 using AirFlash.App.ViewModels;
@@ -17,6 +18,7 @@ public partial class SoundGlowPanel : UserControl, IDisposable
     private readonly DispatcherTimer _timer = new() { Interval = TimeSpan.FromSeconds(15) };
     private AppViewModel? _app;
     private string? _lastPalette;
+    private byte[]? _preview;
     private bool _busy, _disposed;
 
     public AppViewModel? App { get => (AppViewModel?)GetValue(AppProperty); set => SetValue(AppProperty, value); }
@@ -53,7 +55,22 @@ public partial class SoundGlowPanel : UserControl, IDisposable
         else UpdateState();
     }
 
-    private static string PaletteLabel(string? palette) => L.Get(palette switch { "metadata_only" => "Song information only", "red" => "Red", "blue" => "Blue", "green" => "Green", _ => "Not sent" });
+    private static string PaletteLabel(string? palette) => L.Get(palette switch { "player_artwork" => "Follow current album cover", "metadata_only" => "Song information only", "red" => "Red", "blue" => "Blue", "green" => "Green", _ => "Not sent" });
+
+    private async void OnFollowArtworkClick(object sender, RoutedEventArgs args)
+    {
+        if (_busy || _disposed || _app is null) return;
+        bool enabled = FollowArtwork.IsChecked == true;
+        Cycle.IsChecked = false;
+        _busy = true; UpdateState();
+        try
+        {
+            await _app.Session.SetFollowPlayerArtworkAsync(enabled);
+            if (!_disposed) { _lastPalette = null; Swatch.Background = Brushes.Gray; }
+        }
+        catch (Exception error) { Append(error.Message); }
+        finally { _busy = false; if (!_disposed) UpdateState(); }
+    }
 
     private async void OnPaletteClick(object sender, RoutedEventArgs args)
     {
@@ -84,6 +101,7 @@ public partial class SoundGlowPanel : UserControl, IDisposable
         try
         {
             var receiver = _app.Session.Snapshot.Receiver;
+            if (_app.Session.FollowPlayerArtwork) await _app.Session.SetFollowPlayerArtworkAsync(false);
             await _app.Session.StopAsync();
             _lastPalette = null; Swatch.Background = Brushes.Gray;
             if (!_disposed && receiver is not null) await _app.Session.StartAsync(receiver, _app.Settings.Clone());
@@ -118,6 +136,7 @@ public partial class SoundGlowPanel : UserControl, IDisposable
     private void OnFeedback(JsonElement item) => Dispatcher.BeginInvoke(() =>
     {
         if (_disposed) return;
+        UpdateState();
         if (item.Text("event") == "sound_glow_queued") { Append(L.Get("Queued by the engine; receiver acceptance is not yet confirmed.")); return; }
         if (item.Text("event") == "sound_glow_error" || item.Boolean("accepted") == false) Cycle.IsChecked = false;
         Append(item.Text("event") == "sound_glow_result"
@@ -136,10 +155,21 @@ public partial class SoundGlowPanel : UserControl, IDisposable
     private void UpdateState()
     {
         if (_disposed) return;
-        if (_app is null) { StateText.Text = ""; Actions.IsEnabled = false; Cycle.IsEnabled = false; return; }
+        if (_app is null) { StateText.Text = ""; Actions.IsEnabled = false; Cycle.IsEnabled = false; FollowArtwork.IsEnabled = false; return; }
         var supported = _app.Session.SoundGlowSupported;
         var streaming = _app.Session.Snapshot.State == PlaybackState.Streaming;
-        StateText.Text = streaming && !supported ? L.Get("This audio engine does not support the Sound Glow experiment.")
+        var following = _app.Session.FollowPlayerArtwork;
+        FollowArtwork.IsChecked = following;
+        FollowArtwork.IsEnabled = !_busy && (following || streaming && _app.Session.PlayerArtworkSupported);
+        var jpeg = following ? _app.Session.CurrentArtworkJpeg : null;
+        if (!ReferenceEquals(jpeg, _preview))
+        {
+            _preview = jpeg;
+            using var previewStream = jpeg is null ? null : new System.IO.MemoryStream(jpeg, writable: false);
+            CoverPreview.Source = previewStream is null ? null : BitmapFrame.Create(previewStream,
+                BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
+        }
+        StateText.Text = following ? _app.Session.PlayerArtworkStatus : streaming && !supported ? L.Get("This audio engine does not support the Sound Glow experiment.")
             : L.Format("Playback: {0} · Requested palette: {1}", _app.StatusTitle, PaletteLabel(_lastPalette));
         Actions.IsEnabled = streaming && supported && !_busy; Cycle.IsEnabled = streaming && supported && !_busy;
     }

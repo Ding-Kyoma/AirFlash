@@ -12,9 +12,12 @@ namespace AirFlash.App.Metadata;
 /// build without the contract) simply produces no metadata instead of failing the
 /// stream.
 /// </remarks>
-public sealed class SmtcNowPlayingSource(Action<string>? log = null) : INowPlayingSource
+public sealed class SmtcNowPlayingSource(Action<string>? log = null, Func<long?>? artworkGeneration = null) : INowPlayingSource
 {
     private GlobalSystemMediaTransportControlsSessionManager? _manager;
+    private (long Generation, string App, string Title, string Artist, string Album)? _coverKey;
+    private long _nextCoverCheck;
+    private byte[]? _jpeg;
     public async Task ExecuteAsync(RemoteCommand command, CancellationToken cancellation)
     {
         try
@@ -34,12 +37,12 @@ public sealed class SmtcNowPlayingSource(Action<string>? log = null) : INowPlayi
         {
             _manager ??= await GlobalSystemMediaTransportControlsSessionManager.RequestAsync().AsTask(cancellation).ConfigureAwait(false);
             var session = _manager.GetCurrentSession();
-            if (session is null) return null;
+            if (session is null) { _coverKey = null; _jpeg = null; return null; }
             var properties = await session.TryGetMediaPropertiesAsync().AsTask(cancellation).ConfigureAwait(false);
             var playback = session.GetPlaybackInfo();
             var timeline = session.GetTimelineProperties();
             var playing = playback.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
-            return new AirFlash.Core.NowPlaying(
+            var now = new AirFlash.Core.NowPlaying(
                 properties.Title ?? "",
                 properties.Artist ?? "",
                 properties.AlbumTitle ?? "",
@@ -47,6 +50,39 @@ public sealed class SmtcNowPlayingSource(Action<string>? log = null) : INowPlayi
                 playing,
                 Math.Max(0, (long)(timeline.EndTime - timeline.StartTime).TotalMilliseconds),
                 Math.Max(0, (long)(timeline.Position - timeline.StartTime).TotalMilliseconds));
+            if (artworkGeneration?.Invoke() is not long generation || now.IsEmpty)
+            {
+                _coverKey = null; _jpeg = null;
+                return now;
+            }
+            var key = (generation, session.SourceAppUserModelId, now.Title, now.Artist, now.Album);
+            if (_coverKey != key) { _coverKey = key; _jpeg = null; _nextCoverCheck = 0; }
+            if (Environment.TickCount64 >= _nextCoverCheck)
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+                timeout.CancelAfter(TimeSpan.FromSeconds(3));
+                try
+                {
+                    var image = properties.Thumbnail is { } thumb
+                        ? await PlayerArtworkReader.ReadAsync(thumb, timeout.Token).ConfigureAwait(false) : null;
+                    // A slow thumbnail can finish after the player has already switched tracks.
+                    if (image is not null)
+                    {
+                        var current = _manager.GetCurrentSession();
+                        if (current is null || current.SourceAppUserModelId != session.SourceAppUserModelId) return null;
+                        var check = await current.TryGetMediaPropertiesAsync().AsTask(timeout.Token).ConfigureAwait(false);
+                        if ((check.Title ?? "") != now.Title || (check.Artist ?? "") != now.Artist || (check.AlbumTitle ?? "") != now.Album) return null;
+                    }
+                    if (image is null || !_jpeg.AsSpan().SequenceEqual(image)) _jpeg = image;
+                    _nextCoverCheck = Environment.TickCount64 + (_jpeg is null ? 4000 : 30000);
+                }
+                catch (Exception error) when (!cancellation.IsCancellationRequested)
+                {
+                    _nextCoverCheck = Environment.TickCount64 + 10000;
+                    log?.Invoke($"Player artwork unavailable: {error.Message}");
+                }
+            }
+            return now with { ArtworkGeneration = generation, ArtworkJpeg = _jpeg };
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception error)

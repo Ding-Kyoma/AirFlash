@@ -174,7 +174,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         // A receiver's own buttons arrive as transport commands; forward them to the
         // media keys so the app that is playing reacts, without touching the stream.
         _nowPlayingStop = new();
-        var nowPlayingSource = new AirFlash.App.Metadata.SmtcNowPlayingSource(AppPaths.Log);
+        var nowPlayingSource = new AirFlash.App.Metadata.SmtcNowPlayingSource(AppPaths.Log, () => Session.PlayerArtworkGeneration);
         Session.RemoteCommandReceived += command =>
         {
             if (command.Name is "play" or "pause")

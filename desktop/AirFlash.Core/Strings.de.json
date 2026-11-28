@@ -1,4 +1,9 @@
 {
+  "Follow current album cover": "Aktuellem Albumcover folgen",
+  "Enable Sound Glow in the Home app. Album covers follow track changes even after closing Settings.": "Sound Glow in der Home-App aktivieren. Albumcover wechseln mit dem Titel, auch wenn die Einstellungen geschlossen sind.",
+  "Waiting for the current album cover.": "Warten auf das aktuelle Albumcover.",
+  "No cover available: {0}": "Kein Cover verfügbar: {0}",
+  "Current cover: {0}": "Aktuelles Cover: {0}",
   "No receivers found": "Keine Empfänger gefunden",
   "Discovery paused. Showing previous results.": "Die Gerätesuche ist pausiert. Die vorherigen Ergebnisse werden angezeigt.",
   "Check for updates": "Nach Updates suchen",
@@ -426,7 +431,7 @@
   "Playback: {0} · Requested palette: {1}": "Wiedergabe: {0} · Angeforderte Farbe: {1}",
   "Start streaming before testing Sound Glow.": "Starten Sie die Wiedergabe, bevor Sie Sound Glow testen.",
   "Sound Glow": "Sound Glow",
-  "Test HomePod light effects with synthetic covers and metadata.": "HomePod-Lichteffekte mit Testcovern und Metadaten prüfen.",
+  "Use player album covers or test colors with HomePod Sound Glow.": "Albumcover des Players oder Testfarben für Sound Glow auf dem HomePod verwenden.",
   "Log": "Protokoll",
   "Bit-exact passthrough": "Bitgenaue Weitergabe",
   "Copy the capture untouched when its sample rate already matches the stream": "Aufnahme unverändert übernehmen, wenn ihre Abtastrate bereits dem Stream entspricht",

@@ -6,6 +6,12 @@ namespace AirFlash.Core;
 /// <summary>What the receiver should show right now.</summary>
 public sealed record NowPlaying(string Title, string Artist, string Album, string Genre, bool Playing, long DurationMs, long PositionMs)
 {
+    public long? ArtworkGeneration { get; init; }
+    public byte[]? ArtworkJpeg { get; init; }
+    public const int MaxArtworkBytes = 24 * 1024;
+    // Leave room for Base64 and JSON-escaped track strings in the 64 KiB IPC frame.
+    public bool HasSendableArtwork => ArtworkJpeg is { Length: > 0 and <= MaxArtworkBytes }
+        && Title.Length <= 1024 && Artist.Length <= 1024 && Album.Length <= 1024 && !IsEmpty;
     public bool IsEmpty => Title.Length == 0 && Artist.Length == 0 && Album.Length == 0;
     /// <summary>Display delay of a poll that lands between two updates of the same
     /// track: the receiver's progress bar is driven by interpolating from the last
@@ -76,6 +82,7 @@ public sealed class NowPlayingPump(INowPlayingSource source, Func<long>? clock =
     private bool ShouldPublish(NowPlaying sample)
     {
         if (_lastPublished is not { } last) return true;
+        if (last.ArtworkGeneration != sample.ArtworkGeneration || last.ArtworkJpeg != sample.ArtworkJpeg) return true;
         if (last.Title != sample.Title || last.Artist != sample.Artist || last.Album != sample.Album || last.Genre != sample.Genre) return true;
         if (last.Playing != sample.Playing) return true;
         if (Math.Abs(last.DurationMs - sample.DurationMs) > 0) return true;

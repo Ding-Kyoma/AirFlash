@@ -447,6 +447,47 @@ public sealed class SessionTests
     }
 
     [Fact]
+    public async Task PlayerArtworkIsOptInDeduplicatedAndScopedToTheStream()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection();
+        await using var controller = new SessionController(new FakeFactory(first, second), new FakeAudio(), timing: Fast with { Read = SessionTiming.Default.Read });
+        await controller.StartAsync(Pod(), Settings());
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.Null(controller.PlayerArtworkGeneration);
+        var song = new NowPlaying("Real title", "Artist", "", "", true, 10000, 1000);
+        await controller.SetFollowPlayerArtworkAsync(true);
+        var generation = controller.PlayerArtworkGeneration;
+        Assert.NotNull(generation);
+        var cover = song with { ArtworkJpeg = [0xff, 0xd8, 0xff, 0xd9], ArtworkGeneration = generation };
+        await controller.PublishNowPlayingAsync(cover);
+        await controller.PublishNowPlayingAsync(cover with { PositionMs = 4000 });
+        var sent = first.Commands.Where(c => c.Command == "set_sound_glow").ToArray();
+        Assert.Equal(2, sent.Length);
+        Assert.Equal(cover.ArtworkJpeg, sent[1].Parameters.GetProperty("track").GetProperty("jpeg").GetBytesFromBase64());
+        await controller.PublishNowPlayingAsync(song with { Title = "No artwork", ArtworkGeneration = generation });
+        Assert.Equal(JsonValueKind.Null, first.Commands.Last(c => c.Command == "set_sound_glow").Parameters.GetProperty("track").ValueKind);
+        first.EmitData(new { @event = "standby", reason = "silence" });
+        await Until(() => controller.Snapshot.State == PlaybackState.Standby);
+        first.EmitData(new { @event = "streaming" });
+        await Until(() => controller.PlayerArtworkGeneration.HasValue && controller.PlayerArtworkGeneration != generation);
+        int count = first.Commands.Count(c => c.Command == "set_sound_glow");
+        await controller.PublishNowPlayingAsync(cover);
+        Assert.Equal(count, first.Commands.Count(c => c.Command == "set_sound_glow"));
+        await controller.PublishNowPlayingAsync(cover with { ArtworkGeneration = controller.PlayerArtworkGeneration });
+        Assert.Equal(count + 1, first.Commands.Count(c => c.Command == "set_sound_glow"));
+        await controller.StopAsync();
+        await controller.StartAsync(Pod(), Settings());
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.NotEqual(generation, controller.PlayerArtworkGeneration);
+        await controller.PublishNowPlayingAsync(cover);
+        Assert.DoesNotContain(second.Commands, c => c.Command == "set_sound_glow");
+        await controller.SendSoundGlowTestAsync("blue");
+        Assert.False(controller.FollowPlayerArtwork);
+        await controller.PublishNowPlayingAsync(cover);
+        Assert.Single(second.Commands, c => c.Command == "set_sound_glow");
+    }
+
+    [Fact]
     public async Task StopCancelsBlockedSoundGlowAndQueuedRequests()
     {
         var process = new FakeConnection();
@@ -1789,7 +1830,7 @@ public sealed class SessionTests
                 case "set_gain": GainEntered?.TrySetResult(); if (GainGate is not null) await GainGate.Task.WaitAsync(cancellation); break;
             }
         }
-        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "multi_room", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture" }.Where(c => SupportsOwnershipGuard || c != "receiver_ownership_guard").Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).Concat(SupportsSoundGlow ? ["sound_glow_test"] : Array.Empty<string>()).Concat(SupportsForcedLatency ? ["forced_latency"] : Array.Empty<string>()).Concat(SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).Concat(SupportsInitialVolume ? ["initial_volume"] : Array.Empty<string>()).ToArray() });
+        public void EmitHello() => EmitData(new { @event = "hello", capabilities = new[] { "receiver_profiles", "software_stereo", "multi_room", "continuity", "buffered_audio", "member_volume", "receiver_password", "standby_release", "receiver_ownership_guard", "application_capture" }.Where(c => SupportsOwnershipGuard || c != "receiver_ownership_guard").Concat(ReceiverCapabilityResponse is null ? [] : new[] { "receiver_capabilities" }).Concat(SupportsSoundGlow ? ["sound_glow_test", "player_artwork"] : Array.Empty<string>()).Concat(SupportsForcedLatency ? ["forced_latency"] : Array.Empty<string>()).Concat(SupportsAdaptiveLead ? ["adaptive_lead_v2"] : Array.Empty<string>()).Concat(SupportsInitialVolume ? ["initial_volume"] : Array.Empty<string>()).ToArray() });
         public void ConfirmLead(int extra)
         {
             var command = Commands.Last(c => c.Command == "set_lead");
